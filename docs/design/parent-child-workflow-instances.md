@@ -152,6 +152,10 @@ Milestone M-42
 
 除正常完成和 recovery/blocker 外，Parent 还可以进入不可恢复的 `abandoned` 终态。首期使用的原因包括 `policy-incompatible-change` 和 `workflow-definition-incompatible`。进入该终态后 Host 只记录原因、提示用户并停止推进，不自动清理、回滚或恢复任何本地与远端产物；后续工作必须创建全新 Parent 并从当前远端基线重新开始。具体检测规则见 `docs/design/workflow-policy-dsl-static-validation.md`。
 
+正常 Ledger generation 内，只有 `completed` 或 `abandoned` Parent 才释放 Product Workspace 的 Active Parent 名额。后续持久化设计另确认一个破坏性 Host 级例外：SQLite schema 不兼容时，直接人类可以归档并重置整个 Ledger generation，即使旧 Parent 仍 active。该操作不伪造 Parent 终态、不清理任何本地/远端产物，也不复用旧 Parent/evidence/effect；它不是第四种 Parent terminal state。完整约束见 `docs/design/durable-workflow-ledger.md`。
+
+本文件中“Child/Event/evidence/attempt 不删除、append-only 保留历史”的表述适用于 Parent 保留期间。持久化专项后续确认：Parent 提交 `completed` 或 `abandoned` 终态满 30 天后，Host 自动物理删除该 Parent 在 current Ledger 及 current rotating backups 中的全部记录，不留 Tombstone；永久 generation/incident archive 若已存在则不重写。该 retention 不清理任何 Git、GitHub、DSH session 或其他外部产物。
+
 ## 5. 子实例生命周期
 
 普通 Issue 子实例的概念流程如下：
@@ -404,7 +408,7 @@ GitHub 无法为多个独立仓库提供原子 merge。首版明确接受非原�
 代码仓最终交付流程：
 
 ```text
-获得父实例级 release lease
+获得固定 release task 的 `task-execution` lease
 → 对所有代码仓最终 PR 做全量预检
 → 任意一个失败：一个代码仓都不开始合并
 → 全部通过：按 policy 声明的代码仓顺序串行合并
@@ -466,7 +470,7 @@ GitHub 暂时不可达、rate limit 或进程崩溃
 
 未全部交付前，不关闭 Milestone，也不将本次版本视为可部署完成。
 
-release lease 只能阻止由本插件管理的并发写任务，不能阻止插件外的 GitHub 操作者更新 baseline branch。最终 merge 前仍必须重新读取和验证远端事实。
+固定 release task 的 `task-execution` lease 只能阻止由本插件管理的重复 release task owner，不能阻止插件外的 GitHub 操作者更新 baseline branch。最终 merge 前仍必须重新读取和验证远端事实；具体 lease 与 fencing 语义见 `docs/design/durable-workflow-ledger.md`。
 
 ### 11.4 伞仓最终收尾
 

@@ -222,6 +222,8 @@ workflow-recovery
 
 恢复完成后返回 `workflow-active`。Parent 进入 `completed` 后，或持久化 `abandoned` 并向用户送达 notice 后，主会话解除 active Parent 绑定并返回 `normal`；abandoned 的具体触发和不清理规则见 Workflow Policy Profile 设计。
 
+另有一个不属于 Parent transition 的 Host 级破坏性例外：SQLite schema 不兼容时，直接人类可以执行 Ledger Generation Reset，归档整个旧 generation 并解除当前运行时绑定。旧 Parent 不被伪造为 completed/abandoned，旧 Role Actor mapping/evidence/effect 不进入新 generation，Host 也不清理任何外部产物。该入口及风险见 `docs/design/durable-workflow-ledger.md`。
+
 ### 6.4 模式约束的实现边界
 
 Plugin 可以硬性执行：
@@ -363,7 +365,7 @@ Continuable Role Actor 暂时不在内存时，应优先使用同一个 durable 
 - 不把新 Agent 伪装成旧 Agent；
 - 重新派发当前尚未完成的任务。
 
-具体替换事件和数据库字段留给持久化设计。
+Host Boot 重启后，旧 boot 中未释放的 `task-execution` lease 先标记为 orphaned，Parent 进入 `workflow-recovery`。Host 必须确认旧 turn 不再运行并检查其可能留下的本地/远端事实；旧输出只作为 candidate，不能自动成为权威 outcome。原 durable session 可恢复时继续使用同一 Actor mapping，不可恢复时才按上述规则替换；随后对同一个未完成 Workflow Task 分配更大的 fencing token 并重新派发完整当前上下文。具体 ledger 顺序见 `docs/design/durable-workflow-ledger.md`。
 
 ### 9.5 Role Agent 运行定义或继承模型变化时替换
 
@@ -385,11 +387,13 @@ Parent 进入 `completed` 或 `abandoned` 终态后：
 - sessions 可以归档或按 DSH 生命周期清理；
 - 后续 Parent 创建新的 Role Actors。
 
+上述历史 mapping/session reference 只在 Parent retention window 内由当前 Ledger 保留。持久化专项确认：Parent completed/abandoned 满 30 天后，该 Parent 的 Actor mappings 与全部其他 Parent-owned Ledger records 一起物理删除且不留 Tombstone；Host 不因此删除 DSH session 或向旧 Actor 执行外部 cleanup。完整规则见 `docs/design/durable-workflow-ledger.md`。
+
 ## 10. Manager 派发模型
 
 ### 10.1 不建立 Assignment 子系统
 
-Parent 状态机已经唯一确定下一项 required work，Issue 又严格串行，因此首期不建立通用 Assignment、claim、lease 或任务池。
+Parent 状态机已经唯一确定 required work，Issue 又严格串行，因此首期不建立通用 Assignment、任意资源 claim 或任务池。引擎只为固定 Workflow Definition 产生持久化 Workflow Task，并以固定 `task-execution(parentId, taskId)` lease 保护其长时间执行；这不是 Agent 可自行领取或 Policy 可扩展的通用 lease 子系统。
 
 Child 只需要知道负责它的 roleKey。Manager 根据 `nextRequiredGate` 和 `nextRunnableChild` 决定向哪个 Role Actor 发送消息。
 
@@ -607,7 +611,7 @@ Host 可以硬性锁定 active Parent 和 transition，但普通自然语言消�
 6. 一个 Role Actor 首期只代表一个 roleKey。
 7. 主会话直接担任 Manager，不创建 Manager subagent。
 8. 一个主 session 同一时间最多绑定一个 active Parent。
-9. Parent active 时，主会话进入 workflow 模式并持续到完成、abandoned 或 recovery/blocker；completed/abandoned 后解除绑定并返回 normal。
+9. Parent active 时，主会话进入 workflow 模式并持续到完成、abandoned 或 recovery/blocker；completed/abandoned 后解除绑定并返回 normal。SQLite schema 不兼容时经直接人类确认的 Ledger Generation Reset 是 Host 级破坏性例外：它解除旧 generation 的运行时绑定，但不伪造 Parent 终态。
 10. Role Actors 是 Manager 的直接 continuable children。
 11. Role Actor 在 definition、继承 route 和可恢复性不变时于同一 Parent 中持续复用；替换后旧 mapping 留史，任何 Role Actor 都不跨 Parent 复用。
 12. Role Actor 可以按需创建，创建后登记 DSH 返回的 durable child id。
