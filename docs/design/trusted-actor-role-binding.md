@@ -3,7 +3,7 @@
 - 状态：已确认（首期简化模型）
 - 日期：2026-08-18
 - 主题：DSH 运行时身份、主会话 Manager、持续 Role Agent、角色映射与门禁授权
-- 关联设计：`docs/design/parent-child-workflow-instances.md`、`docs/design/workflow-policy-dsl-static-validation.md`
+- 关联设计：`docs/design/parent-child-workflow-instances.md`、`docs/design/workflow-policy-dsl-static-validation.md`、`docs/design/workflow-state-store.md`
 
 ## 1. 目的
 
@@ -105,7 +105,7 @@ Persona 用于行为引导，tool filter 用于减少可见工具，真正的最
 - Review 历史；
 - 测试历史。
 
-但 Agent 上下文不是工作流事实来源。每次派发仍必须包含当前状态、目标 Child、仓库、分支、Gate 和 SHA，Host ledger 才是权威状态。
+但 Agent 上下文不是工作流事实来源。每次派发仍必须包含当前状态、目标 Child、仓库、分支、Gate 和 SHA，Host Workflow State Snapshot 才是当前本地状态来源。
 
 ## 4. 核心术语
 
@@ -222,7 +222,7 @@ workflow-recovery
 
 恢复完成后返回 `workflow-active`。Parent 进入 `completed` 后，或持久化 `abandoned` 并向用户送达 notice 后，主会话解除 active Parent 绑定并返回 `normal`；abandoned 的具体触发和不清理规则见 Workflow Policy Profile 设计。
 
-另有一个不属于 Parent transition 的 Host 级破坏性例外：SQLite schema 不兼容时，直接人类可以执行 Ledger Generation Reset，归档整个旧 generation 并解除当前运行时绑定。旧 Parent 不被伪造为 completed/abandoned，旧 Role Actor mapping/evidence/effect 不进入新 generation，Host 也不清理任何外部产物。该入口及风险见 `docs/design/durable-workflow-ledger.md`。
+若极简本地状态损坏、格式不兼容或中断现场不值得恢复，用户可以显式重置 Workflow State Snapshot 并解除当前运行时绑定。旧 Parent 不被伪造为 completed/abandoned，旧 Role Actor mapping/evidence/effect 不迁移到新状态，Host 也不清理任何外部产物。具体见 `docs/design/workflow-state-store.md`。
 
 ### 6.4 模式约束的实现边界
 
@@ -260,7 +260,7 @@ Plugin 可以硬性执行：
 - 业务代码冲突由 `developer` 处理；
 - policy 明确允许的伞仓非代码资源冲突由 `manager` 处理。
 
-自动 test runner、GitHub adapter、outbox worker 等是内部执行组件，不伪装成 Role Agent。具体自动化测试证据模型在测试专项设计中确定。
+自动 test runner、GitHub adapter、最小 `pendingEffect` executor 等是内部执行组件，不伪装成 Role Agent。具体自动化测试证据模型在测试专项设计中确定。
 
 ## 8. Role Actor 配置
 
@@ -341,7 +341,7 @@ Role Actor 可以在首次需要时创建：
   → spawn Tester
 ```
 
-创建后在 definition、继承模型路由和可恢复性未变化时持续复用；Policy 热重载、Manager 继承路由变化或不可恢复故障会按 9.4/9.5 创建 replacement，并保留旧 mapping 历史。
+创建后在 definition、继承模型路由和可恢复性未变化时持续复用；Policy 热重载、Manager 继承路由变化或不可恢复故障会按 9.4/9.5 创建 replacement。极简 snapshot 只保留当前 mapping，不保存 replacement 历史。
 
 ### 9.3 注册映射
 
@@ -365,7 +365,7 @@ Continuable Role Actor 暂时不在内存时，应优先使用同一个 durable 
 - 不把新 Agent 伪装成旧 Agent；
 - 重新派发当前尚未完成的任务。
 
-Host Boot 重启后，旧 boot 中未释放的 `task-execution` lease 先标记为 orphaned，Parent 进入 `workflow-recovery`。Host 必须确认旧 turn 不再运行并检查其可能留下的本地/远端事实；旧输出只作为 candidate，不能自动成为权威 outcome。原 durable session 可恢复时继续使用同一 Actor mapping，不可恢复时才按上述规则替换；随后对同一个未完成 Workflow Task 分配更大的 fencing token 并重新派发完整当前上下文。具体 ledger 顺序见 `docs/design/durable-workflow-ledger.md`。
+Host 重启后若 snapshot 仍存在 `runningTask`，将其视为系统中断并进入简单 `workflow-recovery`。Host 检查旧 turn 是否仍可恢复及其可能留下的本地/远端事实；旧输出只作为 candidate，不能自动成为权威 outcome。原 durable session 可恢复时继续使用同一 Actor mapping，不可恢复时才按上述规则替换；随后继续同一个未完成 Workflow Task。首期不使用持久化 lease、fencing token 或 owner takeover，具体状态存储见 `docs/design/workflow-state-store.md`。
 
 ### 9.5 Role Agent 运行定义或继承模型变化时替换
 
@@ -376,24 +376,24 @@ Host 为 mapping 记录解析后的 route、`routeSource=inherited|explicit` 和
 - 继承型 Role Actor 的 route 与 Manager 当前 route 不同；
 - Policy 热重载改变该角色的 subagentProvider、model、persona 或 tools.deny，导致 roleDefinitionHash 变化。
 
-Policy 热重载只在旧 Actor 没有运行中的 turn 时接受，并在同一 ledger transition 中把旧 mapping 标记为 `stale-policy-reload`；该 mapping 从此不能再接收任务。下一次派发前，Host 将 stale mapping 转为历史并按当前已接受 definition 创建新 Role Actor。该替换产生新的 agent.id，保留旧 session、mapping 和 evidence，并重新派发完整当前上下文；既有 evidence 不因运行定义变化自动失效。旧 Actor 仍在运行时 fail closed，Manager 必须先停止 Agent loop。Replacement 创建失败时不回滚已经接受的新 Policy，也不重新启用旧 stale Actor；Parent 进入 `workflow-recovery` 后重试创建。
+Policy 热重载只在旧 Actor 没有运行中的 turn 时接受，并在当前 snapshot 中把旧 mapping 标记为 `stale-policy-reload`；该 mapping 从此不能再接收任务。下一次派发前，Host 按当前已接受 definition 创建新 Role Actor，并用新的 agent.id 直接覆盖当前 mapping。插件不保存旧 session/mapping 历史；DSH 可独立保留旧 session。既有 current Gate evidence 不因运行定义变化自动失效。旧 Actor 仍在运行时，Manager 必须先停止 Agent loop。Replacement 创建失败时不回滚已经接受的新 Policy，也不重新启用 stale Actor；Parent 进入简单 `workflow-recovery` 后重试创建。
 
 ### 9.6 结束
 
 Parent 进入 `completed` 或 `abandoned` 终态后：
 
-- Role Actor mappings 进入历史状态；
-- Role Actor 不再接受新工作流任务；
-- sessions 可以归档或按 DSH 生命周期清理；
-- 后续 Parent 创建新的 Role Actors。
+- 当前 Role Actor 不再接受新工作流任务；
+- snapshot 可暂时保留当前 mappings 供近期诊断，并在新 Workflow 初始化或状态重置时直接清空；
+- sessions 可以按 DSH 自身生命周期保留或清理；
+- 后续 Parent 创建新的 Role Actors，不复用旧 mapping。
 
-上述历史 mapping/session reference 只在 Parent retention window 内由当前 Ledger 保留。持久化专项确认：Parent completed/abandoned 满 30 天后，该 Parent 的 Actor mappings 与全部其他 Parent-owned Ledger records 一起物理删除且不留 Tombstone；Host 不因此删除 DSH session 或向旧 Actor 执行外部 cleanup。完整规则见 `docs/design/durable-workflow-ledger.md`。
+极简 Workflow State Snapshot 只保存当前 Workflow 仍需要的 Role Actor mappings；不建立长期 mapping 历史或 30 天 retention。状态重置或新 Workflow 初始化时可以直接丢弃旧 mapping reference，但 Host 不因此删除 DSH session，也不向旧 Actor 执行外部 cleanup。
 
 ## 10. Manager 派发模型
 
 ### 10.1 不建立 Assignment 子系统
 
-Parent 状态机已经唯一确定 required work，Issue 又严格串行，因此首期不建立通用 Assignment、任意资源 claim 或任务池。引擎只为固定 Workflow Definition 产生持久化 Workflow Task，并以固定 `task-execution(parentId, taskId)` lease 保护其长时间执行；这不是 Agent 可自行领取或 Policy 可扩展的通用 lease 子系统。
+Parent 状态机已经唯一确定 required work，Issue 又严格串行，因此首期不建立通用 Assignment、任意资源 claim、持久化 lease 或任务池。引擎只为固定 Workflow Definition 产生 Workflow Task；Host 通过进程内串行队列和 snapshot 中唯一 `runningTask` 防止当前会话重复派发。
 
 Child 只需要知道负责它的 roleKey。Manager 根据 `nextRequiredGate` 和 `nextRunnableChild` 决定向哪个 Role Actor 发送消息。
 
@@ -457,7 +457,7 @@ Expected Gate: child-code-review
 | 执行 Manager-owned 伞仓非代码 effect | Manager |
 | 执行最终交付编排 | Manager |
 
-同一个 `code-reviewer` Role Actor 可以执行 Child 和 Milestone 两级 Review，但它们仍是两个独立 Gate、两个独立 attempt 和两个独立 SHA-bound evidence。
+同一个 `code-reviewer` Role Actor 可以执行 Child 和 Milestone 两级 Review，但它们仍是两个独立 Gate，各自在 snapshot 中保存自己的当前 SHA-bound evidence；不保存 attempt 历史。
 
 首期接受二者不是组织上独立 Reviewer 的妥协。
 
@@ -498,26 +498,22 @@ Role Agent 必须直接提交自己负责的权威 Gate 结果。
 
 例如 Code Reviewer 应自己调用 Review 提交工具，而不是只把“PASS”发给 Manager，再由 Manager 代为提交。
 
-每条权威 evidence 至少关联：
+Host 在提交 evidence 时仍校验当前 Role Actor mapping 和调用者 `agent.id`，但极简 State Store 只在对应 Gate 保存当前 evidence：
 
-- Parent；
 - Child 或 Gate scope；
-- roleKey；
-- Host 观测到的 `agent.id`；
-- attempt；
 - repository/branch；
-- candidate SHA；
+- candidate SHA 或 manifest hash；
 - PASS/FAIL；
-- 时间；
-- 结构化结果或报告引用。
+- 验证时间；
+- 可选结构化结果摘要或报告引用。
 
-Manager 可以读取、展示和根据 evidence 推进状态，但不能冒充其他 Role Agent 产生 evidence。
+不保存 attempt、旧 evidence、roleKey/agent.id provenance 历史。Manager 可以读取、展示和根据 current evidence 推进状态，但不能冒充其他 Role Agent 提交结果。
 
 测试自动化后，原始 runner 结果与 Tester 的分析结论可能是不同记录；该细节留给自动化测试设计。
 
-## 13. 临时只读并发
+## 13. 临时只读辅助 Subagent
 
-父子实例设计只允许读任务并发。首期 trusted actor 模型按以下方式处理：
+所有权威 Workflow Task 严格串行；当前权威 Task 内可以使用不进入 Workflow 状态的临时只读辅助 subagent：
 
 - Manager 或 Role Actor 可以创建临时只读 subagent；
 - 临时 Agent 不加入 Role Actor mapping；
@@ -534,7 +530,7 @@ Manager 可以读取、展示和根据 evidence 推进状态，但不能冒充�
 
 `agent.id` 能证明不同 DSH sessions，不能证明不同人、组织、模型提供商或 GitHub 账号。
 
-首期只提供运行时身份和审计归属，不提供企业 IAM。
+首期只提供当前运行时身份与职责校验，不提供责任审计或企业 IAM。
 
 ### 14.2 Manager 控制团队成员
 
@@ -592,7 +588,7 @@ Host 可以硬性锁定 active Parent 和 transition，但普通自然语言消�
 - Parent 仍负责整体编排和 Gate；
 - Child 仍负责具体开发任务；
 - Issue 仍严格串行；
-- 只有读任务可以并行；
+- 所有权威 Workflow Task 严格串行；当前 Task 内仅临时、非权威的只读辅助 subagent 可以并行；
 - PRD Review、Child Code Review 和 Milestone Aggregate Code Review 仍是三个不同 Gate；
 - Manager 不修改业务代码；
 - Manager 可以处理 policy 明确允许的伞仓非代码资源；
@@ -605,15 +601,15 @@ Host 可以硬性锁定 active Parent 和 transition，但普通自然语言消�
 
 1. `agent.id` 是 DSH Host 提供的 Session identity。
 2. `agent.id` 不是预配置角色名称。
-3. 一个 roleKey 同一时刻最多有一个 current continuable Role Actor；definition/route/recovery 变化可依次产生 replacement，旧 mapping 保留为 stale/history。
+3. 一个 roleKey 同一时刻最多有一个 current continuable Role Actor；definition/route/recovery 变化可产生 replacement，新 mapping 直接覆盖旧 mapping，不保留插件历史。
 4. Host 保存 `(parentId, roleKey) → currentAgentId`。
 5. 一个 roleKey 同一时间最多有一个 active Role Actor。
 6. 一个 Role Actor 首期只代表一个 roleKey。
 7. 主会话直接担任 Manager，不创建 Manager subagent。
 8. 一个主 session 同一时间最多绑定一个 active Parent。
-9. Parent active 时，主会话进入 workflow 模式并持续到完成、abandoned 或 recovery/blocker；completed/abandoned 后解除绑定并返回 normal。SQLite schema 不兼容时经直接人类确认的 Ledger Generation Reset 是 Host 级破坏性例外：它解除旧 generation 的运行时绑定，但不伪造 Parent 终态。
+9. Parent active 时，主会话进入 workflow 模式并持续到完成、abandoned 或 recovery/blocker；completed/abandoned 后解除绑定并返回 normal。状态损坏、格式不兼容或用户放弃恢复时，可以显式重置本地 Workflow State Snapshot；该操作解除运行时绑定但不伪造 Parent 终态或清理外部产物。
 10. Role Actors 是 Manager 的直接 continuable children。
-11. Role Actor 在 definition、继承 route 和可恢复性不变时于同一 Parent 中持续复用；替换后旧 mapping 留史，任何 Role Actor 都不跨 Parent 复用。
+11. Role Actor 在 definition、继承 route 和可恢复性不变时于同一 Parent 中持续复用；替换后当前 mapping 直接覆盖，任何 Role Actor 都不跨 Parent 复用。
 12. Role Actor 可以按需创建，创建后登记 DSH 返回的 durable child id。
 13. Persona、label、prompt 和 tool 参数不构成角色授权。
 14. 不建立通用 Actor、Role Binding、Assignment 或 Capability 子系统。
@@ -626,7 +622,7 @@ Host 可以硬性锁定 active Parent 和 transition，但普通自然语言消�
 21. 同一个 Code Reviewer Role Actor 可以执行 Child 与 Milestone 两级 Review，但 evidence 独立。
 22. 临时只读 Agent 不进入 role mapping，不能提交权威 Gate 或状态 mutation。
 23. 原 Role Actor 可恢复时继续使用同一 durable id；不可恢复时进入显式 recovery，不静默冒充或替换。
-24. Parent 进入 completed 或 abandoned 终态后，该 Parent 的 Role Actor mappings 进入历史状态。
+24. Parent 进入 completed 或 abandoned 终态后，当前 Role Actor mappings 不再用于派发，并在新 Workflow 初始化或状态重置时直接清空。
 25. 首期接受 session identity 不等于真实人类身份的边界。
 26. Role Actor mapping 不替代 GitHub ruleset、路径策略、SHA preflight 和远端验证。
 27. 首期 Policy 必须且只能配置 `prd-reviewer`、`developer`、`code-reviewer`、`tester` 四个固定 Role Agent key，不能增删角色或改变职责映射。
@@ -636,9 +632,8 @@ Host 可以硬性锁定 active Parent 和 transition，但普通自然语言消�
 
 ## 18. 后续专项设计
 
-Workflow Policy Profile 与 Role Agent definition 的首期边界已在关联设计中冻结。以下内容仍需分别讨论：
+Workflow Policy Profile、Role Agent definition 与极简 Workflow State Store 的首期边界已在关联设计中冻结；状态存储见 `docs/design/workflow-state-store.md`。以下内容仍需分别讨论：
 
-- SQLite ledger、revision、幂等、恢复、outbox；
 - Workflow tool/action 的具体名称和 authorization matrix；
 - DSH continuable child 创建、恢复与替换适配器；
 - GitHub adapter、credential 和 ruleset；

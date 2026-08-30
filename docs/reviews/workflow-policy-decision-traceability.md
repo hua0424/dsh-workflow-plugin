@@ -42,9 +42,9 @@
 | 20 | 无 Validation Profile Registry；每仓唯一 unit test definition；workspace 唯一 integration definition | Policy §3.20 | 完整 |
 | 21 | 结构化、稳定排序、可汇总、无 secret/persona 泄漏且不 auto-fix 的 diagnostics | Policy §3.21 | 完整 |
 | 22 | Policy 固定在 `<cwd>/.dsh/workflow-policy.yaml`；不搜索、不接受 path override、Agent 只读 | Policy §3.22 | 完整 |
-| 23 | Parent 记录当前 accepted source/semantic hashes、schema/Definition 版本和伞仓 identity；reload 历史 append-only | Policy §3.23 | 完整 |
+| 23 | State Store 保存当前 accepted source/semantic hashes、schema/Definition 版本和伞仓 identity；reload 只追加 bounded recentEvents 摘要，不保留 append-only 历史 | Policy §3.23 | 已按个人单会话 State Store 简化修订 |
 | 24 | 精确 `schemaVersion: workflow-policy/v1`；不迁移、猜测、降级；Definition compatibility 独立版本化 | Policy §3.24 | 完整 |
-| 25 | artifacts.directory 必填且自动 Manager-owned；唯一权威文档是固定 PRD；不镜像 GitHub/ledger 事实 | Policy §3.25 | 完整 |
+| 25 | artifacts.directory 必填且自动 Manager-owned；唯一权威文档是固定 PRD；不镜像 GitHub/Workflow State Store 事实 | Policy §3.25 | 完整 |
 | 26 | GitHub credential 属于 Host runtime，不进入 Policy/hash；轮换不废弃 Parent | Policy §3.26 | 完整 |
 | 27 | v1 无顶层通用 runtime/retry/timeout；各专项拥有自己的时序语义 | Policy §3.27 | 完整 |
 | 28 | origin、spawn、空 deny/ownership 和五类 branch prefix 使用 schema 固定安全默认值 | Policy §3.28 | 完整 |
@@ -110,6 +110,7 @@ ownership.managerOwned.directories
 - `docs/design/workflow-policy-dsl-static-validation.md`
 - `docs/design/parent-child-workflow-instances.md`
 - `docs/design/trusted-actor-role-binding.md`
+- `docs/design/workflow-state-store.md`
 - `docs/pending-discussions/automated-testing-and-test-learning.md`
 - `CONTEXT.md`
 
@@ -123,9 +124,9 @@ ownership.managerOwned.directories
 - Static Validator 与 Environment Preflight 完整错误码；
 - GitHub/Git/Provider adapter 级检查细节；
 - Role Agent 和 Workflow tool/action 最终名称；
-- SQLite ledger、revision、idempotency、recovery 和 outbox；
+- 当时尚未讨论的本地持久化后来已按个人单会话前提简化为极简 SQLite Workflow State Store；具体见 `docs/design/workflow-state-store.md`；
 - Web UI workflow-active 交互。
 
 ## 7. 版本控制状态
 
-复核时这些文件已经写入工作区，但 `git status --short` 仍显示 `CONTEXT.md` 和 `docs/` 为未跟踪内容。本报告确认的是“已正确落盘”，不代表已经提交到 Git；提交或建基线需要后续单独执行。
+原始 Policy 决策复核时这些文件尚未跟踪；随后已在提交 `97a8b9f` 与 `3786eba` 中建立基线。当前个人单会话 Workflow State Store 精简及关联文档同步仍是未提交工作区改动，提交或 push 需要后续单独执行。

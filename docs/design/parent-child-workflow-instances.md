@@ -15,7 +15,7 @@
 5. baseline branch 变化和最终 PR 冲突如何处理；
 6. 多仓库最终合并无法原子完成时，如何保证最终状态一致性。
 
-本文只冻结父子实例的领域语义，不冻结数据库 schema、DSH adapter、GitHub API 或自动化测试框架。Workflow Policy Profile 的首期边界另见 `docs/design/workflow-policy-dsl-static-validation.md`。
+本文只冻结父子实例的领域语义，不冻结 SQLite 物理实现、DSH adapter、GitHub API 或自动化测试框架。Workflow Policy Profile 另见 `docs/design/workflow-policy-dsl-static-validation.md`，当前状态持久化另见 `docs/design/workflow-state-store.md`。
 
 本文中的 baseline branch 指 Policy `workspace.baselineBranch`；远端引用使用相应仓库配置或默认解析出的 remote alias，不假定分支名一定是 `dev1` 或 remote 一定是 `origin`。
 
@@ -94,10 +94,10 @@ Milestone M-42
 1. 父实例负责阶段编排和聚合门禁，子实例负责具体开发任务。
 2. 父、子实例使用独立状态机，不将全部子状态组合进父状态。
 3. 子实例由父实例的明确 transition 创建，不能依赖 LLM 判断工作属于哪种实例。
-4. 子实例有稳定顺序；已创建和已完成的子实例不删除、不改写历史。
+4. 子实例有稳定顺序；在当前 Workflow State Snapshot 内，已创建和已完成的子实例保留到新 Workflow 初始化或 reset。
 5. 后续发现的新任务通过追加修复子实例处理。
 6. 所有开发 Issue 严格串行；前一个未取消子实例未 `integrated`，下一个不得开始开发。
-7. 强制读任务与写任务互斥；读任务之间可以并行。
+7. 首期所有权威 Workflow Task 严格串行；读/验证 Task 与写 Task 互斥。临时只读辅助 subagent 可在当前 Task 内并行，但不能提交 Gate 或修改 Workflow 状态。
 8. PRD Review、子实例 Code Review、Milestone 整体 Code Review 是三个不同作用域的门禁。
 9. 集成测试只验证冻结的 release candidate；分支或基线发生变化后，旧证据失效。
 10. 多仓库最终交付不追求原子性，但必须达到所有目标仓库均成功合入 baseline branch 的最终一致状态。
@@ -105,7 +105,7 @@ Milestone M-42
 
 ## 4. 父实例生命周期
 
-父实例的概念阶段如下；首期具体状态名由固定 Workflow Definition 和 ledger schema 冻结，不由 Policy 配置：
+父实例的概念阶段如下；首期具体状态名由固定 Workflow Definition 冻结，并由 Workflow State Snapshot strict schema 保存，不由 Policy 配置：
 
 ```text
 加载并静态校验 Policy
@@ -148,13 +148,13 @@ Milestone M-42
 
 父实例只在阶段边界发生状态变化。子实例内部的每个开发、Review 和测试状态不复制到父实例中。
 
-父流程不保存一个可以直接跳回的“中断点”。每次子实例集成或远端事实变化后，父实例重新计算门禁有效性，并路由到最早一个尚未满足或已经失效的强制门禁。旧的 Review、测试和交付尝试保留为审计历史，不通过覆盖状态实现“重置”。
+父流程不保存一个可以直接跳回的精确“中断点”。每次子实例集成或远端事实变化后，父实例重新计算门禁有效性，并路由到最早一个尚未满足或已经失效的强制门禁。极简 snapshot 只保存当前 Gate/evidence 和最近诊断摘要，不长期保留旧 Review、测试或交付 attempt。
 
 除正常完成和 recovery/blocker 外，Parent 还可以进入不可恢复的 `abandoned` 终态。首期使用的原因包括 `policy-incompatible-change` 和 `workflow-definition-incompatible`。进入该终态后 Host 只记录原因、提示用户并停止推进，不自动清理、回滚或恢复任何本地与远端产物；后续工作必须创建全新 Parent 并从当前远端基线重新开始。具体检测规则见 `docs/design/workflow-policy-dsl-static-validation.md`。
 
-正常 Ledger generation 内，只有 `completed` 或 `abandoned` Parent 才释放 Product Workspace 的 Active Parent 名额。后续持久化设计另确认一个破坏性 Host 级例外：SQLite schema 不兼容时，直接人类可以归档并重置整个 Ledger generation，即使旧 Parent 仍 active。该操作不伪造 Parent 终态、不清理任何本地/远端产物，也不复用旧 Parent/evidence/effect；它不是第四种 Parent terminal state。完整约束见 `docs/design/durable-workflow-ledger.md`。
+正常运行时，极简 Workflow State Snapshot 只保存一个 Active Parent；`completed` 或 `abandoned` 后可以开始新 Parent。若状态损坏、格式不兼容或中断现场不值得恢复，用户也可以显式重置插件本地状态并从当前 Git/远端现场重新开始；重置不伪造 Parent 终态，也不自动清理、回滚或修改任何本地/远端产物。具体见 `docs/design/workflow-state-store.md`。
 
-本文件中“Child/Event/evidence/attempt 不删除、append-only 保留历史”的表述适用于 Parent 保留期间。持久化专项后续确认：Parent 提交 `completed` 或 `abandoned` 终态满 30 天后，Host 自动物理删除该 Parent 在 current Ledger 及 current rotating backups 中的全部记录，不留 Tombstone；永久 generation/incident archive 若已存在则不重写。该 retention 不清理任何 Git、GitHub、DSH session 或其他外部产物。
+本文件中“不删除、不改写历史”的表述降级为当前 Workflow 生命周期内的逻辑要求：运行中不通过覆盖旧 Gate/evidence 来伪造 PASS。极简存储不提供长期 append-only 历史，仅保留 snapshot 最近 100 条诊断摘要；状态重置或新 Workflow 开始后可以丢弃旧详细历史。
 
 ## 5. 子实例生命周期
 
@@ -204,7 +204,7 @@ children:
   - issue-103, sequence=3
 ```
 
-首期所有新建 Child 默认且固定参与完成条件，不提供 `optional` 配置。尚未开始开发且确实不再需要的 Child，只能通过引擎定义的显式取消 transition 处理，并保留取消原因和历史。
+首期所有新建 Child 默认且固定参与完成条件，不提供 `optional` 配置。尚未开始开发且确实不再需要的 Child，只能通过引擎定义的显式取消 transition 处理；当前 snapshot 保留该 Child 的 `cancelled` 状态和取消原因，直到新 Workflow 或 reset。
 
 父实例计算：
 
@@ -225,11 +225,12 @@ WRITE phase
 - 不允许强制 Review、审计或测试任务同时进行
 
 READ/VALIDATION phase
-- 多个只读任务可以并行
+- 同一时间只运行一个权威 Review/验证 Task
 - 不允许任何开发子实例开始或恢复代码修改
+- 当前 Task 内可以使用不具备 Gate/mutation 权限的临时只读辅助 subagent
 ```
 
-“存在读任务”仅指固定 Workflow Definition 已要求、并由 Parent/Child 当前 task facts 创建且尚未完成的强制读/验证任务，不包括无关的临时只读 Agent。
+权威读/验证 Task 由固定 Workflow Definition 创建并写入唯一 `runningTask`。无关的临时只读 Agent 不属于权威 Task，不能使 Gate satisfied 或修改 Workflow 状态。
 
 Manager 调度、状态查询和不会改变代码候选的只读操作不自动获得代码修改权限。
 
@@ -282,7 +283,7 @@ nextRequiredGate = 最早一个尚未满足或证据已经失效的强制门禁
 
 例如集成测试失败后创建 remediation 子实例。该子实例合入 Milestone 会改变候选 SHA，因此 release candidate、整体 Review 和集成测试证据都不再适用于当前候选。父实例自然返回基线同步/候选冻结，再重新执行整体 Review 和集成测试，而不是从旧集成测试中断点直接继续。
 
-门禁的历史尝试 append-only 保留；“重新执行”创建新的 gate attempt，不删除或覆盖旧证据。
+“重新执行”直接更新当前 Gate evidence，并在 `recentEvents` 追加一条通过、失败或失效摘要；不保存 append-only gate attempt 历史。
 
 ## 8. Milestone 基线同步
 
@@ -296,7 +297,7 @@ nextRequiredGate = 最早一个尚未满足或证据已经失效的强制门禁
 
 同步不会把 Milestone 未测试代码推入 baseline branch。变化只发生在同步分支和 Milestone 集成分支。
 
-不采用只在本地同步而不 push 的方案，因为 Review、CI、集成环境、重启恢复和远端审计都需要稳定的远端 SHA。
+不采用只在本地同步而不 push 的方案，因为 Review、CI、集成环境和重启恢复都需要稳定的远端 SHA。
 
 ### 8.2 无冲突同步
 
@@ -389,7 +390,7 @@ Git 无冲突不等于集成测试仍然有效，因此不能只依赖最终 PR 
 6. 重新执行 Milestone 整体 Code Review；
 7. Review PASS 后重新执行集成测试。
 
-这不是从旧集成测试中断点恢复，而是从最早失效门禁重新推进。旧 release candidate、Review 和测试结果保留为历史事件，不覆盖或删除。
+这不是从旧集成测试中断点恢复，而是从最早失效门禁重新推进。snapshot 更新为新的 release candidate 和 current Review/测试结果，旧值仅可能留在最近 100 条诊断摘要中。
 
 自动化测试执行和测试经验沉淀方案另见：
 
@@ -408,7 +409,7 @@ GitHub 无法为多个独立仓库提供原子 merge。首版明确接受非原�
 代码仓最终交付流程：
 
 ```text
-获得固定 release task 的 `task-execution` lease
+将固定 release task 设为当前唯一 `runningTask`
 → 对所有代码仓最终 PR 做全量预检
 → 任意一个失败：一个代码仓都不开始合并
 → 全部通过：按 policy 声明的代码仓顺序串行合并
@@ -458,7 +459,7 @@ required checks 失败且需要修改代码
 → 重新计算最早失效门禁
 
 GitHub 暂时不可达、rate limit 或进程崩溃
-→ outbox retry / reconciliation
+→ 保留 `pendingEffect` 并在恢复时重新查询远端事实
 → 不创建开发 Issue
 
 权限、branch protection 或运维配置错误
@@ -470,7 +471,7 @@ GitHub 暂时不可达、rate limit 或进程崩溃
 
 未全部交付前，不关闭 Milestone，也不将本次版本视为可部署完成。
 
-固定 release task 的 `task-execution` lease 只能阻止由本插件管理的重复 release task owner，不能阻止插件外的 GitHub 操作者更新 baseline branch。最终 merge 前仍必须重新读取和验证远端事实；具体 lease 与 fencing 语义见 `docs/design/durable-workflow-ledger.md`。
+Host 进程内串行队列和 snapshot 中的唯一 `runningTask` 只阻止本插件在当前会话重复启动 release task，不能阻止插件外的 GitHub 操作者更新 baseline branch。最终 merge 前仍必须重新读取和验证远端事实；系统中断后的最小恢复语义见 `docs/design/workflow-state-store.md`。
 
 ### 11.4 伞仓最终收尾
 
@@ -518,7 +519,7 @@ GitHub 暂时不可达、rate limit 或进程崩溃
 - 首期所有新建 Child 均固定参与完成条件，不开放 Policy 级 `required/optional` 配置；
 - 尚未开始开发且确实不再需要的 Child，可以通过引擎定义的显式取消 transition 进入固定的 `cancelled` 终态，不物理删除；
 - `failed`、`blocked` 或其他失败状态不能由 Policy 配置为可接受完成状态；
-- 追加或取消子实例必须由受权 transition 完成并留下事件和原因。
+- 追加或取消子实例必须由受权 transition 完成；当前 snapshot 保存取消状态/原因，并在 `recentEvents` 留下短摘要。
 
 ## 14. 已确认的不变量
 
@@ -531,7 +532,7 @@ GitHub 暂时不可达、rate limit 或进程崩溃
 7. 一般代码问题统一使用 `remediation` 子实例，并通过 `cause` 记录问题来源。
 8. Git 冲突使用 `conflict-resolution` 子实例；业务代码冲突由开发角色处理，Manager 只处理 policy 明确归类的 Manager-owned 非代码资源。
 9. 子实例严格串行；前一项未合入 Milestone，后一项不启动开发。
-10. 只有读任务允许并行；强制读/验证阶段不允许开发。
+10. 所有权威 Workflow Task 严格串行；强制读/验证阶段不允许开发。当前 Task 内的临时只读辅助 subagent 不具有 Gate 或 mutation 权限。
 11. PRD Review PASS 后才能创建开发 Issues。
 12. 子实例开发完成后先 Code Review，再执行正式单元测试。
 13. 全部未取消 Issues 合入 Milestone 后，先执行整体 Code Review，再执行集成测试。
@@ -545,7 +546,7 @@ GitHub 暂时不可达、rate limit 或进程崩溃
 21. 所有代码仓合入 baseline branch 后，伞仓更新 submodule/Gitlink 指针并最后合入伞仓 baseline branch；此前父实例不能完成。
 22. 伞仓及 policy 明确归类的非代码路径冲突可由 Manager 在 conflict-resolution 子实例中处理；业务代码冲突仍必须交给开发角色。
 23. 仅伞仓文档或指针变化不触发完整集成测试，但任何代码仓 SHA 变化仍按正常门禁规则使候选和测试证据失效。
-24. 首期所有新建 Child 均固定参与完成条件，不开放 optional 或 Policy 自定义可接受终态；仅尚未开始开发的 Child 可通过固定显式 transition 取消并保留原因和历史。
+24. 首期所有新建 Child 均固定参与完成条件，不开放 optional 或 Policy 自定义可接受终态；仅尚未开始开发的 Child 可通过固定显式 transition 取消，当前 snapshot 保留取消状态和原因。
 25. Policy continuity projection 变化或 Workflow Definition 不兼容时，Parent 进入不可恢复的 `abandoned` 终态；源文件表示或 reloadable 字段变化不直接废弃 Parent。
 26. Static Policy Validation 不访问外部环境；Environment Preflight 在 Parent 启动前、受影响仓库确定后和最终交付前分阶段执行，并在 reloadable Role Agent definition 变化时增加受影响角色的定向 preflight。
 27. 一个 Policy 对应一个产品工作区、一个伞仓和固定 Repository Catalog；Parent 只能从该 Catalog 选择受影响代码仓库，交付顺序由 Policy 全局顺序投影得到。
@@ -555,16 +556,15 @@ GitHub 暂时不可达、rate limit 或进程崩溃
 31. Policy 只能配置各类引擎分支的 prefix；稳定 ID、后缀格式和 branch 类型映射由引擎固定，不开放完整模板。
 32. Manager-owned 路径只作用于伞仓，使用精确目录和最终文件名 segment 的非递归 `*`；固定拒绝目标、Catalog 代码仓和 Gitlink 不受普通路径规则授权。
 33. 首期每个 Catalog Repository 直接内联唯一 unit test definition，Product Workspace 直接内联唯一 integration test definition，不建立 Validation Profile Registry 或运行时替代选择。
-34. Policy 只配置一个 artifacts.directory；首期仅固定位置的 `prd.md` 是权威 Workflow 文档，Issue、Review、测试、交付和 ledger 状态不生成 Markdown 镜像。
+34. Policy 只配置一个 artifacts.directory；首期仅固定位置的 `prd.md` 是权威 Workflow 文档，Issue、Review、测试、交付和 Workflow State Store 状态不生成 Markdown 镜像。
 35. Parent 创建前 Environment Preflight 失败只拒绝启动；创建后的可修复环境失败进入 workflow-recovery。只有 Policy continuity projection 变化或 Workflow Definition 不兼容进入不可恢复的 abandoned。
 36. 首期仅 Role Agent subagentProvider/model/persona/tools.deny 与 ownership.managerOwned 允许在 Manager Turn 边界热重载；接受前必须确认受影响 Actor 没有运行中的 turn，并完成所需定向 preflight；随后原子推进 accepted hashes 并将旧 mapping 标记 stale。下一次派发前以新的 agent.id 替换，既有 evidence 不因此失效；替换失败时保留新 Policy 和 stale mapping，Parent 进入 workflow-recovery。
 
 ## 15. 后续设计边界
 
-Trusted Actor/Role Actor 与 Workflow Policy Profile 已由关联设计冻结。以下内容仍需分别讨论：
+Trusted Actor/Role Actor、Workflow Policy Profile 与极简 Workflow State Store 已由关联设计冻结；状态存储见 `docs/design/workflow-state-store.md`。以下内容仍需分别讨论：
 
-- SQLite ledger、revision、idempotency、lease 和 outbox；
 - GitHub adapter 和 branch protection 校验；
 - 自动化测试编排、缓存、增量测试和测试经验沉淀；
 - Web UI、可解释 denial 和人工操作入口；
-- 固定 Workflow Definition 的具体代码常量、tool/action 名和数据库字段。
+- 固定 Workflow Definition 的精确 state/transition 常量、tool/action 名，以及 State Store 各嵌套对象尚未冻结的具体字段/enum；singleton SQLite columns 已由 State Store 设计冻结。

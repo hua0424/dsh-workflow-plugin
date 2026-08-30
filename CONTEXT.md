@@ -124,92 +124,44 @@ Policy Source Document 所遵循的精确结构契约版本。首期唯一值是
 
 ## Workflow Artifact Directory
 
-Policy 配置的伞仓相对目录，自动属于 Manager-owned 范围。首期只有其中固定位置的 `prd.md` 是权威 Workflow 文档；其他辅助文档由 Manager 按需创建，GitHub 和 ledger 事实不生成 Markdown 镜像。
+Policy 配置的伞仓相对目录，自动属于 Manager-owned 范围。首期只有其中固定位置的 `prd.md` 是权威 Workflow 文档；其他辅助文档由 Manager 按需创建，GitHub 和 Workflow State Store 事实不生成 Markdown 镜像。
 
 ## Host GitHub Credential
 
 Host 当前用于 GitHub adapter 的默认运行时凭据。首期它不由 Policy 选择，也不进入 Policy hash；Environment Preflight 验证其当前可用性和阶段所需权限。
 
-## Workflow Ledger
+## Workflow State Snapshot
 
-由 Host 维护的 Parent/Child 工作流持久化事实与审计记录，包括当前状态、revision、transition history、evidence reference、Role Actor mapping 和待协调的外部 effect。它是工作流状态的权威本地记录，但不是 GitHub、Git remote、provider 或测试环境等外部事实的替代品。
+当前 Workflow 的唯一可恢复状态表示，包含 Parent/Child、Gate、当前 Role Actor mapping、candidate/evidence、Running Task、recovery 和可选 Pending Effect。它只服务于个人单会话的当前流程，不是长期审计历史，也不替代 Git/GitHub/provider 等外部事实。
 
-## Parent Revision
+## State Version
 
-一个 Parent 一致性聚合的单调提交序号。该 Parent 下所有 Child、Gate、evidence、Role Actor mapping 和 delivery 状态 mutation 共用同一 revision；调用方必须基于明确的预期 revision 发起 mutation，过期请求不能自动套用到新状态。不同 Parent 的 revision 相互独立。
+Workflow State Snapshot 每次成功变化时递增的本地顺序号，只用于诊断、展示和识别状态先后，不表示多参与者并发版本。
 
 ## Canonical Parent State
 
 固定 Workflow Definition 为 Parent 定义的唯一当前状态值。Active、Terminal、Recovery 和 Delivery Partial 等分类从该状态及明确关系推导，不保存可能互相矛盾的状态布尔列；Host readiness、main session mode、Task/Child/Effect state 属于其他状态域。
 
-## Workflow Event
+## Pending Effect
 
-对一次已提交 Workflow mutation 的不可修改审计记录，与对应当前状态和 Parent Revision 在同一原子提交中产生。Workflow Event 用于解释历史和关联 evidence、Actor 与外部 effect，但首期不是可脱离当前状态独立重建整个 Workflow Ledger 的唯一事实源。记录在所属 Parent 保留期间不可改写；Parent 终态满 30 天后的整聚合 purge 会删除全部 Event 且不留 Tombstone。
+Host 在调用外部 Git/GitHub 等 effect 前写入 Workflow State Snapshot 的唯一未决操作，包含 `id`、固定 type、target、expected facts 和 `prepared|started|unknown` 状态。确认外部结果后更新当前 Workflow 并清空；系统中断后若可能已执行，则先查询真实外部状态，无法判断时停止并交由用户处理或重置。
 
-## Effect Intent
+## Workflow Reset
 
-Host 在执行外部 effect 前原子记录的不可变执行意图，绑定目标 Parent、触发 revision、effect 类型、已解析目标和确定参数。Effect Intent 提交后 Workflow 仅表示该操作待执行或待确认；只有外部结果经验证并再次提交 Ledger 后，才能进入 Workflow Definition 规定的后继状态。
-
-## Command ID
-
-由可信调用边界为一次 Workflow 命令派生的稳定幂等身份。它用于识别同一调用的重入或重复交付，不来自 Agent 可自由填写的参数，也不替代 Actor authorization、Parent Revision 或 Workflow 状态校验。
-
-## Command Receipt
-
-一次成功 Workflow mutation 的不可变幂等回执，绑定 Command ID、规范化请求语义、提交后的 Parent Revision、Workflow Event 及可选 Effect Intent。相同命令重入时返回原提交结果而不再次产生状态变化；同一 Command ID 对应不同请求语义时必须失败关闭。该保证只在所属 Parent 保留期间成立；Parent 终态满 30 天后 Receipt 随整聚合删除。
-
-## Command Attempt
-
-Host 对一次被拒 Workflow 命令形成的独立安全审计事实。它只在 caller 与目标 Parent 可从可信上下文确定时记录结构化 denial，不产生 Command Receipt 或 Workflow Event，也不推进 Parent Revision。
-
-## Effect ID
-
-Host 为一个逻辑 Effect Intent 分配的不可变幂等身份。该 effect 的执行、结果未知、对账和受控重试始终共用同一个 Effect ID；首期不为每次执行尝试创建独立 Attempt 身份，只在 effect 上保留安全恢复所需的最小执行元数据。
+由当前主会话的直接人类明确请求、用于清空本地 Workflow State Snapshot 的粗粒度恢复动作。它不伪造 Parent 终态，也不自动执行 Git reset、清理分支、修改 GitHub 资源或删除 DSH session；Agent 和后台逻辑不能自行触发。
 
 ## Active Parent
 
-尚未进入 `completed` 或 `abandoned` 终态的 Parent。正常推进、Workflow Recovery、Delivery Partial、等待修复和存在未决 Effect Intent 的 Parent 都仍是 Active Parent；首期一个 Product Workspace 在同一正常 Ledger Generation 中最多存在一个 Active Parent。SQLite schema 不兼容时经直接人类确认的 Ledger Generation Reset 可以结束整个旧 generation，但不会把其中的 Active Parent 伪造为终态。
-
-## Durable Lease
-
-Host 为跨事务、跨进程的长时间工作或独占资源记录的持久执行所有权。首期 lease 不使用时间 TTL；它在 owner 正常释放、固定取消流程确认停止，或所属 Host Boot 终结后被恢复流程判为 orphaned 时失效。它用于防止旧 worker 与新 owner 同时操作，但不替代 Parent Revision、Actor authorization、Workflow 状态校验或外部事实 preflight。
+尚未进入 `completed` 或 `abandoned` 终态的 Parent。正常推进、Workflow Recovery、Delivery Partial、等待修复和存在 Pending Effect 的 Parent 都仍是 Active Parent；首期一个本地 Workflow State Snapshot 最多保存一个 Active Parent。用户显式重置本地状态时可以丢弃该绑定，但不会把 Parent 伪造为终态或清理外部产物。
 
 ## Workflow Task
 
-由固定 Workflow Definition 根据 Parent/Child 当前状态创建的持久化必需工作单元，绑定明确的 task type、scope、授权 Actor/Host executor 和完成条件。它不是通用任务池或 Agent 自行创建的 assignment；首期长时间 Task 执行通过固定 `task-execution` lease 取得单一 owner。
-
-## Fencing Token
-
-某个 Durable Lease key 每次成功获取执行世代时严格递增的不可复用序号。Host 用当前 owner 与 token 共同拒绝已经释放、orphaned 或被 takeover 的旧 worker、旧 Actor turn 和延迟消息；token 不由 Agent 参数提供。
-
-## Host Boot Epoch
-
-一次 Host 进程启动形成的不可复用运行世代，由持久化 `hostBootId` 标识。首期 Durable Lease 绑定获得它的 Host Boot Epoch；新 Host 冷启动将旧 boot 中未释放的 lease 标记为 orphaned，再按 Task/Effect 恢复规则决定是否以更大 Fencing Token 接管。
-
-## Lease Audit
-
-对 Durable Lease acquire、release、orphan 和 takeover 的不可修改运维审计记录，与 lease current record 在同一运维事务提交。Lease Audit 不属于 Parent 领域事件序列，因此不推进 Parent Revision，也不产生 Workflow Event 或 Command Receipt。
-
-## Workspace Storage Identity
-
-Host 根据 Workspace Root 的 canonical real path 计算的本地持久化范围身份。它使同一 checkout 跨 DSH profile 共享一个 Workflow Ledger，同时把不同 clone 视为不同 Product Workspace；checkout 路径变化不会自动迁移旧 Ledger。
-
-## Ledger Generation
-
-一个 Product Workspace 在某一精确 SQLite schema 下连续使用的一代 Workflow Ledger。正常情况下 Active Parent 必须进入终态后才能启动新 Parent；SQLite schema 不兼容时，直接人类可以选择归档整个旧 generation 并创建空的新 generation。该重置不迁移旧状态、不伪造旧 Parent 终态，也不处理旧本地或远端产物。
+由固定 Workflow Definition 根据 Parent/Child 当前状态创建的必需工作单元，绑定明确的 task type、scope、授权 Actor/Host executor 和完成条件。它不是通用任务池或 Agent 自行创建的 assignment；首期一个 Workflow 同时最多有一个 Running Task。
 
 ## Effect Catalog
 
-固定 Workflow Definition/Host 支持的外部 effect type 闭集。每种类型必须预先定义 intent schema、实时 preflight、远端幂等或 reconciliation identity、已发生/未发生判据和未知结果处理；Policy 与 Agent 不能新增 effect type 或改变其恢复契约。
+固定 Workflow Definition 支持的外部 effect type 闭集。每种类型都有明确的执行前检查、执行和结果确认语义；Policy 与 Agent 不能新增类型。结果无法确认时停止自动推进并交由用户处理或 Workflow Reset。
 
-## Evidence Observation
+## Current Gate Evidence
 
-Host 对某一确定 subject fingerprint 在特定时点完成验证后产生的不可变证据事实，绑定 Gate scope、remote/reference、SHA 或 candidate manifest、verdict、collector 和验证契约版本。所属 Parent 保留期间，重新验证产生新的 observation 且旧记录不被覆盖；Parent 终态满 30 天后 observations 随整聚合删除。当前 Gate 是否满足由独立 projection 表达。
-
-## Evidence Artifact
-
-Evidence Observation 可选引用的不可变本地内容对象，用于保存无法合理内联到 Ledger 的受控报告或诊断材料。Artifact 按最终字节 SHA-256 存入 Workspace 私有 content-addressed store；Ledger 只保存 digest、类型、大小和生产契约，不保存 blob 或任意本地路径。
-
-## Parent Retention Window
-
-Parent 从提交 `completed` 或 `abandoned` 终态起固定保留 30 天的期限。期限内 Parent-owned Event、Receipt、Evidence、Actor mapping、Task、Effect 和 Audit 保持既定不可变历史；到期后 Host 从 current Ledger 与 current rotating backups 物理删除整个 Parent 聚合，不留 Tombstone，也不处理任何外部资源。已存在的永久 generation/incident archive 不重写。
+Workflow State Snapshot 中某个 Gate 当前采用的验证摘要，绑定当前 PR head SHA、candidate manifest hash 或测试目标 hash，并可带 GitHub reference、验证时间和短 summary。它只用于判断当前 Gate 是否满足；新验证可覆盖旧值，目标变化时立即清空，不保存长期 Observation/Artifact 历史。

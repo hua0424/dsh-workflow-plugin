@@ -3,7 +3,7 @@
 - 状态：已确认（Policy v1 骨架、静态校验与热重载边界）
 - 日期：2026-08-18
 - 主题：固定 Workflow Definition 上的受限声明式配置、静态校验与受控热重载
-- 关联设计：`docs/design/parent-child-workflow-instances.md`、`docs/design/trusted-actor-role-binding.md`
+- 关联设计：`docs/design/parent-child-workflow-instances.md`、`docs/design/trusted-actor-role-binding.md`、`docs/design/workflow-state-store.md`
 
 ## 1. 背景
 
@@ -83,7 +83,7 @@ Trusted Actor 设计已经冻结主会话 Manager、持续 Role Actor、`(parent
 - 所有新建 Child 默认且固定参与完成条件，不允许 Policy 将其声明为 optional；
 - Policy 不能把 `failed`、`blocked` 或其他失败状态配置为可接受完成状态；
 - 确实不再需要且尚未开始开发的 Child，只能通过引擎定义的显式取消 transition 处理；
-- 取消必须记录原因并保留历史，不能删除 Child；
+- 取消时当前 snapshot 必须保留该 Child 的 `cancelled` 状态和原因，直到新 Workflow 或 reset；不要求长期历史；
 - 显式取消是固定领域行为，不是 Policy 可扩展的“可接受终态”列表。
 
 这收紧了父子实例设计中为 `required/optional` 和可接受终态预留的配置空间。首期不实现该扩展点。
@@ -125,7 +125,7 @@ Parent 启动时：
 
 - 原始 hash 和所有语义 hash 都相同：正常继续；
 - 只有注释、空白、object key 顺序等源表示变化：接受新 `policySourceHash`，不改变运行语义；deliveryOrder 等有序 array 重排仍是语义变化；
-- `policyContinuityHash` 相同，但 reloadable 投影变化：先执行受影响字段的定向 Environment Preflight；成功后接受热重载并记录 `policy-reloaded` 事件，失败则不采用新配置并进入 `workflow-recovery`；
+- `policyContinuityHash` 相同，但 reloadable 投影变化：先执行受影响字段的定向 Environment Preflight；成功后接受热重载并在 `recentEvents` 记录 `policy-reloaded` 摘要，失败则不采用新配置并进入 `workflow-recovery`；
 - `policyContinuityHash` 不同：Parent 进入不可恢复的 `abandoned(cause=policy-incompatible-change)`；
 - 新文件无法读取、解析或通过静态校验：不采用新配置，fail closed 并进入 `workflow-recovery`；
 - 当前 Host 与已记录的 `workflowDefinitionVersion` 不兼容：进入 `abandoned(cause=workflow-definition-incompatible)`。
@@ -141,17 +141,17 @@ ownership.managerOwned.files
 ownership.managerOwned.directories
 ```
 
-成功接受热重载是一次原子 ledger transition：
+成功接受热重载是一次原子 Workflow State Snapshot 更新：
 
 1. 确认所有受影响旧 Role Actor 都没有运行中的 turn；否则不接受新 hashes，进入 `workflow-recovery`；
 2. 对变更的 subagentProvider/model/tool filter 执行定向 Environment Preflight；失败时不接受新 hashes，进入 `workflow-recovery`；
-3. 在同一事务中更新已接受的 `policySourceHash`、全部语义投影 hash，更新当前 Manager-owned authorization，标记受影响 Role Actor mapping 为 `stale-policy-reload`，并追加 `policy-reloaded` 事件；
+3. 在同一事务中更新已接受的 `policySourceHash`、全部语义投影 hash，更新当前 Manager-owned authorization，标记受影响 Role Actor mapping 为 `stale-policy-reload`，并在 bounded `recentEvents` 追加 `policy-reloaded` 摘要；
 4. 从该事务提交后开始，旧 stale mapping 禁止接受新任务；其他未受影响角色可以继续；
 5. 下一次派发受影响角色前创建 replacement Role Actor。创建失败时保留已经接受的新 Policy 和 stale mapping，Parent 进入 `workflow-recovery`，不能回退使用旧 Actor。
 
-纯 source 表示变化也在一次 ledger transition 中推进已接受的 `policySourceHash` 并记录 source reload；语义投影 hash 不变，不创建 replacement。这样后续 Manager Turn 不会重复处理同一版本。
+纯 source 表示变化也在一次 State Store snapshot 更新中推进已接受的 `policySourceHash` 并追加一条近期诊断摘要；语义投影 hash 不变，不创建 replacement。这样后续 Manager Turn 不会重复处理同一版本。
 
-Role Agent definition 变化通过 `roleDefinitionHash` 检测。DSH continuable child 不能原地修改 provider/model/persona/tool filter，因此 reload transaction 先把无运行中 turn 的旧 Role Actor mapping 标记为 stale；下一次派发前再转为历史，并按新 definition 创建新的 agent.id。旧 session、mapping 和 evidence 保留；既有 evidence 仍只按 Gate scope、状态和 SHA/manifest 判断有效性。
+Role Agent definition 变化通过 `roleDefinitionHash` 检测。DSH continuable child 不能原地修改 provider/model/persona/tool filter，因此 reload 时先把无运行中 turn 的当前 Role Actor mapping 标记为 stale；下一次派发前按新 definition 创建新的 agent.id 并直接覆盖当前 mapping。插件不保存旧 session/mapping 历史；DSH 可以独立保留旧 session。既有 current Gate evidence 仍只按 Gate scope、状态和 SHA/manifest 判断有效性。
 
 Manager-owned 规则变化通过 `managerOwnershipHash` 检测，从当前 Manager Turn 起用于后续 Manager 写操作；它不重新解释过去的 commit 或 evidence。这里不新增通用 per-role writable paths，reloadable 文件范围只指现有 `ownership.managerOwned`。固定拒绝目标始终优先，不能通过热重载开放。
 
@@ -518,16 +518,16 @@ routeSource = inherited | explicit
 - `routeSource=inherited` 且 route 不同：使用 Manager 当前 route 替换 Role Actor；
 - 热重载导致该角色 `roleDefinitionHash` 变化：无论 routeSource 为何，都按新的 subagentProvider/model/persona/tools.deny 替换 Role Actor。
 
-替换前必须确认旧 Role Actor 没有运行中的 turn，再将旧 mapping 转为历史，创建替代 Role Actor，登记新的 agent.id 并派发任务。
+替换前必须确认旧 Role Actor 没有运行中的 turn，再把当前 mapping 标为 stale，创建替代 Role Actor，并以新的 agent.id 覆盖当前 mapping 后派发任务。
 
 替换规则：
 
 - 不静默复用旧 agent.id；
-- 旧 session、mapping 和 evidence 保留；
+- 插件不保留旧 session/mapping 历史；DSH 可独立保留旧 session，current Gate evidence 不因替换自动失效；
 - 既有 evidence 是否有效仍只由 Gate scope、状态和 SHA/manifest 决定，不因模型替换自动失效；
 - 新 Role Actor 必须收到完整 Parent/Child/Gate/repository/branch/SHA 上下文；
 - 如果旧 Role Actor 仍在运行，替换 fail closed，Manager 必须先停止 Agent loop；
-- 替换事件进入 ledger。
+- 替换摘要追加到 snapshot 的 `recentEvents`。
 
 该机制用于流程中途模型额度耗尽或 Manager 主动切换模型，不建立 fallback model 列表或自动供应商选择器。
 
@@ -621,7 +621,7 @@ workflowDefinitionVersion
 resolved umbrella repository identity
 ```
 
-这些 hash 字段表示 Parent 当前已接受的 Policy baseline；成功 reload 时原子更新，reload event append-only 保存 old/new hashes 和受影响 roleKey/ownership 标识。固定路径、hash 历史和 Environment Preflight 解析出的真实伞仓身份共同提供足够的审计与热重载判断，避免人工 ID 与实际 Workspace 不一致。
+这些 hash 字段表示 Parent 当前已接受的 Policy baseline，并直接保存在 Workflow State Snapshot。成功 reload 时整体更新当前 hashes，并在 `recentEvents` 追加一条受影响 roleKey/ownership 的短摘要；不保存 append-only reload event 或完整 hash 历史。固定路径、当前 hashes 和 Environment Preflight 解析出的真实伞仓身份足以支持个人单会话的热重载判断。
 
 ### 3.24 schemaVersion 使用精确命名版本
 
@@ -649,7 +649,7 @@ Policy 必须配置一个相对于伞仓根目录的 `artifacts.directory`。该
 
 `prd.md` 同时承载需求背景、范围、非目标、验收标准和 Issue 拆分依据。PRD Review Gate 绑定伞仓 repository、Milestone branch、该固定 path 和 candidate commit SHA。
 
-GitHub 与 ledger 已经是以下事实的权威来源，因此 Host 不生成对应 Markdown 镜像：
+GitHub 与 Workflow State Store 已经分别保存远端事实和当前本地流程状态，因此 Host 不生成对应 Markdown 镜像：
 
 - GitHub Issue 和 Milestone；
 - Child/Parent 状态；
@@ -661,7 +661,7 @@ GitHub 与 ledger 已经是以下事实的权威来源，因此 Host 不生成�
 
 Manager 可以按需在 artifacts.directory 或其他 Manager-owned 路径创建 decision、note、research、migration plan 等辅助文档。其名称和是否创建由 Manager 判断，Host 不解析它们推进状态，也不把它们视为完成条件。
 
-首期不固定 `issues/`、`reviews/`、`tests/` 或 `delivery/` 文档目录，避免与 GitHub/ledger 形成双重事实来源。
+首期不固定 `issues/`、`reviews/`、`tests/` 或 `delivery/` 文档目录，避免与 GitHub/Workflow State Store 形成双重事实来源。
 
 ### 3.26 GitHub credential 属于 Host 运行环境
 
@@ -675,11 +675,11 @@ GitHub App、token、`gh` auth 或其他 adapter credential 的具体实现留�
 
 ### 3.27 Policy v1 不提供通用 runtime retry/timeout
 
-首期不定义顶层 `runtime` section，也不提供可以同时影响 GitHub、Git、Provider、Role Actor、outbox 和测试的通用 timeout/retry 参数。
+首期不定义顶层 `runtime` section，也不提供可以同时影响 GitHub、Git、Provider、Role Actor、`pendingEffect` handler 和测试的通用 timeout/retry 参数。
 
 各类运行控制由所属专项负责：
 
-- GitHub/outbox retry 由 ledger/outbox 和 GitHub adapter 设计；
+- GitHub 外部操作的系统中断恢复由 State Store `pendingEffect` 与固定 adapter handler 处理；
 - Provider 与 Role Actor timeout 使用 DSH/Host 规则；
 - test timeout 只能在未来 Validation Definition 的明确 runner 语义中定义；
 - Git 命令和 Environment Preflight timeout 使用 adapter 固定策略。
@@ -832,7 +832,7 @@ validation:
 
 Host 重启后的第一个 Manager Turn 使用同一流程。如果当前文件无法读取、解析或静态验证，fail closed 进入 recovery，不采用新配置；修正后在下一 Manager Turn 重新分类。
 
-Manager 派发时把当前步骤需要的 repository identity、branch、SHA、Gate、Role Actor definition fingerprint 和其他已解析参数写入 task/attempt/dispatch 事实。Role Actor 后续 mutation 依赖这些 ledger 事实和固定 Host 校验，不在 child turn 中重新解释 Policy。
+Manager 派发时把当前步骤需要的 repository identity、branch、SHA、Gate、Role Actor definition fingerprint 和其他已解析参数写入 Workflow State Snapshot 的唯一 `runningTask`。Role Actor 后续 mutation 依赖当前 snapshot 与固定 Host 校验，不在 child turn 中重新解释 Policy。
 
 Environment Preflight 仍只在相应阶段执行，不因为每轮重新静态校验而每轮重复查询全部外部环境。
 
@@ -850,7 +850,7 @@ Parent 创建前的 Environment Preflight 失败只拒绝启动、返回 diagnos
 
 Parent 已创建后的仓库阶段或其他可修复环境预检失败：
 
-- 记录 preflight attempt 和 diagnostics；
+- 返回本次结构化 diagnostics，并在 snapshot 更新当前 recovery code/短提示与一条 `recentEvents` 摘要；不保存 preflight attempt 历史；
 - 不产生该阶段后续 effect；
 - Parent 进入 `workflow-recovery`；
 - Host 不自动修改 remote、初始化 submodule、创建 baseline branch 或调整 GitHub ruleset/权限；
@@ -896,7 +896,7 @@ Parent 已创建后的仓库阶段或其他可修复环境预检失败：
 21. 每个 Manager Turn 完整加载和静态校验 Policy 一次，不跨 turn 缓存；Role Actor turn 不独立加载。
 22. `policySourceHash` 检测原始字节变化；规范化 `policyContinuityHash`、`roleDefinitionHash[]` 和 `managerOwnershipHash` 判断变化影响，成功分类后原子推进 accepted hashes。
 23. 首期 reloadable 白名单仅包含 Role Agent subagentProvider/model/persona/tools.deny 和 ownership.managerOwned；接受前执行所需定向 preflight。
-24. Role Agent definition 热重载时先将无运行 turn 的旧 mapping 标记 stale；下一次派发前以新的 agent.id 替换。继承模型路由变化使用同类替换，旧 session、mapping 和 evidence 保留。
+24. Role Agent definition 热重载时先将无运行 turn 的当前 mapping 标记 stale；下一次派发前以新的 agent.id 覆盖。继承模型路由变化使用同类替换；插件不保留旧 session/mapping 历史，current Gate evidence 不因替换自动失效。
 25. active Parent 读到显式且不同的 schemaVersion 字符串，或有效 workspace、artifacts、repositories、branches、validation 投影变化时，属于 continuity 不兼容并进入 `abandoned(policy-incompatible-change)`。
 26. Workflow Definition 不兼容进入 `abandoned(workflow-definition-incompatible)`；abandoned 后 Host 只记录、提示和停止，不自动清理本地或远端产物。
 27. 新 Policy 无法读取/YAML 解析、schemaVersion 缺失或类型错误，或在 schemaVersion 未明确变化时无法通过静态验证，则不采用并使 active Parent 进入 workflow-recovery；管理员修正后重新分类。
