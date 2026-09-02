@@ -1,33 +1,51 @@
 /**
- * Real-host e2e smoke: runs the smoke-test workflow through the actual
- * engine + real SQLite store + real catalog (the REAL ~/.dsh home), with ONLY
- * the model dispatch layer stubbed (steer/sendRoleActor = scripted log,
- * judge = scripted file inspection).
+ * Real-code-path e2e smoke: runs the smoke-test workflow through the actual
+ * engine + real SQLite store + real catalog loader, with ONLY the model
+ * dispatch layer stubbed (steer/sendRoleActor = scripted log, judge =
+ * scripted file inspection).
+ *
+ * ISOLATION (issue #3): the harness NEVER touches the real ~/.dsh home or the
+ * repo workspace's real state row. It copies smoke-test.yaml into a fresh
+ * temporary DSH home and uses a synthetic workspace directory inside it; all
+ * state rows and trace logs live under that temp home, which is removed at
+ * the end. If a real state row exists for the repo workspace it is left
+ * strictly untouched.
  *
  * Proves the full start → claim → judge → advance → deferred dispatch → END
- * loop on production code paths and the production state database.
+ * loop on production code paths, plus the run trace log (PRD
+ * workflow-run-logging AC1/AC2/AC5).
  */
-import { join } from 'node:path'
-import { mkdirSync, existsSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { tmpdir } from 'node:os'
+import { mkdtempSync, mkdirSync, copyFileSync, existsSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { StateStore, workspaceKeyOf } from '../src/state/store.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { loadCatalogEntry } from '../src/catalog/loader.ts'
 import { topFrame } from '../src/state/invariants.ts'
 
-const home = resolveDshHome()
-const ws = process.cwd() // run from the repo workspace
+// ---- Isolated environment (temp DSH home + synthetic workspace) ----
+const home = mkdtempSync(join(tmpdir(), 'dsh-e2e-home-'))
+const ws = join(home, 'workspace')
+mkdirSync(ws, { recursive: true })
 const workspaceKey = await workspaceKeyOf(ws)
 if (workspaceKey === undefined) throw new Error('no workspace key')
 
+// Copy the REAL catalog entry into the isolated home so the e2e still
+// exercises the production smoke-test.yaml verbatim, without writing
+// anything into the real home.
+const realHome = resolveDshHome()
+const realEntry = await loadCatalogEntry(realHome, 'smoke-test')
+if (realEntry === undefined) throw new Error('smoke-test not found in the real catalog')
+mkdirSync(join(home, 'workflows'), { recursive: true })
+copyFileSync(realEntry.path, join(home, 'workflows', 'smoke-test.yaml'))
+
 const store = new StateStore(home)
 try {
-  // Fresh e2e row for the repo workspace: reset first.
-  await store.deleteRow(workspaceKey)
-
-  // Load smoke-test from the REAL catalog in the REAL home.
+  // The temp home is fresh, so no state row exists; never delete rows from
+  // any home we do not own.
   const entry = await loadCatalogEntry(home, 'smoke-test')
-  if (entry === undefined) throw new Error('smoke-test not found in catalog')
+  if (entry === undefined) throw new Error('smoke-test not found in the isolated catalog')
 
   const stateHost = {
     async get(key) {
@@ -69,9 +87,9 @@ try {
   const engine = new WorkflowEngine(targets, subagents, programs, stateHost)
   engine.cwdResolver = async () => ws
 
-  // 1. start
+  // 1. start (configPath feeds the run trace log directory)
   const run = engine.buildInitialRun('manager-session-e2e', 'smoke-test', entry.config, entry.definitionHash)
-  const started = await engine.startRun(workspaceKey, run)
+  const started = await engine.startRun(workspaceKey, run, entry.path)
   console.log('1. start:', started.ok, started.message, '| frame:', topFrame(started.run).nodeId, '|', started.run.status)
   console.log('   dispatch:', dispatchLog.at(-1))
 
@@ -103,14 +121,35 @@ try {
   if (final === undefined) throw new Error('row vanished at the end')
   console.log('5. FINAL:', final.run.status, '| callStack:', JSON.stringify(final.run.callStack))
 
-  const pass = final.run.status === 'completed' && final.run.callStack.length === 0
+  let pass = final.run.status === 'completed' && final.run.callStack.length === 0
+
+  // 6. run trace log assertions (PRD workflow-run-logging AC1/AC2)
+  const TS = '\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]'
+  const logDir = join(dirname(entry.path), 'smoke-test')
+  const logFiles = existsSync(logDir) ? readdirSync(logDir).filter(f => f.endsWith('.txt')) : []
+  if (logFiles.length !== 1 || !/^\d{8}-\d{6}-[0-9a-f-]{8}\.txt$/.test(logFiles[0])) {
+    console.log('6. trace log FAIL: expected one yyyyMMdd-HHmmss-<runId8>.txt in', logDir, '| got:', JSON.stringify(logFiles))
+    pass = false
+  } else {
+    const log = readFileSync(join(logDir, logFiles[0]), 'utf8')
+    const expectations = [
+      new RegExp(`${TS} START workflow=smoke-test run=${run.runId}\\n`),
+      new RegExp(`${TS} NODE smoke-test/hello PASS -> worker-echo\\n`),
+      new RegExp(`${TS} NODE smoke-test/worker-echo PASS -> END\\n`),
+    ]
+    for (const [i, re] of expectations.entries()) {
+      const ok = re.test(log)
+      console.log(`6.${i + 1} trace log line ${ok ? 'OK' : 'MISSING'}: ${re.source}`)
+      if (!ok) pass = false
+    }
+    if (pass) console.log('   trace log:', join(logDir, logFiles[0]))
+  }
+
   console.log(pass ? 'E2E SMOKE PASS' : 'E2E SMOKE FAIL')
   if (!pass) process.exitCode = 1
 } finally {
   store.close()
-  // Remove the synthetic harness row so the real user's run starts clean.
-  const cleanup = new StateStore(home)
-  await cleanup.deleteRow(workspaceKey)
-  cleanup.close()
-  rmSync(join(ws, 'smoke'), { recursive: true, force: true })
+  // Remove ONLY the isolated temp home (state db + catalog copy + trace logs
+  // + synthetic workspace). The real ~/.dsh home is never modified.
+  rmSync(home, { recursive: true, force: true })
 }
