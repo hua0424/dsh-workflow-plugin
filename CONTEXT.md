@@ -1,167 +1,155 @@
 # Domain Glossary
 
-## Workflow Policy Profile
+## Agent Team Workflow
 
-对固定 Workflow Definition 开放的受限声明式配置。它只能为引擎预先定义的配置槽位提供值，不能创建状态、transition、Gate 或新的工作流语义。
+在DSH主会话中，由Manager与若干固定Role Actors按预配置Workflow Definition串行协作，直到Root Workflow到达END。它只定义团队编排、Node推进、Checker判断和中断继续，不内置PRD、GitHub、测试或交付等具体业务流程。
 
-首期文档中出现的“Workflow policy DSL”均指 Workflow Policy Profile，而不是可编程的通用状态机语言。
+## Manager
 
-## Engine Invariant
+当前DSH主会话承担的编排者。Manager启动Run、为动态决策Node选择业务对象、把上下文交给后续Node、处理中断/BLOCK、与直接人类沟通，并可执行配置为`manager` Role的Actor Task。Manager执行Actor Task时仍不能自行判定PASS。
 
-无论 Workflow Policy Profile 如何配置都必须成立的工作流规则，例如固定的 Parent/Child 结构、状态转换、Gate 顺序、读写屏障、角色职责边界以及 evidence 与候选 SHA 的绑定关系。
+## Role Definition
+
+团队中一种工作职责的不可变运行定义，包括`roleKey`、persona、model route和tool restrictions。Role Definition可以由多个Node复用。Session Preset提供基础persona/tools/Skills/MCP和helper subagents；Role Actor继承Preset后再应用Workflow Role覆盖/收窄。Manager是保留roleKey且不在roles配置中。
+
+## Role Actor
+
+某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用；不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping。
+
+## Judge Role
+
+整个Root Workflow只配置一次的独立判断职责，包括persona、model和Engine固定read-only allow-list：read/glob/grep/read_image及current workspace/repository限定的`workflow_inspect_git`、`workflow_inspect_github` wrappers；不暴露shell/SSH/mutation/MCP/subagent/Workflow control。Judge Role不承担普通工作Node，也不能修改被判断对象。
+
+## Judge Agent
+
+根据Judge Role为一次具体Checker判断创建的fresh、non-continuable Agent。Parent/Child Workflow共享同一个Judge Role配置，但不复用Judge session。Host临时提供Manager Session中USER/MANAGER可见conversation投影；上次Judge结果只有在Manager明确复述到主会话时才会进入，且不写Workflow State。
+
+宿主实现已确认：`toolFilter.allow`过滤整个继承工具面（global+Preset ancestor层），固定allow-list对继承Preset的Judge成立；两个`workflow_inspect_*` wrapper注册在host行，执行时由`tools.guard()`校验调用者属于当前Judge session；每次spawn后Host对Judge final visible schema做fail-closed断言。
+
+## Workflow Configuration
+
+`${DSH_HOME:-$HOME/.dsh}/workflows/<workflow-id>.yaml`中的一个自包含Catalog文件。文件名stem就是Root Workflow ID；顶层`workflow`保存Root Graph，可选`childWorkflows`保存复用子流程。文件还内联全部Role Definitions和一个Judge Role。Schema精确为`agent-workflow/v1`，使用单文档受限YAML 1.2，无duplicate key、anchor/alias/merge、custom tag或模板插值。首期不存在import、include、extends、overlay、跨文件引用或远程Registry。Catalog每次list/start fresh非递归扫描根目录，只接受lowercase`[a-z][a-z0-9-]*.yaml`普通文件，拒绝symlink/junction和`.yml`；invalid文件只阻塞自身。主入口是原生Command：`/dsh-flow list|start <workflow-id> [extra text]|status|reset`；无参数返回usage error，不做隐式status/list。
+
+## Workflow Plugin Bundle
+
+插件以DSH Profile Bundle分发：package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装。Engine、`/dsh-flow`命令、七个Workflow tools和两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。bundle成员变更需重启DSH；home/patch层修改可热载。
 
 ## Workflow Definition
 
-由引擎实现的一套完整 Parent/Child 状态机、Gate、失败回路和恢复路由。首期只提供一个固定的功能交付 Workflow Definition；当未来出现其他真实工作流后，再基于实际差异讨论 Definition 抽象。
+一个不可变的有向Node Graph，由`workflowId`、`startNode`和Nodes组成。Graph运行中不能修改；Node业务判断只产生`PASS|FAIL`，不支持任意表达式、脚本transition、多结果分支或并行Node。
 
-## Policy Parameter
+## Root Workflow
 
-Workflow Policy Profile 中由引擎明确开放的配置槽位。Policy Parameter 可以描述执行环境或选择引擎已知的执行方式，但不能关闭 Gate、改变状态转换、接受失败结果或降低 Engine Invariant 的保障强度。
+Catalog文件名对应的入口Workflow Definition。Root startNode必须是`actor-task role:manager`，以直接利用当前主会话conversation并在主聊天开始编排；后续Node不限。Root到达END时整个Run completed。
 
-## Effective Policy
+## Child Workflow
 
-某个 Parent 在当前 Manager Turn 从唯一固定 Policy Location 加载、完整解析并接受的 Workflow Policy Profile。首期不存在 Registry、选择、继承、overlay、仓库局部覆盖或启动参数覆盖。Parent 不保存完整不可变 Policy snapshot；每个 Manager Turn 重新加载，并根据连续性投影区分可热重载变化与不兼容变化。
+被Parent Workflow中的`child-workflow` Node引用的可复用Workflow Definition。调用时push一个Child Run Frame；Child内部FAIL由自己的onFail循环/修复处理，BLOCK保留Child Frame，只有到达END才pop并让Parent调用Node视为PASS。首期Child不返回独立FAIL终点，Workflow引用图禁止直接或间接递归。
 
-## Policy Continuity Projection
+## Parent Workflow
 
-Policy 中会影响 schema 语义、baseline/remote、权威 PRD、Repository Catalog、交付顺序、分支身份或强制验证的字段集合。该投影变化后，既有 Parent 不能继续，进入 Abandoned。
+当前调用另一个Child Workflow的Workflow Definition或Run Frame。Parent/Child描述Graph复用与Runtime调用栈，不再固定表示GitHub Milestone/Issue等业务对象。
 
-## Reloadable Policy Field
+## Workflow Run
 
-可以在 Manager Turn 边界重新加载且不重新解释既有状态或 Gate evidence 的 Policy 字段。首期仅包括固定 Role Agent 的 subagentProvider/model/persona/tools.deny，以及 ownership.managerOwned 文件和目录规则。Role definition reload 接受前必须确认旧 Actor 无运行 turn，并通过所需定向 preflight；随后原子推进 accepted hashes，将旧 mapping 标记 stale 并禁止继续派发。Replacement 失败时不回滚新 Policy 或恢复旧 Actor，Parent 进入 Workflow Recovery。
+一次Root Workflow执行。Run保存启动时的完整immutable Definition Snapshot、当前call stack、Role Actor mappings和最小诊断状态。Run状态闭集是`running|blocked|completed`。
 
-## Abandoned Parent
+## Definition Snapshot
 
-因 Policy Continuity Projection 变化或 Workflow Definition 不兼容而不可继续的 Parent 终态。仅注释/格式等源表示变化或 Reloadable Policy Field 变化不使 Parent abandoned。Abandoned Parent 不等于完成或可恢复暂停；Host 只记录原因、提示用户并停止推进，不自动处理其本地或远端产物。
+Run启动时对完整Workflow Configuration严格校验、规范化后保存的不可变副本。Active Run只使用该Snapshot；外部YAML之后的修改只影响下一个Run，不热重载当前Graph或Role。
 
-## Manager Turn
+## Run Frame
 
-主会话 Manager 响应一次用户输入并编排当前 Workflow 的执行轮次。首期在每个 Manager Turn 开始时完整加载、校验并分类 Policy 变化；该轮派发的 Role Actor 工作不再独立加载。
+Call Stack中的一个Root或Child执行帧，只包含`workflowId`、`nodeId`和current `nodeToken`。Token是每次Node进入/resume/replacement派发时更新的UUID，用于拒绝旧Turn/旧消息迟到mutation；不保存旧Token历史。Runtime不保存working/checking/interrupted phase、completion claim、attempt或Node历史。
 
-## Policy Source Document
+## Node
 
-管理员编写并由 Host 加载的 Workflow Policy Profile 源文件。首期只接受受限 YAML 1.2；它是纯声明式数据，不支持 anchor、alias、merge、自定义 tag、多文档、模板或脚本执行。
+Workflow Definition中的最小执行单元。Node包含稳定`nodeId`、一种Execution Type、可选instruction/Checker、必填`onPass`和可选`onFail`。Node运行时不被修改。
 
-## Strict Policy Schema
+## Execution Type
 
-对 Policy Source Document 采取失败关闭的结构契约。未知字段、错误类型、未知枚举、无效引用或缺失的关键字段都会阻止 Workflow 启动；Host 不通过忽略字段或类型转换猜测管理员意图。
+Node如何执行的代码内置闭集：
 
-## Static Policy Validation
+- `actor-task`：由Manager或一个continuable Role Actor工作；必须配置Checker；
+- `builtin-program`：运行代码内置Program，可执行动作或读取现场，并在结果明确时直接返回PASS/FAIL；
+- `child-workflow`：调用可复用Child Workflow，Child到END后返回PASS。
 
-只根据 Policy 数据、schema 和 Workflow Definition 判断配置是否合法的确定性校验，不读取 GitHub、provider、仓库或其他外部环境。
+## Builtin Program
 
-## Environment Preflight
+由代码注册的固定业务程序，具有稳定`programId`、config/parameter/result schema。Node保存静态config，Manager在current Node通过`node_run_program`提供不持久化的typed parameters；Host固定programId。它可以执行业务动作或纯检查。v1仅含固定当前Workspace repository的`github.initialize-milestone(title,branchName)`与`github.all-milestone-issues-complete(milestoneNumber)`；Program parameters/details不持久化。只有结果明确时返回PASS/FAIL；ERROR/INDETERMINATE不走Graph Edge，在当前Node进入BLOCK并交给Manager处理。扩展Program必须修改代码。
 
-在产生对应外部 effect 前，对 credential、provider、repository、branch、ruleset、远端 SHA 等当前环境事实进行的阶段性检查。Parent 创建前失败只拒绝启动；创建后的可修复环境失败进入 Workflow Recovery，而不是 Abandoned。Reloadable Role Agent definition 变化还需对受影响 provider/model/tool-filter capability 执行定向 preflight。
+## Checker
 
-## Product Workspace
+`actor-task`的实际推进门控。Node配置`checkerId`和该Checker schema允许的config；Worker只能claim completed/failed，Checker才产生PASS/FAIL。Runtime不保存Checker状态、evidence或attempt history。
 
-由一个伞仓和一个固定代码仓库 Catalog 共同构成的产品交付范围。首期一个 Workflow Policy Profile 只描述一个 Product Workspace。
+## Checker Definition
 
-## Repository Catalog
+插件源码内部固定Catalog中的Checker实现，包括`checkerId`、evaluation mode、config/claim/parameter schema、可选Judge prompt template和evaluate逻辑。不提供运行时register API；新增ID但不改变配置结构/既有语义时仍可属于v1，结构或既有语义不兼容才升级v2；扩展Checker必须修改插件源码、测试和版本；配置不能提供任意程序、脚本或Checker类型。
 
-Product Workspace 中由稳定 repositoryKey 标识的允许仓库集合。Parent 只能从 Catalog 选择本次受影响的代码仓库子集，不能在运行时加入任意仓库。首期 Catalog 中的代码仓库都必须来自伞仓 `.gitmodules`。
+## Deterministic Program Checker（未来扩展）
 
-## Workspace Root
+直接根据Worker claim、Node config和live workspace/remote facts计算PASS/FAIL的Checker；v1尚无该类checkerId。
 
-启动 Workflow 的 Manager session 的绝对工作目录。首期 Host 将它作为伞仓候选根目录并执行环境预检，不在 Policy 中重复配置本地 checkoutPath。
+## Judge-assisted Program Checker（未来扩展）
 
-## Resolved Repository Identity
+使用fresh Judge从claim/现场提取固定parameter schema，再由内置程序计算最终PASS/FAIL的Checker；v1尚无该类checkerId。Judge不能选择任意command或checkerId。
 
-Host 根据伞仓、`.gitmodules` 和 checkout 的 Git remote 解析并验证出的具体 GitHub 仓库身份。它是 Parent 的运行时事实，不由 Agent 参数或 Policy 中重复填写的 owner/repository 决定。
+## Judge Decision Checker
 
-## Catalog Repository
+由fresh Judge根据Global Judge persona、内置Checker template、Node criteria、Worker claim、只读现场，以及Host临时生成的Manager Session USER/MANAGER可见文本projection直接给出PASS/FAIL与reason的Checker。Projection排除system/tool/subagent/hidden内容且不写State。v1唯一Checker `judge.goal-satisfied`只允许Node配置criteria文本；fresh Judge输出固定`{result:PASS|FAIL,reason}`，异常不产生Graph结果而BLOCK当前Node。它不能替换Judge只读职责和strict输出协议。
 
-由 Policy 明确列入 Repository Catalog、允许 Parent 选择和交付的代码仓库。`.gitmodules` 中未被 Policy 列出的 submodule 不是 Catalog Repository，不能自动获得 Workflow 操作范围。首期 repositoryKey 必须等于 `.gitmodules` 的 submodule name。
+## PASS / FAIL
 
-## Baseline Branch
+Checker或Builtin Program在业务结果明确时产生的唯一Graph结果。PASS走`onPass`；FAIL在配置`onFail`时走该Edge，未配置onFail时当前Node进入BLOCK。
 
-Product Workspace 中伞仓和全部 Catalog Repository 共同使用的目标基线分支。首期由 Policy 在 workspace 级显式声明，不允许每仓覆盖。
+## END
 
-## Branch Prefix
+成功终点，不是Node结果。Root到END表示Run completed；Child到END表示Child成功并返回Parent PASS。
 
-Policy 为某类引擎分支声明的固定名称前缀。首期 Policy 只能配置 prefix，稳定 ID 和后缀格式由引擎生成，不提供任意 branch template。
+Root END 时 Engine 向 Manager 主会话 steer 一条完成通知（`workflow "<id>" 已完成（run <runId>）`），用户因此在主聊天里能明确看到工作流结束；通知是 best-effort，失败不影响已持久化的 completed 状态。
 
-## Manager-owned Path
+## BLOCK
 
-Policy 明确允许 Manager 修改的伞仓非代码文件或目录范围。首期目录规则是精确前缀；文件规则只支持最终文件名 segment 中非递归的 `*`。该范围可以在 Manager Turn 边界热重载；固定拒绝目标和 Catalog 代码仓永远不因该规则获得 Manager 写权限。
+当前Node/Run的可恢复暂停状态，不是Graph Edge或业务结果。Actor可以主动报告BLOCK；Actor/Manager Turn结束但未提交Node结果、派发失败、Host重启后缺少匹配Turn、Judge错误、Builtin Program ERROR/INDETERMINATE或FAIL且无onFail也进入BLOCK。BLOCK保留current Node和call stack；Manager处理后只能resume同一Node或Reset，不能跳到任意Node。
 
-## Fixed Workflow Role
+## Manager Session Context
 
-首期由引擎固定职责和 Gate 映射的 Role Agent key，包括 prd-reviewer、developer、code-reviewer 和 tester。Policy 只能配置它们的运行定义，不能增删角色或重新分配职责。
+当前主会话中已有的USER/MANAGER conversation、workspace instructions、Skills和Tools。`/dsh-flow`启动后steer同一个Manager，因此Run State不复制conversation/system/Skill/MCP上下文。Role/Judge Agent由DSH按各自cwd/preset重新装配环境。
 
-## Role Agent Definition
+## Handoff Context
 
-Policy 中为一个 Fixed Workflow Role 内联声明的 continuable child 运行配置，包括 subagentProvider、LLM model route、persona 和可选 per-role tool deny-list。它不是运行时身份；创建后产生的 durable agent.id 才是当前 Parent 的 Role Actor。Definition 可以热重载，但既有 continuable child 不能原地修改，必须以新的 agent.id 替换。
+Actor Task在临时completion claim中可提供的opaque文本。Checker PASS后，Engine/Manager把它原样放进发给下一Node或Child Actor的消息，但不持久化。它用于Agent动态选择Issue/仓库等对象，替代typed resolver、变量、output binding和data-flow DSL；发送窗口丢失时重新询问或按真实现场重建。
 
-## Role Tool Deny-list
+## Node Claim
 
-Role Agent Definition 中可选的 DSH child toolFilter 配置，只从该 Role Actor 继承的 Manager 工具集合中移除指定工具，不限制 Manager，也不构成新的 Policy 权限层。
+Current Actor Task Worker通过携带current nodeToken的`node_claim`提交的临时`completed|failed`声明、summary和可选handoffContext。Claim和handoff都必须经过Checker，且不持久化；系统中断后让Worker重新claim。
 
-## Role Model Route
+## Node Block
 
-Role Actor 创建时解析并固定的 LLM provider、model 和 maxTokens。来源可以是 Policy 中的显式配置，也可以继承 Manager 当前路由；继承型路由在 Manager 切换模型后通过创建新的 Role Actor 生效，而不是修改既有 agent.id。
+Current Actor或Manager可在Run running且token匹配时通过`node_block(nodeToken,reason)`把current Node置为BLOCK。它不运行Checker/Edge，也不自动interrupt Actor；BLOCK后迟到mutation因status不再running而拒绝。
 
-## Validation Definition
+## Node Program Run
 
-Policy 中直接归属于一个 Catalog Repository 或 Product Workspace 的强制验证配置。首期不通过可复用 Profile ID 间接引用：每仓唯一 unit test definition，工作区唯一 integration test definition。
+Manager在current `builtin-program` Node调用`node_run_program(nodeToken,parameters)`的动作。Engine从current Node固定programId/config，只接收其parameterSchema允许的临时参数；参数不持久化、不形成变量或handoff，中断后重新提供。
 
-## Policy Diagnostic
+## Node Resume
 
-Static Policy Validation 或 Environment Preflight 产生的结构化问题记录，包含稳定 code、phase、配置 path 和管理员可读 message。Validator 汇总相互独立的问题但不自动修改 Policy。
+Manager在current Role Actor无active turn时通过`node_resume(nodeToken,resolutionContext)`恢复BLOCK Node。它清除BLOCK状态，把处理结果发给当前Worker，或用于重新运行Builtin Program/Child调用；不能修改current Node。ResolutionContext不持久化，派发失败后再次resume必须重新提供。
 
-## Policy Location
+## Manual Program Resolution
 
-首期固定为 Product Workspace 根目录下的 `.dsh/workflow-policy.yaml`。它不通过搜索、环境变量、启动参数或 Agent 参数定位。
+只要current Node是builtin-program、Run处于BLOCK且nodeToken匹配，Manager检查真实现场后可调用`node_resolve_program(nodeToken,result,reason)`确认PASS/FAIL。Host不分类BLOCK原因；Manager因此可以覆盖builtin-program的明确FAIL，但Actor Checker和Child结果仍不能override。
 
-## Policy Schema Version
+## Workflow Visibility
 
-Policy Source Document 所遵循的精确结构契约版本。首期唯一值是 `workflow-policy/v1`；Host 不进行别名解析、版本范围协商或自动迁移。
+首期不开发自定义Workflow Web UI。Manager输出和Tool/Command Cards显示在主聊天，Role Actors显示在Child Session hierarchy，`/dsh-flow status`展示current workspace的Run status/call stack/current Node/Role/blockReason/model override；历史查看复用DSH Session log。
 
-## Validated Policy
+## Workflow State Store
 
-某个 Manager Turn 开始时，对当前 Policy Source Document 完成源 hash、受限 YAML、Strict Schema、Static Policy Validation 和语义投影分类后得到的本轮有效配置对象。它只在该 Manager Turn 内复用，不跨 turn 缓存。
+`${DSH_HOME}/workflows/state.sqlite3`中按current Manager Session cwd的filesystem canonical realpath分Row保存current Run的最小持久化边界。一个Workspace最多一个Run并永久绑定启动managerSessionId，不同Workspace可并发；其他Session不能接管/推进，但同Workspace任意direct-human Session可用`/dsh-flow reset`只删除本地Row；一个connection/queue串行短写。State只包含catalogWorkflowId、immutable Definition Snapshot、Run identity/status、call stack、Role Actor mappings、current model overrides和blockReason；Root frame.workflowId等于catalogWorkflowId；不保存recentEvents、业务对象状态、completion claim、Checker evidence、Task/Effect、Recovery状态或精确外部副作用历史。历史完全复用DSH Session log。
 
-## Workflow Artifact Directory
+宿主实现确认：Home路径用`resolveDshHome()`（显式配置>`DSH_HOME`环境变量>`~/.dsh`）；cwd取自`agent.session.header.cwd`，缺失时拒绝start；SQLite用内置`node:sqlite`的`DatabaseSync`（与DSH storage-sqlite同款），owner-only目录/文件、WAL、单连接加短mutation队列。Turn结算订阅`session/event`的durable `turn/end`；`subagent/end`是Activation-epoch级、不能用于Node结果关联。自动BLOCK写入必须defer，不能在`session/event`回调内同步append同一Session。
 
-Policy 配置的伞仓相对目录，自动属于 Manager-owned 范围。首期只有其中固定位置的 `prd.md` 是权威 Workflow 文档；其他辅助文档由 Manager 按需创建，GitHub 和 Workflow State Store 事实不生成 Markdown 镜像。
+## External Fact
 
-## Host GitHub Credential
-
-Host 当前用于 GitHub adapter 的默认运行时凭据。首期它不由 Policy 选择，也不进入 Policy hash；Environment Preflight 验证其当前可用性和阶段所需权限。
-
-## Workflow State Snapshot
-
-当前 Workflow 的唯一可恢复状态表示，包含 Parent/Child、Gate、当前 Role Actor mapping、candidate/evidence、Running Task、recovery 和可选 Pending Effect。它只服务于个人单会话的当前流程，不是长期审计历史，也不替代 Git/GitHub/provider 等外部事实。
-
-## State Version
-
-Workflow State Snapshot 每次成功变化时递增的本地顺序号，只用于诊断、展示和识别状态先后，不表示多参与者并发版本。
-
-## Canonical Parent State
-
-固定 Workflow Definition 为 Parent 定义的唯一当前状态值。Active、Terminal、Recovery 和 Delivery Partial 等分类从该状态及明确关系推导，不保存可能互相矛盾的状态布尔列；Host readiness、main session mode、Task/Child/Effect state 属于其他状态域。
-
-## Pending Effect
-
-Host 在调用外部 Git/GitHub 等 effect 前写入 Workflow State Snapshot 的唯一未决操作，包含 `id`、固定 type、target、expected facts 和 `prepared|started|unknown` 状态。确认外部结果后更新当前 Workflow 并清空；系统中断后若可能已执行，则先查询真实外部状态，无法判断时停止并交由用户处理或重置。
-
-## Workflow Reset
-
-由当前主会话的直接人类明确请求、用于清空本地 Workflow State Snapshot 的粗粒度恢复动作。它不伪造 Parent 终态，也不自动执行 Git reset、清理分支、修改 GitHub 资源或删除 DSH session；Agent 和后台逻辑不能自行触发。
-
-## Active Parent
-
-尚未进入 `completed` 或 `abandoned` 终态的 Parent。正常推进、Workflow Recovery、Delivery Partial、等待修复和存在 Pending Effect 的 Parent 都仍是 Active Parent；首期一个本地 Workflow State Snapshot 最多保存一个 Active Parent。用户显式重置本地状态时可以丢弃该绑定，但不会把 Parent 伪造为终态或清理外部产物。
-
-## Workflow Task
-
-由固定 Workflow Definition 根据 Parent/Child 当前状态创建的必需工作单元，绑定明确的 task type、scope、授权 Actor/Host executor 和完成条件。它不是通用任务池或 Agent 自行创建的 assignment；首期一个 Workflow 同时最多有一个 Running Task。
-
-## Effect Catalog
-
-固定 Workflow Definition 支持的外部 effect type 闭集。每种类型都有明确的执行前检查、执行和结果确认语义；Policy 与 Agent 不能新增类型。结果无法确认时停止自动推进并交由用户处理或 Workflow Reset。
-
-## Current Gate Evidence
-
-Workflow State Snapshot 中某个 Gate 当前采用的验证摘要，绑定当前 PR head SHA、candidate manifest hash 或测试目标 hash，并可带 GitHub reference、验证时间和短 summary。它只用于判断当前 Gate 是否满足；新验证可覆盖旧值，目标变化时立即清空，不保存长期 Observation/Artifact 历史。
+Git、GitHub、文件系统、SSH环境等Node工作涉及的真实现场。插件不为外部副作用建设精准Effect recovery；系统中断后Manager/Worker重新读取External Facts，自行决定继续、重做、重新claim或BLOCK。
