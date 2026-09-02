@@ -256,7 +256,7 @@ export function apply(ctx: Context) {
         if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
         const run = engine.buildInitialRun(agent.session.id, workflowId, entry.config, entry.definitionHash)
         sessionWorkspaces.set(agent.session.id, workspaceKey)
-        const outcome = await engine.startRun(workspaceKey, run)
+        const outcome = await engine.startRun(workspaceKey, run, entry.path)
         if (!outcome.ok) return { ok: false, reason: outcome.reason }
         // Design §2.6: extra text only enters the steer message to the Manager.
         if (extraText !== '') {

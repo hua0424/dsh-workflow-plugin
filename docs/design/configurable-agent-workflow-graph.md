@@ -350,6 +350,16 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
 
 `BLOCK`是current Node/Run状态，不是Node结果或Edge target；它不pop frame、不走其他Edge，也不是终态。Current Actor或Manager可主动报告BLOCK；Role Actor turn因quota/provider/error异常结束时Engine也在当前Node进入BLOCK；Builtin Program ERROR/INDETERMINATE进入BLOCK；Checker/Program FAIL且Node未配置onFail也默认BLOCK。Engine保留current Node/call stack，写`Run.status=blocked`和短reason。Manager/用户处理现场后只能resume同一Node（重新message Actor、运行Program或调用Child），或Reset整个Run；不能从BLOCK任意跳到其他Node。
 
+### 5.4 运行轨迹日志（Run Trace Log）
+
+已确认（PRD `docs/prd/workflow-run-logging.md`，R1-R4）：每个Run在文件系统留一份人可读的、按时间顺序的执行轨迹日志，作为派生产物，**不进SQLite State**（保持最小状态原则）。
+
+- **目录**：catalog entry配置文件同级、与workflow同名目录（config path去掉`.yaml`，如`~/.dsh/workflows/smoke-test.yaml`→`~/.dsh/workflows/smoke-test/`）。
+- **文件名**：`yyyyMMdd-HHmmss-<runId前8位>.txt`（本地时间；runId短码避免同秒冲突），追加写入、UTF-8。
+- **行格式**：每行前缀`[YYYY-MM-DD HH:mm:ss]`（本地时间）。Run启动写`START workflow=<id> run=<runId>`；checker/program判定路由时写`NODE <workflowId>/<nodeId> PASS -> <nextNodeId|END>`或`FAIL -> <onFailNodeId|BLOCK>`；child-workflow压栈写`PUSH -> <childWorkflowId>`，出栈由child的END行与parent节点的PASS行共同记录；行内始终含所属workflowId。
+- **失败容忍（R4）**：tracelog模块所有函数绝不抛错——目录/文件创建失败返回`undefined`、追加失败静默忽略，日志问题永不影响Run推进。Engine以runId为键在内存中保存日志路径，Run completed或reset时清理。
+- **不做**日志轮转/清理/归档、Web UI展示、turn级对话内容记录、用户自定义格式/路径（本期格式固定）。
+
 ## 6. 中断恢复
 
 已确认不区分working/checking/interrupted/recovery phase，也不在SQLite保存completionClaim。Active Run始终只停在current Node。Worker claim/Judge判断存在当前DSH对话和调用过程；中断窗口丢失就让Worker重新claim。PASS后只把handoffContext发送给下一Actor/Manager，不持久化；发送窗口丢失时重新询问或重建。

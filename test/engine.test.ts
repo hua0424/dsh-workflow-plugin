@@ -1,5 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { WorkflowEngine, type StateHost, type SubagentHost, type ProgramHost, type DispatchTargets } from '../src/engine/engine.ts'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../src/catalog/validate.ts'
@@ -353,4 +356,151 @@ test('child END pops the frame and treats the parent node as PASS', async () => 
   assert.equal(h.mem.run!.callStack.length, 0)
   // Completion notification is steered to the Manager.
   assert.ok(h.steers.some(t => /已完成/.test(t)), 'manager should get a completion steer')
+})
+
+// ---- run trace log (issue #2 / PRD workflow-run-logging R1-R4) ----
+
+/** Create a temp catalog dir containing `<workflowId>.yaml`; removed after fn. */
+async function withTempCatalog(workflowId: string, fn: (configPath: string) => Promise<void>): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), 'engine-tracelog-'))
+  try {
+    const configPath = join(dir, `${workflowId}.yaml`)
+    writeFileSync(configPath, 'schemaVersion: agent-workflow/v1\n')
+    await fn(configPath)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+/** Read the single run log file created under the config's sibling directory. */
+function readRunLog(configPath: string, workflowId: string): string {
+  const dir = join(dirname(configPath), workflowId)
+  const files = readdirSync(dir).filter(f => f.endsWith('.txt'))
+  assert.equal(files.length, 1, 'exactly one run log file should exist')
+  assert.match(files[0]!, /^\d{8}-\d{6}-[0-9a-f-]{8}\.txt$/)
+  return readFileSync(join(dir, files[0]!), 'utf8')
+}
+
+const TS = '\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]'
+
+test('startRun creates the trace log and writes the START line (AC1)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    const run = initialRun()
+    const outcome = await h.engine.startRun('ws', run, configPath)
+    assert.ok(outcome.ok)
+    assert.equal(h.mem.run!.status, 'running')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`^${TS} START workflow=eng-test run=${run.runId}\\n`))
+  })
+})
+
+test('trace log records a PASS routing line (AC2)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    h.nextJudgeResult = { result: 'PASS', reason: 'planned ok' }
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} NODE eng-test/plan PASS -> build\\n`))
+  })
+})
+
+test('trace log records a FAIL routing line to onFail (AC3), and FAIL -> BLOCK without one', async () => {
+  const FAIL_CONFIG = validateAndNormalize(parseCatalogConfig(`
+schemaVersion: agent-workflow/v1
+roles: {}
+judgeRole: { persona: J }
+workflow:
+  startNode: try
+  nodes:
+    try:
+      execution: { type: actor-task, role: manager, instruction: Try. }
+      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      onPass: END
+      onFail: retry
+    retry:
+      execution: { type: actor-task, role: manager, instruction: Retry. }
+      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      onPass: END
+`), { workflowId: 'fail-test' })
+  const failRun = (): RunState => ({
+    runId: crypto.randomUUID(),
+    managerSessionId: MANAGER,
+    catalogWorkflowId: 'fail-test',
+    definitionHash: computeDefinitionHash(FAIL_CONFIG),
+    definitionSnapshot: FAIL_CONFIG,
+    status: 'running',
+    callStack: [{ workflowId: 'fail-test', nodeId: 'try', nodeToken: newNodeToken() }],
+    roleActors: {},
+    modelOverrides: {},
+    blockReason: null,
+  })
+  // FAIL with an onFail edge routes to the retry node.
+  await withTempCatalog('fail-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', failRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    h.nextJudgeResult = { result: 'FAIL', reason: 'not good' }
+    const outcome = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'failed', summary: 'failed' }, MANAGER)
+    assert.ok(outcome.ok)
+    assert.equal(topFrame(h.mem.run!).nodeId, 'retry')
+    const log = readRunLog(configPath, 'fail-test')
+    assert.match(log, new RegExp(`${TS} NODE fail-test/try FAIL -> retry\\n`))
+  })
+  // FAIL without an onFail edge BLOCKs and is logged as FAIL -> BLOCK.
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    h.nextJudgeResult = { result: 'FAIL', reason: 'not planned' }
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'failed', summary: 'failed' }, MANAGER)
+    assert.equal(h.mem.run!.status, 'blocked')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} NODE eng-test/plan FAIL -> BLOCK\\n`))
+  })
+})
+
+test('trace log covers child push/pop routing with owning workflow ids (AC2)', async () => {
+  await withTempCatalog('child-test', async (configPath) => {
+    const h = makeChildHarness()
+    await h.engine.startRun('ws', h.childRun(), configPath)
+    const beginToken = topFrame(h.mem.run!).nodeToken
+    h.nextJudgeResult = { result: 'PASS', reason: 'begun' }
+    await h.engine.handleClaim('ws', { nodeToken: beginToken, outcome: 'completed', summary: 'begun' }, MANAGER)
+    await h.engine.handleTurnEnded('ws', MANAGER)
+    let log = readRunLog(configPath, 'child-test')
+    assert.match(log, new RegExp(`${TS} NODE child-test/begin PASS -> call-child\\n`))
+    assert.match(log, new RegExp(`${TS} NODE child-test/call-child PUSH -> child-a\\n`))
+    const childToken = topFrame(h.mem.run!).nodeToken
+    h.nextJudgeResult = { result: 'PASS', reason: 'child done' }
+    await h.engine.handleClaim('ws', { nodeToken: childToken, outcome: 'completed', summary: 'done' }, 'actor-child-1')
+    log = readRunLog(configPath, 'child-test')
+    assert.match(log, new RegExp(`${TS} NODE child-a/child-step PASS -> END\\n`))
+    assert.match(log, new RegExp(`${TS} NODE child-test/call-child PASS -> END\\n`))
+  })
+})
+
+test('log creation/append failure never breaks run startup or routing (AC4)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'engine-tracelog-blocked-'))
+  try {
+    const configPath = join(dir, 'eng-test.yaml')
+    writeFileSync(configPath, '')
+    // A regular FILE where the log directory must be created → mkdir fails.
+    writeFileSync(join(dir, 'eng-test'), 'i block the log directory')
+    const h = makeHarness()
+    const outcome = await h.engine.startRun('ws', initialRun(), configPath)
+    assert.ok(outcome.ok)
+    assert.equal(h.mem.run!.status, 'running')
+    assert.equal(h.steers.length, 1)
+    // Routing still advances with no log file attached.
+    const token = topFrame(h.mem.run!).nodeToken
+    h.nextJudgeResult = { result: 'PASS', reason: 'ok' }
+    const claim = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'x' }, MANAGER)
+    assert.ok(claim.ok)
+    assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

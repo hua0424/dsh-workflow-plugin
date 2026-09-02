@@ -78,3 +78,22 @@ pnpm run test:e2e          → E2E SMOKE PASS
 6. 结束后 `/dsh-flow reset` 清理
 
 如任何一步报错，把错误贴回来（不必手动修复，我根据错误修代码 + 重新部署，重启 DSH 生效）。
+
+## 5. 真实模型 live e2e 结论（2026-09-02）
+
+### 已跑通的验收
+
+- **smoke-test**：完整跑通两次。start → Manager 执行 → Judge PASS → worker 节点 → END → Manager 收到完成通知（`workflow "<id>" 已完成`）。`/dsh-flow list/start/status/reset` 全部实际使用通过。
+- **milestone-delivery（真实 GitHub + gh CLI）**：从 `draft-prd` 起步，跑完 3 个 Issue 的完整交付循环，真实创建并关闭 Milestone #1 `workflow-run-logging`、3 个 Issue，真实分支 `feat/workflow-run-logging` 发布到 origin（最终 `b080155`）。子工作流（child-workflow）压栈/出栈、BLOCK/resume、Judge 门控、FAIL 循环（`all-issues-complete` FAIL → 回 `select-next-issue`）均实测通过。
+
+### 事故与处理
+
+1. **reviewer 忘记调用 node_claim**（只发文字报告就结束回合）→ 引擎正确 BLOCK（`actor-turn-ended-without-result`），`node_resume` 恢复后正常。根因：milestone-delivery.yaml 里 reviewer persona 缺少"必须用 node_claim 报告"的硬约束。
+2. **e2e-smoke.mjs 误删活动 run 状态行** → 脚本用真实 `~/.dsh` + 本 workspace key 做清理，摧毁了正在跑的 run。已用事故前转储的 snapshot 手术恢复（definitionHash 校验一致）。已在 Issue #3 修复：e2e 改用隔离 DSH home + 合成 workspace key。
+3. **长寿 continuable Role Actor 上下文耗尽** → developer/reviewer 从 Issue #1 贯穿到 #3，后期 `failed before it finished`（无结束消息）。`workflow_set_role_model` 换模型（重建 actor）后恢复。
+
+### 后续优化（待办）
+
+- **【P1】Judge 上下文污染**：Judge 本是一次性 fresh 会话（`subagents.start('spawn')`，非 fork），但 `projectManagerTranscript` 把**完整 Manager 会话投影**（上限 `PROJECTION_MAX_CHARS=120_000`）注入 Judge prompt，等价于把持续历史塞回"纯净" Judge。随 Manager 会话变长，Judge 的 structured output 大量失败（pro/flash/k3 三 provider 复现，成功率约 1/6），`runJudge` 返回 `undefined` → 引擎 BLOCK（`judge evaluation produced no result`）。**方向**：投影应收缩到最近小窗口（如 ~8k）或干脆不注入全量历史（判定标准 + claim 摘要 + 真实工作区事实才是权威输入），保持 Judge 真正 fresh。
+- **【P2】Role Actor 生命周期**：role actor 应支持在节点间按需重建，而非一个会话硬扛到底，避免上下文耗尽可能性。
+- **【P2】catalog persona 硬约束**：所有 role persona 统一加一句"必须用 node_claim/node_block 工具报告，文字回复不算提交"。

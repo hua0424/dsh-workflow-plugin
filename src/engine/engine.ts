@@ -6,6 +6,7 @@
 import type { WorkflowConfig, NodeClaim, JudgeResult, RunState, CallFrame } from '../types.ts'
 import { WorkflowError } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
+import { createRunLog, appendLine } from './tracelog.ts'
 
 /** Deliverable messages to Manager / Role Actors. */
 export interface DispatchTargets {
@@ -112,6 +113,8 @@ export class WorkflowEngine {
 
   private readonly dispatchBook = new Map<string, DispatchBook>()
   private readonly inFlight = new Map<string, string>() // workspaceKey → operation kind
+  /** runId → trace-log file path (PRD workflow-run-logging R1; in-memory only). */
+  private readonly logFiles = new Map<string, string>()
   private readonly targets: DispatchTargets
   private readonly subagents: SubagentHost
   private readonly programs: ProgramHost
@@ -143,7 +146,7 @@ export class WorkflowEngine {
   frozenRoute: { provider?: string; model?: string } = {}
 
   /** Start a run: persist the initial row, then dispatch the root start node immediately. */
-  async startRun(workspaceKey: string, run: RunState): Promise<EngineOutcome> {
+  async startRun(workspaceKey: string, run: RunState, configPath?: string): Promise<EngineOutcome> {
     let version: number
     try {
       version = await this.state.create(workspaceKey, run)
@@ -153,12 +156,32 @@ export class WorkflowEngine {
       }
       throw error
     }
+    // R1/R2: create the run trace log beside the catalog config and write the
+    // START line. Best-effort — tracelog never throws, so logging can never
+    // block run startup (R4).
+    if (configPath !== undefined) {
+      const logPath = createRunLog(configPath, run.catalogWorkflowId, run.runId)
+      if (logPath !== undefined) {
+        this.logFiles.set(run.runId, logPath)
+        this.logLine(run, `START workflow=${run.catalogWorkflowId} run=${run.runId}`)
+      }
+    }
     // F22: freeze the Manager's current route as the inherited fallback at Run
     // start, so later Manager UI model switches do not change first-time
     // Worker/Judge spawns.
     this.frozenRoute = await this.managerRoute(run.managerSessionId)
     await this.dispatchNow(workspaceKey, run, version)
     return { ok: true, run, message: run.blockReason ?? `dispatched ${topFrame(run).nodeId}` }
+  }
+
+  /**
+   * Append one line to this run's trace log (best-effort, R4). No-op when the
+   * run has no log file (no configPath at start, or log creation failed).
+   */
+  private logLine(run: RunState, line: string): void {
+    const logPath = this.logFiles.get(run.runId)
+    if (logPath === undefined) return
+    appendLine(logPath, line)
   }
 
   nodeAt(run: RunState, frame: CallFrame): NodeView | undefined {
@@ -212,6 +235,8 @@ export class WorkflowEngine {
       const childDef = run.definitionSnapshot.childWorkflows?.[childId]
       if (childDef === undefined) throw new WorkflowError(`child workflow "${childId}" is missing from the snapshot`)
       run.callStack.push({ workflowId: childId, nodeId: childDef.startNode, nodeToken: newNodeToken() })
+      // R3: child-workflow push routing (the pop side is logged by advance()).
+      this.logLine(run, `NODE ${frame.workflowId}/${frame.nodeId} PUSH -> ${childId}`)
       // The handoff reaches the Child's start node (design §2.6).
       await this.dispatchCurrent(run, transientContext)
     }
@@ -222,9 +247,12 @@ export class WorkflowEngine {
     const frame = topFrame(run)
     const node = this.nodeAt(run, frame)
     if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
+    // R3: log the routing decision as `NODE <workflowId>/<nodeId> <verdict> -> <target>`.
+    const route = (line: string) => this.logLine(run, `NODE ${frame.workflowId}/${frame.nodeId} ${line}`)
     if (verdict === 'PASS') {
       const target = node.onPass
       if (target === 'END') {
+        route('PASS -> END')
         if (run.callStack.length === 1) {
           run.status = 'completed'
           run.callStack = []
@@ -235,16 +263,19 @@ export class WorkflowEngine {
         this.advance(run, 'PASS', '')
         return
       }
+      route(`PASS -> ${target}`)
       frame.nodeId = target
       frame.nodeToken = newNodeToken()
       return
     }
     const target = node.onFail
     if (target === undefined || target === 'END') {
+      route('FAIL -> BLOCK')
       run.status = 'blocked'
       run.blockReason = `checker FAIL${reason.trim() !== '' ? `: ${reason.trim()}` : ''} and no onFail edge`
       return
     }
+    route(`FAIL -> ${target}`)
     frame.nodeId = target
     frame.nodeToken = newNodeToken()
   }
@@ -293,6 +324,8 @@ export class WorkflowEngine {
   /** When a run reaches Root END, notify the Manager (the user's main session). */
   private async notifyCompletion(run: RunState): Promise<void> {
     if (run.status !== 'completed') return
+    // The run's trace log is complete; drop the in-memory mapping.
+    this.logFiles.delete(run.runId)
     try {
       await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。`)
     } catch {
@@ -568,6 +601,8 @@ export class WorkflowEngine {
 
   /** Reset: remove the workspace row (design A5). */
   async handleReset(workspaceKey: string): Promise<void> {
+    const row = await this.state.get(workspaceKey)
+    if (row !== undefined) this.logFiles.delete(row.run.runId)
     await this.state.remove(workspaceKey)
     this.dispatchBook.delete(workspaceKey)
   }

@@ -2,7 +2,7 @@
 
 DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
 workflows (`agent-workflow/v1`). Implementation complete; offline-verifiable
-acceptance items all pass (84 unit tests + real-host smoke e2e). The one
+acceptance items all pass (103 unit tests + isolated smoke e2e). The one
 remaining item is the live-model Web GUI e2e after a DSH restart.
 
 ## Current documentation
@@ -56,3 +56,29 @@ Re-deploy after every `pnpm run build` (step 2). The profile's `pnpm install`
 owns runtime deps (`yaml`, `zod`).
 
 Workflow configs live in `%DSH_HOME%\workflows\*.yaml` (e.g. `milestone-delivery.yaml`, `smoke-test.yaml`).
+
+## Run trace logs
+
+Every workflow run writes a human-readable trace log beside its catalog
+config file (`src/engine/tracelog.ts`):
+
+- **Location**: `<catalogDir>/<workflowId>/` — the config path with the
+  `.yaml` suffix stripped (e.g. `~/.dsh/workflows/smoke-test.yaml` →
+  `~/.dsh/workflows/smoke-test/`).
+- **Naming**: `yyyyMMdd-HHmmss-<runId前8位>.txt` (local time; the run-id
+  prefix avoids same-second collisions), appended in UTF-8.
+- **Format**: one line per event, each prefixed with
+  `[YYYY-MM-DD HH:mm:ss]` (local time):
+  - `[ts] START workflow=<workflowId> run=<runId>` — written at run start.
+  - `[ts] NODE <workflowId>/<nodeId> PASS -> <nextNodeId|END>` / `FAIL ->
+    <onFailNodeId|BLOCK>` — written when a checker/program verdict routes to
+    the next node. Child-workflow push/pop routing is logged too
+    (`PUSH -> <childWorkflowId>` on entry; the child's END line plus the
+    parent node's PASS line on return).
+- **Best-effort**: log directory/file creation or appends never fail the run
+  — failures are silently ignored and the workflow keeps advancing. Logs are
+  derived artifacts; they are not part of the SQLite state.
+
+The e2e smoke (`pnpm run test:e2e`) asserts the START line and both PASS
+routing lines of the smoke-test workflow in an isolated temporary DSH home
+(the real `~/.dsh` is never touched).
