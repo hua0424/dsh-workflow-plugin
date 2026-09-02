@@ -2,7 +2,7 @@
 
 DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
 workflows (`agent-workflow/v1`). Implementation complete; offline-verifiable
-acceptance items all pass (84 unit tests + real-host smoke e2e). The one
+acceptance items all pass (103 unit tests + isolated smoke e2e). The one
 remaining item is the live-model Web GUI e2e after a DSH restart.
 
 ## Current documentation

@@ -47,7 +47,7 @@ TRACE-LOG E2E PASS
 
 The script cleaned up after itself (state row, `smoke/` dir, created log file) and was deleted after the run; working tree is clean.
 
-Also run: `pnpm run test:e2e` → **E2E SMOKE PASS** (unchanged harness, still green). Note: `e2e-smoke.mjs` calls `startRun` without `configPath`, so it does not itself exercise the trace log — the temporary script above covers that gap.
+Also run: `pnpm run test:e2e` → **E2E SMOKE PASS** (unchanged harness, still green). Note: `e2e-smoke.mjs` calls `startRun` without `configPath`, so it does not itself exercise the trace log — the temporary script above covers that gap. **[Superseded by issue #3 / commit 2a25e7f: `e2e-smoke.mjs` now passes `entry.path` and asserts the full trace log (START + both PASS routing lines) in an isolated temporary DSH home; the real `~/.dsh` is never modified.]**
 
 ## Additional checks
 
