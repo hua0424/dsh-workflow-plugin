@@ -47,11 +47,11 @@ judgeRole = {
 
 Role key使用kebab-case；`manager`和`judge`保留，禁止出现在roles。Judge tools不可配置，由Engine固定只读。
 
-已确认`manager`是保留roleKey，可被actor-task Node引用，但禁止出现在`roles`配置中；它始终由当前主会话承担，YAML不伪装修改其persona/model/tools。`roles.*`只定义按需创建并在Run内复用的continuable worker subagents。Judge使用独立`judgeRole`配置。
+已确认`manager`是保留roleKey，可被actor-task Node引用，但禁止出现在`roles`配置中；它始终由当前主会话承担，YAML不伪装修改其persona/model/tools。`roles.*`只定义按需创建并在Run内复用的continuable worker subagents，每次派发新Node前对其执行Node边界compact（`compactNow`）。Judge使用独立`judgeRole`配置。
 
 Preset与Workflow分工已确认：当前Session Preset定义基础persona/tool/Skills/MCP和generic/specialized helper-subagent tools；Workflow YAML定义本Run的worker Role persona/model/toolFilter和Graph。Role Actor先继承Parent Preset composition，再应用Workflow Role覆盖/收窄，因此可以继续使用Preset提供的`qa-expert`、`vue-developer`等helper。首期不为每个Workflow创建独立Preset，也不把Workflow Role仅放在Preset中。
 
-Provider已确认固定：Worker Role Actor使用DSH in-process`spawn` continuable；每次Judge使用`spawn`one-shot/fresh。YAML不配置subagentProvider。Model只允许provider+modelId；省略时在Run启动时继承并冻结当前Manager route，不配置maxTokens/temperature/fallback等provider属性。
+Provider已确认固定：Worker Role Actor使用DSH in-process`spawn` continuable；Judge也使用continuable（每Node fresh、Node内可followup），不再one-shot/fresh。YAML不配置subagentProvider。Model只允许provider+modelId；省略时在Run启动时继承并冻结当前Manager route，不配置maxTokens/temperature/fallback等provider属性。
 
 Role工具限制只支持role-level`tools.deny`，不支持allow-list或per-node override。Role Actor继承Preset tool catalog后一次性收窄；unknown deny name在Run启动时失败，node_claim/node_block等必需工具不能deny。Preset helper未被deny时可供Role在Node内部使用。Codex/Claude/qa-expert/vue-developer等Preset subagent tools只作为Node内部helper，不作为Workflow Role backend。
 
@@ -69,21 +69,21 @@ Judge不承担普通工作Node，不判断自己完成的工作。它只：
 - 为judge-assisted program check生成固定schema参数；
 - 解释失败原因。
 
-Parent/Child Workflow共享同一个Judge Role Definition，但每次判断创建一个fresh、non-continuable Judge Agent；不复用Judge session，避免前序判断污染独立性。
+Parent/Child Workflow共享同一个Judge Role Definition，但每个Node创建一个全新Judge Session（Node内可因`NEED_CONTEXT`被Manager followup续接）；跨Node不复用Judge session，避免前序判断污染独立性。
 
 Judge提示词已确认使用三层模型：
 
 ```text
 全Workflow一个Judge Role persona
-+ 每次Checker创建fresh Judge Agent
-+ 每个checkerId由代码内置prompt template与output/parameter protocol
++ 每个Node创建fresh Judge Session（Node内可followup）
++ 每个checkerId由代码内置prompt template与judge_claim protocol
 + Node只配置该checker schema允许的criteria/context
-+ Host临时注入Manager Session USER/MANAGER可见文本projection；上次判断仅在Manager主动复述时出现
++ 只注入当前Node的Node-local projection（Node实际dispatch边界起，按事件时间戳合并Manager/User/Actor消息，排除system/tool/notice/旧Node历史）
 ```
 
 Node不能替换Judge系统职责、checker参数schema或PASS/FAIL协议。Judge-decision可以接收较自由的criteria；judge-assisted checker必须按内置template输出typed参数。
 
-Judge每次创建时使用Engine固定allow-list：`read`、`glob`、`grep`、`read_image`，以及插件自有`workflow_inspect_git`/`workflow_inspect_github`只读wrapper。Wrapper目标固定current workspace/repository、operation为enum，不接受任意command/URL或mutation。Judge不暴露bash/pwsh/SSH、edit/write、通用GitHub/MCP mutation、Workflow control、Skill或subagent tools。缺少所需读取能力时本次判断不产生结果并BLOCK。
+Judge每次创建时使用Engine固定allow-list：`read`、`glob`、`grep`、`read_image`、专用`judge_claim`，以及插件自有`workflow_inspect_git`/`workflow_inspect_github`只读wrapper。Wrapper目标固定current workspace/repository、operation为enum，不接受任意command/URL或mutation。Judge不暴露bash/pwsh/SSH、edit/write、通用GitHub/MCP mutation、Workflow control（`judge_claim`除外）、Skill或subagent tools。缺少所需读取能力时本次判断不产生结果并BLOCK。
 
 宿主实现已确认：`toolFilter.allow`过滤整个继承工具面（global层+Preset ancestor层），仅Child自身scope注册的delegation machinery豁免，因此固定allow-list对继承Preset的Judge Child成立（历史缺陷已在`tools.view()`修复）。两个wrapper注册在Profile Bundle的host行（global layer）使Judge可见，执行时由`tools.guard()`校验调用者属于当前Judge session。Host在每次Judge spawn后对其final visible schema做fail-closed断言（⊆允许集∪machinery），超出即拒绝spawn并让当前Node BLOCK。
 
@@ -304,11 +304,14 @@ Definition Snapshot直接保存在该Row的`snapshot_json.definitionSnapshot`；
   ],
   roleActors: { [roleKey]: continuableActorId },
   modelOverrides: { [roleKey | judge]: { provider, modelId } },
-  blockReason: string | null
+  blockReason: string | null,
+  nodeBoundary: NodeContextBoundary,
+  judgeSessionId?: string,
+  pendingClaim?: { outcome, summary }
 }
 ```
 
-Manager不进mapping，fresh Judge不进State。ModelOverrides只保存current值不保存历史。State不保存lastError或block kind。Strict invariants：running/blocked要求callStack非空，completed要求callStack=[]；blocked iff blockReason非空且对应top frame token，running/completed要求reason=null；每个frame nodeToken是UUID；roleActors keys只能来自Definition roles，modelOverrides keys只能来自roles或judge。SQLite不保存recentEvents；Command/Tool/Manager/Child过程历史完全复用DSH Session log，Status只读current facts。
+Manager不进mapping；Judge只以`judgeSessionId`引用进State（当前active/pending），不保存Judge历史。ModelOverrides只保存current值不保存历史。State不保存lastError或block kind。Strict invariants：running/blocked要求callStack非空，completed要求callStack=[]；blocked iff blockReason非空且对应top frame token，running/completed要求reason=null；每个frame nodeToken是UUID；roleActors keys只能来自Definition roles，modelOverrides keys只能来自roles或judge。SQLite不保存recentEvents；Command/Tool/Manager/Child过程历史完全复用DSH Session log，Status只读current facts。
 
 不再保存：
 
@@ -330,7 +333,7 @@ Manager手工resolve允许任何处于BLOCK的current builtin-program使用：Ho
 
 ### 5.2 一个Human Command与七个Model Tools
 
-Direct-human只使用一个`/dsh-flow` Command负责Catalog/list/start/status/reset。Workflow control model-facing闭集为七个；Judge另有两个固定只读inspection wrappers，不属于Workflow control：
+Direct-human只使用一个`/dsh-flow` Command负责Catalog/list/start/status/reset。Workflow control model-facing闭集为九个；Judge另有专用`judge_claim`与两个固定只读inspection wrappers，不属于Workflow control：
 
 ```text
 workflow_status()
@@ -340,11 +343,12 @@ node_resume({ nodeToken, resolutionContext })
 node_run_program({ nodeToken, parameters })
 node_resolve_program({ nodeToken, result: PASS | FAIL, reason })
 workflow_set_role_model({ roleKey, provider, modelId })
+judge_respawn({ nodeToken, reason? })
 ```
 
-所有Node mutation tool必须回传current frame nodeToken，过期token拒绝。每次进入新Node、BLOCK后resume同一Node或Actor replacement重新派发时生成新UUID并覆盖；不保存旧token/history。Tool description固定要求claim/block为当前Turn最后动作，成功后后续输出/tool语义上忽略；首期不调用DSH interrupt。
+所有Node mutation tool必须回传current frame nodeToken，过期token拒绝。每次进入新Node、BLOCK后resume同一Node或Actor replacement重新派发时生成新UUID并覆盖；不保存旧token/history。Token是尽力而为的stale防护（防凭记忆用旧token，防不住迟到方实时查`workflow_status`拿新token伪装——已知限制），Actor一律以`workflow_status`为准。Tool description固定要求claim/block为当前Turn最后动作，成功后后续输出/tool语义上忽略；首期不调用DSH interrupt。
 
-Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、token匹配、completed|failed、1..4000 summary和仅completed可用的1..8000 handoff；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和非空provider/modelId，目标Worker active时拒绝；Worker override写入后删除current roleActors mapping，旧DSH session保留但不再授权，下一次Node dispatch/resume创建replacement；Judge override只影响下一次fresh判断。Unknown字段拒绝。Judge不调用Workflow Tool，使用structured result。Claim/parameters/handoff/resolution/result details均不持久化。
+Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、token匹配、completed|failed、1..4000 summary和仅completed可用的1..8000 handoff；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和非空provider/modelId，目标Worker active时拒绝；Worker override写入后删除current roleActors mapping，旧DSH session保留但不再授权，下一次Node dispatch/resume创建replacement；Judge override只影响下一次Judge重建。Unknown字段拒绝。Judge不调用Workflow Tool，使用专用`judge_claim({nodeToken,result,reason})`提交`PASS|FAIL|NEED_CONTEXT`；`judge_respawn({nodeToken,reason?})`为Manager显式重建当前Judge。claim进入判定阶段后其`{outcome,summary}`作为`pendingClaim`持久化（判定结束清除），parameters/handoff/resolution/result details均不持久化。
 
 ### 5.3 BLOCK是当前Node上的可恢复暂停
 
@@ -362,7 +366,7 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
 
 ## 6. 中断恢复
 
-已确认不区分working/checking/interrupted/recovery phase，也不在SQLite保存completionClaim。Active Run始终只停在current Node。Worker claim/Judge判断存在当前DSH对话和调用过程；中断窗口丢失就让Worker重新claim。PASS后只把handoffContext发送给下一Actor/Manager，不持久化；发送窗口丢失时重新询问或重建。
+已确认不区分working/checking/interrupted/recovery phase。Active Run始终只停在current Node。判定阶段的`pendingClaim`持久化供Judge重建；其余claim/Judge过程存在于当前DSH对话和调用过程，中断窗口丢失就让Worker重新claim。PASS后只把handoffContext发送给下一Actor/Manager，不持久化；发送窗口丢失时重新询问或重建。
 
 中断后Manager统一处理：
 
@@ -370,7 +374,7 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
 读取current frame/node
 → 有Worker continuable session就发消息让其检查现场并继续
 → Worker session不可用就创建replacement并发送current Node/context
-→ Judge中断时不恢复旧session：让Worker重新claim，再创建fresh Judge
+→ 判定阶段BLOCK：judgeSessionId存在则followup该Judge，不存在则spawn重建；judge_respawn显式重建
 → builtin-program无Actor时由Manager重新运行program，或创建fresh Judge/由Manager判断现场是否已成功
 → 成功则推进PASS Edge
 → 未成功则重新执行/继续当前Node
@@ -434,23 +438,31 @@ roles:
     persona: |
       Implement the current issue. Use the issue and repository context
       supplied by the Manager. Report only through node_claim/node_block.
+      node_claim/node_block is the FINAL action of your turn; call it at most
+      once per turn, and never after a successful claim.
 
   reviewer:
     persona: |
       Review the current issue implementation independently.
       Do not modify implementation files.
+      Report only through node_claim/node_block — a text report alone does not
+      submit your result. node_claim/node_block is the FINAL action of your
+      turn; call it at most once per turn.
     tools:
       deny: [edit, write]
 
   tester:
     persona: |
       Execute the tests required by the current issue and leave a clear report.
-      Report only through node_claim/node_block.
+      Report only through node_claim/node_block. node_claim/node_block is the
+      FINAL action of your turn; call it at most once per turn.
 
 judgeRole:
   persona: |
     Independently inspect the current claim and real workspace/remote facts.
-    Never modify evaluated artifacts. Return only the required structured result.
+    Never modify evaluated artifacts. Submit your verdict ONLY through
+    judge_claim({nodeToken, result: PASS|FAIL|NEED_CONTEXT, reason}).
+    Prefer PASS/FAIL; use NEED_CONTEXT only when information is genuinely missing.
 
 workflow:
   startNode: draft-prd
@@ -483,6 +495,9 @@ workflow:
         role: manager
         instruction: |
           Create and organize the GitHub Issues required to deliver the PRD.
+          When using `gh issue create`, pass the milestone by TITLE
+          (--milestone "<title>"), NOT its number — the gh CLI --milestone flag
+          expects a title, while `gh api ...?milestone=` expects a number.
       checker:
         checkerId: judge.goal-satisfied
         config:
