@@ -160,6 +160,19 @@ test('the A3 submission constraint is stripped from the projected dispatch text 
   assert.doesNotMatch(out[0]!.text, /node_claim/)
 })
 
+test('stripping preserves the surrounding instruction and handoff text verbatim (A3 AC3)', () => {
+  const text = `[handoff]\nrepo=acme/server\n\n[instruction]\nWrite the file.${SUBMISSION_CONSTRAINT}`
+  const s = makeSession([
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }), surfaceOp: 'append' },
+  ])
+  const out = projectSessionSurface(s, 0, 'ACTOR')
+  assert.equal(out.length, 1)
+  // Both non-constraint sections survive with their exact newlines.
+  assert.match(out[0]!.text, /\[handoff\]\nrepo=acme\/server/)
+  assert.match(out[0]!.text, /\[instruction\]\nWrite the file\.$/)
+  assert.doesNotMatch(out[0]!.text, /提交要求/)
+})
+
 test('manager-session user messages project as USER, assistant output as MANAGER (A1 R3)', () => {
   const user = createUserMessage({ content: [{ type: 'text', text: 'human question' }], source: { kind: 'user' } })
   const assistant = { turn: 1, step: 1, message: { id: 'm' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'manager answer' }], source: { kind: 'model', model: 'm' } } }

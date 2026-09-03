@@ -42,7 +42,7 @@
 
 核心：无 `faultKind`，只采集 `detail`；`judgeSessionId` 二分恢复；`judge_respawn`；`pendingClaim`。
 
-- `src/types.ts`：`RunState` 增加 `pendingClaim?: { outcome, summary }`（A4 R9）。
+- `src/types.ts`：`RunState` 增加 `pendingClaim?: { outcome, summary, handoffContext? }`（A4 R9/R10，handoff 随 claim 持久化——评审方案 2）。
 - `src/plugin/host.ts`：`runJudge` 把吞掉的异常/stopReason 捕获为 `detail` 字符串（A4 R1），不再 `catch { return undefined }` 全吞。
 - `src/engine/engine.ts`：`handleClaim` 判定阶段持久化 `pendingClaim`；判定结束（PASS/FAIL）清除；技术故障 BLOCK 时写 `blockReason = 'judge fault: <detail>'` 并主动 steer Manager 模板（A4 R2）；`handleResume` 按 `judgeSessionId` 是否存在走 followup 或 spawn 重建（A4 R4，**引擎不做 followup 失败的自动兜底**）；新增 `handleRespawnJudge`。
 - `src/tools/tools.ts` + `src/tools/authz.ts`：新增 `judge_respawn({ nodeToken, reason? })`（Manager 专用），清 `judgeSessionId` + spawn 重建 + 重投 packet（用 `pendingClaim`）。
@@ -95,7 +95,7 @@ pendingClaim?: { outcome, summary, handoffContext? }   // A4，判定阶段持�
 ## 7. 已完成的文档回写（无需重做）
 
 - `docs/pending-discussions/live-e2e-issues.md`：已加决策总览表 + 每个问题标「已决策」。
-- `CONTEXT.md`：Role Actor / Judge Agent / Run Frame / Judge Decision Checker / BLOCK / Node Claim / Node Resume / State Store 已按目标语义更新。
+- `CONTEXT.md`：Role Actor / Judge Agent / Run Frame / Judge Decision Checker / BLOCK / Node Claim / Node Resume / State Store 已按目标语义更新（handoff 持久化方案 2 已回写）。
 - `docs/design/configurable-agent-workflow-graph.md`：state 结构、tool 列表（九个 + `judge_respawn`）、Judge 三层模型、中断恢复、Milestone 示例配置已更新（含 gh milestone title/number 语义、`judge_claim` persona、claim 软约束）。
 
 ## 8. 参考

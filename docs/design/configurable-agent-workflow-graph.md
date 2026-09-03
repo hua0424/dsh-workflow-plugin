@@ -128,7 +128,7 @@ Schema已确认精确`agent-workflow/v1`，输入使用受限YAML 1.2：单文�
 
 启动时把完整normalized配置和definitionHash写入Run State。Active Run之后只读取该snapshot并忽略YAML后续修改；新YAML配置只影响下一个Run，不做hot reload/continuity projection。唯一运行中Role replacement来源是Manager显式`workflow_set_role_model`或Actor session不可恢复。
 
-部署形态已确认：插件以DSH Profile Bundle分发——package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装；改动bundle成员需重启DSH，home/patch层修改可热载。Engine、`/dsh-flow`命令、七个Workflow tools与两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。
+部署形态已确认：插件以DSH Profile Bundle分发——package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装；改动bundle成员需重启DSH，home/patch层修改可热载。Engine、`/dsh-flow`命令、九个Workflow tools与两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。
 
 ### 2.4 Workflow Definition最小Schema
 
@@ -307,7 +307,7 @@ Definition Snapshot直接保存在该Row的`snapshot_json.definitionSnapshot`；
   blockReason: string | null,
   nodeBoundary: NodeContextBoundary,
   judgeSessionId?: string,
-  pendingClaim?: { outcome, summary }
+  pendingClaim?: { outcome, summary, handoffContext? }
 }
 ```
 
@@ -331,7 +331,7 @@ Manager不进mapping；Judge只以`judgeSessionId`引用进State（当前active/
 
 Manager手工resolve允许任何处于BLOCK的current builtin-program使用：Host只校验caller、Node类型和nodeToken，Manager检查真实现场后提交PASS/FAIL+reason。Actor-task不能绕过Checker，Child Workflow只有END返回PASS且BLOCK只暂停；但Manager可对任何BLOCK中的current builtin-program在检查现场后手工PASS/FAIL。
 
-### 5.2 一个Human Command与七个Model Tools
+### 5.2 一个Human Command与九个Model Tools
 
 Direct-human只使用一个`/dsh-flow` Command负责Catalog/list/start/status/reset。Workflow control model-facing闭集为九个；Judge另有专用`judge_claim`与两个固定只读inspection wrappers，不属于Workflow control：
 
@@ -348,7 +348,7 @@ judge_respawn({ nodeToken, reason? })
 
 所有Node mutation tool必须回传current frame nodeToken，过期token拒绝。每次进入新Node、BLOCK后resume同一Node或Actor replacement重新派发时生成新UUID并覆盖；不保存旧token/history。Token是尽力而为的stale防护（防凭记忆用旧token，防不住迟到方实时查`workflow_status`拿新token伪装——已知限制），Actor一律以`workflow_status`为准。Tool description固定要求claim/block为当前Turn最后动作，成功后后续输出/tool语义上忽略；首期不调用DSH interrupt。
 
-Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、token匹配、completed|failed、1..4000 summary和仅completed可用的1..8000 handoff；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和非空provider/modelId，目标Worker active时拒绝；Worker override写入后删除current roleActors mapping，旧DSH session保留但不再授权，下一次Node dispatch/resume创建replacement；Judge override只影响下一次Judge重建。Unknown字段拒绝。Judge不调用Workflow Tool，使用专用`judge_claim({nodeToken,result,reason})`提交`PASS|FAIL|NEED_CONTEXT`；`judge_respawn({nodeToken,reason?})`为Manager显式重建当前Judge。claim进入判定阶段后其`{outcome,summary}`作为`pendingClaim`持久化（判定结束清除），parameters/handoff/resolution/result details均不持久化。
+Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、token匹配、completed|failed、1..4000 summary和仅completed可用的1..8000 handoff；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和非空provider/modelId，目标Worker active时拒绝；Worker override写入后删除current roleActors mapping，旧DSH session保留但不再授权，下一次Node dispatch/resume创建replacement；Judge override只影响下一次Judge重建。Unknown字段拒绝。Judge不调用Workflow Tool，使用专用`judge_claim({nodeToken,result,reason})`提交`PASS|FAIL|NEED_CONTEXT`；`judge_respawn({nodeToken,reason?})`为Manager显式重建当前Judge。claim进入判定阶段后其`{outcome,summary,handoffContext?}`作为`pendingClaim`持久化（判定结束清除；`handoffContext`仅completed且非空时写入，20260902-fixbug 评审方案 2），parameters/resolutionContext/result details均不持久化。
 
 ### 5.3 BLOCK是当前Node上的可恢复暂停
 

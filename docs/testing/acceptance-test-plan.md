@@ -71,9 +71,9 @@
   output/缺读取能力 → 不产生结果 → BLOCK。
 - F3 criteria trim 后 1..8000 校验。
 
-### G. 七个 Workflow Tools + 两个 inspection wrappers（设计 §5.2）
+### G. 九个 Workflow Tools + 两个 inspection wrappers（设计 §5.2）
 
-- G1 工具集合恰好七个；所有 Node mutation 必须携带 current frame nodeToken；过期拒绝。
+- G1 工具集合恰好九个；所有 Node mutation 必须携带 current frame nodeToken；过期拒绝。
 - G2 `node_claim`：仅 running + token 匹配；completed|failed；summary 1..4000；
   handoffContext 仅 completed 时 1..8000。
 - G3 `node_block`：running + token 匹配；写 BLOCK；BLOCK 后迟到 claim 因非 running 拒绝。
@@ -90,7 +90,7 @@
 
 - H1 重启后所有 running Row → BLOCK（host-restarted-before-node-result）；blocked/completed 不变。
 - H2 Manager `node_resume` 同一 Node 重派；Actor 不可用 → replacement。
-- H3 handoffContext/resolutionContext/parameters 均不持久化（重启后由 Manager 重建）。
+- H3 resolutionContext/parameters 均不持久化（重启后由 Manager 重建）；`handoffContext` 例外——随 `pendingClaim` 持久化（20260902-fixbug 评审方案 2）。
 
 ### I. Builtin Programs（设计 §10.1）
 

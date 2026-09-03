@@ -44,7 +44,7 @@ export function messageText(message: ReturnType<typeof deriveEventMessage>): str
 
 /** One projected, ordered surface message from any session. */
 export interface ProjectedMessage {
-  /** Sort key: event.time asc, then seq asc, then stable session tie-break. */
+  /** Sort key: event.time asc, then sessionId asc, then seq within a session. */
   time: number
   seq: number
   sessionId: string

@@ -32,7 +32,7 @@
 
 ## Workflow Plugin Bundle
 
-插件以DSH Profile Bundle分发：package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装。Engine、`/dsh-flow`命令、七个Workflow tools和两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。bundle成员变更需重启DSH；home/patch层修改可热载。
+插件以DSH Profile Bundle分发：package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装。Engine、`/dsh-flow`命令、九个Workflow tools和两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。bundle成员变更需重启DSH；home/patch层修改可热载。
 
 ## Workflow Definition
 
@@ -134,7 +134,7 @@ Manager在current `builtin-program` Node调用`node_run_program(nodeToken,parame
 
 ## Node Resume
 
-Manager在current Role Actor无active turn时通过`node_resume(nodeToken,resolutionContext)`恢复BLOCK Node。它清除BLOCK状态，把处理结果发给当前Worker，或用于重新运行Builtin Program/Child调用；不能修改current Node。判定阶段的BLOCK：`judgeSessionId`存在时followup该Judge，不存在时spawn重建Judge；`judge_respawn(nodeToken,reason?)`显式重建。resume成功后nodeToken必然轮换，Actor一律以`workflow_status`为准。ResolutionContext不承载nodeToken、不持久化，派发失败后再次resume必须重新提供。
+Manager在current Role Actor无active turn时通过`node_resume(nodeToken,resolutionContext)`恢复BLOCK Node。它清除BLOCK状态，把处理结果发给当前Worker，或用于重新运行Builtin Program/Child调用；不能修改current Node。判定阶段的BLOCK：`judgeSessionId`存在时followup该Judge（followup文本显式携带轮换后的新nodeToken——A1 R10「新token必须告知Judge」），不存在时spawn重建Judge；`judge_respawn(nodeToken,reason?)`显式重建。resume成功后nodeToken必然轮换，Actor一律以`workflow_status`为准。ResolutionContext不承载nodeToken、不持久化，派发失败后再次resume必须重新提供。
 
 ## Manual Program Resolution
 

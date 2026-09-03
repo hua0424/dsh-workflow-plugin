@@ -49,6 +49,10 @@ export function apply(ctx: Context) {
           judgeWorkspaces.set(sessionId, ws)
           sessionWorkspaces.set(sessionId, ws)
         }
+        // A resolution failure is NOT swallowed silently: a Judge admitted by
+        // id (judgeSessions) without a workspace mapping fails every
+        // workspace-scoped authorization check until it is repaired, keeping
+        // the system fail-closed (no logging infra in this plugin layer).
       }).catch(() => {})
     }
   }
@@ -73,9 +77,17 @@ export function apply(ctx: Context) {
     return undefined
   }
 
-  /** Whether a session is (or durably claims to be) the current node's Judge. */
+  /**
+   * Whether a session is authorized as the current node's Judge for one
+   * workspace. The live registration is workspace-scoped: a Judge admission
+   * (and its repair) always resolves through the workspace key recorded at
+   * registration time, never through the session id alone.
+   */
   async function isJudgeSessionOf(sessionId: string, workspaceKey: string): Promise<boolean> {
-    if (judgeSessions.has(sessionId)) return true
+    if (judgeSessions.has(sessionId)) {
+      // Live admission must still match the workspace it was admitted for.
+      return judgeWorkspaces.get(sessionId) === workspaceKey
+    }
     const row = await store.get(workspaceKey)
     if (row !== undefined && row.run.judgeSessionId === sessionId) {
       // Repair the live mapping: re-admit the cold-resumed Judge.
