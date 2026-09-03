@@ -108,6 +108,25 @@ export interface WorkflowConfig {
 
 export type RunStatus = 'running' | 'blocked' | 'completed'
 
+/**
+ * The precise local cursor for one Node's context isolation (A1 R2). Built when
+ * the Node is actually dispatched (A1 R1); timestamps only order, cursors only
+ * filter (A1 R3).
+ */
+export interface NodeContextBoundary {
+  /** Unix epoch ms when the Node was actually dispatched. */
+  dispatchedAt: number
+  /** Manager Session next-seq at the dispatch boundary. */
+  managerFromSeq: number
+  /** Non-manager executor Session id for this Node, when one exists. */
+  executorSessionId?: string
+  /** The dispatch message id returned by startContinuable/followup (A1 R2). */
+  executorDispatchMessageId?: string
+}
+
+/** Judge verdict + protocol (A1 R9). PASS/FAIL are the only Graph results. */
+export type JudgeVerdict = 'PASS' | 'FAIL' | 'NEED_CONTEXT'
+
 export interface CallFrame {
   workflowId: string
   nodeId: string
@@ -134,6 +153,12 @@ export interface RunState {
   roleActors: Record<string, string>
   modelOverrides: Record<string, ModelOverride>
   blockReason: string | null
+  /** Current Node's precise context boundary (A1 R2/R4). */
+  nodeBoundary: NodeContextBoundary
+  /** Current active/pending Judge session id for this Node (A1/A4). */
+  judgeSessionId?: string
+  /** Worker claim held during the judgment phase for respawn rebuild (A4 R9). */
+  pendingClaim?: { outcome: ClaimOutcome; summary: string }
 }
 
 export interface StateRow {
@@ -155,9 +180,9 @@ export interface NodeClaim {
   handoffContext?: string
 }
 
-/** Judge structured result (design §3.1). */
+/** Judge decision submitted through the `judge_claim` protocol (A1 R9). */
 export interface JudgeResult {
-  result: 'PASS' | 'FAIL'
+  result: JudgeVerdict
   reason: string
 }
 

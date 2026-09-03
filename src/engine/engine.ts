@@ -3,31 +3,82 @@
  * the whole engine is testable without a live DSH host. The plugin's `apply()`
  * wires real DSH services into these.
  */
-import type { WorkflowConfig, NodeClaim, JudgeResult, RunState, CallFrame } from '../types.ts'
-import { WorkflowError } from '../types.ts'
+import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome } from '../types.ts'
+import { WorkflowError, LIMITS } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { createRunLog, appendLine } from './tracelog.ts'
+
+/** A3 R1: the submission hard constraint appended to every actor-task dispatch. */
+const SUBMISSION_CONSTRAINT = `\n\n[提交要求]\n完成后必须调用 node_claim 提交结果（outcome: completed | failed，并附 summary）。\n仅输出文字不视为提交，会导致当前 Node BLOCK。`
+
+/** A2 R4: marker prefix compactBeforeDispatch throws with (for clean BLOCK routing). */
+const COMPACT_FAIL_PREFIX = 'node-boundary compact failed: '
+
+/** A4 R2: fixed template for a judge technical fault (steered to the Manager). */
+function judgeFaultNotice(run: RunState, nodeId: string, detail: string): string {
+  return `⚠️ Judge 判定故障（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 你的补充/指示交给当前 Judge 继续（followup）；\n  2. judge_respawn({nodeToken}) —— 放弃当前 Judge，重建新 Judge 重来一次判定；\n  3. workflow_set_role_model({roleKey:'judge', ...}) 换模型后再 resume/respawn；\n  4. node_block 保留现场等待人工。`
+}
+
+/** A1 R10: fixed template for a NEED_CONTEXT judgment (steered to the Manager). */
+function needContextNotice(run: RunState, nodeId: string, reason: string): string {
+  return `⚠️ Judge 需要补充信息（workflow ${run.runId} / node ${nodeId}）\n原因：${reason}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 你的补充交给当前 Judge 继续；\n  2. node_block 保留现场等待人工。`
+}
+
+/** A3 R3: fixed template for an actor-turn-without-result BLOCK (steered to the Manager). */
+function actorNoResultNotice(run: RunState, nodeId: string): string {
+  return `⚠️ Actor 未提交结果（workflow ${run.runId} / node ${nodeId}）\n当前 Actor 结束回合但未调用 node_claim。\n当前 Node 已 BLOCK，未推进。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 将你的指示交给当前 Actor 继续并提交；\n  2. node_block 保留现场等待人工。`
+}
+
+/** A2 R4: fixed template for a node-boundary compact failure (steered to the Manager). */
+function compactFaultNotice(run: RunState, nodeId: string, detail: string): string {
+  return `⚠️ Node 边界 compact 失败（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未派发。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 重试派发（compact 会再次尝试）；\n  2. workflow_set_role_model 换 summarization 模型后 resume；\n  3. node_block 保留现场等待人工。`
+}
 
 /** Deliverable messages to Manager / Role Actors. */
 export interface DispatchTargets {
   steerManager(run: RunState, text: string): Promise<void>
-  /** Deliver to an EXISTING mapped role actor (followup). */
-  sendRoleActor(run: RunState, roleKey: string, text: string): Promise<void>
+  /** Deliver to an EXISTING mapped role actor (followup); returns the message id (A1 R2). */
+  sendRoleActor(run: RunState, roleKey: string, text: string): Promise<{ messageId: string }>
+  /** The Manager session's current next-seq, captured at dispatch (A1 R2). */
+  managerSessionSeq(run: RunState): number
+}
+
+/** Judge spawn input the host needs to build the Judgment Packet. */
+export interface JudgeSpawnInput {
+  nodeToken: string
+  instruction: string
+  criteria: string
+  claim: { outcome: ClaimOutcome; summary: string }
+  cwd: string
 }
 
 /** Subagent lifecycle used by roles/judge. */
 export interface SubagentHost {
   /**
    * Create a continuable role actor for roleKey and deliver `initialText` as
-   * its first prompt. Returns the durable child id.
+   * its first prompt. Returns the durable child id + the dispatch message id.
    */
-  ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<string>
-  runJudge(run: RunState, input: {
-    instruction: string
-    criteria: string
-    claim: NodeClaim
-    cwd: string
-  }): Promise<JudgeResult | undefined>
+  ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<{ childId: string; messageId: string }>
+  /** Start a fresh continuable Judge and deliver its Judgment Packet (A1 R8). */
+  startJudge(run: RunState, input: JudgeSpawnInput): Promise<{ judgeSessionId: string; messageId: string }>
+  /** Followup an existing Judge session with supplemental context (A1 R10). */
+  followupJudge(run: RunState, judgeSessionId: string, text: string): Promise<void>
+  /**
+   * Retire a Judge after its PASS/FAIL verdict (A1 R11): revoke its
+   * authorization only. The resident Activation is released by DSH's own
+   * settlement watcher once the Judge's turn ends — an explicit drain from
+   * inside the Judge's own `judge_claim` tool call would cancel the very turn
+   * executing the call and deadlock on its quiescence.
+   */
+  retireJudge(run: RunState, judgeSessionId: string): Promise<void>
+  /**
+   * Drain a Judge's resident Activation (revoke + explicit drain). Only safe
+   * from a turn OTHER than the Judge's own (judge_respawn); an absent target
+   * is an accepted no-op.
+   */
+  drainJudge(run: RunState, judgeSessionId: string): Promise<void>
+  /** Node-boundary compact of a resident role actor (A2). */
+  compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
 }
 
 /** Program executor used by builtin-program nodes. */
@@ -75,12 +126,18 @@ export interface NodeView {
  * - transientContext: one-shot context to prepend to the next dispatch
  *   message (handoffContext on PASS / resolutionContext on resume). Never
  *   persisted; consumed by exactly one dispatch (design §2.6/§5.2 G4).
+ * - workerSettled: the dispatched executor's turn already ended while a
+ *   judgment was pending (the async-Judge era: the worker's `node_claim` ends
+ *   its turn long before the verdict). When true, a later PASS/FAIL verdict
+ *   dispatches the next node immediately instead of deferring to a turn/end
+ *   that already fired (A1 R9–R11).
  */
 interface DispatchBook {
   dispatchedToken: string
   executorSessionId: string
   pendingDispatch: boolean
   transientContext: string | null
+  workerSettled: boolean
 }
 
 /** The current node's precise executor session (design §4 seriality). */
@@ -113,6 +170,8 @@ export class WorkflowEngine {
 
   private readonly dispatchBook = new Map<string, DispatchBook>()
   private readonly inFlight = new Map<string, string>() // workspaceKey → operation kind
+  /** nodeToken → transient handoffContext (not persisted; design §2.6/A4 R9). */
+  private readonly handoffByToken = new Map<string, string | undefined>()
   /** runId → trace-log file path (PRD workflow-run-logging R1; in-memory only). */
   private readonly logFiles = new Map<string, string>()
   private readonly targets: DispatchTargets
@@ -139,6 +198,7 @@ export class WorkflowEngine {
       roleActors: {},
       modelOverrides: {},
       blockReason: null,
+      nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
     }
   }
 
@@ -201,8 +261,11 @@ export class WorkflowEngine {
   /**
    * Deliver the current node's prompt to its executor (design §4.1).
    * A one-shot transientContext (handoff / resolution) is prepended to the
-   * message and consumed. Mutates the run in memory only (role mapping + child
-   * frames). Throws on dispatch failure so callers can BLOCK.
+   * message and consumed. Establishes the NodeContextBoundary at actual
+   * dispatch (A1 R1), performs node-boundary compaction (A2), and injects the
+   * submission hard constraint for actor-tasks (A3 R1). Mutates the run in
+   * memory only (role mapping + child frames + boundary). Throws on dispatch
+   * failure so callers can BLOCK.
    */
   async dispatchCurrent(run: RunState, transientContext: string | null): Promise<void> {
     const frame = topFrame(run)
@@ -212,20 +275,49 @@ export class WorkflowEngine {
     const text = transientContext !== null && transientContext !== ''
       ? `[handoff]\n${transientContext}\n\n[instruction]\n${execution.instruction ?? ''}`
       : (execution.instruction ?? '')
+
     if (execution.type === 'actor-task') {
+      // A3 R1: append the submission hard constraint (never replace the original).
+      const dispatchText = text + SUBMISSION_CONSTRAINT
       if (execution.role === 'manager') {
-        await this.targets.steerManager(run, text)
+        // A2 R2: the Manager (user main session) is never compacted.
+        this.establishManagerBoundary(run)
+        await this.targets.steerManager(run, dispatchText)
       } else {
         const roleKey = execution.role!
         const existing = run.roleActors[roleKey]
+        // A2 R6 / A1 R4: compact only on fresh node entry — a retained
+        // boundary for the SAME executor means this is a same-node resume.
+        const isSameNodeResume = run.nodeBoundary.dispatchedAt !== 0
+          && run.nodeBoundary.executorSessionId === existing
         if (existing !== undefined) {
-          await this.targets.sendRoleActor(run, roleKey, text)
+          if (!isSameNodeResume) {
+            await this.compactBeforeDispatch(run, roleKey)
+          }
+          const { messageId } = await this.targets.sendRoleActor(run, roleKey, dispatchText)
+          if (!isSameNodeResume) {
+            run.nodeBoundary = {
+              dispatchedAt: Date.now(),
+              managerFromSeq: this.targets.managerSessionSeq(run),
+              executorSessionId: existing,
+              executorDispatchMessageId: messageId,
+            }
+          }
+          // Same-node resume: RETAIN the original boundary (A1 R4/AC5) so the
+          // Judge projection keeps this node's pre-resume local history; the
+          // resume dispatch itself still projects (it follows the boundary seq).
         } else {
-          const childId = await this.subagents.ensureRoleActor(run, roleKey, text)
+          // A2 R3: first creation has no history — create directly, no compact.
+          const dispatchedAt = Date.now()
+          const managerFromSeq = this.targets.managerSessionSeq(run)
+          const { childId, messageId } = await this.subagents.ensureRoleActor(run, roleKey, dispatchText)
           run.roleActors[roleKey] = childId
+          run.nodeBoundary = { dispatchedAt, managerFromSeq, executorSessionId: childId, executorDispatchMessageId: messageId }
         }
       }
     } else if (execution.type === 'builtin-program') {
+      // A3 R1: builtin-program dispatch is NOT injected with the constraint.
+      this.establishManagerBoundary(run)
       const programText = text !== ''
         ? text
         : 'Run the current builtin program via node_run_program.'
@@ -242,11 +334,36 @@ export class WorkflowEngine {
     }
   }
 
+  /** Establish the boundary for a Manager-driven node (no executor session). */
+  private establishManagerBoundary(run: RunState): void {
+    // A1 R4: on resume the boundary is retained; on fresh node entry it is
+    // (re)established from the current manager session cursor.
+    if (run.nodeBoundary.dispatchedAt !== 0) return
+    run.nodeBoundary = { dispatchedAt: Date.now(), managerFromSeq: this.targets.managerSessionSeq(run) }
+  }
+
+  /** A2: node-boundary compact of a resident role actor (best-effort trace log). */
+  private async compactBeforeDispatch(run: RunState, roleKey: string): Promise<void> {
+    // Fresh-node-entry decision is the caller's (dispatchCurrent): same-node
+    // resume and first creation never reach here (A2 R3/R6).
+    const result = await this.subagents.compactRoleActor(run, roleKey)
+    if (!result.ok) {
+      const detail = result.detail ?? 'unknown compaction failure'
+      this.logLine(run, `COMPACT ${topFrame(run).workflowId}/${topFrame(run).nodeId} role=${roleKey} FAIL: ${detail}`)
+      throw new WorkflowError(`${COMPACT_FAIL_PREFIX}${detail}`)
+    }
+    this.logLine(run, `COMPACT ${topFrame(run).workflowId}/${topFrame(run).nodeId} role=${roleKey} ${result.detail ?? 'ok'}`)
+  }
+
   /** Mutate the run along a PASS/FAIL edge (no persistence). */
   private advance(run: RunState, verdict: 'PASS' | 'FAIL', reason: string): void {
     const frame = topFrame(run)
     const node = this.nodeAt(run, frame)
     if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
+    // A1 R4: leaving the node invalidates its context boundary.
+    run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
+    delete run.judgeSessionId
+    delete run.pendingClaim
     // R3: log the routing decision as `NODE <workflowId>/<nodeId> <verdict> -> <target>`.
     const route = (line: string) => this.logLine(run, `NODE ${frame.workflowId}/${frame.nodeId} ${line}`)
     if (verdict === 'PASS') {
@@ -287,7 +404,18 @@ export class WorkflowEngine {
         await this.dispatchCurrent(run, transientContext)
       } catch (error) {
         run.status = 'blocked'
-        run.blockReason = `dispatch-failed: ${String(error)}`
+        // A2 R4/AC5: a node-boundary compact failure gets its own clean
+        // reason (no double wrapping) and an active Manager notification,
+        // reusing the A4 BLOCK-steer framework.
+        if (error instanceof WorkflowError && error.message.startsWith(COMPACT_FAIL_PREFIX)) {
+          run.blockReason = error.message.slice(0, LIMITS.blockReasonMax)
+          await this.state.put(workspaceKey, run, expectedVersion)
+          this.dispatchBook.delete(workspaceKey)
+          this.logLine(run, `DISPATCH BLOCKED ${topFrame(run).workflowId}/${topFrame(run).nodeId}: ${run.blockReason}`)
+          await this.targets.steerManager(run, compactFaultNotice(run, topFrame(run).nodeId, error.message.slice(COMPACT_FAIL_PREFIX.length))).catch(() => {})
+          return
+        }
+        run.blockReason = `dispatch-failed: ${String(error)}`.slice(0, LIMITS.blockReasonMax)
       }
     }
     await this.state.put(workspaceKey, run, expectedVersion)
@@ -297,6 +425,7 @@ export class WorkflowEngine {
         executorSessionId: executorSessionOf(run),
         pendingDispatch: false,
         transientContext: null,
+        workerSettled: false,
       })
     } else {
       this.dispatchBook.delete(workspaceKey)
@@ -314,6 +443,7 @@ export class WorkflowEngine {
         executorSessionId: previous?.executorSessionId ?? '',
         pendingDispatch: true,
         transientContext,
+        workerSettled: false,
       })
     } else {
       this.dispatchBook.delete(workspaceKey)
@@ -333,7 +463,13 @@ export class WorkflowEngine {
     }
   }
 
-  /** Handle a worker node_claim (design §5.2 G2): run the checker and advance. */
+  /**
+   * Handle a worker node_claim (design §5.2 G2): enter the judgment phase by
+   * spawning a fresh continuable Judge with the Node-local Judgment Packet (A1
+   * R7/R8) and persist the `pendingClaim` for respawn rebuild (A4 R9). The
+   * verdict arrives later via `judge_claim` (handleJudgeClaim) or, on a
+   * technical fault, via handleJudgeTurnEnded.
+   */
   async handleClaim(workspaceKey: string, claim: NodeClaim, callerSessionId: string): Promise<EngineOutcome> {
     const row = await this.state.get(workspaceKey)
     if (row === undefined) return { ok: false, reason: 'no active run' }
@@ -357,6 +493,10 @@ export class WorkflowEngine {
     if (checker.checkerId !== 'judge.goal-satisfied') {
       return { ok: false, reason: `unknown checker ${checker.checkerId}` }
     }
+    // A1 R9 / single-flight: a node already in judgment phase rejects new claims.
+    if (run.pendingClaim !== undefined) {
+      return { ok: false, reason: 'a judgment is already pending for this node' }
+    }
     // F14: single-flight per node token — one in-flight Judge per claim.
     const flightKey = `${workspaceKey}:${claim.nodeToken}`
     if (this.inFlight.has(flightKey)) {
@@ -367,37 +507,191 @@ export class WorkflowEngine {
       const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
       const cwd = await this.cwdResolver(run)
 
-      // Async Judge evaluation — the per-workspace mutation queue is NOT held.
-      const verdict = await this.subagents.runJudge(run, {
-        instruction: node.execution.instruction ?? '',
-        criteria,
-        claim,
-        cwd,
-      })
-
-      // Fresh re-read + token revalidation before applying the verdict (design §4).
-      const fresh = await this.state.get(workspaceKey)
-      if (fresh === undefined) return { ok: false, reason: 'state row vanished during judgment' }
-      if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
-        return { ok: false, reason: 'stale judge result discarded: the node moved or blocked meanwhile' }
+      // A4 R9: persist pendingClaim AT judgment-phase entry — BEFORE the spawn
+      // — so a crash between claim acceptance and spawn completion can still
+      // rebuild the packet via node_resume's spawn-recovery path.
+      const entered = await this.state.get(workspaceKey)
+      if (entered === undefined) return { ok: false, reason: 'state row vanished during claim' }
+      if (entered.run.status !== 'running' || topFrame(entered.run).nodeToken !== claim.nodeToken) {
+        return { ok: false, reason: 'stale claim discarded: the node moved or blocked meanwhile' }
       }
-      if (verdict === undefined) {
-        fresh.run.status = 'blocked'
-        fresh.run.blockReason = 'judge evaluation produced no result'
-        await this.state.put(workspaceKey, fresh.run, fresh.version)
-        this.dispatchBook.delete(workspaceKey)
-        return { ok: true, run: fresh.run, message: fresh.run.blockReason }
-      }
-      this.advance(fresh.run, verdict.result, verdict.reason)
-      // handoffContext rides the deferred dispatch (design §2.6) — only completed claims.
-      const handoff = claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== ''
+      entered.run.pendingClaim = { outcome: claim.outcome, summary: claim.summary }
+      // handoffContext is transient (design §2.6): stash it for the verdict phase.
+      this.handoffByToken.set(frame.nodeToken, claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== ''
         ? claim.handoffContext
-        : null
-      await this.persistDeferred(workspaceKey, fresh.run, fresh.version, handoff)
-      return { ok: true, run: fresh.run, message: `checker ${verdict.result}` }
+        : undefined)
+      await this.state.put(workspaceKey, entered.run, entered.version)
+
+      // A4 R1: spawn failure becomes a judge technical fault → BLOCK with detail.
+      let spawned: { judgeSessionId: string; messageId: string }
+      try {
+        spawned = await this.subagents.startJudge(run, {
+          nodeToken: frame.nodeToken,
+          instruction: node.execution.instruction ?? '',
+          criteria,
+          claim: { outcome: claim.outcome, summary: claim.summary },
+          cwd,
+        })
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        const fresh = await this.state.get(workspaceKey)
+        if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge spawn' }
+        if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
+          return { ok: false, reason: 'stale judge spawn discarded: the node moved or blocked meanwhile' }
+        }
+        // pendingClaim was already persisted above (A4 R8/R9); blockOnJudgeFault
+        // keeps it for spawn-rebuild.
+        await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
+        return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
+      }
+
+      // Record the judge session mapping on a fresh, still-valid row.
+      const fresh = await this.state.get(workspaceKey)
+      if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge spawn' }
+      if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
+        // The node moved or blocked while the judge was spawning — drain the stray judge.
+        await this.subagents.drainJudge(fresh.run, spawned.judgeSessionId).catch(() => {})
+        return { ok: false, reason: 'stale judge spawn discarded: the node moved or blocked meanwhile' }
+      }
+      fresh.run.judgeSessionId = spawned.judgeSessionId
+      await this.state.put(workspaceKey, fresh.run, fresh.version)
+      return { ok: true, run: fresh.run, message: `judge spawned for node ${frame.nodeId}` }
     } finally {
       this.inFlight.delete(flightKey)
     }
+  }
+
+  /**
+   * A4 R1/R2: fail-closed BLOCK on a judge technical fault, with steer.
+   * A4 R4/R5/R9: KEEP both `judgeSessionId` and `pendingClaim` — the recovery
+   * control signal is solely "judgeSessionId exists → followup"; whether to
+   * continue following up or explicitly rebuild (judge_respawn) is the
+   * Manager's decision, never the engine's.
+   */
+  private async blockOnJudgeFault(workspaceKey: string, run: RunState, version: number, detail: string): Promise<void> {
+    const frame = topFrame(run)
+    const reason = `judge fault: ${detail}`.slice(0, LIMITS.blockReasonMax)
+    run.status = 'blocked'
+    run.blockReason = reason
+    await this.state.put(workspaceKey, run, version)
+    this.dispatchBook.delete(workspaceKey)
+    this.logLine(run, `JUDGE FAULT ${frame.workflowId}/${frame.nodeId}: ${detail}`)
+    await this.targets.steerManager(run, judgeFaultNotice(run, frame.nodeId, detail)).catch(() => {})
+  }
+
+  /**
+   * Handle the Judge's `judge_claim` tool call (A1 R9–R11, A4 R4).
+   * PASS/FAIL advance the node and release the judge; NEED_CONTEXT BLOCKs and
+   * keeps the judge session for a followup.
+   */
+  async handleJudgeClaim(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<EngineOutcome> {
+    const row = await this.state.get(workspaceKey)
+    if (row === undefined) return { ok: false, reason: 'no active run' }
+    const { run, version } = row
+    if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}; judge claims are rejected` }
+    const frame = topFrame(run)
+    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
+    // A1 R9 / AC9: only the current node's mapped judge session may claim.
+    if (run.judgeSessionId === undefined || run.judgeSessionId !== judgeSessionId) {
+      return { ok: false, reason: 'judge session is not the current node judge' }
+    }
+    if (run.pendingClaim === undefined) {
+      return { ok: false, reason: 'no pending judgment for this node' }
+    }
+    if (result === 'NEED_CONTEXT') {
+      // A1 R10: BLOCK, keep the judge session + pendingClaim + boundary.
+      run.status = 'blocked'
+      run.blockReason = reason.slice(0, LIMITS.blockReasonMax)
+      await this.state.put(workspaceKey, run, version)
+      this.dispatchBook.delete(workspaceKey)
+      this.logLine(run, `JUDGE NEED_CONTEXT ${frame.workflowId}/${frame.nodeId}: ${reason}`)
+      await this.targets.steerManager(run, needContextNotice(run, frame.nodeId, reason)).catch(() => {})
+      return { ok: true, run, message: run.blockReason }
+    }
+    // PASS/FAIL: apply the edge and retire the judge.
+    const handoff = this.handoffByToken.get(frame.nodeToken)
+    this.handoffByToken.delete(frame.nodeToken)
+    this.advance(run, result, reason)
+    // A1 R11: retire the judge (revoke authorization; the resident Activation
+    // is released by DSH's settlement watcher once its turn ends). Never drain
+    // from inside the judge's own tool call — see SubagentHost.retireJudge.
+    await this.subagents.retireJudge(run, judgeSessionId).catch(() => {})
+    // Dispatch the next node. If the worker's turn already settled (the common
+    // async-Judge ordering), no future turn/end will arrive — dispatch now.
+    // Otherwise defer to that settlement (handleTurnEnded's pendingDispatch
+    // branch) so we never dispatch into a still-open executor turn.
+    const book = this.dispatchBook.get(workspaceKey)
+    if (book !== undefined && !book.workerSettled) {
+      await this.persistDeferred(workspaceKey, run, version, handoff ?? null)
+    } else {
+      await this.dispatchNow(workspaceKey, run, version, handoff ?? null)
+    }
+    return { ok: true, run, message: `checker ${result}` }
+  }
+
+  /**
+   * A4 R4/R5: judge turn ended without a `judge_claim` → technical fault →
+   * BLOCK with detail. The engine does NOT auto-retry or auto-respawn.
+   */
+  async handleJudgeTurnEnded(workspaceKey: string, judgeSessionId: string, detail?: string): Promise<EngineOutcome | undefined> {
+    const row = await this.state.get(workspaceKey)
+    if (row === undefined) return undefined
+    const { run, version } = row
+    if (run.status !== 'running') return undefined
+    if (run.judgeSessionId !== judgeSessionId) return undefined
+    const frame = topFrame(run)
+    const reason = detail ?? 'judge turn ended without judge_claim'
+    await this.blockOnJudgeFault(workspaceKey, run, version, reason)
+    return { ok: true, run, message: run.blockReason ?? '' }
+  }
+
+  /** A4 R6: Manager-only explicit judge rebuild (clear + spawn + re-deliver packet). */
+  async handleRespawnJudge(workspaceKey: string, nodeToken: string, reason?: string, callerSessionId?: string): Promise<EngineOutcome> {
+    const row = await this.state.get(workspaceKey)
+    if (row === undefined) return { ok: false, reason: 'no active run' }
+    const { run, version } = row
+    if (run.status !== 'blocked') return { ok: false, reason: `run is ${run.status}; respawn requires blocked` }
+    if (run.managerSessionId !== callerSessionId) {
+      return { ok: false, reason: 'only the Manager may respawn the judge' }
+    }
+    const frame = topFrame(run)
+    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
+    if (run.pendingClaim === undefined) {
+      return { ok: false, reason: 'no pending judgment to respawn' }
+    }
+    // Drain the old judge (if any) and clear the mapping + revoke authz.
+    const oldJudge = run.judgeSessionId
+    delete run.judgeSessionId
+    if (oldJudge !== undefined) {
+      await this.subagents.drainJudge(run, oldJudge).catch(() => {})
+    }
+    // Rebuild: spawn a fresh judge and re-deliver the full packet.
+    const node = this.nodeAt(run, frame)!
+    const checker = node.checker!
+    const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
+    const cwd = await this.cwdResolver(run)
+    let spawned: { judgeSessionId: string; messageId: string }
+    try {
+      spawned = await this.subagents.startJudge(run, {
+        nodeToken: frame.nodeToken,
+        instruction: node.execution.instruction ?? '',
+        criteria,
+        claim: run.pendingClaim,
+        cwd,
+      })
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      await this.blockOnJudgeFault(workspaceKey, run, version, detail)
+      return { ok: true, run, message: run.blockReason ?? '' }
+    }
+    run.judgeSessionId = spawned.judgeSessionId
+    run.status = 'running'
+    run.blockReason = null
+    await this.state.put(workspaceKey, run, version)
+    if (reason !== undefined) {
+      this.logLine(run, `JUDGE RESPAWN ${frame.workflowId}/${frame.nodeId}: ${reason}`)
+    }
+    return { ok: true, run, message: `judge respawned for node ${frame.nodeId}` }
   }
 
   /** Handle node_block (design §5.2 G3). */
@@ -421,7 +715,7 @@ export class WorkflowEngine {
     return { ok: true, run, message: `blocked: ${reason}` }
   }
 
-  /** Handle node_resume (design §5.2 G4): rotate token, dispatch now with resolutionContext. */
+  /** Handle node_resume (design §5.2 G4 / A1 R10 / A4 R4): rotate token, dispatch or followup. */
   async handleResume(workspaceKey: string, nodeToken: string, resolutionContext: string, callerSessionId: string): Promise<EngineOutcome> {
     const row = await this.state.get(workspaceKey)
     if (row === undefined) return { ok: false, reason: 'no active run' }
@@ -432,6 +726,53 @@ export class WorkflowEngine {
     }
     const frame = topFrame(run)
     if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
+
+    // A4 R4: in the judgment phase, the sole control signal is judgeSessionId.
+    if (run.pendingClaim !== undefined) {
+      run.status = 'running'
+      run.blockReason = null
+      frame.nodeToken = newNodeToken()
+      // The claim's handoffContext was keyed by the pre-rotation token; a
+      // later PASS looks it up by the CURRENT token — migrate it across the
+      // rotation so the handoff survives NEED_CONTEXT / fault recovery.
+      this.rotateHandoffKey(nodeToken, frame.nodeToken)
+      if (run.judgeSessionId !== undefined) {
+        // followup the SAME judge (A1 R10 / A4 R3); do not re-dispatch the actor.
+        const followup = `[manager resolution]\n${resolutionContext}\n\n请用新的 nodeToken "${frame.nodeToken}" 继续判定，并再次调用 judge_claim 提交。`
+        try {
+          await this.subagents.followupJudge(run, run.judgeSessionId, followup)
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error)
+          await this.blockOnJudgeFault(workspaceKey, run, version, detail)
+          return { ok: true, run, message: run.blockReason ?? '' }
+        }
+        await this.state.put(workspaceKey, run, version)
+        return { ok: true, run, message: `followup judge ${run.judgeSessionId}` }
+      }
+      // No judge session: spawn a fresh judge and re-deliver the packet (A4 R4).
+      const node = this.nodeAt(run, frame)!
+      const checker = node.checker!
+      const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
+      const cwd = await this.cwdResolver(run)
+      let spawned: { judgeSessionId: string; messageId: string }
+      try {
+        spawned = await this.subagents.startJudge(run, {
+          nodeToken: frame.nodeToken,
+          instruction: node.execution.instruction ?? '',
+          criteria,
+          claim: run.pendingClaim!,
+          cwd,
+        })
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        await this.blockOnJudgeFault(workspaceKey, run, version, detail)
+        return { ok: true, run, message: run.blockReason ?? '' }
+      }
+      run.judgeSessionId = spawned.judgeSessionId
+      await this.state.put(workspaceKey, run, version)
+      return { ok: true, run, message: `judge respawned for node ${frame.nodeId}` }
+    }
+
     // F13: never dispatch while the current node's actor has an active turn.
     const currentExecutor = executorSessionOf(run)
     if (currentExecutor !== run.managerSessionId && currentExecutor !== '') {
@@ -443,8 +784,19 @@ export class WorkflowEngine {
     run.status = 'running'
     run.blockReason = null
     frame.nodeToken = newNodeToken()
+    // A plain BLOCK→resume also rotates the token; keep any handoff the worker
+    // re-claimed under the old token reachable for a later PASS (S3 fix).
+    this.rotateHandoffKey(nodeToken, frame.nodeToken)
     await this.dispatchNow(workspaceKey, run, version, resolutionContext)
     return { ok: true, run, message: run.blockReason ?? `resumed: ${resolutionContext.slice(0, 120)}` }
+  }
+
+  /** Re-key the transient handoffContext across a nodeToken rotation (S3). */
+  private rotateHandoffKey(oldToken: string, newToken: string): void {
+    if (!this.handoffByToken.has(oldToken)) return
+    const handoff = this.handoffByToken.get(oldToken)
+    this.handoffByToken.delete(oldToken)
+    this.handoffByToken.set(newToken, handoff)
   }
 
   /** Handle node_run_program (design §5.2 G5). */
@@ -576,11 +928,22 @@ export class WorkflowEngine {
       await this.dispatchNow(workspaceKey, run, row.version, context)
       return { ok: true, run, message: run.blockReason ?? `dispatched ${topFrame(run).nodeId}` }
     }
+    // A judgment is in flight for this node: the worker's accepted claim ends
+    // its turn BEFORE the async Judge verdict arrives. That turn-end is the
+    // expected conclusion of a claiming turn, not a no-result turn (A3 R2
+    // scopes the BLOCK to turns without node_claim/node_block). Record the
+    // settlement so the later PASS/FAIL dispatches immediately (A1 R9–R11).
+    if (run.pendingClaim !== undefined) {
+      book.workerSettled = true
+      return undefined
+    }
     if (topFrame(run).nodeToken === book.dispatchedToken && currentExecutor === sessionId) {
       run.status = 'blocked'
       run.blockReason = 'actor-turn-ended-without-result'
       await this.state.put(workspaceKey, run, row.version)
       this.dispatchBook.delete(workspaceKey)
+      // A3 R3: actively notify the Manager.
+      await this.targets.steerManager(run, actorNoResultNotice(run, topFrame(run).nodeId)).catch(() => {})
       return { ok: true, run, message: run.blockReason }
     }
     // Token changed without pendingDispatch: the old turn settled after an

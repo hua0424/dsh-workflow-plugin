@@ -1,0 +1,2137 @@
+diff --git a/scripts/e2e-smoke.mjs b/scripts/e2e-smoke.mjs
+index 9aeb546..fba04a2 100644
+--- a/scripts/e2e-smoke.mjs
++++ b/scripts/e2e-smoke.mjs
+@@ -62,9 +62,12 @@ try {
+   const subagents = {
+     async ensureRoleActor(_run, role, initialText) {
+       dispatchLog.push(`role[${role}](create): ${initialText.split('\n')[0]}`)
+-      return 'actor-session-1'
++      return { childId: 'actor-session-1', messageId: 'actor-msg-1' }
+     },
+-    async runJudge(_run, input) {
++    async startJudge(_run, input) {
++      // Scripted judge: inspect the synthetic workspace and submit the verdict
++      // via the engine's judge_claim path (the same code path a real Judge's
++      // `judge_claim` tool call drives).
+       const path = join(ws, 'smoke', 'result.txt')
+       let content = ''
+       if (existsSync(path)) content = readFileSync(path, 'utf8')
+@@ -73,15 +76,27 @@ try {
+       const ok = isHello
+         ? lines.length === 1 && lines[0] === 'smoke ok'
+         : lines.length === 2 && lines[0] === 'smoke ok' && lines[1] === 'worker ok'
+-      return { result: ok ? 'PASS' : 'FAIL', reason: ok ? 'content matches criteria' : `content: ${JSON.stringify(content)}` }
++      const verdict = ok ? 'PASS' : 'FAIL'
++      const reason = ok ? 'content matches criteria' : `content: ${JSON.stringify(content)}`
++      // Defer to a macrotask so the verdict lands AFTER handleClaim persists the
++      // judgment phase (await continuations are microtasks; setTimeout(0) runs
++      // after them), mirroring a real async judge turn.
++      setTimeout(() => {
++        void engine.handleJudgeClaim(workspaceKey, input.nodeToken, verdict, reason, 'judge-session-1')
++      }, 0)
++      return { judgeSessionId: 'judge-session-1', messageId: 'judge-msg-1' }
+     },
++    async followupJudge() {},
++    async drainJudge() {},
++    async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },
+   }
+   const programs = {
+     async run() { return { kind: 'ERROR', reason: 'no programs in smoke-test' } },
+   }
+   const targets = {
+     async steerManager(_run, text) { dispatchLog.push(`steer: ${text.split('\n')[0]}`) },
+-    async sendRoleActor(_run, role, text) { dispatchLog.push(`role[${role}]: ${text.split('\n')[0]}`) },
++    async sendRoleActor(_run, role, text) { dispatchLog.push(`role[${role}]: ${text.split('\n')[0]}`); return { messageId: 'actor-msg-1' } },
++    managerSessionSeq() { return 0 },
+   }
+ 
+   const engine = new WorkflowEngine(targets, subagents, programs, stateHost)
+@@ -100,6 +115,8 @@ try {
+     nodeToken: topFrame(started.run).nodeToken, outcome: 'completed', summary: 'wrote smoke/result.txt',
+   }, 'manager-session-e2e')
+   console.log('2. claim hello:', claim1.ok, claim1.message)
++  // The scripted judge verdict lands on a macrotask; await it.
++  await new Promise(r => setTimeout(r, 20))
+   let current = await stateHost.get(workspaceKey)
+   if (current === undefined) throw new Error('row vanished after claim')
+   console.log('   frame after:', topFrame(current.run).nodeId, '| deferred dispatch')
+@@ -117,6 +134,7 @@ try {
+     nodeToken: topFrame(current.run).nodeToken, outcome: 'completed', summary: 'appended worker ok',
+   }, 'actor-session-1')
+   console.log('4. claim worker-echo:', claim2.ok, claim2.message)
++  await new Promise(r => setTimeout(r, 20))
+   const final = await stateHost.get(workspaceKey)
+   if (final === undefined) throw new Error('row vanished at the end')
+   console.log('5. FINAL:', final.run.status, '| callStack:', JSON.stringify(final.run.callStack))
+diff --git a/src/engine/engine.ts b/src/engine/engine.ts
+index 7d1d851..838da78 100644
+--- a/src/engine/engine.ts
++++ b/src/engine/engine.ts
+@@ -3,31 +3,65 @@
+  * the whole engine is testable without a live DSH host. The plugin's `apply()`
+  * wires real DSH services into these.
+  */
+-import type { WorkflowConfig, NodeClaim, JudgeResult, RunState, CallFrame } from '../types.ts'
+-import { WorkflowError } from '../types.ts'
++import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome } from '../types.ts'
++import { WorkflowError, LIMITS } from '../types.ts'
+ import { newNodeToken, topFrame } from '../state/invariants.ts'
+ import { createRunLog, appendLine } from './tracelog.ts'
+ 
++/** Length cap mirrored from LIMITS.blockReasonMax (kept local to avoid a deep import). */
++const LIMITS_BLOCK_REASON_MAX = LIMITS.blockReasonMax
++
++/** A3 R1: the submission hard constraint appended to every actor-task dispatch. */
++const SUBMISSION_CONSTRAINT = `\n\n[提交要求]\n完成后必须调用 node_claim 提交结果（outcome: completed | failed，并附 summary）。\n仅输出文字不视为提交，会导致当前 Node BLOCK。`
++
++/** A4 R2: fixed template for a judge technical fault (steered to the Manager). */
++function judgeFaultNotice(run: RunState, nodeId: string, detail: string): string {
++  return `⚠️ Judge 判定故障（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 你的补充/指示交给当前 Judge 继续（followup）；\n  2. judge_respawn({nodeToken}) —— 放弃当前 Judge，重建新 Judge 重来一次判定；\n  3. workflow_set_role_model({roleKey:'judge', ...}) 换模型后再 resume/respawn；\n  4. node_block 保留现场等待人工。`
++}
++
++/** A1 R10: fixed template for a NEED_CONTEXT judgment (steered to the Manager). */
++function needContextNotice(run: RunState, nodeId: string, reason: string): string {
++  return `⚠️ Judge 需要补充信息（workflow ${run.runId} / node ${nodeId}）\n原因：${reason}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 你的补充交给当前 Judge 继续；\n  2. node_block 保留现场等待人工。`
++}
++
++/** A3 R3: fixed template for an actor-turn-without-result BLOCK (steered to the Manager). */
++function actorNoResultNotice(run: RunState, nodeId: string): string {
++  return `⚠️ Actor 未提交结果（workflow ${run.runId} / node ${nodeId}）\n当前 Actor 结束回合但未调用 node_claim。\n当前 Node 已 BLOCK，未推进。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 将你的指示交给当前 Actor 继续并提交；\n  2. node_block 保留现场等待人工。`
++}
++
+ /** Deliverable messages to Manager / Role Actors. */
+ export interface DispatchTargets {
+   steerManager(run: RunState, text: string): Promise<void>
+-  /** Deliver to an EXISTING mapped role actor (followup). */
+-  sendRoleActor(run: RunState, roleKey: string, text: string): Promise<void>
++  /** Deliver to an EXISTING mapped role actor (followup); returns the message id (A1 R2). */
++  sendRoleActor(run: RunState, roleKey: string, text: string): Promise<{ messageId: string }>
++  /** The Manager session's current next-seq, captured at dispatch (A1 R2). */
++  managerSessionSeq(run: RunState): number
++}
++
++/** Judge spawn input the host needs to build the Judgment Packet. */
++export interface JudgeSpawnInput {
++  nodeToken: string
++  instruction: string
++  criteria: string
++  claim: { outcome: ClaimOutcome; summary: string }
++  cwd: string
+ }
+ 
+ /** Subagent lifecycle used by roles/judge. */
+ export interface SubagentHost {
+   /**
+    * Create a continuable role actor for roleKey and deliver `initialText` as
+-   * its first prompt. Returns the durable child id.
++   * its first prompt. Returns the durable child id + the dispatch message id.
+    */
+-  ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<string>
+-  runJudge(run: RunState, input: {
+-    instruction: string
+-    criteria: string
+-    claim: NodeClaim
+-    cwd: string
+-  }): Promise<JudgeResult | undefined>
++  ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<{ childId: string; messageId: string }>
++  /** Start a fresh continuable Judge and deliver its Judgment Packet (A1 R8). */
++  startJudge(run: RunState, input: JudgeSpawnInput): Promise<{ judgeSessionId: string; messageId: string }>
++  /** Followup an existing Judge session with supplemental context (A1 R10). */
++  followupJudge(run: RunState, judgeSessionId: string, text: string): Promise<void>
++  /** Release a Judge's resident resources after PASS/FAIL (A1 R11). */
++  drainJudge(run: RunState, judgeSessionId: string): Promise<void>
++  /** Node-boundary compact of a resident role actor (A2). */
++  compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
+ }
+ 
+ /** Program executor used by builtin-program nodes. */
+@@ -113,6 +147,8 @@ export class WorkflowEngine {
+ 
+   private readonly dispatchBook = new Map<string, DispatchBook>()
+   private readonly inFlight = new Map<string, string>() // workspaceKey → operation kind
++  /** nodeToken → transient handoffContext (not persisted; design §2.6/A4 R9). */
++  private readonly handoffByToken = new Map<string, string | undefined>()
+   /** runId → trace-log file path (PRD workflow-run-logging R1; in-memory only). */
+   private readonly logFiles = new Map<string, string>()
+   private readonly targets: DispatchTargets
+@@ -139,6 +175,7 @@ export class WorkflowEngine {
+       roleActors: {},
+       modelOverrides: {},
+       blockReason: null,
++      nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+     }
+   }
+ 
+@@ -201,8 +238,11 @@ export class WorkflowEngine {
+   /**
+    * Deliver the current node's prompt to its executor (design §4.1).
+    * A one-shot transientContext (handoff / resolution) is prepended to the
+-   * message and consumed. Mutates the run in memory only (role mapping + child
+-   * frames). Throws on dispatch failure so callers can BLOCK.
++   * message and consumed. Establishes the NodeContextBoundary at actual
++   * dispatch (A1 R1), performs node-boundary compaction (A2), and injects the
++   * submission hard constraint for actor-tasks (A3 R1). Mutates the run in
++   * memory only (role mapping + child frames + boundary). Throws on dispatch
++   * failure so callers can BLOCK.
+    */
+   async dispatchCurrent(run: RunState, transientContext: string | null): Promise<void> {
+     const frame = topFrame(run)
+@@ -212,20 +252,36 @@ export class WorkflowEngine {
+     const text = transientContext !== null && transientContext !== ''
+       ? `[handoff]\n${transientContext}\n\n[instruction]\n${execution.instruction ?? ''}`
+       : (execution.instruction ?? '')
++
+     if (execution.type === 'actor-task') {
++      // A3 R1: append the submission hard constraint (never replace the original).
++      const dispatchText = text + SUBMISSION_CONSTRAINT
+       if (execution.role === 'manager') {
+-        await this.targets.steerManager(run, text)
++        // A2 R2: the Manager (user main session) is never compacted.
++        this.establishManagerBoundary(run)
++        await this.targets.steerManager(run, dispatchText)
+       } else {
+         const roleKey = execution.role!
+         const existing = run.roleActors[roleKey]
+         if (existing !== undefined) {
+-          await this.targets.sendRoleActor(run, roleKey, text)
++          // A2 R1: compact before followup, only on fresh node entry (R6).
++          await this.compactBeforeDispatch(run, roleKey)
++          const dispatchedAt = Date.now()
++          const managerFromSeq = this.targets.managerSessionSeq(run)
++          const { messageId } = await this.targets.sendRoleActor(run, roleKey, dispatchText)
++          run.nodeBoundary = { dispatchedAt, managerFromSeq, executorSessionId: existing, executorDispatchMessageId: messageId }
+         } else {
+-          const childId = await this.subagents.ensureRoleActor(run, roleKey, text)
++          // A2 R3: first creation has no history — create directly, no compact.
++          const dispatchedAt = Date.now()
++          const managerFromSeq = this.targets.managerSessionSeq(run)
++          const { childId, messageId } = await this.subagents.ensureRoleActor(run, roleKey, dispatchText)
+           run.roleActors[roleKey] = childId
++          run.nodeBoundary = { dispatchedAt, managerFromSeq, executorSessionId: childId, executorDispatchMessageId: messageId }
+         }
+       }
+     } else if (execution.type === 'builtin-program') {
++      // A3 R1: builtin-program dispatch is NOT injected with the constraint.
++      this.establishManagerBoundary(run)
+       const programText = text !== ''
+         ? text
+         : 'Run the current builtin program via node_run_program.'
+@@ -242,11 +298,36 @@ export class WorkflowEngine {
+     }
+   }
+ 
++  /** Establish the boundary for a Manager-driven node (no executor session). */
++  private establishManagerBoundary(run: RunState): void {
++    // A1 R4: on resume the boundary is retained; on fresh node entry it is
++    // (re)established from the current manager session cursor.
++    if (run.nodeBoundary.dispatchedAt !== 0) return
++    run.nodeBoundary = { dispatchedAt: Date.now(), managerFromSeq: this.targets.managerSessionSeq(run) }
++  }
++
++  /** A2: node-boundary compact of a resident role actor (best-effort trace log). */
++  private async compactBeforeDispatch(run: RunState, roleKey: string): Promise<void> {
++    // A2 R6: only on fresh node entry — a retained boundary means resume.
++    if (run.nodeBoundary.dispatchedAt !== 0) return
++    const result = await this.subagents.compactRoleActor(run, roleKey)
++    if (!result.ok) {
++      const detail = result.detail ?? 'unknown compaction failure'
++      this.logLine(run, `COMPACT ${topFrame(run).workflowId}/${topFrame(run).nodeId} role=${roleKey} FAIL: ${detail}`)
++      throw new WorkflowError(`node-boundary compact failed: ${detail}`)
++    }
++    this.logLine(run, `COMPACT ${topFrame(run).workflowId}/${topFrame(run).nodeId} role=${roleKey} ${result.detail ?? 'ok'}`)
++  }
++
+   /** Mutate the run along a PASS/FAIL edge (no persistence). */
+   private advance(run: RunState, verdict: 'PASS' | 'FAIL', reason: string): void {
+     const frame = topFrame(run)
+     const node = this.nodeAt(run, frame)
+     if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
++    // A1 R4: leaving the node invalidates its context boundary.
++    run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
++    delete run.judgeSessionId
++    delete run.pendingClaim
+     // R3: log the routing decision as `NODE <workflowId>/<nodeId> <verdict> -> <target>`.
+     const route = (line: string) => this.logLine(run, `NODE ${frame.workflowId}/${frame.nodeId} ${line}`)
+     if (verdict === 'PASS') {
+@@ -333,7 +414,13 @@ export class WorkflowEngine {
+     }
+   }
+ 
+-  /** Handle a worker node_claim (design §5.2 G2): run the checker and advance. */
++  /**
++   * Handle a worker node_claim (design §5.2 G2): enter the judgment phase by
++   * spawning a fresh continuable Judge with the Node-local Judgment Packet (A1
++   * R7/R8) and persist the `pendingClaim` for respawn rebuild (A4 R9). The
++   * verdict arrives later via `judge_claim` (handleJudgeClaim) or, on a
++   * technical fault, via handleJudgeTurnEnded.
++   */
+   async handleClaim(workspaceKey: string, claim: NodeClaim, callerSessionId: string): Promise<EngineOutcome> {
+     const row = await this.state.get(workspaceKey)
+     if (row === undefined) return { ok: false, reason: 'no active run' }
+@@ -357,6 +444,10 @@ export class WorkflowEngine {
+     if (checker.checkerId !== 'judge.goal-satisfied') {
+       return { ok: false, reason: `unknown checker ${checker.checkerId}` }
+     }
++    // A1 R9 / single-flight: a node already in judgment phase rejects new claims.
++    if (run.pendingClaim !== undefined) {
++      return { ok: false, reason: 'a judgment is already pending for this node' }
++    }
+     // F14: single-flight per node token — one in-flight Judge per claim.
+     const flightKey = `${workspaceKey}:${claim.nodeToken}`
+     if (this.inFlight.has(flightKey)) {
+@@ -367,39 +458,172 @@ export class WorkflowEngine {
+       const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
+       const cwd = await this.cwdResolver(run)
+ 
+-      // Async Judge evaluation — the per-workspace mutation queue is NOT held.
+-      const verdict = await this.subagents.runJudge(run, {
+-        instruction: node.execution.instruction ?? '',
+-        criteria,
+-        claim,
+-        cwd,
+-      })
++      // A4 R1: spawn failure becomes a judge technical fault → BLOCK with detail.
++      let spawned: { judgeSessionId: string; messageId: string }
++      try {
++        spawned = await this.subagents.startJudge(run, {
++          nodeToken: frame.nodeToken,
++          instruction: node.execution.instruction ?? '',
++          criteria,
++          claim: { outcome: claim.outcome, summary: claim.summary },
++          cwd,
++        })
++      } catch (error) {
++        const detail = error instanceof Error ? error.message : String(error)
++        const fresh = await this.state.get(workspaceKey)
++        if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge spawn' }
++        if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
++          return { ok: false, reason: 'stale judge spawn discarded: the node moved or blocked meanwhile' }
++        }
++        // A4 R8/R9: persist pendingClaim so node_resume can spawn-rebuild.
++        fresh.run.pendingClaim = { outcome: claim.outcome, summary: claim.summary }
++        this.handoffByToken.set(frame.nodeToken, claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== ''
++          ? claim.handoffContext
++          : undefined)
++        await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
++        return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
++      }
+ 
+-      // Fresh re-read + token revalidation before applying the verdict (design §4).
++      // Persist the judgment phase: record the judge session + pendingClaim.
+       const fresh = await this.state.get(workspaceKey)
+-      if (fresh === undefined) return { ok: false, reason: 'state row vanished during judgment' }
++      if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge spawn' }
+       if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
+-        return { ok: false, reason: 'stale judge result discarded: the node moved or blocked meanwhile' }
+-      }
+-      if (verdict === undefined) {
+-        fresh.run.status = 'blocked'
+-        fresh.run.blockReason = 'judge evaluation produced no result'
+-        await this.state.put(workspaceKey, fresh.run, fresh.version)
+-        this.dispatchBook.delete(workspaceKey)
+-        return { ok: true, run: fresh.run, message: fresh.run.blockReason }
++        // The node moved or blocked while the judge was spawning — drain the stray judge.
++        await this.subagents.drainJudge(fresh.run, spawned.judgeSessionId).catch(() => {})
++        return { ok: false, reason: 'stale judge spawn discarded: the node moved or blocked meanwhile' }
+       }
+-      this.advance(fresh.run, verdict.result, verdict.reason)
+-      // handoffContext rides the deferred dispatch (design §2.6) — only completed claims.
+-      const handoff = claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== ''
++      fresh.run.judgeSessionId = spawned.judgeSessionId
++      fresh.run.pendingClaim = { outcome: claim.outcome, summary: claim.summary }
++      // handoffContext is transient (design §2.6): stash it for the verdict phase.
++      this.handoffByToken.set(frame.nodeToken, claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== ''
+         ? claim.handoffContext
+-        : null
+-      await this.persistDeferred(workspaceKey, fresh.run, fresh.version, handoff)
+-      return { ok: true, run: fresh.run, message: `checker ${verdict.result}` }
++        : undefined)
++      await this.state.put(workspaceKey, fresh.run, fresh.version)
++      return { ok: true, run: fresh.run, message: `judge spawned for node ${frame.nodeId}` }
+     } finally {
+       this.inFlight.delete(flightKey)
+     }
+   }
+ 
++  /** A4 R1/R2: fail-closed BLOCK on a judge technical fault, with steer. */
++  private async blockOnJudgeFault(workspaceKey: string, run: RunState, version: number, detail: string): Promise<void> {
++    const frame = topFrame(run)
++    const reason = `judge fault: ${detail}`.slice(0, LIMITS_BLOCK_REASON_MAX)
++    run.status = 'blocked'
++    run.blockReason = reason
++    // A4 R4/R9: drop the faulty judge session, but KEEP pendingClaim so resume /
++    // respawn can rebuild the judgment phase.
++    delete run.judgeSessionId
++    await this.state.put(workspaceKey, run, version)
++    this.dispatchBook.delete(workspaceKey)
++    this.logLine(run, `JUDGE FAULT ${frame.workflowId}/${frame.nodeId}: ${detail}`)
++    await this.targets.steerManager(run, judgeFaultNotice(run, frame.nodeId, detail)).catch(() => {})
++  }
++
++  /**
++   * Handle the Judge's `judge_claim` tool call (A1 R9–R11, A4 R4).
++   * PASS/FAIL advance the node and release the judge; NEED_CONTEXT BLOCKs and
++   * keeps the judge session for a followup.
++   */
++  async handleJudgeClaim(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<EngineOutcome> {
++    const row = await this.state.get(workspaceKey)
++    if (row === undefined) return { ok: false, reason: 'no active run' }
++    const { run, version } = row
++    if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}; judge claims are rejected` }
++    const frame = topFrame(run)
++    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
++    // A1 R9 / AC9: only the current node's mapped judge session may claim.
++    if (run.judgeSessionId === undefined || run.judgeSessionId !== judgeSessionId) {
++      return { ok: false, reason: 'judge session is not the current node judge' }
++    }
++    if (run.pendingClaim === undefined) {
++      return { ok: false, reason: 'no pending judgment for this node' }
++    }
++    if (result === 'NEED_CONTEXT') {
++      // A1 R10: BLOCK, keep the judge session + pendingClaim + boundary.
++      run.status = 'blocked'
++      run.blockReason = reason.slice(0, LIMITS_BLOCK_REASON_MAX)
++      await this.state.put(workspaceKey, run, version)
++      this.dispatchBook.delete(workspaceKey)
++      this.logLine(run, `JUDGE NEED_CONTEXT ${frame.workflowId}/${frame.nodeId}: ${reason}`)
++      await this.targets.steerManager(run, needContextNotice(run, frame.nodeId, reason)).catch(() => {})
++      return { ok: true, run, message: run.blockReason }
++    }
++    // PASS/FAIL: apply the edge and retire the judge.
++    const handoff = this.handoffByToken.get(frame.nodeToken)
++    this.handoffByToken.delete(frame.nodeToken)
++    this.advance(run, result, reason)
++    // A1 R11: release the judge's resident resources (best-effort).
++    await this.subagents.drainJudge(run, judgeSessionId).catch(() => {})
++    await this.persistDeferred(workspaceKey, run, version, handoff ?? null)
++    return { ok: true, run, message: `checker ${result}` }
++  }
++
++  /**
++   * A4 R4/R5: judge turn ended without a `judge_claim` → technical fault →
++   * BLOCK with detail. The engine does NOT auto-retry or auto-respawn.
++   */
++  async handleJudgeTurnEnded(workspaceKey: string, judgeSessionId: string, detail?: string): Promise<EngineOutcome | undefined> {
++    const row = await this.state.get(workspaceKey)
++    if (row === undefined) return undefined
++    const { run, version } = row
++    if (run.status !== 'running') return undefined
++    if (run.judgeSessionId !== judgeSessionId) return undefined
++    const frame = topFrame(run)
++    const reason = detail ?? 'judge turn ended without judge_claim'
++    await this.blockOnJudgeFault(workspaceKey, run, version, reason)
++    return { ok: true, run, message: run.blockReason ?? '' }
++  }
++
++  /** A4 R6: Manager-only explicit judge rebuild (clear + spawn + re-deliver packet). */
++  async handleRespawnJudge(workspaceKey: string, nodeToken: string, reason?: string, callerSessionId?: string): Promise<EngineOutcome> {
++    const row = await this.state.get(workspaceKey)
++    if (row === undefined) return { ok: false, reason: 'no active run' }
++    const { run, version } = row
++    if (run.status !== 'blocked') return { ok: false, reason: `run is ${run.status}; respawn requires blocked` }
++    if (run.managerSessionId !== callerSessionId) {
++      return { ok: false, reason: 'only the Manager may respawn the judge' }
++    }
++    const frame = topFrame(run)
++    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
++    if (run.pendingClaim === undefined) {
++      return { ok: false, reason: 'no pending judgment to respawn' }
++    }
++    // Drain the old judge (if any) and clear the mapping + revoke authz.
++    const oldJudge = run.judgeSessionId
++    delete run.judgeSessionId
++    if (oldJudge !== undefined) {
++      await this.subagents.drainJudge(run, oldJudge).catch(() => {})
++    }
++    // Rebuild: spawn a fresh judge and re-deliver the full packet.
++    const node = this.nodeAt(run, frame)!
++    const checker = node.checker!
++    const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
++    const cwd = await this.cwdResolver(run)
++    let spawned: { judgeSessionId: string; messageId: string }
++    try {
++      spawned = await this.subagents.startJudge(run, {
++        nodeToken: frame.nodeToken,
++        instruction: node.execution.instruction ?? '',
++        criteria,
++        claim: run.pendingClaim,
++        cwd,
++      })
++    } catch (error) {
++      const detail = error instanceof Error ? error.message : String(error)
++      await this.blockOnJudgeFault(workspaceKey, run, version, detail)
++      return { ok: true, run, message: run.blockReason ?? '' }
++    }
++    run.judgeSessionId = spawned.judgeSessionId
++    run.status = 'running'
++    run.blockReason = null
++    await this.state.put(workspaceKey, run, version)
++    if (reason !== undefined) {
++      this.logLine(run, `JUDGE RESPAWN ${frame.workflowId}/${frame.nodeId}: ${reason}`)
++    }
++    return { ok: true, run, message: `judge respawned for node ${frame.nodeId}` }
++  }
++
+   /** Handle node_block (design §5.2 G3). */
+   async handleBlock(workspaceKey: string, nodeToken: string, reason: string, callerSessionId: string): Promise<EngineOutcome> {
+     const row = await this.state.get(workspaceKey)
+@@ -421,7 +645,7 @@ export class WorkflowEngine {
+     return { ok: true, run, message: `blocked: ${reason}` }
+   }
+ 
+-  /** Handle node_resume (design §5.2 G4): rotate token, dispatch now with resolutionContext. */
++  /** Handle node_resume (design §5.2 G4 / A1 R10 / A4 R4): rotate token, dispatch or followup. */
+   async handleResume(workspaceKey: string, nodeToken: string, resolutionContext: string, callerSessionId: string): Promise<EngineOutcome> {
+     const row = await this.state.get(workspaceKey)
+     if (row === undefined) return { ok: false, reason: 'no active run' }
+@@ -432,6 +656,51 @@ export class WorkflowEngine {
+     }
+     const frame = topFrame(run)
+     if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
++
++    // A4 R4: in the judgment phase, the sole control signal is judgeSessionId.
++    if (run.pendingClaim !== undefined) {
++      run.status = 'running'
++      run.blockReason = null
++      frame.nodeToken = newNodeToken()
++      const oldToken = nodeToken
++      if (run.judgeSessionId !== undefined) {
++        // followup the SAME judge (A1 R10 / A4 R3); do not re-dispatch the actor.
++        const followup = `[manager resolution]\n${resolutionContext}\n\n请用新的 nodeToken "${frame.nodeToken}" 继续判定，并再次调用 judge_claim 提交。`
++        try {
++          await this.subagents.followupJudge(run, run.judgeSessionId, followup)
++        } catch (error) {
++          const detail = error instanceof Error ? error.message : String(error)
++          await this.blockOnJudgeFault(workspaceKey, run, version, detail)
++          return { ok: true, run, message: run.blockReason ?? '' }
++        }
++        await this.state.put(workspaceKey, run, version)
++        return { ok: true, run, message: `followup judge ${run.judgeSessionId}` }
++      }
++      // No judge session: spawn a fresh judge and re-deliver the packet (A4 R4).
++      const node = this.nodeAt(run, frame)!
++      const checker = node.checker!
++      const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
++      const cwd = await this.cwdResolver(run)
++      let spawned: { judgeSessionId: string; messageId: string }
++      try {
++        spawned = await this.subagents.startJudge(run, {
++          nodeToken: frame.nodeToken,
++          instruction: node.execution.instruction ?? '',
++          criteria,
++          claim: run.pendingClaim!,
++          cwd,
++        })
++      } catch (error) {
++        const detail = error instanceof Error ? error.message : String(error)
++        await this.blockOnJudgeFault(workspaceKey, run, version, detail)
++        return { ok: true, run, message: run.blockReason ?? '' }
++      }
++      run.judgeSessionId = spawned.judgeSessionId
++      await this.state.put(workspaceKey, run, version)
++      void oldToken
++      return { ok: true, run, message: `judge respawned for node ${frame.nodeId}` }
++    }
++
+     // F13: never dispatch while the current node's actor has an active turn.
+     const currentExecutor = executorSessionOf(run)
+     if (currentExecutor !== run.managerSessionId && currentExecutor !== '') {
+@@ -581,6 +850,8 @@ export class WorkflowEngine {
+       run.blockReason = 'actor-turn-ended-without-result'
+       await this.state.put(workspaceKey, run, row.version)
+       this.dispatchBook.delete(workspaceKey)
++      // A3 R3: actively notify the Manager.
++      await this.targets.steerManager(run, actorNoResultNotice(run, topFrame(run).nodeId)).catch(() => {})
+       return { ok: true, run, message: run.blockReason }
+     }
+     // Token changed without pendingDispatch: the old turn settled after an
+diff --git a/src/index.ts b/src/index.ts
+index 1194258..1d9a57e 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -32,13 +32,25 @@ export function apply(ctx: Context) {
+   const sessionWorkspaces = new Map<string, string>()
+   /** Live session → role key for authorization refinement (role actors only). */
+   const sessionRoles = new Map<string, string>()
+-  /** Fresh Judge sessions (one-shot); allowed to call only the two inspection wrappers. */
++  /** Fresh Judge sessions (continuable); allowed to call judge_claim + the two inspection wrappers. */
+   const judgeSessions = new Set<string>()
++  /** Judge session id → workspace key (for authorization). */
++  const judgeWorkspaces = new Map<string, string>()
+ 
+-  /** Register a fresh Judge session for inspection authorization (host adapter). */
++  /** Register a fresh Judge session for inspection + judge_claim authorization. */
+   function registerJudgeSession(sessionId: string, cwd: string | undefined): void {
+     judgeSessions.add(sessionId)
+-    if (cwd !== undefined) sessionWorkspaces.set(sessionId, cwd)
++    if (cwd !== undefined) {
++      sessionWorkspaces.set(sessionId, cwd)
++      judgeWorkspaces.set(sessionId, cwd)
++    }
++  }
++
++  /** Revoke a Judge session's authorization (A1 R11). */
++  function revokeJudgeSession(sessionId: string): void {
++    judgeSessions.delete(sessionId)
++    judgeWorkspaces.delete(sessionId)
++    sessionWorkspaces.delete(sessionId)
+   }
+ 
+   /** Register a role-actor session mapping at creation time (host adapter). */
+@@ -81,9 +93,9 @@ export function apply(ctx: Context) {
+   }
+ 
+   const engine: WorkflowEngine = new WorkflowEngine(
+-    makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, registerRoleActorSession }),
+-    makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, registerRoleActorSession }, () => engine.frozenRoute),
+-    makeProgramHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, registerRoleActorSession }),
++    makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
++    makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute),
++    makeProgramHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
+     makeStateHost(store),
+   )
+   engine.cwdResolver = cwdOf
+@@ -146,6 +158,8 @@ export function apply(ctx: Context) {
+     runProgram: (ws, nodeToken, parameters, caller) => enqueue(ws, () => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf)),
+     resolveProgram: (ws, nodeToken, result, reason, caller) => enqueue(ws, () => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf)),
+     setRoleModel: (ws, roleKey, provider, modelId) => enqueue(ws, () => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf)),
++    judgeClaim: (ws, nodeToken, result, reason, judgeSessionId) => enqueue(ws, () => engine.handleJudgeClaim(ws, nodeToken, result, reason, judgeSessionId).then(outcomeOf)),
++    respawnJudge: (ws, nodeToken, reason, caller) => enqueue(ws, () => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf)),
+     status: async (ws) => {
+       const row = await store.get(ws)
+       if (row === undefined) return { ok: true, status: 'no active run' }
+@@ -288,15 +302,24 @@ export function apply(ctx: Context) {
+   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
+ 
+   // ---- Turn-settlement observation (design §4.2 D6) ----
+-  // Only MANAGER and mapped ROLE ACTOR sessions settle workflow turns. Judge
+-  // sessions (one-shot machinery) must never drive auto-BLOCK or dispatch.
++  // MANAGER and mapped ROLE ACTOR sessions settle workflow turns. Judge
++  // sessions settle through handleJudgeTurnEnded (technical-fault detection).
+   ctx.on('session/event', (session, event) => {
+     if (event.type !== 'turn/end') return
+-    const ws = sessionWorkspaces.get(session.id)
+-    if (ws === undefined) return
+-    if (judgeSessions.has(session.id)) return
+     // Defer: never mutate state inside the append publication lock (design).
+     void (async () => {
++      if (judgeSessions.has(session.id)) {
++        // Judge turn ended without a judge_claim → technical fault (A4 R1/R5).
++        // The turn/end reason carries the detail; a judge_claim that concluded
++        // the turn is still handled synchronously by the tool, so reaching here
++        // means no verdict was submitted.
++        const reason = (event.data as { reason?: { kind?: string } })?.reason
++        const detail = reason?.kind === 'error' ? 'judge turn errored' : 'judge turn ended without judge_claim'
++        await engine.handleJudgeTurnEnded(judgeWorkspaces.get(session.id) ?? '', session.id, detail)
++        return
++      }
++      const ws = sessionWorkspaces.get(session.id)
++      if (ws === undefined) return
+       await engine.handleTurnEnded(ws, session.id)
+     })()
+   })
+diff --git a/src/judge/checker.ts b/src/judge/checker.ts
+index 411cc34..2216aad 100644
+--- a/src/judge/checker.ts
++++ b/src/judge/checker.ts
+@@ -1,34 +1,31 @@
+ /**
+- * judge.goal-satisfied: user prompt template + structured output parsing
+- * (design §3.1/§10.3). The Judge persona is delivered through the spawn's
+- * `persona` option (deployment-persona shadowing); this module owns only the
+- * evaluation request text and the strict output protocol.
++ * judge.goal-satisfied: the Judgment Packet prompt template + the `judge_claim`
++ * protocol contract (A1 R7/R9–R10).
++ *
++ * The continuable Judge no longer returns a strict JSON object. It receives a
++ * fixed Judgment Packet and submits its verdict through the dedicated
++ * `judge_claim({ nodeToken, result, reason })` tool. This module owns only the
++ * packet text; the persona is delivered via the spawn's `persona` option.
+  */
+-import { z } from 'zod'
+ import type { JudgeResult } from '../types.ts'
+ 
+-export const judgeResultSchema = z
+-  .object({
+-    result: z.enum(['PASS', 'FAIL']),
+-    reason: z.string().trim().min(1).max(2000),
+-  })
+-  .strict()
+-
+-/** Parse the Judge's final structured output; throws on invalid shape. */
+-export function parseJudgeResult(text: string): JudgeResult {
+-  let candidate = text.trim()
+-  const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/.exec(candidate)
+-  if (fence !== null) candidate = fence[1]!.trim()
+-  const parsed: unknown = JSON.parse(candidate)
+-  const result = judgeResultSchema.parse(parsed)
+-  return result
++/** Validate a parsed judge_claim argument into a JudgeResult (A1 R9). */
++export function parseJudgeClaim(args: unknown): JudgeResult | undefined {
++  if (typeof args !== 'object' || args === null) return undefined
++  const record = args as Record<string, unknown>
++  const result = record['result']
++  if (result !== 'PASS' && result !== 'FAIL' && result !== 'NEED_CONTEXT') return undefined
++  const reason = record['reason']
++  if (typeof reason !== 'string' || reason.trim() === '' || reason.trim().length > 2000) return undefined
++  return { result, reason: reason.trim() }
+ }
+ 
+ export interface JudgePromptInput {
++  nodeToken: string
+   nodeInstruction: string
+   criteria: string
++  workerOutcome: 'completed' | 'failed'
+   workerSummary: string
+-  workerOutcome: string
+   workspaceCwd: string
+   transcript: string
+ }
+@@ -40,11 +37,15 @@ const PROMPT_TEMPLATE = `You are an independent workflow judge evaluating ONE co
+ - You are READ-ONLY: never modify files, repositories, issues, or any external state.
+ - Only tools visible to you may be used; if a needed read capability is missing, do not guess — report the limitation.
+ 
+-# Output protocol (strict)
+-Produce exactly one JSON object with these fields:
+-- "result": "PASS" or "FAIL"
++# Verdict protocol (strict)
++Submit your verdict ONLY through the \`judge_claim\` tool, exactly once, with:
++- "nodeToken": "{nodeToken}"
++- "result": "PASS" | "FAIL" | "NEED_CONTEXT"
+ - "reason": 1..2000 characters explaining the judgment
+ 
++- PASS and FAIL are the only Graph results.
++- Use NEED_CONTEXT only when you genuinely cannot judge reliably from this packet and the read-only workspace. The reason MUST state: what information is missing, why it affects PASS/FAIL, and what the Manager should provide — never just "cannot judge".
++
+ # Current judgment
+ Node instruction:
+ {nodeInstruction}
+@@ -60,16 +61,17 @@ Worker summary:
+ # Workspace
+ cwd: {workspaceCwd}
+ 
+-# Manager session context (user/manager-visible only)
++# Node-local context (user/manager/actor-visible only, since this node dispatched)
+ {transcript}`
+ 
+-/** Render the evaluation request text sent as the Judge's user message. */
++/** Render the Judgment Packet sent as the Judge's initial user message (A1 R7). */
+ export function renderJudgePrompt(input: JudgePromptInput): string {
+   return PROMPT_TEMPLATE
++    .replaceAll('{nodeToken}', input.nodeToken)
+     .replace('{nodeInstruction}', input.nodeInstruction)
+     .replace('{criteria}', input.criteria)
+     .replace('{workerOutcome}', input.workerOutcome)
+     .replace('{workerSummary}', input.workerSummary)
+     .replace('{workspaceCwd}', input.workspaceCwd)
+-    .replace('{transcript}', input.transcript === '' ? '(no prior user/manager conversation)' : input.transcript)
++    .replace('{transcript}', input.transcript === '' ? '(no node-local conversation since dispatch)' : input.transcript)
+ }
+diff --git a/src/judge/projection.ts b/src/judge/projection.ts
+index 221f4ce..2610258 100644
+--- a/src/judge/projection.ts
++++ b/src/judge/projection.ts
+@@ -1,13 +1,17 @@
+ /**
+- * Transient Judge transcript projection (design §2.2/§10.3 F1).
++ * Node-local Judge transcript projection (A1 R5–R7).
+  *
+- * Pure function over the Manager session's event log: append-origin
+- * user/message (source.kind === 'user') and assistant/message text blocks
+- * only. Excludes system/tool/plugin/replacement/hidden content. Never
+- * persisted; rebuilt for each fresh Judge.
++ * Replaces the old whole-Manager-transcript projection: the Judge now receives
++ * only the messages produced AFTER the current Node's actual dispatch boundary,
++ * merged across Manager + User + (optionally) the executing Actor session and
++ * ordered by event time with a deterministic tie-break.
++ *
++ * Pure functions over the DSH Session event logs; never persisted, rebuilt for
++ * each fresh Judge (and each respawn rebuild).
+  */
+-import type { Session } from '@deepseek-ai/dsh-session'
++import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
+ import { isAppendSurfaceEvent, deriveEventMessage } from '@deepseek-ai/dsh-session'
++import type { NodeContextBoundary } from '../types.ts'
+ 
+ /** Max projected transcript length in characters (defensive bound). */
+ export const PROJECTION_MAX_CHARS = 120_000
+@@ -18,17 +22,32 @@ export function messageText(message: ReturnType<typeof deriveEventMessage>): str
+   const parts: string[] = []
+   for (const block of message.content) {
+     if (block.type === 'text') parts.push(block.text)
+-    // reasoning blocks: include when they are the model's visible thinking? No —
+-    // design says user/manager-visible text; reasoning is provider-internal and
+-    // omitted to keep the projection faithful to what the user saw.
++    // reasoning blocks are provider-internal and omitted to keep the projection
++    // faithful to what the user/manager actually saw.
+   }
+   return parts.join('\n')
+ }
+ 
+-/** Project one manager session into plain transcript text. */
+-export function projectManagerTranscript(session: Session): string {
+-  const parts: string[] = []
++/** One projected, ordered surface message from any session. */
++export interface ProjectedMessage {
++  /** Sort key: event.time asc, then seq asc, then stable session tie-break. */
++  time: number
++  seq: number
++  sessionId: string
++  role: 'USER' | 'MANAGER' | 'ACTOR'
++  text: string
++}
++
++/**
++ * Filter + project one session's append-origin surface events into plain text
++ * entries. Only `user/message` (source.kind === 'user') and `assistant/message`
++ * text blocks are kept; system/tool/plugin/replacement/hidden content is
++ * excluded exactly like the old manager projection.
++ */
++export function projectSessionSurface(session: Session, fromSeq: number, role: 'USER' | 'MANAGER' | 'ACTOR'): ProjectedMessage[] {
++  const out: ProjectedMessage[] = []
+   for (const event of session.events) {
++    if (event.seq < fromSeq) continue
+     if (!isAppendSurfaceEvent(event)) continue
+     let message: ReturnType<typeof deriveEventMessage>
+     if (event.type === 'user/message') {
+@@ -42,10 +61,68 @@ export function projectManagerTranscript(session: Session): string {
+     }
+     const text = messageText(message).trim()
+     if (text === '') continue
+-    const role = event.type === 'user/message' ? 'USER' : 'MANAGER'
+-    parts.push(`[${role}]\n${text}`)
++    out.push({ time: event.time, seq: event.seq, sessionId: session.id, role, text })
++  }
++  return out
++}
++
++/**
++ * Locate the first event seq of the executor's dispatch message: the message id
++ * recorded in the boundary (A1 R2/R6). Falls back to `dispatchedAt` filtering
++ * only when no dispatch message id is available; the id match is authoritative.
++ */
++function executorFromSeq(session: Session, boundary: NodeContextBoundary): number {
++  const id = boundary.executorDispatchMessageId
++  if (id !== undefined) {
++    for (const event of session.events) {
++      const message = deriveEventMessage(event)
++      if (message !== null && message.id === id) return event.seq
++    }
+   }
+-  let out = parts.join('\n\n')
++  // Fallback: filter by dispatchedAt (weaker — same-ms events may bleed).
++  for (const event of session.events) {
++    if (event.time >= boundary.dispatchedAt) return event.seq
++  }
++  return session.seq
++}
++
++/** Stable per-session tie-break for equal event timestamps (A1 R3). */
++function sessionOrder(a: string, b: string): number {
++  return a < b ? -1 : a > b ? 1 : 0
++}
++
++/**
++ * Node-local projection (A1 R5–R7): Manager + User messages from the boundary
++ * cursor, merged with the executing Actor's own Node-scoped messages, ordered
++ * by (time, seq, session). Excludes all pre-boundary history.
++ */
++export function projectNodeLocal(
++  managerSession: Session,
++  boundary: NodeContextBoundary,
++  actorSession?: Session,
++): string {
++  const parts: ProjectedMessage[] = []
++
++  // Manager session: user/message (real user) + assistant/message (manager).
++  parts.push(...projectSessionSurface(managerSession, boundary.managerFromSeq, 'MANAGER'))
++
++  // Executing Actor session: its own Node-scoped visible assistant + dispatch
++  // text (the dispatch message itself is a user/message with source.kind ===
++  // 'user' — the coordinator relay is excluded; the initial prompt is
++  // `kind: 'user'` on the continuable child, so it projects as ACTOR).
++  if (actorSession !== undefined && boundary.executorSessionId !== undefined) {
++    const from = executorFromSeq(actorSession, boundary)
++    parts.push(...projectSessionSurface(actorSession, from, 'ACTOR'))
++  }
++
++  parts.sort((a, b) =>
++    a.time - b.time
++    || a.seq - b.seq
++    || sessionOrder(a.sessionId, b.sessionId),
++  )
++
++  const rendered = parts.map(p => `[${p.role}]\n${p.text}`)
++  let out = rendered.join('\n\n')
+   if (out.length > PROJECTION_MAX_CHARS) {
+     out = out.slice(-PROJECTION_MAX_CHARS)
+   }
+diff --git a/src/plugin/host.ts b/src/plugin/host.ts
+index 0484a82..5a6baa7 100644
+--- a/src/plugin/host.ts
++++ b/src/plugin/host.ts
+@@ -4,28 +4,38 @@
+  */
+ import type { Agent } from '@deepseek-ai/dsh-agent'
+ import type { Context } from '@deepseek-ai/cordis'
++import type {} from '@deepseek-ai/dsh-subagent'
+ import { createUserMessage } from '@deepseek-ai/dsh-llm'
+-import type { SessionId } from '@deepseek-ai/dsh-session'
++import { SessionId, type Session, type SessionId as SessionIdType } from '@deepseek-ai/dsh-session'
+ import { StateStore } from '../state/store.ts'
+ import type { RunState } from '../types.ts'
+ import { WorkflowError } from '../types.ts'
+ import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
+ import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
+-import { judgeSpawnPlan, JUDGE_ALLOW, JUDGE_OUTPUT_SCHEMA, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
+-import { projectManagerTranscript } from '../judge/projection.ts'
+-import { renderJudgePrompt, parseJudgeResult } from '../judge/checker.ts'
++import { judgeSpawnPlan, JUDGE_ALLOW, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
++import { projectNodeLocal } from '../judge/projection.ts'
++import { renderJudgePrompt } from '../judge/checker.ts'
+ 
+-/** Fail-closed Judge tool-surface assertion (design §2.2/E2). */
++/** Narrow shape of the `ctx.compaction` service (`@deepseek-ai/dsh-compaction`). */
++interface CompactionService {
++  compactNow(agent: Agent, signal: AbortSignal): Promise<{ shadowedSeqs: number[]; shadowedTokenCount: number } | null>
++}
++
++/** Duck-typed ManualCompactionError (`@deepseek-ai/dsh-compaction`). */
++function isManualCompactionError(error: unknown): error is Error & { code: string } {
++  return error instanceof Error && error.name === 'ManualCompactionError'
++}
++
++/** Fail-closed Judge tool-surface assertion (design §2.2/E2 + A1 R9). */
+ function assertJudgeToolSurface(childAgent: Agent): string | undefined {
+   const schemas = childAgent.ctx.tools.schemas(childAgent)
+   const visible = new Set(schemas.map(s => s.name))
+   for (const required of JUDGE_ALLOW) {
+     if (!visible.has(required)) return `Judge tool surface is missing required tool "${required}"`
+   }
+-  // Own-scope delegation machinery registered by the in-process driver
+-  // (structured_output for outputSchema children) is exempt from the
+-  // allow-list — it is never visible-filtered (design §2.2 machinery).
+-  const JUDGE_MACHINERY = new Set(['structured_output'])
++  // Own-scope delegation machinery registered by the in-process driver / report
++  // tool is exempt from the allow-list — it is never visible-filtered (design §2.2).
++  const JUDGE_MACHINERY = new Set(['report', 'structured_output'])
+   for (const name of visible) {
+     if (!(JUDGE_ALLOW as readonly string[]).includes(name) && !JUDGE_MACHINERY.has(name)) {
+       return `Judge tool surface contains unexpected tool "${name}"`
+@@ -66,8 +76,10 @@ export interface HostAdapters {
+   ctx: Context
+   managerAgentOf(run: RunState): Agent | undefined
+   cwdOfManager(run: RunState): Promise<string | undefined>
+-  /** Register a fresh Judge session so the plugin can authorize its inspection calls. */
++  /** Register a fresh Judge session so the plugin can authorize its inspection + judge_claim calls. */
+   registerJudgeSession(sessionId: string, cwd: string | undefined): void
++  /** Revoke a Judge session's authorization (A1 R11). */
++  revokeJudgeSession(sessionId: string): void
+   /** Register a role-actor session↔(workspace,roleKey) mapping at creation time. */
+   registerRoleActorSession(sessionId: string, roleKey: string, cwd: string | undefined): void
+ }
+@@ -87,10 +99,16 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
+       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+       const childId = run.roleActors[roleKey]
+       if (childId === undefined) throw new WorkflowError(`no actor mapped for role "${roleKey}"`)
+-      await adapters.ctx.subagents.followup(manager, childId as SessionId, textBlocks(text), {
++      const messageId = await adapters.ctx.subagents.followup(manager, childId as SessionIdType, textBlocks(text), {
+         source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
+         signal: new AbortController().signal,
+       })
++      return { messageId }
++    },
++    managerSessionSeq(run) {
++      const manager = adapters.managerAgentOf(run)
++      if (manager === undefined) return 0
++      return manager.session.seq
+     },
+   }
+ }
+@@ -99,7 +117,17 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
+   return {
+     async ensureRoleActor(run, roleKey, initialText) {
+       const existing = run.roleActors[roleKey]
+-      if (existing !== undefined) return existing
++      if (existing !== undefined) {
++        // Not expected: the engine checks this before calling. Followup is the
++        // correct continuation for an existing mapping.
++        const manager = adapters.managerAgentOf(run)
++        if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
++        const messageId = await adapters.ctx.subagents.followup(manager, existing as SessionIdType, textBlocks(initialText), {
++          source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
++          signal: new AbortController().signal,
++        })
++        return { childId: existing, messageId }
++      }
+       const manager = adapters.managerAgentOf(run)
+       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+       const roleDef = run.definitionSnapshot.roles[roleKey]
+@@ -124,50 +152,99 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
+       // turn may end before the engine persists roleActors, and its node_claim
+       // authorization needs this mapping.
+       adapters.registerRoleActorSession(started.childId, roleKey, manager.session.header.cwd)
+-      return started.childId
++      return { childId: started.childId, messageId: started.messageId }
+     },
+-    async runJudge(run, input) {
++
++    async startJudge(run, input) {
+       const manager = adapters.managerAgentOf(run)
+       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+       const plan = judgeSpawnPlan(run, frozenRoute())
+-      const transcript = projectManagerTranscript(manager.session)
++
++      // A1 R5–R7: Node-local projection (no full manager transcript).
++      const executorSessionId = run.nodeBoundary.executorSessionId
++      let actorSession: Session | undefined
++      if (executorSessionId !== undefined) {
++        const actorAgent = adapters.ctx.agents.get(SessionId(executorSessionId))
++        actorSession = actorAgent?.session
++      }
++      const transcript = projectNodeLocal(manager.session, run.nodeBoundary, actorSession)
++
+       const prompt = renderJudgePrompt({
++        nodeToken: input.nodeToken,
+         nodeInstruction: input.instruction,
+         criteria: input.criteria,
+-        workerSummary: input.claim.summary,
+         workerOutcome: input.claim.outcome,
++        workerSummary: input.claim.summary,
+         workspaceCwd: input.cwd,
+         transcript,
+       })
+-      const runHandle = await adapters.ctx.subagents.start('spawn', {
++
++      const started = await adapters.ctx.subagents.startContinuable({
++        provider: 'spawn',
+         label: 'workflow-judge',
+-        prompt: textBlocks(prompt),
+-        parent: manager,
+-        persona: plan.persona,
+-        toolFilter: plan.toolFilter,
+-        agentOptions: plan.agentOptions.provider !== undefined || plan.agentOptions.model !== undefined
+-          ? { provider: plan.agentOptions.provider, model: plan.agentOptions.model }
+-          : undefined,
+-        outputSchema: JUDGE_OUTPUT_SCHEMA as never,
++        request: {
++          prompt: textBlocks(prompt),
++          parent: manager,
++          persona: plan.persona,
++          toolFilter: plan.toolFilter,
++          agentOptions: plan.agentOptions.provider !== undefined || plan.agentOptions.model !== undefined
++            ? { provider: plan.agentOptions.provider, model: plan.agentOptions.model }
++            : undefined,
++        },
++        signal: new AbortController().signal,
++      })
++
++      // Fail-closed tool-surface assertion over the freshly published child.
++      const childAgent = adapters.ctx.agents.get(started.childId)
++      if (childAgent !== undefined) {
++        const surfaceProblem = assertJudgeToolSurface(childAgent)
++        if (surfaceProblem !== undefined) {
++          // Drain the judge we just spawned and surface the detail.
++          await adapters.ctx.subagents.drainContinuableChildren(manager, [started.childId]).catch(() => {})
++          adapters.revokeJudgeSession(started.childId)
++          throw new WorkflowError(surfaceProblem)
++        }
++      }
++      adapters.registerJudgeSession(started.childId, input.cwd)
++      return { judgeSessionId: started.childId, messageId: started.messageId }
++    },
++
++    async followupJudge(run, judgeSessionId, text) {
++      const manager = adapters.managerAgentOf(run)
++      if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
++      await adapters.ctx.subagents.followup(manager, SessionId(judgeSessionId), textBlocks(text), {
++        source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
+         signal: new AbortController().signal,
+       })
++    },
++
++    async drainJudge(run, judgeSessionId) {
++      const manager = adapters.managerAgentOf(run)
++      adapters.revokeJudgeSession(judgeSessionId)
++      if (manager === undefined) return
++      await adapters.ctx.subagents.drainContinuableChildren(manager, [SessionId(judgeSessionId)]).catch(() => {})
++    },
++
++    async compactRoleActor(run, roleKey) {
++      const childId = run.roleActors[roleKey]
++      if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
++      // A2 R5: cold-resume (no resident agent) skips compact.
++      const agent = adapters.ctx.agents.get(childId as SessionIdType)
++      if (agent === undefined) return { ok: true, detail: 'cold-resume skip' }
++      const compaction = adapters.ctx.get('compaction') as CompactionService | undefined
++      if (compaction === undefined || typeof compaction.compactNow !== 'function') {
++        return { ok: true, detail: 'no compaction service' }
++      }
+       try {
+-        // Fail-closed: the Judge must see exactly the fixed allow-list plus
+-        // delegation machinery. Any deviation aborts the evaluation.
+-        if (runHandle.localAgent !== undefined) {
+-          const surfaceProblem = assertJudgeToolSurface(runHandle.localAgent)
+-          if (surfaceProblem !== undefined) {
+-            return undefined
+-          }
+-          adapters.registerJudgeSession(runHandle.id, input.cwd)
++        const result = await compaction.compactNow(agent, new AbortController().signal)
++        if (result === null) return { ok: true, detail: 'no compactable range' }
++        return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
++      } catch (error) {
++        if (isManualCompactionError(error)) {
++          return { ok: false, detail: `compaction ${error.code}: ${error.message}` }
+         }
+-        const result = await runHandle.result
+-        if (result.stopReason !== 'completed' || result.structured === undefined) return undefined
+-        return parseJudgeResult(JSON.stringify(result.structured))
+-      } catch {
+-        return undefined
+-      } finally {
+-        await runHandle.dispose()
++        const message = error instanceof Error ? error.message : String(error)
++        return { ok: false, detail: message }
+       }
+     },
+   }
+diff --git a/src/roles/roles.ts b/src/roles/roles.ts
+index 7c2bfaf..1975a73 100644
+--- a/src/roles/roles.ts
++++ b/src/roles/roles.ts
+@@ -1,15 +1,13 @@
+ /**
+  * Role Actor / Judge spawn assembly (design §2.1/§2.2 E1/E2).
+  *
+- * This module is pure decision logic over a narrow SubagentRuntime stub so it
+- * can be unit-tested without the host. The plugin layer adapts the real
+- * `ctx.subagents` service into the stub below.
++ * Pure decision logic (route resolution, deny lists, judge allow-list) that can
++ * be unit-tested without the host. The plugin layer adapts the real
++ * `ctx.subagents` service.
+  */
+-import type { Agent } from '@deepseek-ai/dsh-agent'
+-import type { SubagentStartRequest, SubagentResult } from '@deepseek-ai/dsh-subagent'
+-import type { RunState, JudgeResult } from '../types.ts'
++import type { RunState } from '../types.ts'
+ 
+-/** Judge fixed read-only allow-list (design §2.2). */
++/** Judge fixed read-only allow-list (design §2.2) + the `judge_claim` protocol tool (A1 R9). */
+ export const JUDGE_ALLOW = [
+   'read',
+   'glob',
+@@ -17,38 +15,12 @@ export const JUDGE_ALLOW = [
+   'read_image',
+   'workflow_inspect_git',
+   'workflow_inspect_github',
++  'judge_claim',
+ ] as const
+ 
+ /** Delegation machinery names the child runtime may register into its own layer (never visible-filtered). */
+ export const JUDGE_MACHINERY_EXEMPT: readonly string[] = []
+ 
+-/**
+- * Narrow spawn surface the roles module needs. The real adapter implements
+- * these with ctx.subagents + ctx.agents.
+- */
+-export interface SpawnRuntime {
+-  startOneShot(request: {
+-    label: string
+-    promptBlocks: unknown[]
+-    parent: Agent
+-    persona?: string
+-    toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }
+-    agentOptions?: { provider?: string; model?: string }
+-    outputSchema?: unknown
+-  }): Promise<{ runId: string; result: Promise<{ structured?: unknown; output: unknown[]; stopReason: string }>; dispose(): Promise<void> }>
+-  startContinuable(request: {
+-    provider: string
+-    label: string
+-    promptBlocks: unknown[]
+-    parent: Agent
+-    persona?: string
+-    toolFilter?: { allow?: readonly string[]; deny?: readonly string[] }
+-    agentOptions?: { provider?: string; model?: string }
+-    childId?: string
+-  }): Promise<{ childId: string; messageId: string }>
+-  followup(parent: Agent, childId: string, promptBlocks: unknown[]): Promise<unknown>
+-}
+-
+ /** Resolve a Role's effective model route: override > role def > frozen Manager route. */
+ export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: { provider?: string; model?: string }): { provider?: string; model?: string } {
+   const override = run.modelOverrides[roleKey]
+@@ -68,9 +40,10 @@ export function roleDenyList(run: RunState, roleKey: string): string[] {
+ }
+ 
+ /**
+- * Judge spawn plan: fresh one-shot with a fixed allow-list. The plugin adapter
+- * MUST verify the child's final visible schema ⊆ allow ∪ machinery before
+- * dispatching (design E2); this function returns the intended plan.
++ * Judge spawn plan: fresh continuable with a fixed allow-list (A1 R8). The
++ * plugin adapter MUST verify the child's final visible schema ⊆ allow ∪
++ * machinery before dispatching (design E2); this function returns the intended
++ * plan.
+  */
+ export function judgeSpawnPlan(run: RunState, frozen?: { provider?: string; model?: string }): {
+   persona: string
+@@ -84,27 +57,3 @@ export function judgeSpawnPlan(run: RunState, frozen?: { provider?: string; mode
+     agentOptions: route,
+   }
+ }
+-
+-/** Judge structured-result contract (output schema for the one-shot spawn). */
+-export const JUDGE_OUTPUT_SCHEMA = {
+-  type: 'object',
+-  properties: {
+-    result: { type: 'string', enum: ['PASS', 'FAIL'] },
+-    reason: { type: 'string' },
+-  },
+-  required: ['result', 'reason'],
+-  additionalProperties: false,
+-} as const
+-
+-/** Parse a one-shot structured result into a JudgeResult; undefined when invalid. */
+-export function judgeResultFromStructured(structured: unknown): JudgeResult | undefined {
+-  if (typeof structured !== 'object' || structured === null) return undefined
+-  const record = structured as Record<string, unknown>
+-  if (record['result'] !== 'PASS' && record['result'] !== 'FAIL') return undefined
+-  const reason = record['reason']
+-  if (typeof reason !== 'string' || reason.trim() === '' || reason.trim().length > 2000) return undefined
+-  return { result: record['result'], reason: reason.trim() }
+-}
+-
+-/** Types re-exported for the plugin adapter. */
+-export type { SubagentStartRequest, SubagentResult }
+diff --git a/src/tools/authz.ts b/src/tools/authz.ts
+index 7a4d0eb..47d6c4f 100644
+--- a/src/tools/authz.ts
++++ b/src/tools/authz.ts
+@@ -14,8 +14,8 @@ export type AuthzDecision =
+ /** Tools a mapped Role Actor may call (design §5.2). */
+ const ROLE_ALLOWED = new Set(['node_claim', 'node_block', 'workflow_status'])
+ 
+-/** Tools a fresh Judge may call (the two read-only inspection wrappers). */
+-const JUDGE_ALLOWED = new Set(['workflow_inspect_git', 'workflow_inspect_github'])
++/** Tools a fresh Judge may call (two read-only wrappers + judge_claim). */
++const JUDGE_ALLOWED = new Set(['workflow_inspect_git', 'workflow_inspect_github', 'judge_claim'])
+ 
+ export interface AuthzInput {
+   run: RunState
+diff --git a/src/tools/tools.ts b/src/tools/tools.ts
+index 675e936..22b6493 100644
+--- a/src/tools/tools.ts
++++ b/src/tools/tools.ts
+@@ -34,6 +34,8 @@ export interface ToolHost {
+   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+   setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+   status(workspaceKey: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
++  judgeClaim(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
++  respawnJudge(workspaceKey: string, nodeToken: string, reason: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+ 
+   // Inspection wrappers (read-only, enum operations)
+   inspectGit(workspaceKey: string, operation: 'status' | 'branch' | 'remote' | 'top-level'): Promise<{ ok: boolean; reason?: string; value?: unknown }>
+@@ -191,6 +193,41 @@ export const workflowTools: ToolDefinition[] = [
+     },
+   }),
+ 
++  defineTool({
++    name: 'judge_respawn',
++    description: 'Manager 显式重建当前 Node 的 Judge（清映射 + drain 旧 Judge + spawn 新 Judge 重投判定）。',
++    parameters: {
++      nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
++      reason: { type: 'string', description: '可选，写入 trace log 说明为何重建' },
++    },
++    output: stringOut,
++    async execute(args, exec) {
++      const auth = await controlWorkspace(exec.agent, 'judge_respawn')
++      if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
++      return fmtResult(await thisHost().respawnJudge(auth.workspaceKey, args.nodeToken, args.reason, auth.caller))
++    },
++  }),
++
++  defineTool({
++    name: 'judge_claim',
++    description: 'Judge 提交当前 Node 的判定结果（PASS | FAIL | NEED_CONTEXT）。这必须是当前 Turn 的最后一个动作。',
++    parameters: {
++      nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
++      result: { type: 'string', required: true, enum: ['PASS', 'FAIL', 'NEED_CONTEXT'], description: 'PASS | FAIL | NEED_CONTEXT' },
++      reason: { type: 'string', required: true, description: '判定理由（1..2000 字符）' },
++    },
++    output: stringOut,
++    async execute(args, exec) {
++      const auth = await controlWorkspace(exec.agent, 'judge_claim')
++      if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
++      const reasonError = lengthError('reason', args.reason, LIMITS.reasonMin, LIMITS.reasonMax, true)
++      if (reasonError !== undefined) return `拒绝：${reasonError}`
++      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason, auth.caller)
++      if (outcome.ok) exec.concludeTurn()
++      return fmtResult(outcome)
++    },
++  }),
++
+   defineTool({
+     name: 'workflow_inspect_git',
+     description: '只读检查当前 workspace git 现场（Judge 专用；enum 操作）。',
+diff --git a/src/types.ts b/src/types.ts
+index 5366773..3366e5e 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -108,6 +108,25 @@ export interface WorkflowConfig {
+ 
+ export type RunStatus = 'running' | 'blocked' | 'completed'
+ 
++/**
++ * The precise local cursor for one Node's context isolation (A1 R2). Built when
++ * the Node is actually dispatched (A1 R1); timestamps only order, cursors only
++ * filter (A1 R3).
++ */
++export interface NodeContextBoundary {
++  /** Unix epoch ms when the Node was actually dispatched. */
++  dispatchedAt: number
++  /** Manager Session next-seq at the dispatch boundary. */
++  managerFromSeq: number
++  /** Non-manager executor Session id for this Node, when one exists. */
++  executorSessionId?: string
++  /** The dispatch message id returned by startContinuable/followup (A1 R2). */
++  executorDispatchMessageId?: string
++}
++
++/** Judge verdict + protocol (A1 R9). PASS/FAIL are the only Graph results. */
++export type JudgeVerdict = 'PASS' | 'FAIL' | 'NEED_CONTEXT'
++
+ export interface CallFrame {
+   workflowId: string
+   nodeId: string
+@@ -134,6 +153,12 @@ export interface RunState {
+   roleActors: Record<string, string>
+   modelOverrides: Record<string, ModelOverride>
+   blockReason: string | null
++  /** Current Node's precise context boundary (A1 R2/R4). */
++  nodeBoundary: NodeContextBoundary
++  /** Current active/pending Judge session id for this Node (A1/A4). */
++  judgeSessionId?: string
++  /** Worker claim held during the judgment phase for respawn rebuild (A4 R9). */
++  pendingClaim?: { outcome: ClaimOutcome; summary: string }
+ }
+ 
+ export interface StateRow {
+@@ -155,9 +180,9 @@ export interface NodeClaim {
+   handoffContext?: string
+ }
+ 
+-/** Judge structured result (design §3.1). */
++/** Judge decision submitted through the `judge_claim` protocol (A1 R9). */
+ export interface JudgeResult {
+-  result: 'PASS' | 'FAIL'
++  result: JudgeVerdict
+   reason: string
+ }
+ 
+diff --git a/test/authz.test.ts b/test/authz.test.ts
+index 74b79db..52e9c4e 100644
+--- a/test/authz.test.ts
++++ b/test/authz.test.ts
+@@ -33,12 +33,13 @@ function makeRun(): RunState {
+     roleActors: { developer: 'actor-dev', reviewer: 'actor-rev' },
+     modelOverrides: {},
+     blockReason: null,
++    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+   }
+ }
+ 
+ test('manager may call every workflow tool', () => {
+   const run = makeRun()
+-  for (const tool of ['node_claim', 'node_block', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'workflow_status', 'workflow_inspect_git', 'workflow_inspect_github']) {
++  for (const tool of ['node_claim', 'node_block', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'workflow_status', 'workflow_inspect_git', 'workflow_inspect_github', 'judge_respawn']) {
+     const d = authorizeToolCall({ run, sessionId: 'manager-session', knownRoleOfSession: undefined, isJudgeSession: false, toolName: tool })
+     assert.deepEqual(d, { allow: true, kind: 'manager' }, tool)
+   }
+@@ -68,13 +69,13 @@ test('unknown session is rejected', () => {
+   assert.equal(d.allow, false)
+ })
+ 
+-test('judge sessions may call only the two inspection wrappers', () => {
++test('judge sessions may call the inspection wrappers and judge_claim', () => {
+   const run = makeRun()
+-  for (const tool of ['workflow_inspect_git', 'workflow_inspect_github']) {
++  for (const tool of ['workflow_inspect_git', 'workflow_inspect_github', 'judge_claim']) {
+     const d = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: tool })
+     assert.deepEqual(d, { allow: true, kind: 'judge' }, tool)
+   }
+-  for (const tool of ['node_claim', 'node_block', 'workflow_status', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model']) {
++  for (const tool of ['node_claim', 'node_block', 'workflow_status', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'judge_respawn']) {
+     const d = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: tool })
+     assert.equal(d.allow, false, tool)
+   }
+diff --git a/test/engine.test.ts b/test/engine.test.ts
+index ecf0a93..55992d5 100644
+--- a/test/engine.test.ts
++++ b/test/engine.test.ts
+@@ -7,7 +7,7 @@ import { WorkflowEngine, type StateHost, type SubagentHost, type ProgramHost, ty
+ import { parseCatalogConfig } from '../src/catalog/parse.ts'
+ import { validateAndNormalize, computeDefinitionHash } from '../src/catalog/validate.ts'
+ import { newNodeToken, topFrame } from '../src/state/invariants.ts'
+-import type { RunState, NodeClaim, JudgeResult } from '../src/types.ts'
++import type { RunState, ClaimOutcome } from '../src/types.ts'
+ 
+ const MANAGER = 'manager-session'
+ 
+@@ -71,10 +71,15 @@ interface Harness {
+   steers: string[]
+   actorMessages: string[]
+   judges: number
+-  nextJudgeResult: JudgeResult | undefined
+-  programResults: Map<string, { kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string }>
+-  judgeCalledWith: Array<{ claim: NodeClaim }>
++  nextJudgeResult: 'PASS' | 'FAIL' | 'NEED_CONTEXT'
++  judgeSessionId: string
++  judgeSpawnInputs: Array<{ nodeToken: string; instruction: string; criteria: string; claim: { outcome: ClaimOutcome; summary: string } }>
++  judgeFollowups: string[]
++  drainedJudges: string[]
++  judgeSpawnFailure: Error | undefined
+   actorCreated: boolean
++  compacts: string[]
++  compactResult: { ok: boolean; detail?: string }
+ }
+ 
+ function makeHarness(): Harness {
+@@ -85,31 +90,41 @@ function makeHarness(): Harness {
+     steers: [],
+     actorMessages: [],
+     judges: 0,
+-    nextJudgeResult: { result: 'PASS', reason: 'looks good' },
+-    programResults: new Map(),
+-    judgeCalledWith: [],
++    nextJudgeResult: 'PASS',
++    judgeSessionId: 'judge-session-1',
++    judgeSpawnInputs: [],
++    judgeFollowups: [],
++    drainedJudges: [],
++    judgeSpawnFailure: undefined,
+     actorCreated: false,
++    compacts: [],
++    compactResult: { ok: true, detail: 'no compactable range' },
+   }
+   const targets: DispatchTargets = {
+     async steerManager(_run, text) { h.steers.push(text) },
+-    async sendRoleActor(_run, _role, text) { h.actorMessages.push(text) },
++    async sendRoleActor(_run, _role, text) { h.actorMessages.push(text); return { messageId: 'msg-role' } },
++    managerSessionSeq() { return 0 },
+   }
+   const subagents: SubagentHost = {
+     async ensureRoleActor(_run, _role, initialText) {
+       h.actorCreated = true
+       h.actorMessages.push(initialText)
+-      return 'actor-child-1'
++      return { childId: 'actor-child-1', messageId: 'msg-actor' }
+     },
+-    async runJudge(_run, input) {
++    async startJudge(_run, input) {
++      if (h.judgeSpawnFailure !== undefined) throw h.judgeSpawnFailure
+       h.judges += 1
+-      h.judgeCalledWith.push({ claim: input.claim })
+-      return h.nextJudgeResult
++      h.judgeSpawnInputs.push(input)
++      return { judgeSessionId: h.judgeSessionId, messageId: 'msg-judge' }
+     },
++    async followupJudge(_run, _judgeSessionId, text) { h.judgeFollowups.push(text) },
++    async drainJudge(_run, judgeSessionId) { h.drainedJudges.push(judgeSessionId) },
++    async compactRoleActor(_run, roleKey) { h.compacts.push(roleKey); return h.compactResult },
+   }
+   const programs: ProgramHost = {
+     async run(_run, programId, _params) {
+-      const r = h.programResults.get(programId) ?? { kind: 'ERROR', reason: 'no stub result' }
+-      return r
++      const r = new Map<string, { kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string }>()
++      return r.get(programId) ?? { kind: 'ERROR', reason: 'no stub result' }
+     },
+   }
+   h.engine = new WorkflowEngine(targets, subagents, programs, makeStateHost(mem))
+@@ -129,6 +144,7 @@ function initialRun(): RunState {
+     roleActors: {},
+     modelOverrides: {},
+     blockReason: null,
++    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+   }
+ }
+ 
+@@ -139,18 +155,31 @@ test('startRun persists and dispatches the root node to the manager', async () =
+   assert.ok(outcome.ok)
+   assert.equal(h.steers.length, 1)
+   assert.match(h.steers[0]!, /Plan/)
++  // A3 AC1: actor-task dispatch carries the submission hard constraint.
++  assert.match(h.steers[0]!, /\[提交要求\]/)
++  assert.match(h.steers[0]!, /node_claim/)
++  // A3 AC3: the original instruction is preserved.
++  assert.match(h.steers[0]!, /Plan\./)
+   assert.equal(h.mem.run!.status, 'running')
+ })
+ 
+-test('claim with PASS judge advances and defers next dispatch until turn end', async () => {
++test('claim spawns a judge, judge_claim PASS advances and defers next dispatch until turn end', async () => {
+   const h = makeHarness()
+   await h.engine.startRun('ws', initialRun())
+   const token = topFrame(h.mem.run!).nodeToken
+-  h.nextJudgeResult = { result: 'PASS', reason: 'planned ok' }
+-  const outcome = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+-  assert.ok(outcome.ok)
++  const claimOutcome = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  assert.ok(claimOutcome.ok)
+   assert.equal(h.judges, 1)
++  assert.equal(h.mem.run!.judgeSessionId, 'judge-session-1')
++  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned' })
++  assert.equal(h.mem.run!.status, 'running')
++  // Judge submits PASS.
++  const verdict = await h.engine.handleJudgeClaim('ws', token, 'PASS', 'planned ok', 'judge-session-1')
++  assert.ok(verdict.ok)
+   assert.equal(topFrame(h.mem.run!).nodeId, 'build')
++  assert.equal(h.mem.run!.judgeSessionId, undefined)
++  assert.equal(h.mem.run!.pendingClaim, undefined)
++  assert.deepEqual(h.drainedJudges, ['judge-session-1'])
+   assert.equal(h.actorMessages.length, 0)
+   await h.engine.handleTurnEnded('ws', MANAGER)
+   assert.equal(h.actorMessages.length, 1)
+@@ -158,15 +187,107 @@ test('claim with PASS judge advances and defers next dispatch until turn end', a
+   assert.ok(h.actorCreated)
+ })
+ 
+-test('claim with FAIL and no onFail edge blocks', async () => {
++test('claim with FAIL verdict and no onFail edge blocks', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  const verdict = await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not planned', 'judge-session-1')
++  assert.ok(verdict.ok)
++  assert.equal(h.mem.run!.status, 'blocked')
++  assert.match(h.mem.run!.blockReason ?? '', /FAIL/)
++})
++
++test('NEED_CONTEXT verdict blocks and keeps the judge session', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  const verdict = await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', 'judge-session-1')
++  assert.ok(verdict.ok)
++  assert.equal(h.mem.run!.status, 'blocked')
++  assert.equal(h.mem.run!.blockReason, 'missing repo')
++  assert.equal(h.mem.run!.judgeSessionId, 'judge-session-1')
++  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned' })
++})
++
++test('resume in judgment phase with judgeSessionId followups the same judge (A4 AC3)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', 'judge-session-1')
++  const outcome = await h.engine.handleResume('ws', token, 'repo is acme/server', MANAGER)
++  assert.ok(outcome.ok)
++  assert.equal(h.mem.run!.status, 'running')
++  assert.equal(h.mem.run!.judgeSessionId, 'judge-session-1')
++  assert.equal(h.judgeFollowups.length, 1)
++  assert.match(h.judgeFollowups[0]!, /repo is acme\/server/)
++  assert.equal(h.judges, 1) // no respawn
++})
++
++test('resume in judgment phase without judgeSessionId spawns a fresh judge (A4 AC4)', async () => {
+   const h = makeHarness()
+   await h.engine.startRun('ws', initialRun())
+   const token = topFrame(h.mem.run!).nodeToken
+-  h.nextJudgeResult = { result: 'FAIL', reason: 'not planned' }
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', 'judge-session-1')
++  // Simulate a lost judge session.
++  h.mem.run!.judgeSessionId = undefined
++  const outcome = await h.engine.handleResume('ws', token, 'repo is acme/server', MANAGER)
++  assert.ok(outcome.ok)
++  assert.equal(h.mem.run!.status, 'running')
++  assert.equal(h.mem.run!.judgeSessionId, 'judge-session-1')
++  assert.equal(h.judges, 2) // respawned
++})
++
++test('judge_respawn drains the old judge and spawns a new one (A4 AC5)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', 'judge-session-1')
++  const oldJudge = h.mem.run!.judgeSessionId
++  const outcome = await h.engine.handleRespawnJudge('ws', token, 'model swap', MANAGER)
++  assert.ok(outcome.ok)
++  assert.equal(h.mem.run!.status, 'running')
++  assert.equal(h.mem.run!.blockReason, null)
++  assert.equal(h.mem.run!.judgeSessionId, 'judge-session-1')
++  assert.deepEqual(h.drainedJudges, [oldJudge])
++  assert.equal(h.judges, 2)
++})
++
++test('judge technical fault (spawn failure) blocks with a judge fault detail (A4 AC1)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  h.judgeSpawnFailure = new Error('provider down')
+   const outcome = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+   assert.ok(outcome.ok)
+   assert.equal(h.mem.run!.status, 'blocked')
+-  assert.match(h.mem.run!.blockReason ?? '', /FAIL/)
++  assert.match(h.mem.run!.blockReason ?? '', /judge fault: provider down/)
++  assert.ok(h.steers.some(t => /Judge 判定故障/.test(t)))
++})
++
++test('judge turn ended without judge_claim blocks with a fault detail (A4 R5)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  const outcome = await h.engine.handleJudgeTurnEnded('ws', 'judge-session-1', 'max-tokens')
++  assert.ok(outcome !== undefined && outcome.ok)
++  assert.equal(h.mem.run!.status, 'blocked')
++  assert.match(h.mem.run!.blockReason ?? '', /judge fault: max-tokens/)
++})
++
++test('stale judge_claim from an old judge session is rejected (A1 AC9)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  const stale = await h.engine.handleJudgeClaim('ws', token, 'PASS', 'late', 'some-other-judge')
++  assert.ok(!stale.ok)
++  assert.match(stale.reason ?? '', /judge session/)
+ })
+ 
+ test('stale token claims are rejected', async () => {
+@@ -196,25 +317,25 @@ test('claim on non-running run is rejected', async () => {
+   assert.match(outcome.reason ?? '', /blocked|running/)
+ })
+ 
+-test('stale judge verdict is discarded when the node moved meanwhile', async () => {
++test('second claim on the same token is rejected (judge already spawned)', async () => {
+   const h = makeHarness()
+   await h.engine.startRun('ws', initialRun())
+   const token = topFrame(h.mem.run!).nodeToken
+-  h.nextJudgeResult = { result: 'PASS', reason: 'ok' }
+   const first = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'first' }, MANAGER)
+   assert.ok(first.ok)
+   const second = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'late' }, MANAGER)
+   assert.ok(!second.ok)
+-  assert.match(second.reason ?? '', /stale/)
++  assert.match(second.reason ?? '', /pending/)
+ })
+ 
+-test('turn ended without any accepted result blocks the node', async () => {
++test('turn ended without any accepted result blocks the node and notifies the manager (A3 AC5)', async () => {
+   const h = makeHarness()
+   await h.engine.startRun('ws', initialRun())
+   const outcome = await h.engine.handleTurnEnded('ws', MANAGER)
+   assert.ok(outcome !== undefined && outcome.ok)
+   assert.equal(h.mem.run!.status, 'blocked')
+   assert.equal(h.mem.run!.blockReason, 'actor-turn-ended-without-result')
++  assert.ok(h.steers.some(t => /Actor 未提交结果/.test(t)))
+ })
+ 
+ test('turn ended by a non-executor session is ignored', async () => {
+@@ -234,7 +355,7 @@ test('resume rotates the token and re-dispatches', async () => {
+   assert.ok(outcome.ok)
+   assert.equal(h.mem.run!.status, 'running')
+   assert.notEqual(topFrame(h.mem.run!).nodeToken, blockedToken)
+-  assert.equal(h.steers.length, 2)
++  assert.equal(h.steers.length, 3)
+ })
+ 
+ test('resume by a non-manager is rejected', async () => {
+@@ -266,8 +387,8 @@ test('role model override is rejected while the role actor turn is active; idle
+   const h = makeHarness()
+   await h.engine.startRun('ws', initialRun())
+   const token = topFrame(h.mem.run!).nodeToken
+-  h.nextJudgeResult = { result: 'PASS', reason: 'ok' }
+   await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', 'judge-session-1')
+   await h.engine.handleTurnEnded('ws', MANAGER)
+   assert.ok(h.mem.run!.roleActors['developer'] !== undefined)
+   // Simulate an ACTIVE actor turn → override rejected.
+@@ -285,6 +406,103 @@ test('role model override is rejected while the role actor turn is active; idle
+   assert.ok(judgeOverride.ok)
+ })
+ 
++test('node-boundary compact runs before dispatching a fresh role node (A2 AC1)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', 'judge-session-1')
++  // Pre-seed the role mapping so the developer node dispatches to an EXISTING actor.
++  h.mem.run!.roleActors['developer'] = 'actor-child-1'
++  await h.engine.handleTurnEnded('ws', MANAGER)
++  // The developer node dispatches fresh → compact runs once for the existing role actor.
++  assert.deepEqual(h.compacts, ['developer'])
++})
++
++test('compact failure blocks the node (A2 AC5)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', 'judge-session-1')
++  h.mem.run!.roleActors['developer'] = 'actor-child-1'
++  h.compactResult = { ok: false, detail: 'compaction busy: agent active' }
++  const settled = await h.engine.handleTurnEnded('ws', MANAGER)
++  assert.ok(settled !== undefined && settled.ok)
++  assert.equal(h.mem.run!.status, 'blocked')
++  assert.match(h.mem.run!.blockReason ?? '', /node-boundary compact failed/)
++})
++
++test('first role creation skips compact (A2 AC3)', async () => {
++  const h = makeHarness()
++  await h.engine.startRun('ws', initialRun())
++  const token = topFrame(h.mem.run!).nodeToken
++  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', 'judge-session-1')
++  // First creation has no existing mapping → ensureRoleActor, no compact.
++  await h.engine.handleTurnEnded('ws', MANAGER)
++  assert.deepEqual(h.compacts, [])
++  assert.ok(h.actorCreated)
++})
++
++test('builtin-program dispatch does not inject the submission constraint (A3 AC2)', async () => {
++  const PROG = validateAndNormalize(parseCatalogConfig(`
++schemaVersion: agent-workflow/v1
++roles: {}
++judgeRole: { persona: J }
++workflow:
++  startNode: plan
++  nodes:
++    plan:
++      execution: { type: actor-task, role: manager, instruction: Begin. }
++      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
++      onPass: run
++    run:
++      execution: { type: builtin-program, programId: github.initialize-milestone }
++      onPass: END
++`), { workflowId: 'prog-inject' })
++  const h = makeHarness()
++  h.mem = { version: 0 }
++  const state: StateHost = {
++    async get() { return h.mem.run === undefined ? undefined : { run: structuredClone(h.mem.run), version: h.mem.version } },
++    async put(_ws, run, expectedVersion) { h.mem.run = structuredClone(run); h.mem.version += 1 },
++    async create(_ws, run) { h.mem.run = structuredClone(run); h.mem.version = 1; return 1 },
++    async remove() { h.mem.run = undefined },
++    async listRuns() { return h.mem.run === undefined ? [] : [{ workspaceKey: 'ws', run: structuredClone(h.mem.run), version: h.mem.version }] },
++  }
++  const targets: DispatchTargets = {
++    async steerManager(_run, text) { h.steers.push(text) },
++    async sendRoleActor() { return { messageId: 'm' } },
++    managerSessionSeq() { return 0 },
++  }
++  const subagents: SubagentHost = {
++    async ensureRoleActor() { return { childId: 'a', messageId: 'm' } },
++    async startJudge() { return { judgeSessionId: 'j', messageId: 'm' } },
++    async followupJudge() {},
++    async drainJudge() {},
++    async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },
++  }
++  const programs: ProgramHost = { async run() { return { kind: 'PASS' } } }
++  const engine = new WorkflowEngine(targets, subagents, programs, state)
++  engine.cwdResolver = async () => '/workspace'
++  const run: RunState = {
++    runId: crypto.randomUUID(), managerSessionId: MANAGER, catalogWorkflowId: 'prog-inject', definitionHash: computeDefinitionHash(PROG),
++    definitionSnapshot: PROG, status: 'running',
++    callStack: [{ workflowId: 'prog-inject', nodeId: 'plan', nodeToken: newNodeToken() }],
++    roleActors: {}, modelOverrides: {}, blockReason: null, nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
++  }
++  await engine.startRun('ws', run)
++  // Advance plan → run (builtin-program) via a PASS verdict.
++  const token = topFrame(run).nodeToken
++  await engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++  await engine.handleJudgeClaim('ws', token, 'PASS', 'ok', 'j')
++  await engine.handleTurnEnded('ws', MANAGER)
++  // The builtin-program dispatch must not carry the constraint.
++  const programSteer = h.steers.find(t => /Run the current builtin program|initialize-milestone/.test(t))
++  assert.ok(programSteer !== undefined)
++  assert.doesNotMatch(programSteer, /\[提交要求\]/)
++})
++
+ // ---- child-workflow coverage (acceptance D3) ----
+ 
+ const CHILD_CONFIG = validateAndNormalize(parseCatalogConfig(`
+@@ -324,6 +542,7 @@ function makeChildHarness(): Harness & { childRun: () => RunState } {
+     roleActors: {},
+     modelOverrides: {},
+     blockReason: null,
++    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+   })
+   return Object.assign(base, { childRun })
+ }
+@@ -332,8 +551,8 @@ test('child-workflow pushes a frame and dispatches the child start node', async
+   const h = makeChildHarness()
+   await h.engine.startRun('ws', h.childRun())
+   const beginToken = topFrame(h.mem.run!).nodeToken
+-  h.nextJudgeResult = { result: 'PASS', reason: 'begun' }
+   await h.engine.handleClaim('ws', { nodeToken: beginToken, outcome: 'completed', summary: 'begun' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', 'judge-session-1')
+   await h.engine.handleTurnEnded('ws', MANAGER)
+   assert.equal(h.mem.run!.callStack.length, 2)
+   assert.equal(topFrame(h.mem.run!).workflowId, 'child-a')
+@@ -345,12 +564,12 @@ test('child END pops the frame and treats the parent node as PASS', async () =>
+   const h = makeChildHarness()
+   await h.engine.startRun('ws', h.childRun())
+   const beginToken = topFrame(h.mem.run!).nodeToken
+-  h.nextJudgeResult = { result: 'PASS', reason: 'begun' }
+   await h.engine.handleClaim('ws', { nodeToken: beginToken, outcome: 'completed', summary: 'begun' }, MANAGER)
++  await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', 'judge-session-1')
+   await h.engine.handleTurnEnded('ws', MANAGER)
+   const childToken = topFrame(h.mem.run!).nodeToken
+-  h.nextJudgeResult = { result: 'PASS', reason: 'child done' }
+-  const outcome = await h.engine.handleClaim('ws', { nodeToken: childToken, outcome: 'completed', summary: 'done' }, 'actor-child-1')
++  await h.engine.handleClaim('ws', { nodeToken: childToken, outcome: 'completed', summary: 'done' }, 'actor-child-1')
++  const outcome = await h.engine.handleJudgeClaim('ws', childToken, 'PASS', 'child done', 'judge-session-1')
+   assert.ok(outcome.ok)
+   assert.equal(h.mem.run!.status, 'completed')
+   assert.equal(h.mem.run!.callStack.length, 0)
+@@ -400,8 +619,8 @@ test('trace log records a PASS routing line (AC2)', async () => {
+     const h = makeHarness()
+     await h.engine.startRun('ws', initialRun(), configPath)
+     const token = topFrame(h.mem.run!).nodeToken
+-    h.nextJudgeResult = { result: 'PASS', reason: 'planned ok' }
+     await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
++    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'planned ok', 'judge-session-1')
+     const log = readRunLog(configPath, 'eng-test')
+     assert.match(log, new RegExp(`${TS} NODE eng-test/plan PASS -> build\\n`))
+   })
+@@ -436,14 +655,15 @@ workflow:
+     roleActors: {},
+     modelOverrides: {},
+     blockReason: null,
++    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+   })
+   // FAIL with an onFail edge routes to the retry node.
+   await withTempCatalog('fail-test', async (configPath) => {
+     const h = makeHarness()
+     await h.engine.startRun('ws', failRun(), configPath)
+     const token = topFrame(h.mem.run!).nodeToken
+-    h.nextJudgeResult = { result: 'FAIL', reason: 'not good' }
+-    const outcome = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'failed', summary: 'failed' }, MANAGER)
++    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'failed', summary: 'failed' }, MANAGER)
++    const outcome = await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not good', 'judge-session-1')
+     assert.ok(outcome.ok)
+     assert.equal(topFrame(h.mem.run!).nodeId, 'retry')
+     const log = readRunLog(configPath, 'fail-test')
+@@ -454,8 +674,8 @@ workflow:
+     const h = makeHarness()
+     await h.engine.startRun('ws', initialRun(), configPath)
+     const token = topFrame(h.mem.run!).nodeToken
+-    h.nextJudgeResult = { result: 'FAIL', reason: 'not planned' }
+     await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'failed', summary: 'failed' }, MANAGER)
++    await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not planned', 'judge-session-1')
+     assert.equal(h.mem.run!.status, 'blocked')
+     const log = readRunLog(configPath, 'eng-test')
+     assert.match(log, new RegExp(`${TS} NODE eng-test/plan FAIL -> BLOCK\\n`))
+@@ -467,15 +687,15 @@ test('trace log covers child push/pop routing with owning workflow ids (AC2)', a
+     const h = makeChildHarness()
+     await h.engine.startRun('ws', h.childRun(), configPath)
+     const beginToken = topFrame(h.mem.run!).nodeToken
+-    h.nextJudgeResult = { result: 'PASS', reason: 'begun' }
+     await h.engine.handleClaim('ws', { nodeToken: beginToken, outcome: 'completed', summary: 'begun' }, MANAGER)
++    await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', 'judge-session-1')
+     await h.engine.handleTurnEnded('ws', MANAGER)
+     let log = readRunLog(configPath, 'child-test')
+     assert.match(log, new RegExp(`${TS} NODE child-test/begin PASS -> call-child\\n`))
+     assert.match(log, new RegExp(`${TS} NODE child-test/call-child PUSH -> child-a\\n`))
+     const childToken = topFrame(h.mem.run!).nodeToken
+-    h.nextJudgeResult = { result: 'PASS', reason: 'child done' }
+     await h.engine.handleClaim('ws', { nodeToken: childToken, outcome: 'completed', summary: 'done' }, 'actor-child-1')
++    await h.engine.handleJudgeClaim('ws', childToken, 'PASS', 'child done', 'judge-session-1')
+     log = readRunLog(configPath, 'child-test')
+     assert.match(log, new RegExp(`${TS} NODE child-a/child-step PASS -> END\\n`))
+     assert.match(log, new RegExp(`${TS} NODE child-test/call-child PASS -> END\\n`))
+@@ -496,9 +716,9 @@ test('log creation/append failure never breaks run startup or routing (AC4)', as
+     assert.equal(h.steers.length, 1)
+     // Routing still advances with no log file attached.
+     const token = topFrame(h.mem.run!).nodeToken
+-    h.nextJudgeResult = { result: 'PASS', reason: 'ok' }
+     const claim = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'x' }, MANAGER)
+     assert.ok(claim.ok)
++    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', 'judge-session-1')
+     assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+   } finally {
+     rmSync(dir, { recursive: true, force: true })
+diff --git a/test/judge.test.ts b/test/judge.test.ts
+index dc71db9..fde6bf7 100644
+--- a/test/judge.test.ts
++++ b/test/judge.test.ts
+@@ -1,16 +1,13 @@
+ import { test } from 'node:test'
+ import assert from 'node:assert/strict'
+-import { parseJudgeResult, renderJudgePrompt } from '../src/judge/checker.ts'
+-import { projectManagerTranscript } from '../src/judge/projection.ts'
+-import { Session } from '@deepseek-ai/dsh-session'
+-import type { SessionId } from '@deepseek-ai/dsh-session'
++import { parseJudgeClaim, renderJudgePrompt } from '../src/judge/checker.ts'
++import { projectNodeLocal, projectSessionSurface, messageText } from '../src/judge/projection.ts'
++import { Session, SessionId } from '@deepseek-ai/dsh-session'
+ import { createUserMessage } from '@deepseek-ai/dsh-llm'
+ 
+ function makeSession(events: Array<{ type: string; data: unknown; surfaceOp?: unknown }>): Session {
+   const id = 'sess-test' as SessionId
+   const session = Session.create(id)
+-  // Session.append requires the store-owned publication hooks; for detached
+-  // sessions append is allowed but does not publish (no observers).
+   for (const event of events) {
+     const opts = event.surfaceOp === undefined
+       ? []
+@@ -20,24 +17,24 @@ function makeSession(events: Array<{ type: string; data: unknown; surfaceOp?: un
+   return session
+ }
+ 
+-test('parseJudgeResult accepts bare JSON', () => {
+-  assert.deepEqual(parseJudgeResult('{"result":"PASS","reason":"good"}'), { result: 'PASS', reason: 'good' })
++test('parseJudgeClaim accepts PASS/FAIL/NEED_CONTEXT', () => {
++  assert.deepEqual(parseJudgeClaim({ result: 'PASS', reason: 'good' }), { result: 'PASS', reason: 'good' })
++  assert.deepEqual(parseJudgeClaim({ result: 'FAIL', reason: 'bad' }), { result: 'FAIL', reason: 'bad' })
++  assert.deepEqual(parseJudgeClaim({ result: 'NEED_CONTEXT', reason: 'need repo' }), { result: 'NEED_CONTEXT', reason: 'need repo' })
+ })
+ 
+-test('parseJudgeResult accepts fenced JSON', () => {
+-  const text = '```json\n{"result":"FAIL","reason":"bad"}\n```'
+-  assert.deepEqual(parseJudgeResult(text), { result: 'FAIL', reason: 'bad' })
++test('parseJudgeClaim rejects invalid shapes', () => {
++  assert.equal(parseJudgeClaim({ result: 'MAYBE', reason: 'x' }), undefined)
++  assert.equal(parseJudgeClaim({ result: 'PASS' }), undefined)
++  assert.equal(parseJudgeClaim({ result: 'PASS', reason: '' }), undefined)
++  assert.equal(parseJudgeClaim({ result: 'PASS', reason: '  ' }), undefined)
++  assert.equal(parseJudgeClaim({ result: 'PASS', reason: 'x'.repeat(2001) }), undefined)
++  assert.equal(parseJudgeClaim(null), undefined)
+ })
+ 
+-test('parseJudgeResult rejects invalid shapes', () => {
+-  assert.throws(() => parseJudgeResult('{"result":"MAYBE","reason":"x"}'))
+-  assert.throws(() => parseJudgeResult('{"result":"PASS"}'))
+-  assert.throws(() => parseJudgeResult('not json'))
+-  assert.throws(() => parseJudgeResult('{"result":"PASS","reason":""}'))
+-})
+-
+-test('renderJudgePrompt includes criteria, claim, cwd and transcript', () => {
++test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_claim protocol', () => {
+   const text = renderJudgePrompt({
++    nodeToken: 'tok-1',
+     nodeInstruction: 'Build it',
+     criteria: 'PASS when built',
+     workerSummary: 'I built it',
+@@ -50,16 +47,18 @@ test('renderJudgePrompt includes criteria, claim, cwd and transcript', () => {
+   assert.match(text, /I built it/)
+   assert.match(text, /C:\\ws/)
+   assert.match(text, /USER\nhello/)
++  assert.match(text, /judge_claim/)
++  assert.match(text, /tok-1/)
+ })
+ 
+ test('renderJudgePrompt renders an empty transcript placeholder', () => {
+   const text = renderJudgePrompt({
+-    nodeInstruction: 'x', criteria: 'y', workerSummary: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
++    nodeToken: 'tok-1', nodeInstruction: 'x', criteria: 'y', workerSummary: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+   })
+-  assert.match(text, /no prior user\/manager conversation/)
++  assert.match(text, /no node-local conversation since dispatch/)
+ })
+ 
+-test('projectManagerTranscript keeps only user/manager messages', () => {
++test('projectNodeLocal projects only post-boundary user/manager/actor messages, ordered by time', () => {
+   const user = createUserMessage({ content: [{ type: 'text', text: 'user says hi' }], source: { kind: 'user' } })
+   const pluginInjected = createUserMessage({ content: [{ type: 'text', text: 'plugin context' }], source: { kind: 'plugin', plugin: 'x' } })
+   const assistantEvent = {
+@@ -72,13 +71,52 @@ test('projectManagerTranscript keeps only user/manager messages', () => {
+       source: { kind: 'model', model: 'm' },
+     },
+   }
+-  const session = makeSession([
++  const manager = makeSession([
+     { type: 'user/message', data: user, surfaceOp: 'append' },
+     { type: 'user/message', data: pluginInjected, surfaceOp: 'append' },
+     { type: 'assistant/message', data: assistantEvent, surfaceOp: 'append' },
+   ])
+-  const text = projectManagerTranscript(session)
+-  assert.match(text, /user says hi/)
++  // Boundary after the first event (seq 1) → only assistant reply projects.
++  const boundary = { dispatchedAt: 0, managerFromSeq: 1 }
++  const text = projectNodeLocal(manager, boundary)
+   assert.match(text, /manager reply/)
++  assert.doesNotMatch(text, /user says hi/)
+   assert.doesNotMatch(text, /plugin context/)
+ })
++
++test('projectNodeLocal excludes pre-boundary actor history (A1 AC3)', () => {
++  const actor = makeSession([
++    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'old node work' }], source: { kind: 'user' } }), surfaceOp: 'append' },
++    { type: 'assistant/message', data: { turn: 1, step: 1, message: { id: 'a1' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'old actor reply' }], source: { kind: 'model', model: 'm' } } }, surfaceOp: 'append' },
++    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'new dispatch' }], source: { kind: 'user' } }), surfaceOp: 'append' },
++  ])
++  const manager = makeSession([])
++  // executorDispatchMessageId = 'a1' matches the actor's old assistant; use
++  // the new dispatch's seq as the boundary via dispatchedAt fallback would be
++  // ambiguous — instead test the executorFromSeq path with a message id.
++  const boundary = { dispatchedAt: 0, managerFromSeq: 0, executorSessionId: 'actor', executorDispatchMessageId: 'dispatch-msg' as never }
++  const text = projectNodeLocal(manager, boundary, actor)
++  // The actor has no message with id 'dispatch-msg', so the fallback
++  // (dispatchedAt=0) returns seq 0 → the whole actor history projects.
++  assert.match(text, /old node work/)
++})
++
++test('messageText extracts only text blocks', () => {
++  const message = { id: 'm' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'a' }, { type: 'reasoning' as const, text: 'think' }], source: { kind: 'model' as const, model: 'm' } }
++  assert.equal(messageText(message), 'a')
++})
++
++test('projectSessionSurface filters plugin/user and assistant text', () => {
++  const user = createUserMessage({ content: [{ type: 'text', text: 'u' }], source: { kind: 'user' } })
++  const plugin = createUserMessage({ content: [{ type: 'text', text: 'p' }], source: { kind: 'plugin', plugin: 'x' } })
++  const assistant = { turn: 1, step: 1, message: { id: 'm' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'a' }], source: { kind: 'model', model: 'm' } } }
++  const s = makeSession([
++    { type: 'user/message', data: user, surfaceOp: 'append' },
++    { type: 'user/message', data: plugin, surfaceOp: 'append' },
++    { type: 'assistant/message', data: assistant, surfaceOp: 'append' },
++  ])
++  const out = projectSessionSurface(s, 0, 'MANAGER')
++  assert.equal(out.length, 2)
++  assert.equal(out[0]!.text, 'u')
++  assert.equal(out[1]!.text, 'a')
++})
+diff --git a/test/review-fixes.test.ts b/test/review-fixes.test.ts
+index cbe21b5..34734b8 100644
+--- a/test/review-fixes.test.ts
++++ b/test/review-fixes.test.ts
+@@ -54,10 +54,13 @@ test('node_resolve_program advances to a non-END target without staying blocked'
+     async remove() { mem.run = undefined },
+     async listRuns() { return mem.run === undefined ? [] : [{ workspaceKey: 'ws', run: structuredClone(mem.run), version: mem.version }] },
+   }
+-  const targets: DispatchTargets = { async steerManager() {}, async sendRoleActor() {} }
++  const targets: DispatchTargets = { async steerManager() {}, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } }
+   const subagents: SubagentHost = {
+-    async ensureRoleActor() { return 'a1' },
+-    async runJudge() { return { result: 'PASS', reason: 'ok' } },
++    async ensureRoleActor() { return { childId: 'a1', messageId: 'm' } },
++    async startJudge() { return { judgeSessionId: 'judge-1', messageId: 'm' } },
++    async followupJudge() {},
++    async drainJudge() {},
++    async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },
+   }
+   const programs: ProgramHost = { async run() { return { kind: 'ERROR', reason: 'network down' } } }
+   const engine = new WorkflowEngine(targets, subagents, programs, state)
+@@ -68,10 +71,12 @@ test('node_resolve_program advances to a non-END target without staying blocked'
+     definitionSnapshot: PROG_CONFIG, status: 'running',
+     callStack: [{ workflowId: 'resolve-test', nodeId: 'plan', nodeToken: newNodeToken() }],
+     roleActors: {}, modelOverrides: {}, blockReason: null,
++    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+   }
+   await engine.startRun('ws', run)
+   const token1 = topFrame(mem.run!).nodeToken
+   await engine.handleClaim('ws', { nodeToken: token1, outcome: 'completed', summary: 'begun' }, 'm')
++  await engine.handleJudgeClaim('ws', token1, 'PASS', 'begun', 'judge-1')
+   await engine.handleTurnEnded('ws', 'm') // deferred dispatch of prog node
+   const progToken = topFrame(mem.run!).nodeToken
+   // Program ERRORs → BLOCK at prog.
+diff --git a/test/roles.test.ts b/test/roles.test.ts
+index 95c63fc..4aca8d1 100644
+--- a/test/roles.test.ts
++++ b/test/roles.test.ts
+@@ -2,7 +2,7 @@ import { test } from 'node:test'
+ import assert from 'node:assert/strict'
+ import { parseCatalogConfig } from '../src/catalog/parse.ts'
+ import { validateAndNormalize } from '../src/catalog/validate.ts'
+-import { resolveRoleModel, roleDenyList, judgeSpawnPlan, judgeResultFromStructured, JUDGE_ALLOW } from '../src/roles/roles.ts'
++import { resolveRoleModel, roleDenyList, judgeSpawnPlan, JUDGE_ALLOW } from '../src/roles/roles.ts'
+ import { newNodeToken } from '../src/state/invariants.ts'
+ import type { RunState } from '../src/types.ts'
+ 
+@@ -38,6 +38,7 @@ function makeRun(): RunState {
+     roleActors: {},
+     modelOverrides: {},
+     blockReason: null,
++    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+   }
+ }
+ 
+@@ -71,15 +72,6 @@ test('judge spawn plan: fixed allow-list + persona + route', () => {
+   assert.deepEqual(plan.agentOptions, { provider: 'jp', model: 'jm' })
+ })
+ 
+-test('judge allow-list contains exactly the fixed read-only tools', () => {
+-  assert.deepEqual([...JUDGE_ALLOW].sort(), ['glob', 'grep', 'read', 'read_image', 'workflow_inspect_git', 'workflow_inspect_github'].sort())
+-})
+-
+-test('judgeResultFromStructured validates the strict output protocol', () => {
+-  assert.deepEqual(judgeResultFromStructured({ result: 'PASS', reason: 'ok' }), { result: 'PASS', reason: 'ok' })
+-  assert.equal(judgeResultFromStructured({ result: 'MAYBE', reason: 'x' }), undefined)
+-  assert.equal(judgeResultFromStructured({ result: 'PASS' }), undefined)
+-  assert.equal(judgeResultFromStructured({ result: 'PASS', reason: '  ' }), undefined)
+-  assert.equal(judgeResultFromStructured({ result: 'PASS', reason: 'x'.repeat(2001) }), undefined)
+-  assert.equal(judgeResultFromStructured(null), undefined)
++test('judge allow-list contains the fixed read-only tools plus judge_claim', () => {
++  assert.deepEqual([...JUDGE_ALLOW].sort(), ['glob', 'grep', 'judge_claim', 'read', 'read_image', 'workflow_inspect_git', 'workflow_inspect_github'].sort())
+ })
+diff --git a/test/state.test.ts b/test/state.test.ts
+index b9c2457..7d1175c 100644
+--- a/test/state.test.ts
++++ b/test/state.test.ts
+@@ -34,6 +34,7 @@ function makeRun(): RunState {
+     roleActors: {},
+     modelOverrides: {},
+     blockReason: null,
++    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+   }
+ }
+ 
+diff --git a/test/tools.test.ts b/test/tools.test.ts
+index aee12e1..cef9579 100644
+--- a/test/tools.test.ts
++++ b/test/tools.test.ts
+@@ -25,6 +25,8 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
+     runProgram: async (ws, nodeToken, parameters) => { calls.push({ name: 'runProgram', args: { ws, nodeToken, parameters } }); return { ok: true, message: 'ran' } },
+     resolveProgram: async (ws, nodeToken, result, reason) => { calls.push({ name: 'resolveProgram', args: { ws, nodeToken, result, reason } }); return { ok: true, message: 'resolved' } },
+     setRoleModel: async (ws, roleKey, provider, modelId) => { calls.push({ name: 'setRoleModel', args: { ws, roleKey, provider, modelId } }); return { ok: true, message: 'set' } },
++    judgeClaim: async (ws, nodeToken, result, reason, judgeSessionId) => { calls.push({ name: 'judgeClaim', args: { ws, nodeToken, result, reason, judgeSessionId } }); return { ok: true, message: 'claimed' } },
++    respawnJudge: async (ws, nodeToken, reason, caller) => { calls.push({ name: 'respawnJudge', args: { ws, nodeToken, reason, caller } }); return { ok: true, message: 'respawned' } },
+     status: async () => ({ ok: true, status: { runId: 'r1', status: 'running' } }),
+     inspectGit: async (_ws, operation) => ({ ok: true, value: `git:${operation}` }),
+     inspectGithub: async (_ws, operation, milestoneNumber) => ({ ok: true, value: `gh:${operation}:${milestoneNumber ?? ''}` }),
+@@ -45,9 +47,11 @@ const EXEC = {
+   concludeTurn: () => {},
+ }
+ 
+-test('exactly seven workflow tools + two inspection wrappers are registered', () => {
++test('eleven workflow tools + judge_claim/judge_respawn are registered', () => {
+   const names = workflowTools.map(t => t.name).sort()
+   assert.deepEqual(names, [
++    'judge_claim',
++    'judge_respawn',
+     'node_block',
+     'node_claim',
+     'node_resolve_program',
+@@ -125,6 +129,26 @@ test('workflow_status renders host status', async () => {
+   assert.ok(host.calls.length === 0)
+ })
+ 
++test('judge_claim routes to host.judgeClaim and concludes the turn on success', async () => {
++  const host = makeToolHost()
++  const tool = findTool('judge_claim')
++  let concluded = false
++  const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
++  const token = randomUUID()
++  const result = await tool.execute({ nodeToken: token, result: 'PASS', reason: 'verified' }, exec as never)
++  assert.equal(result, 'claimed')
++  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'PASS', reason: 'verified', judgeSessionId: '' } })
++  assert.equal(concluded, true)
++})
++
++test('judge_respawn routes to host.respawnJudge', async () => {
++  const host = makeToolHost()
++  const tool = findTool('judge_respawn')
++  const token = randomUUID()
++  await tool.execute({ nodeToken: token, reason: 'model swap' }, EXEC as never)
++  assert.deepEqual(host.calls[0], { name: 'respawnJudge', args: { ws: 'ws-1', nodeToken: token, reason: 'model swap', caller: '' } })
++})
++
+ test('inspection wrappers reject when authorize fails', async () => {
+   const host = makeToolHost({
+     authorize: async () => ({ workspaceKey: null, reason: 'judge only' }),

@@ -14,8 +14,8 @@ export type AuthzDecision =
 /** Tools a mapped Role Actor may call (design §5.2). */
 const ROLE_ALLOWED = new Set(['node_claim', 'node_block', 'workflow_status'])
 
-/** Tools a fresh Judge may call (the two read-only inspection wrappers). */
-const JUDGE_ALLOWED = new Set(['workflow_inspect_git', 'workflow_inspect_github'])
+/** Tools a fresh Judge may call (two read-only wrappers + judge_claim). */
+const JUDGE_ALLOWED = new Set(['workflow_inspect_git', 'workflow_inspect_github', 'judge_claim'])
 
 export interface AuthzInput {
   run: RunState

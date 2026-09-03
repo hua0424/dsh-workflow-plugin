@@ -33,12 +33,13 @@ function makeRun(): RunState {
     roleActors: { developer: 'actor-dev', reviewer: 'actor-rev' },
     modelOverrides: {},
     blockReason: null,
+    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
   }
 }
 
 test('manager may call every workflow tool', () => {
   const run = makeRun()
-  for (const tool of ['node_claim', 'node_block', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'workflow_status', 'workflow_inspect_git', 'workflow_inspect_github']) {
+  for (const tool of ['node_claim', 'node_block', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'workflow_status', 'workflow_inspect_git', 'workflow_inspect_github', 'judge_respawn']) {
     const d = authorizeToolCall({ run, sessionId: 'manager-session', knownRoleOfSession: undefined, isJudgeSession: false, toolName: tool })
     assert.deepEqual(d, { allow: true, kind: 'manager' }, tool)
   }
@@ -68,13 +69,13 @@ test('unknown session is rejected', () => {
   assert.equal(d.allow, false)
 })
 
-test('judge sessions may call only the two inspection wrappers', () => {
+test('judge sessions may call the inspection wrappers and judge_claim', () => {
   const run = makeRun()
-  for (const tool of ['workflow_inspect_git', 'workflow_inspect_github']) {
+  for (const tool of ['workflow_inspect_git', 'workflow_inspect_github', 'judge_claim']) {
     const d = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: tool })
     assert.deepEqual(d, { allow: true, kind: 'judge' }, tool)
   }
-  for (const tool of ['node_claim', 'node_block', 'workflow_status', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model']) {
+  for (const tool of ['node_claim', 'node_block', 'workflow_status', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'judge_respawn']) {
     const d = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: tool })
     assert.equal(d.allow, false, tool)
   }

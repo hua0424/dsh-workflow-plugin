@@ -34,6 +34,7 @@ function makeRun(): RunState {
     roleActors: {},
     modelOverrides: {},
     blockReason: null,
+    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
   }
 }
 

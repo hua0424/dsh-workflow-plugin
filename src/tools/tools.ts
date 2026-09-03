@@ -34,6 +34,8 @@ export interface ToolHost {
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
+  judgeClaim(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  respawnJudge(workspaceKey: string, nodeToken: string, reason: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
 
   // Inspection wrappers (read-only, enum operations)
   inspectGit(workspaceKey: string, operation: 'status' | 'branch' | 'remote' | 'top-level'): Promise<{ ok: boolean; reason?: string; value?: unknown }>
@@ -188,6 +190,41 @@ export const workflowTools: ToolDefinition[] = [
       const auth = await controlWorkspace(exec.agent, 'workflow_set_role_model')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       return fmtResult(await thisHost().setRoleModel(auth.workspaceKey, args.roleKey, args.provider, args.modelId))
+    },
+  }),
+
+  defineTool({
+    name: 'judge_respawn',
+    description: 'Manager 显式重建当前 Node 的 Judge（清映射 + drain 旧 Judge + spawn 新 Judge 重投判定）。',
+    parameters: {
+      nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
+      reason: { type: 'string', description: '可选，写入 trace log 说明为何重建' },
+    },
+    output: stringOut,
+    async execute(args, exec) {
+      const auth = await controlWorkspace(exec.agent, 'judge_respawn')
+      if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
+      return fmtResult(await thisHost().respawnJudge(auth.workspaceKey, args.nodeToken, args.reason, auth.caller))
+    },
+  }),
+
+  defineTool({
+    name: 'judge_claim',
+    description: 'Judge 提交当前 Node 的判定结果（PASS | FAIL | NEED_CONTEXT）。这必须是当前 Turn 的最后一个动作。',
+    parameters: {
+      nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
+      result: { type: 'string', required: true, enum: ['PASS', 'FAIL', 'NEED_CONTEXT'], description: 'PASS | FAIL | NEED_CONTEXT' },
+      reason: { type: 'string', required: true, description: '判定理由（1..2000 字符）' },
+    },
+    output: stringOut,
+    async execute(args, exec) {
+      const auth = await controlWorkspace(exec.agent, 'judge_claim')
+      if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
+      const reasonError = lengthError('reason', args.reason, LIMITS.reasonMin, LIMITS.reasonMax, true)
+      if (reasonError !== undefined) return `拒绝：${reasonError}`
+      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason, auth.caller)
+      if (outcome.ok) exec.concludeTurn()
+      return fmtResult(outcome)
     },
   }),
 

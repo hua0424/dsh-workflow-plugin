@@ -14,7 +14,7 @@
 
 ## Role Actor
 
-某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用；每次派发新Node前Engine对其执行Node边界compact（`ctx.compaction.compactNow`，历史压缩为checkpoint summary），compact异常进入BLOCK，cold-resume场景跳过并靠DSH auto-compaction兜底；不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping，也不被compact。
+某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用（Session级复用：DSH continuable child在quiescent时Activation被自动释放，后续followup自动cold-resume）；每次派发新Node前Engine对其执行Node边界compact（`ctx.compaction.compactNow`，要求resident idle Agent；实践中派发点Actor通常已被DSH自动settle，compact多为跳过，实际上下文控制依赖DSH auto-compaction兜底——见`docs/pending-discussions/`的A2前提记录），compact异常进入BLOCK；不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping，也不被compact。
 
 ## Judge Role
 
@@ -146,7 +146,7 @@ Manager在current Role Actor无active turn时通过`node_resume(nodeToken,resolu
 
 ## Workflow State Store
 
-`${DSH_HOME}/workflows/state.sqlite3`中按current Manager Session cwd的filesystem canonical realpath分Row保存current Run的最小持久化边界。一个Workspace最多一个Run并永久绑定启动managerSessionId，不同Workspace可并发；其他Session不能接管/推进，但同Workspace任意direct-human Session可用`/dsh-flow reset`只删除本地Row；一个connection/queue串行短写。State只包含catalogWorkflowId、immutable Definition Snapshot、Run identity/status、call stack（含`NodeContextBoundary`）、Role Actor mappings、current model overrides、blockReason、当前`judgeSessionId`映射和判定阶段`pendingClaim{outcome,summary}`；Root frame.workflowId等于catalogWorkflowId；不保存recentEvents、业务对象状态、Judge历史、Checker evidence、Task/Effect、Recovery状态或精确外部副作用历史。历史完全复用DSH Session log。
+`${DSH_HOME}/workflows/state.sqlite3`中按current Manager Session cwd的filesystem canonical realpath分Row保存current Run的最小持久化边界。一个Workspace最多一个Run并永久绑定启动managerSessionId，不同Workspace可并发；其他Session不能接管/推进，但同Workspace任意direct-human Session可用`/dsh-flow reset`只删除本地Row；一个connection/queue串行短写。State只包含catalogWorkflowId、immutable Definition Snapshot、Run identity/status、call stack、当前active Node的`NodeContextBoundary`（串行执行下top frame唯一活跃，实现为Run级单字段，离开Node即重置）、Role Actor mappings、current model overrides、blockReason、当前`judgeSessionId`映射和判定阶段`pendingClaim{outcome,summary}`；Root frame.workflowId等于catalogWorkflowId；不保存recentEvents、业务对象状态、Judge历史、Checker evidence、Task/Effect、Recovery状态或精确外部副作用历史。历史完全复用DSH Session log。
 
 宿主实现确认：Home路径用`resolveDshHome()`（显式配置>`DSH_HOME`环境变量>`~/.dsh`）；cwd取自`agent.session.header.cwd`，缺失时拒绝start；SQLite用内置`node:sqlite`的`DatabaseSync`（与DSH storage-sqlite同款），owner-only目录/文件、WAL、单连接加短mutation队列。Turn结算订阅`session/event`的durable `turn/end`；`subagent/end`是Activation-epoch级、不能用于Node结果关联。自动BLOCK写入必须defer，不能在`session/event`回调内同步append同一Session。
 

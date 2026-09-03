@@ -25,6 +25,8 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
     runProgram: async (ws, nodeToken, parameters) => { calls.push({ name: 'runProgram', args: { ws, nodeToken, parameters } }); return { ok: true, message: 'ran' } },
     resolveProgram: async (ws, nodeToken, result, reason) => { calls.push({ name: 'resolveProgram', args: { ws, nodeToken, result, reason } }); return { ok: true, message: 'resolved' } },
     setRoleModel: async (ws, roleKey, provider, modelId) => { calls.push({ name: 'setRoleModel', args: { ws, roleKey, provider, modelId } }); return { ok: true, message: 'set' } },
+    judgeClaim: async (ws, nodeToken, result, reason, judgeSessionId) => { calls.push({ name: 'judgeClaim', args: { ws, nodeToken, result, reason, judgeSessionId } }); return { ok: true, message: 'claimed' } },
+    respawnJudge: async (ws, nodeToken, reason, caller) => { calls.push({ name: 'respawnJudge', args: { ws, nodeToken, reason, caller } }); return { ok: true, message: 'respawned' } },
     status: async () => ({ ok: true, status: { runId: 'r1', status: 'running' } }),
     inspectGit: async (_ws, operation) => ({ ok: true, value: `git:${operation}` }),
     inspectGithub: async (_ws, operation, milestoneNumber) => ({ ok: true, value: `gh:${operation}:${milestoneNumber ?? ''}` }),
@@ -45,9 +47,11 @@ const EXEC = {
   concludeTurn: () => {},
 }
 
-test('exactly seven workflow tools + two inspection wrappers are registered', () => {
+test('eleven workflow tools + judge_claim/judge_respawn are registered', () => {
   const names = workflowTools.map(t => t.name).sort()
   assert.deepEqual(names, [
+    'judge_claim',
+    'judge_respawn',
     'node_block',
     'node_claim',
     'node_resolve_program',
@@ -123,6 +127,26 @@ test('workflow_status renders host status', async () => {
   const result = await tool.execute({}, EXEC as never)
   assert.match(result as string, /r1/)
   assert.ok(host.calls.length === 0)
+})
+
+test('judge_claim routes to host.judgeClaim and concludes the turn on success', async () => {
+  const host = makeToolHost()
+  const tool = findTool('judge_claim')
+  let concluded = false
+  const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
+  const token = randomUUID()
+  const result = await tool.execute({ nodeToken: token, result: 'PASS', reason: 'verified' }, exec as never)
+  assert.equal(result, 'claimed')
+  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'PASS', reason: 'verified', judgeSessionId: '' } })
+  assert.equal(concluded, true)
+})
+
+test('judge_respawn routes to host.respawnJudge', async () => {
+  const host = makeToolHost()
+  const tool = findTool('judge_respawn')
+  const token = randomUUID()
+  await tool.execute({ nodeToken: token, reason: 'model swap' }, EXEC as never)
+  assert.deepEqual(host.calls[0], { name: 'respawnJudge', args: { ws: 'ws-1', nodeToken: token, reason: 'model swap', caller: '' } })
 })
 
 test('inspection wrappers reject when authorize fails', async () => {

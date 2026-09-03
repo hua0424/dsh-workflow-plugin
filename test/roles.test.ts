@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
-import { resolveRoleModel, roleDenyList, judgeSpawnPlan, judgeResultFromStructured, JUDGE_ALLOW } from '../src/roles/roles.ts'
+import { resolveRoleModel, roleDenyList, judgeSpawnPlan, JUDGE_ALLOW } from '../src/roles/roles.ts'
 import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
@@ -38,6 +38,7 @@ function makeRun(): RunState {
     roleActors: {},
     modelOverrides: {},
     blockReason: null,
+    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
   }
 }
 
@@ -71,15 +72,6 @@ test('judge spawn plan: fixed allow-list + persona + route', () => {
   assert.deepEqual(plan.agentOptions, { provider: 'jp', model: 'jm' })
 })
 
-test('judge allow-list contains exactly the fixed read-only tools', () => {
-  assert.deepEqual([...JUDGE_ALLOW].sort(), ['glob', 'grep', 'read', 'read_image', 'workflow_inspect_git', 'workflow_inspect_github'].sort())
-})
-
-test('judgeResultFromStructured validates the strict output protocol', () => {
-  assert.deepEqual(judgeResultFromStructured({ result: 'PASS', reason: 'ok' }), { result: 'PASS', reason: 'ok' })
-  assert.equal(judgeResultFromStructured({ result: 'MAYBE', reason: 'x' }), undefined)
-  assert.equal(judgeResultFromStructured({ result: 'PASS' }), undefined)
-  assert.equal(judgeResultFromStructured({ result: 'PASS', reason: '  ' }), undefined)
-  assert.equal(judgeResultFromStructured({ result: 'PASS', reason: 'x'.repeat(2001) }), undefined)
-  assert.equal(judgeResultFromStructured(null), undefined)
+test('judge allow-list contains the fixed read-only tools plus judge_claim', () => {
+  assert.deepEqual([...JUDGE_ALLOW].sort(), ['glob', 'grep', 'judge_claim', 'read', 'read_image', 'workflow_inspect_git', 'workflow_inspect_github'].sort())
 })

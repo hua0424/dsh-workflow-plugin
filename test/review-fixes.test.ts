@@ -54,10 +54,14 @@ test('node_resolve_program advances to a non-END target without staying blocked'
     async remove() { mem.run = undefined },
     async listRuns() { return mem.run === undefined ? [] : [{ workspaceKey: 'ws', run: structuredClone(mem.run), version: mem.version }] },
   }
-  const targets: DispatchTargets = { async steerManager() {}, async sendRoleActor() {} }
+  const targets: DispatchTargets = { async steerManager() {}, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } }
   const subagents: SubagentHost = {
-    async ensureRoleActor() { return 'a1' },
-    async runJudge() { return { result: 'PASS', reason: 'ok' } },
+    async ensureRoleActor() { return { childId: 'a1', messageId: 'm' } },
+    async startJudge() { return { judgeSessionId: 'judge-1', messageId: 'm' } },
+    async followupJudge() {},
+    async retireJudge() {},
+    async drainJudge() {},
+    async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },
   }
   const programs: ProgramHost = { async run() { return { kind: 'ERROR', reason: 'network down' } } }
   const engine = new WorkflowEngine(targets, subagents, programs, state)
@@ -68,10 +72,12 @@ test('node_resolve_program advances to a non-END target without staying blocked'
     definitionSnapshot: PROG_CONFIG, status: 'running',
     callStack: [{ workflowId: 'resolve-test', nodeId: 'plan', nodeToken: newNodeToken() }],
     roleActors: {}, modelOverrides: {}, blockReason: null,
+    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
   }
   await engine.startRun('ws', run)
   const token1 = topFrame(mem.run!).nodeToken
   await engine.handleClaim('ws', { nodeToken: token1, outcome: 'completed', summary: 'begun' }, 'm')
+  await engine.handleJudgeClaim('ws', token1, 'PASS', 'begun', 'judge-1')
   await engine.handleTurnEnded('ws', 'm') // deferred dispatch of prog node
   const progToken = topFrame(mem.run!).nodeToken
   // Program ERRORs → BLOCK at prog.

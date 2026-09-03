@@ -32,13 +32,25 @@ export function apply(ctx: Context) {
   const sessionWorkspaces = new Map<string, string>()
   /** Live session → role key for authorization refinement (role actors only). */
   const sessionRoles = new Map<string, string>()
-  /** Fresh Judge sessions (one-shot); allowed to call only the two inspection wrappers. */
+  /** Fresh Judge sessions (continuable); allowed to call judge_claim + the two inspection wrappers. */
   const judgeSessions = new Set<string>()
+  /** Judge session id → workspace key (for authorization). */
+  const judgeWorkspaces = new Map<string, string>()
 
-  /** Register a fresh Judge session for inspection authorization (host adapter). */
+  /** Register a fresh Judge session for inspection + judge_claim authorization. */
   function registerJudgeSession(sessionId: string, cwd: string | undefined): void {
     judgeSessions.add(sessionId)
-    if (cwd !== undefined) sessionWorkspaces.set(sessionId, cwd)
+    if (cwd !== undefined) {
+      sessionWorkspaces.set(sessionId, cwd)
+      judgeWorkspaces.set(sessionId, cwd)
+    }
+  }
+
+  /** Revoke a Judge session's authorization (A1 R11). */
+  function revokeJudgeSession(sessionId: string): void {
+    judgeSessions.delete(sessionId)
+    judgeWorkspaces.delete(sessionId)
+    sessionWorkspaces.delete(sessionId)
   }
 
   /** Register a role-actor session mapping at creation time (host adapter). */
@@ -81,9 +93,9 @@ export function apply(ctx: Context) {
   }
 
   const engine: WorkflowEngine = new WorkflowEngine(
-    makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, registerRoleActorSession }),
-    makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, registerRoleActorSession }, () => engine.frozenRoute),
-    makeProgramHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, registerRoleActorSession }),
+    makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
+    makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute),
+    makeProgramHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
     makeStateHost(store),
   )
   engine.cwdResolver = cwdOf
@@ -146,6 +158,8 @@ export function apply(ctx: Context) {
     runProgram: (ws, nodeToken, parameters, caller) => enqueue(ws, () => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf)),
     resolveProgram: (ws, nodeToken, result, reason, caller) => enqueue(ws, () => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf)),
     setRoleModel: (ws, roleKey, provider, modelId) => enqueue(ws, () => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf)),
+    judgeClaim: (ws, nodeToken, result, reason, judgeSessionId) => enqueue(ws, () => engine.handleJudgeClaim(ws, nodeToken, result, reason, judgeSessionId).then(outcomeOf)),
+    respawnJudge: (ws, nodeToken, reason, caller) => enqueue(ws, () => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf)),
     status: async (ws) => {
       const row = await store.get(ws)
       if (row === undefined) return { ok: true, status: 'no active run' }
@@ -288,16 +302,32 @@ export function apply(ctx: Context) {
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
 
   // ---- Turn-settlement observation (design §4.2 D6) ----
-  // Only MANAGER and mapped ROLE ACTOR sessions settle workflow turns. Judge
-  // sessions (one-shot machinery) must never drive auto-BLOCK or dispatch.
+  // MANAGER and mapped ROLE ACTOR sessions settle workflow turns. Judge
+  // sessions settle through handleJudgeTurnEnded (technical-fault detection).
   ctx.on('session/event', (session, event) => {
     if (event.type !== 'turn/end') return
-    const ws = sessionWorkspaces.get(session.id)
-    if (ws === undefined) return
-    if (judgeSessions.has(session.id)) return
     // Defer: never mutate state inside the append publication lock (design).
+    // Route through the same per-workspace mutation queue as tool-driven
+    // engine calls so a settlement never races an in-flight judge_claim.
     void (async () => {
-      await engine.handleTurnEnded(ws, session.id)
+      if (judgeSessions.has(session.id)) {
+        // Judge turn ended without a judge_claim → technical fault (A4 R1/R5).
+        // A judge_claim that concluded the turn revoked the session mapping
+        // synchronously before this event, so reaching here means no verdict
+        // was submitted. A4 R1: the detail is the stopReason (or equivalent).
+        const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } })?.reason
+        const kind = reason?.kind ?? 'unknown'
+        const errorMessage = reason?.kind === 'error' && reason.error?.message !== undefined ? `: ${reason.error.message}` : ''
+        const detail = kind === 'completed'
+          ? 'judge turn ended without judge_claim'
+          : `judge turn ended (${kind})${errorMessage}`
+        const ws = judgeWorkspaces.get(session.id) ?? ''
+        if (ws !== '') await enqueue(ws, () => engine.handleJudgeTurnEnded(ws, session.id, detail).then(() => undefined))
+        return
+      }
+      const ws = sessionWorkspaces.get(session.id)
+      if (ws === undefined) return
+      await enqueue(ws, () => engine.handleTurnEnded(ws, session.id).then(() => undefined))
     })()
   })
 
