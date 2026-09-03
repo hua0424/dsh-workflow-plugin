@@ -32,7 +32,7 @@
 
 ## Workflow Plugin Bundle
 
-插件以DSH Profile Bundle分发：package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装。Engine、`/dsh-flow`命令、九个Workflow tools和两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。bundle成员变更需重启DSH；home/patch层修改可热载。
+插件以DSH Profile Bundle分发：package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装。Engine、`/dsh-flow`命令、八个Workflow control tools、Judge专用`judge_claim`和两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权；共十一个注册工具）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。bundle成员变更需重启DSH；home/patch层修改可热载。
 
 ## Workflow Definition
 

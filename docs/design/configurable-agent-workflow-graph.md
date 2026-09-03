@@ -128,7 +128,7 @@ Schema已确认精确`agent-workflow/v1`，输入使用受限YAML 1.2：单文�
 
 启动时把完整normalized配置和definitionHash写入Run State。Active Run之后只读取该snapshot并忽略YAML后续修改；新YAML配置只影响下一个Run，不做hot reload/continuity projection。唯一运行中Role replacement来源是Manager显式`workflow_set_role_model`或Actor session不可恢复。
 
-部署形态已确认：插件以DSH Profile Bundle分发——package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装；改动bundle成员需重启DSH，home/patch层修改可热载。Engine、`/dsh-flow`命令、九个Workflow tools与两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。
+部署形态已确认：插件以DSH Profile Bundle分发——package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装；改动bundle成员需重启DSH，home/patch层修改可热载。Engine、`/dsh-flow`命令、八个Workflow control tools、Judge专用`judge_claim`与两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权；共十一个注册工具）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。
 
 ### 2.4 Workflow Definition最小Schema
 
@@ -331,9 +331,9 @@ Manager不进mapping；Judge只以`judgeSessionId`引用进State（当前active/
 
 Manager手工resolve允许任何处于BLOCK的current builtin-program使用：Host只校验caller、Node类型和nodeToken，Manager检查真实现场后提交PASS/FAIL+reason。Actor-task不能绕过Checker，Child Workflow只有END返回PASS且BLOCK只暂停；但Manager可对任何BLOCK中的current builtin-program在检查现场后手工PASS/FAIL。
 
-### 5.2 一个Human Command与九个Model Tools
+### 5.2 一个Human Command与八个Workflow control tools
 
-Direct-human只使用一个`/dsh-flow` Command负责Catalog/list/start/status/reset。Workflow control model-facing闭集为九个；Judge另有专用`judge_claim`与两个固定只读inspection wrappers，不属于Workflow control：
+Direct-human只使用一个`/dsh-flow` Command负责Catalog/list/start/status/reset。Workflow control model-facing闭集为八个；Judge另有专用`judge_claim`与两个固定只读inspection wrappers，不属于Workflow control：
 
 ```text
 workflow_status()

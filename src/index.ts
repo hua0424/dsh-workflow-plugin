@@ -42,17 +42,15 @@ export function apply(ctx: Context) {
     judgeSessions.add(sessionId)
     // S3: store the CANONICAL workspace key (realpath), not the raw header cwd
     // — state rows are keyed by canonical path, and a mismatch would partition
-    // the mutation queue and silently stall the run.
+    // the mutation queue and silently stall the run. If this async lookup fails
+    // or races the Judge's first tool call, authorization falls through to the
+    // durable state row repair in isJudgeSessionOf (A1 R12 fail-closed).
     if (cwd !== undefined) {
       void workspaceKeyOf(cwd).then(ws => {
         if (ws !== undefined) {
           judgeWorkspaces.set(sessionId, ws)
           sessionWorkspaces.set(sessionId, ws)
         }
-        // A resolution failure is NOT swallowed silently: a Judge admitted by
-        // id (judgeSessions) without a workspace mapping fails every
-        // workspace-scoped authorization check until it is repaired, keeping
-        // the system fail-closed (no logging infra in this plugin layer).
       }).catch(() => {})
     }
   }
@@ -84,13 +82,17 @@ export function apply(ctx: Context) {
    * registration time, never through the session id alone.
    */
   async function isJudgeSessionOf(sessionId: string, workspaceKey: string): Promise<boolean> {
-    if (judgeSessions.has(sessionId)) {
-      // Live admission must still match the workspace it was admitted for.
-      return judgeWorkspaces.get(sessionId) === workspaceKey
+    const admittedWorkspace = judgeWorkspaces.get(sessionId)
+    if (admittedWorkspace !== undefined) {
+      // A known live mapping is workspace-scoped: it cannot authorize another
+      // workspace even when the session id remains admitted.
+      return admittedWorkspace === workspaceKey
     }
+    // Missing mapping can be a registration race (async realpath) or a host
+    // restart. Fall back to the durable row in either case; a positive match
+    // repairs the live mappings.
     const row = await store.get(workspaceKey)
     if (row !== undefined && row.run.judgeSessionId === sessionId) {
-      // Repair the live mapping: re-admit the cold-resumed Judge.
       judgeSessions.add(sessionId)
       judgeWorkspaces.set(sessionId, workspaceKey)
       sessionWorkspaces.set(sessionId, workspaceKey)

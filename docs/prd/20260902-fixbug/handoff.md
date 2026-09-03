@@ -96,7 +96,7 @@ pendingClaim?: { outcome, summary, handoffContext? }   // A4，判定阶段持�
 
 - `docs/pending-discussions/live-e2e-issues.md`：已加决策总览表 + 每个问题标「已决策」。
 - `CONTEXT.md`：Role Actor / Judge Agent / Run Frame / Judge Decision Checker / BLOCK / Node Claim / Node Resume / State Store 已按目标语义更新（handoff 持久化方案 2 已回写）。
-- `docs/design/configurable-agent-workflow-graph.md`：state 结构、tool 列表（九个 + `judge_respawn`）、Judge 三层模型、中断恢复、Milestone 示例配置已更新（含 gh milestone title/number 语义、`judge_claim` persona、claim 软约束）。
+- `docs/design/configurable-agent-workflow-graph.md`：state 结构、tool 列表（八个 Workflow control tools + Judge 专用 `judge_claim` + 两个 inspection wrappers）、Judge 三层模型、中断恢复、Milestone 示例配置已更新（含 gh milestone title/number 语义、`judge_claim` persona、claim 软约束）。
 
 ## 8. 参考
 

@@ -46,8 +46,8 @@ export interface JudgeSpawnInput {
   nodeToken: string
   instruction: string
   criteria: string
-  /** A4 R9/R10: the persisted pendingClaim (handoffContext included, 方案 2). */
-  claim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
+  /** A1 R7: the Judge sees only the worker's claim outcome/summary. */
+  claim: { outcome: ClaimOutcome; summary: string }
   cwd: string
 }
 
@@ -537,8 +537,7 @@ export class WorkflowEngine {
           nodeToken: frame.nodeToken,
           instruction: node.execution.instruction ?? '',
           criteria,
-          // The full persisted pendingClaim (handoffContext included, A4 R10).
-          claim: entered.run.pendingClaim!,
+          claim: { outcome: claim.outcome, summary: claim.summary },
           cwd,
         })
       } catch (error) {

@@ -21,7 +21,7 @@ pnpm run test:e2e          → E2E SMOKE PASS
 | `test/state.test.ts`（12） | C1（路径/STRICT/roundtrip/并发冲突）、C2（invariants 全覆盖）、C3（snapshot）、版本冲突 |
 | `test/engine.test.ts`（16） | D1/D3/D4/D5/D6/D7、E4、H1/H2、精确 executor 绑定（非执行者 claim/turn 被拒、非 Manager resume 被拒）、模型切换 active/idle 语义 |
 | `test/authz.test.ts`（6） | G8（manager 全权/role 三工具/judge 两 wrapper/cold-resume/unknown/stale） |
-| `test/tools.test.ts`（17） | G1-G9（工具集恰好九个、路由、concludeTurn、长度校验、授权拒绝路径）、A3/A5 命令语法 |
+| `test/tools.test.ts`（17） | G1-G9（工具集恰好十一个、路由、concludeTurn、长度校验、授权拒绝路径）、A3/A5 命令语法 |
 | `test/roles.test.ts`（6） | E1/E2/E4（路由解析/deny/allow-list/override 拒绝/frozen route） |
 | `test/programs.test.ts`（5） | I1/I2/I3 基础（origin 解析/gh 运行/ENOENT） |
 | `test/judge.test.ts`（11） | F1（投影过滤）、F2/F3（输出协议/边界） |

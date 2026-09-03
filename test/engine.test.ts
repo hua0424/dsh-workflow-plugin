@@ -175,10 +175,10 @@ test('claim spawns a judge, judge_claim PASS advances and defers next dispatch u
   assert.ok(claimOutcome.ok)
   assert.equal(h.judges, 1)
   assert.equal(h.mem.run!.judgeSessionId, 'judge-session-1')
+  // A4 R10: the claim is persisted with its handoff; A1 R7: the Judge packet
+  // itself still receives only outcome/summary, not the handoff text.
   assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned', handoffContext: 'repo=acme/server' })
-  // A4 R10 (评审 R1): the initial Judgment Packet already carries the
-  // persisted handoff — no future rebuild should be able to drop it.
-  assert.deepEqual(h.judgeSpawnInputs[0]!.claim, { outcome: 'completed', summary: 'planned', handoffContext: 'repo=acme/server' })
+  assert.deepEqual(h.judgeSpawnInputs[0]!.claim, { outcome: 'completed', summary: 'planned' })
   assert.equal(h.mem.run!.status, 'running')
   // Judge submits PASS BEFORE the worker's turn settles (fast-verdict ordering).
   const verdict = await h.engine.handleJudgeClaim('ws', token, 'PASS', 'planned ok', 'judge-session-1')
