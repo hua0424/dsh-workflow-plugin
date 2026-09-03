@@ -65,6 +65,18 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   }
 }
 
+/** Best-effort durable existence probe for a reserved Judge Session id. */
+async function judgeSessionExistsInPersistence(ctx: Context, sessionId: string): Promise<boolean> {
+  try {
+    const source = await inspectPersistedSession(ctx, sessionId)
+    return source !== undefined && source.id === sessionId
+  } catch {
+    // A persistence fault is not proof of existence. Fail closed toward
+    // spawn-rebuild, which rebuilds the Judge packet from pendingClaim.
+    return false
+  }
+}
+
 /** Fail-closed Judge tool-surface assertion (design §2.2/E2 + A1 R9). */
 function assertJudgeToolSurface(childAgent: Agent): string | undefined {
   const schemas = childAgent.ctx.tools.schemas(childAgent)
@@ -263,6 +275,10 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       }
       adapters.registerJudgeSession(started.childId, input.cwd)
       return { judgeSessionId: started.childId, messageId: started.messageId }
+    },
+
+    async judgeSessionExists(judgeSessionId) {
+      return judgeSessionExistsInPersistence(adapters.ctx, judgeSessionId)
     },
 
     async followupJudge(run, judgeSessionId, text) {

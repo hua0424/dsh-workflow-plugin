@@ -78,6 +78,7 @@ interface Harness {
   judgeSpawnFailure: Error | undefined
   judgeSpawnGate: Promise<void> | undefined
   releaseJudgeSpawn: () => void
+  judgeSessionExists: (id: string) => Promise<boolean>
   actorCreated: boolean
   compacts: string[]
   compactResult: { ok: boolean; detail?: string }
@@ -98,6 +99,7 @@ function makeHarness(): Harness {
     judgeSpawnFailure: undefined,
     judgeSpawnGate: undefined,
     releaseJudgeSpawn: () => {},
+    judgeSessionExists: async () => true,
     actorCreated: false,
     compacts: [],
     compactResult: { ok: true, detail: 'no compactable range' },
@@ -126,6 +128,7 @@ function makeHarness(): Harness {
       return { judgeSessionId: input.judgeSessionId, messageId: 'msg-judge' }
     },
     async followupJudge(_run, _judgeSessionId, text) { h.judgeFollowups.push(text) },
+    async judgeSessionExists(id) { return h.judgeSessionExists(id) },
     async retireJudge(_run, judgeSessionId) { h.retiredJudges.push(judgeSessionId) },
     async drainJudge(_run, judgeSessionId) { h.drainedJudges.push(judgeSessionId) },
     async compactRoleActor(_run, roleKey) { h.compacts.push(roleKey); return h.compactResult },
@@ -467,6 +470,37 @@ test('restart reconciliation blocks every running row', async () => {
   await h.engine.handleRestartReconcile()
   assert.equal(h.mem.run!.status, 'blocked')
   assert.equal(h.mem.run!.blockReason, 'host-restarted-before-node-result')
+})
+
+test('restart reconciliation clears a reserved Judge id whose Session never materialized', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+  const reserved = h.mem.run!.judgeSessionId
+  assert.ok(reserved !== undefined)
+  // Host crash before admission: the id exists in State but no Session exists.
+  h.judgeSessionExists = async () => false
+  await h.engine.handleRestartReconcile()
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.equal(h.mem.run!.blockReason, 'host-restarted-before-node-result')
+  assert.equal(h.mem.run!.judgeSessionId, undefined)
+  // node_resume must now rebuild a Judge instead of following up the phantom.
+  const resumed = await h.engine.handleResume('ws', token, 'rebuild after restart', MANAGER)
+  assert.ok(resumed.ok)
+  assert.equal(h.mem.run!.judgeSessionId, reservedJudgeId(h))
+  assert.notEqual(h.mem.run!.judgeSessionId, reserved)
+})
+
+test('restart reconciliation keeps an existing Judge session id', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+  const reserved = h.mem.run!.judgeSessionId
+  assert.ok(reserved !== undefined)
+  await h.engine.handleRestartReconcile()
+  assert.equal(h.mem.run!.judgeSessionId, reserved)
 })
 
 test('reset removes the row', async () => {
