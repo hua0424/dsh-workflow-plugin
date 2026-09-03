@@ -18,8 +18,12 @@ export const JUDGE_ALLOW = [
   'judge_claim',
 ] as const
 
-/** Delegation machinery names the child runtime may register into its own layer (never visible-filtered). */
-export const JUDGE_MACHINERY_EXEMPT: readonly string[] = []
+/**
+ * Delegation machinery names the child runtime may register into its own
+ * layer (never visible-filtered). Single source of truth for the
+ * fail-closed tool-surface assertion (used by the plugin adapter, host.ts).
+ */
+export const JUDGE_MACHINERY_EXEMPT = ['report', 'structured_output'] as const
 
 /** Resolve a Role's effective model route: override > role def > frozen Manager route. */
 export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: { provider?: string; model?: string }): { provider?: string; model?: string } {

@@ -1,9 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseJudgeClaim, renderJudgePrompt } from '../src/judge/checker.ts'
-import { projectNodeLocal, projectSessionSurface, messageText } from '../src/judge/projection.ts'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { projectNodeLocal, projectSessionSurface, messageText, type ProjectionSource } from '../src/judge/projection.ts'
+import { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { SUBMISSION_CONSTRAINT } from '../src/engine/texts.ts'
 
 function makeSession(events: Array<{ type: string; data: unknown; surfaceOp?: unknown }>): Session {
   const id = 'sess-test' as SessionId
@@ -15,6 +16,15 @@ function makeSession(events: Array<{ type: string; data: unknown; surfaceOp?: un
     ;(session.append as (t: string, d: unknown, ...opts: unknown[]) => unknown)(event.type, event.data, ...opts)
   }
   return session
+}
+
+/** A synthetic projection source with FULL control over event time/seq (AC4). */
+function makeSource(id: string, events: Array<{ time: number; seq: number; type: string; data: unknown; surfaceOp?: string }>): ProjectionSource {
+  return {
+    id,
+    seq: events.reduce((max, e) => Math.max(max, e.seq + 1), 0),
+    events: events.map(e => ({ type: e.type, seq: e.seq, time: e.time, data: e.data, surfaceOp: e.surfaceOp ?? 'append' }) as SessionEvent),
+  }
 }
 
 test('parseJudgeClaim accepts PASS/FAIL/NEED_CONTEXT', () => {
@@ -135,6 +145,72 @@ test('ACTOR projection keeps coordinator relay dispatch text; MANAGER projection
   const actorView = projectSessionSurface(s, 0, 'ACTOR')
   assert.equal(actorView.length, 1)
   assert.match(actorView[0]!.text, /repo=acme\/server/)
+})
+
+test('the A3 submission constraint is stripped from the projected dispatch text (A3 R1/AC6)', () => {
+  const relay = createUserMessage({
+    content: [{ type: 'text', text: `[instruction]\nBuild it.${SUBMISSION_CONSTRAINT}` }],
+    source: { kind: 'coordinator', form: 'relay', senderSessionId: 'manager-1' },
+  })
+  const s = makeSession([{ type: 'user/message', data: relay, surfaceOp: 'append' }])
+  const out = projectSessionSurface(s, 0, 'ACTOR')
+  assert.equal(out.length, 1)
+  assert.match(out[0]!.text, /Build it\./)
+  assert.doesNotMatch(out[0]!.text, /提交要求/)
+  assert.doesNotMatch(out[0]!.text, /node_claim/)
+})
+
+test('manager-session user messages project as USER, assistant output as MANAGER (A1 R3)', () => {
+  const user = createUserMessage({ content: [{ type: 'text', text: 'human question' }], source: { kind: 'user' } })
+  const assistant = { turn: 1, step: 1, message: { id: 'm' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'manager answer' }], source: { kind: 'model', model: 'm' } } }
+  const s = makeSession([
+    { type: 'user/message', data: user, surfaceOp: 'append' },
+    { type: 'assistant/message', data: assistant, surfaceOp: 'append' },
+  ])
+  const out = projectSessionSurface(s, 0, 'MANAGER')
+  assert.equal(out.length, 2)
+  assert.equal(out[0]!.role, 'USER')
+  assert.equal(out[1]!.role, 'MANAGER')
+  const text = projectNodeLocal(s, { dispatchedAt: 0, managerFromSeq: 0 })
+  assert.match(text, /\[USER\]\nhuman question/)
+  assert.match(text, /\[MANAGER\]\nmanager answer/)
+})
+
+test('equal-time cross-session events order by stable session id, seq only within a session (A1 R3/AC4)', () => {
+  const userMsg = createUserMessage({ content: [{ type: 'text', text: 'user event' }], source: { kind: 'user' } })
+  const managerAssistant = { turn: 1, step: 1, message: { id: 'ma' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'manager event' }], source: { kind: 'model', model: 'm' } } }
+  const actorAssistant = { turn: 1, step: 1, message: { id: 'aa' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'actor event' }], source: { kind: 'model', model: 'm' } } }
+  // All three events share time=100; session ids: manager-session < actor-session.
+  const manager = makeSource('manager-session', [
+    { time: 100, seq: 7, type: 'user/message', data: userMsg },
+    { time: 100, seq: 8, type: 'assistant/message', data: managerAssistant },
+  ])
+  const actor = makeSource('actor-session', [
+    { time: 100, seq: 1, type: 'assistant/message', data: actorAssistant },
+  ])
+  const boundary = { dispatchedAt: 100, managerFromSeq: 0, executorSessionId: 'actor-session', executorDispatchMessageId: 'actor-dispatch' }
+  // The actor cursor cannot locate 'actor-dispatch' (fail closed) → only the
+  // manager surface projects; within it seq 7 < seq 8 at equal time.
+  const text = projectNodeLocal(manager, boundary, actor)
+  const userAt = text.indexOf('user event')
+  const managerAt = text.indexOf('manager event')
+  assert.ok(userAt !== -1 && managerAt !== -1)
+  assert.ok(userAt < managerAt, 'within-session seq orders equal-time events')
+  assert.doesNotMatch(text, /actor event/)
+  // Cross-session equal-time tie-break: give the actor a matchable dispatch id
+  // so both surfaces project; manager-session < actor-session → manager first.
+  const dispatch = { id: 'actor-dispatch' as never, role: 'user' as const, content: [{ type: 'text' as const, text: 'actor dispatch' }], source: { kind: 'user' as const } }
+  const actor2 = makeSource('actor-session', [
+    { time: 100, seq: 0, type: 'user/message', data: dispatch },
+    { time: 100, seq: 1, type: 'assistant/message', data: actorAssistant },
+  ])
+  const text2 = projectNodeLocal(manager, boundary, actor2)
+  const managerAt2 = text2.indexOf('manager event')
+  const actorAt2 = text2.indexOf('actor event')
+  assert.ok(managerAt2 !== -1 && actorAt2 !== -1)
+  // 'actor-session' < 'manager-session' lexicographically → the actor surface
+  // precedes the manager surface at equal time (stable, deterministic).
+  assert.ok(actorAt2 < managerAt2, 'stable session-id tie-break across sessions at equal time')
 })
 
 test('messageText extracts only text blocks', () => {

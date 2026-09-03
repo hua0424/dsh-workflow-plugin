@@ -1,8 +1,8 @@
 /**
  * dsh-agent-team-workflow — plugin entry (design §2.3 deployment).
  *
- * Cordis plugin: registers /dsh-flow command + seven workflow tools + two
- * inspection wrappers, owns the state store + engine, and subscribes to
+ * Cordis plugin: registers /dsh-flow command + workflow tools + inspection
+ * wrappers, owns the state store + engine, and subscribes to
  * session/event for turn-settlement observation.
  */
 import { Context } from '@deepseek-ai/cordis'
@@ -40,9 +40,16 @@ export function apply(ctx: Context) {
   /** Register a fresh Judge session for inspection + judge_claim authorization. */
   function registerJudgeSession(sessionId: string, cwd: string | undefined): void {
     judgeSessions.add(sessionId)
+    // S3: store the CANONICAL workspace key (realpath), not the raw header cwd
+    // — state rows are keyed by canonical path, and a mismatch would partition
+    // the mutation queue and silently stall the run.
     if (cwd !== undefined) {
-      sessionWorkspaces.set(sessionId, cwd)
-      judgeWorkspaces.set(sessionId, cwd)
+      void workspaceKeyOf(cwd).then(ws => {
+        if (ws !== undefined) {
+          judgeWorkspaces.set(sessionId, ws)
+          sessionWorkspaces.set(sessionId, ws)
+        }
+      }).catch(() => {})
     }
   }
 
@@ -51,6 +58,33 @@ export function apply(ctx: Context) {
     judgeSessions.delete(sessionId)
     judgeWorkspaces.delete(sessionId)
     sessionWorkspaces.delete(sessionId)
+  }
+
+  /**
+   * S1: durable Judge repair after a host restart. The in-memory Judge sets
+   * are empty, but running/blocked rows still carry `judgeSessionId`. A
+   * cold-resumed Judge is re-admitted as the current node's judge when its
+   * session id matches the durable row.
+   */
+  async function durableJudgeWorkspace(sessionId: string): Promise<string | undefined> {
+    for (const row of await store.list()) {
+      if (row.run.judgeSessionId === sessionId) return row.workspaceKey
+    }
+    return undefined
+  }
+
+  /** Whether a session is (or durably claims to be) the current node's Judge. */
+  async function isJudgeSessionOf(sessionId: string, workspaceKey: string): Promise<boolean> {
+    if (judgeSessions.has(sessionId)) return true
+    const row = await store.get(workspaceKey)
+    if (row !== undefined && row.run.judgeSessionId === sessionId) {
+      // Repair the live mapping: re-admit the cold-resumed Judge.
+      judgeSessions.add(sessionId)
+      judgeWorkspaces.set(sessionId, workspaceKey)
+      sessionWorkspaces.set(sessionId, workspaceKey)
+      return true
+    }
+    return false
   }
 
   /** Register a role-actor session mapping at creation time (host adapter). */
@@ -136,11 +170,14 @@ export function apply(ctx: Context) {
     if (ws === undefined) return { workspaceKey: null, reason: 'no workspace for this session' }
     const row = await store.get(ws)
     if (row === undefined) return { workspaceKey: null, reason: 'no active run in this workspace' }
+    // S1: a cold-resumed Judge is re-admitted when its id matches the durable
+    // row's current judgeSessionId (host-restart repair).
+    const judge = await isJudgeSessionOf(sessionId, ws)
     const decision = authorizeToolCall({
       run: row.run,
       sessionId,
       knownRoleOfSession: sessionRoles.get(sessionId),
-      isJudgeSession: judgeSessions.has(sessionId),
+      isJudgeSession: judge,
       toolName,
     })
     if (!decision.allow) return { workspaceKey: null, reason: decision.reason }
@@ -249,6 +286,12 @@ export function apply(ctx: Context) {
       sessionWorkspaces.set(info.id, ws)
       const row = await store.get(ws)
       if (row === undefined) return
+      // S1: a cold-resumed JUDGE child re-registers via the durable row.
+      if (row.run.judgeSessionId === info.id) {
+        judgeSessions.add(info.id)
+        judgeWorkspaces.set(info.id, ws)
+        return
+      }
       for (const [roleKey, actorId] of Object.entries(row.run.roleActors)) {
         if (actorId === info.id) {
           sessionRoles.set(info.id, roleKey)
@@ -310,19 +353,31 @@ export function apply(ctx: Context) {
     // Route through the same per-workspace mutation queue as tool-driven
     // engine calls so a settlement never races an in-flight judge_claim.
     void (async () => {
-      if (judgeSessions.has(session.id)) {
-        // Judge turn ended without a judge_claim → technical fault (A4 R1/R5).
-        // A judge_claim that concluded the turn revoked the session mapping
-        // synchronously before this event, so reaching here means no verdict
-        // was submitted. A4 R1: the detail is the stopReason (or equivalent).
+      // S1: in-memory Judge sets are empty after a host restart — fall back to
+      // the durable rows so a cold-resumed Judge's turn/end still routes to
+      // handleJudgeTurnEnded (A4 R4/A1 R12).
+      const liveWs = judgeWorkspaces.get(session.id)
+      if (liveWs !== undefined) {
         const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } })?.reason
         const kind = reason?.kind ?? 'unknown'
         const errorMessage = reason?.kind === 'error' && reason.error?.message !== undefined ? `: ${reason.error.message}` : ''
         const detail = kind === 'completed'
           ? 'judge turn ended without judge_claim'
           : `judge turn ended (${kind})${errorMessage}`
-        const ws = judgeWorkspaces.get(session.id) ?? ''
-        if (ws !== '') await enqueue(ws, () => engine.handleJudgeTurnEnded(ws, session.id, detail).then(() => undefined))
+        await enqueue(liveWs, () => engine.handleJudgeTurnEnded(liveWs, session.id, detail).then(() => undefined))
+        return
+      }
+      const durableWs = await durableJudgeWorkspace(session.id)
+      if (durableWs !== undefined) {
+        judgeWorkspaces.set(session.id, durableWs)
+        sessionWorkspaces.set(session.id, durableWs)
+        const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } })?.reason
+        const kind = reason?.kind ?? 'unknown'
+        const errorMessage = reason?.kind === 'error' && reason.error?.message !== undefined ? `: ${reason.error.message}` : ''
+        const detail = kind === 'completed'
+          ? 'judge turn ended without judge_claim'
+          : `judge turn ended (${kind})${errorMessage}`
+        await enqueue(durableWs, () => engine.handleJudgeTurnEnded(durableWs, session.id, detail).then(() => undefined))
         return
       }
       const ws = sessionWorkspaces.get(session.id)

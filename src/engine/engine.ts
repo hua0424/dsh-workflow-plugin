@@ -7,9 +7,7 @@ import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome } fro
 import { WorkflowError, LIMITS } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { createRunLog, appendLine } from './tracelog.ts'
-
-/** A3 R1: the submission hard constraint appended to every actor-task dispatch. */
-const SUBMISSION_CONSTRAINT = `\n\n[提交要求]\n完成后必须调用 node_claim 提交结果（outcome: completed | failed，并附 summary）。\n仅输出文字不视为提交，会导致当前 Node BLOCK。`
+import { SUBMISSION_CONSTRAINT } from './texts.ts'
 
 /** A2 R4: marker prefix compactBeforeDispatch throws with (for clean BLOCK routing). */
 const COMPACT_FAIL_PREFIX = 'node-boundary compact failed: '
@@ -170,8 +168,6 @@ export class WorkflowEngine {
 
   private readonly dispatchBook = new Map<string, DispatchBook>()
   private readonly inFlight = new Map<string, string>() // workspaceKey → operation kind
-  /** nodeToken → transient handoffContext (not persisted; design §2.6/A4 R9). */
-  private readonly handoffByToken = new Map<string, string | undefined>()
   /** runId → trace-log file path (PRD workflow-run-logging R1; in-memory only). */
   private readonly logFiles = new Map<string, string>()
   private readonly targets: DispatchTargets
@@ -294,11 +290,16 @@ export class WorkflowEngine {
           if (!isSameNodeResume) {
             await this.compactBeforeDispatch(run, roleKey)
           }
+          // A1 R2: capture the boundary cursors BEFORE the followup await — a
+          // manager message landing during the send belongs to this node's
+          // projection window, exactly like the first-creation path.
+          const dispatchedAt = Date.now()
+          const managerFromSeq = this.targets.managerSessionSeq(run)
           const { messageId } = await this.targets.sendRoleActor(run, roleKey, dispatchText)
           if (!isSameNodeResume) {
             run.nodeBoundary = {
-              dispatchedAt: Date.now(),
-              managerFromSeq: this.targets.managerSessionSeq(run),
+              dispatchedAt,
+              managerFromSeq,
               executorSessionId: existing,
               executorDispatchMessageId: messageId,
             }
@@ -360,8 +361,7 @@ export class WorkflowEngine {
     const frame = topFrame(run)
     const node = this.nodeAt(run, frame)
     if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
-    // A1 R4: leaving the node invalidates its context boundary.
-    run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
+    // The verdict always ends the judgment phase.
     delete run.judgeSessionId
     delete run.pendingClaim
     // R3: log the routing decision as `NODE <workflowId>/<nodeId> <verdict> -> <target>`.
@@ -374,6 +374,8 @@ export class WorkflowEngine {
           run.status = 'completed'
           run.callStack = []
           run.blockReason = null
+          // A1 R4: the node has left; the boundary is invalid.
+          run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
           return
         }
         run.callStack.pop()
@@ -383,6 +385,8 @@ export class WorkflowEngine {
       route(`PASS -> ${target}`)
       frame.nodeId = target
       frame.nodeToken = newNodeToken()
+      // A1 R4: the node has left; the next dispatch establishes a fresh boundary.
+      run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
       return
     }
     const target = node.onFail
@@ -390,11 +394,15 @@ export class WorkflowEngine {
       route('FAIL -> BLOCK')
       run.status = 'blocked'
       run.blockReason = `checker FAIL${reason.trim() !== '' ? `: ${reason.trim()}` : ''} and no onFail edge`
+      // A1 R4: FAIL with no onFail keeps the node — the boundary is RETAINED so
+      // a resume preserves this node's local history (and A2 R6 skips compact).
       return
     }
     route(`FAIL -> ${target}`)
     frame.nodeId = target
     frame.nodeToken = newNodeToken()
+    // A1 R4: the node has left via the onFail edge.
+    run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
   }
 
   /** Dispatch the current node NOW (start/resume), then persist. */
@@ -516,10 +524,9 @@ export class WorkflowEngine {
         return { ok: false, reason: 'stale claim discarded: the node moved or blocked meanwhile' }
       }
       entered.run.pendingClaim = { outcome: claim.outcome, summary: claim.summary }
-      // handoffContext is transient (design §2.6): stash it for the verdict phase.
-      this.handoffByToken.set(frame.nodeToken, claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== ''
-        ? claim.handoffContext
-        : undefined)
+      if (claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== '') {
+        entered.run.pendingClaim.handoffContext = claim.handoffContext.trim()
+      }
       await this.state.put(workspaceKey, entered.run, entered.version)
 
       // A4 R1: spawn failure becomes a judge technical fault → BLOCK with detail.
@@ -609,8 +616,7 @@ export class WorkflowEngine {
       return { ok: true, run, message: run.blockReason }
     }
     // PASS/FAIL: apply the edge and retire the judge.
-    const handoff = this.handoffByToken.get(frame.nodeToken)
-    this.handoffByToken.delete(frame.nodeToken)
+    const handoff = run.pendingClaim?.handoffContext
     this.advance(run, result, reason)
     // A1 R11: retire the judge (revoke authorization; the resident Activation
     // is released by DSH's settlement watcher once its turn ends). Never drain
@@ -621,12 +627,26 @@ export class WorkflowEngine {
     // Otherwise defer to that settlement (handleTurnEnded's pendingDispatch
     // branch) so we never dispatch into a still-open executor turn.
     const book = this.dispatchBook.get(workspaceKey)
-    if (book !== undefined && !book.workerSettled) {
+    const workerStillActive = await this.executorActive(run)
+    if (workerStillActive || (book !== undefined && !book.workerSettled)) {
       await this.persistDeferred(workspaceKey, run, version, handoff ?? null)
     } else {
       await this.dispatchNow(workspaceKey, run, version, handoff ?? null)
     }
     return { ok: true, run, message: `checker ${result}` }
+  }
+
+  /**
+   * Whether the run's current executor still has an active (unsettled) turn.
+   * Manager sessions are never treated as active here — the Manager can always
+   * be steered; only role actors need the F13 wait. Used after judgment-phase
+   * BLOCKs, where the dispatch book is gone (S9 hardening).
+   */
+  private async executorActive(run: RunState): Promise<boolean> {
+    if (run.status !== 'running' || run.callStack.length === 0) return false
+    const executor = executorSessionOf(run)
+    if (executor === '' || executor === run.managerSessionId) return false
+    return await this.actorActivity(executor) === 'active'
   }
 
   /**
@@ -732,10 +752,6 @@ export class WorkflowEngine {
       run.status = 'running'
       run.blockReason = null
       frame.nodeToken = newNodeToken()
-      // The claim's handoffContext was keyed by the pre-rotation token; a
-      // later PASS looks it up by the CURRENT token — migrate it across the
-      // rotation so the handoff survives NEED_CONTEXT / fault recovery.
-      this.rotateHandoffKey(nodeToken, frame.nodeToken)
       if (run.judgeSessionId !== undefined) {
         // followup the SAME judge (A1 R10 / A4 R3); do not re-dispatch the actor.
         const followup = `[manager resolution]\n${resolutionContext}\n\n请用新的 nodeToken "${frame.nodeToken}" 继续判定，并再次调用 judge_claim 提交。`
@@ -784,19 +800,8 @@ export class WorkflowEngine {
     run.status = 'running'
     run.blockReason = null
     frame.nodeToken = newNodeToken()
-    // A plain BLOCK→resume also rotates the token; keep any handoff the worker
-    // re-claimed under the old token reachable for a later PASS (S3 fix).
-    this.rotateHandoffKey(nodeToken, frame.nodeToken)
     await this.dispatchNow(workspaceKey, run, version, resolutionContext)
     return { ok: true, run, message: run.blockReason ?? `resumed: ${resolutionContext.slice(0, 120)}` }
-  }
-
-  /** Re-key the transient handoffContext across a nodeToken rotation (S3). */
-  private rotateHandoffKey(oldToken: string, newToken: string): void {
-    if (!this.handoffByToken.has(oldToken)) return
-    const handoff = this.handoffByToken.get(oldToken)
-    this.handoffByToken.delete(oldToken)
-    this.handoffByToken.set(newToken, handoff)
   }
 
   /** Handle node_run_program (design §5.2 G5). */

@@ -68,16 +68,18 @@
 最终 `RunState` 增量（相对现状）仅：
 
 ```
-nodeBoundary: NodeContextBoundary   // A1，Node 实际派发时建立
-judgeSessionId?: string             // A1/A4，当前 active/pending Judge
-pendingClaim?: { outcome, summary } // A4，判定阶段持有，判定结束清除
+nodeBoundary: NodeContextBoundary                      // A1，Node 实际派发时建立
+judgeSessionId?: string                                // A1/A4，当前 active/pending Judge
+pendingClaim?: { outcome, summary, handoffContext? }   // A4，判定阶段持有，判定结束清除
 ```
+
+`handoffContext` 随 claim 持久化进 `pendingClaim`（评审修正「方案 2」）：仅 `completed` 且非空时写入，判定结束随 claim 一起清除，Host 重启不丢 handoff。
 
 不新增 `faultKind`、Judge 历史映射、跨 Node Decision Context、Manager 摘要。
 
 ## 5. 关键约束与非目标（避免实现时跑偏）
 
-- Judge 每 Node 一个新 Session；同一 Node 内 `NEED_CONTEXT` 可 followup；跨 Node 不复用；Node 完成后释放活跃资源（GUI 历史条目清理**不做**）。
+- Judge 每 Node 一个新 Session；同一 Node 内 `NEED_CONTEXT` 可 followup；跨 Node 不复用；Node 完成后释放活跃资源（**只撤销授权**，Activation 由 DSH settlement watcher 自动释放；**禁止在 Judge 自己的 `judge_claim` turn 内 drain 自己**，避免 self-cancel 死锁；GUI 历史条目清理**不做**）。
 - 技术故障**不自动重试**，一律 BLOCK 升级给 Manager。
 - 恢复控制流**只看 `judgeSessionId` 是否存在**，不看故障分类；引擎**不做** followup 失败的自动兜底。
 - token 显式传参**保持不动**，不做 turn/message 自动绑定（C1 已知限制）。
@@ -85,10 +87,10 @@ pendingClaim?: { outcome, summary } // A4，判定阶段持有，判定结束清
 
 ## 6. 验收与门禁
 
-- 每个 PRD 末尾的「验收标准」是硬门禁（A1 AC1–AC11、A4 AC1–AC11、A2 AC1–AC9、A3 AC1–AC7）。
+- 每个 PRD 末尾的「验收标准」是硬门禁（A1 AC1–AC11、A4 AC1–AC11、A2 AC1–AC9、A3 AC1–AC7）。**例外：A2 AC1 已按评审修正降级为条件性 AC（resident idle Actor 存在时 best-effort compact），A2 AC8 挂起至 DSH maintenance API 支持后验收（见 `docs/pending-discussions/a2-compact-residency-premise.md`）。**
 - 全量回归：现有 10 个测试文件 + `scripts/e2e-smoke.mjs` 必须通过；`pnpm run build` 干净。
 - 注意 `scripts/e2e-smoke.mjs` 里的 `runJudge` 是 stub，改 Judge 为 continuable 后该 stub 需要适配（或改 stub 模拟 `judge_claim` 路径），保证 e2e smoke 仍走真实 engine 路径。
-- 完成后跑真实 e2e（`milestone-delivery`）验证 A1–A4 的实际效果。
+- 完成后跑真实 e2e（`milestone-delivery`）验证 A1–A4 的实际效果。**（评审后状态：合成 e2e smoke 已通过；真实 milestone-delivery 由用户人工运行验证。）**
 
 ## 7. 已完成的文档回写（无需重做）
 

@@ -1,7 +1,7 @@
 /**
- * The seven workflow-control tools + two read-only inspection wrappers
- * (design §5.2 G1-G9). Pure definitions + execute closures over a ToolHost
- * interface, so the whole tool layer is unit-testable without the host.
+ * The workflow-control tools (design §5.2 G1-G9) + the read-only inspection
+ * wrappers. Pure definitions + execute closures over a ToolHost interface, so
+ * the whole tool layer is unit-testable without the host.
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'

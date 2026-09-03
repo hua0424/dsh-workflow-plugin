@@ -60,6 +60,21 @@ try {
   }
 
   const dispatchLog = []
+  /** Per-verdict settlement: each scripted judge verdict resolves its own waiter. */
+  let verdictsApplied = 0
+  const verdictWaiters = []
+  function waitVerdict() {
+    if (verdictsApplied > 0) {
+      verdictsApplied -= 1
+      return Promise.resolve()
+    }
+    return new Promise(resolve => verdictWaiters.push(resolve))
+  }
+  function noteVerdict() {
+    const waiter = verdictWaiters.shift()
+    if (waiter !== undefined) waiter()
+    else verdictsApplied += 1
+  }
   const subagents = {
     async ensureRoleActor(_run, role, initialText) {
       dispatchLog.push(`role[${role}](create): ${initialText.split('\n')[0]}`)
@@ -84,6 +99,7 @@ try {
       // after them), mirroring a real async judge turn.
       setTimeout(() => {
         void engine.handleJudgeClaim(workspaceKey, input.nodeToken, verdict, reason, 'judge-session-1')
+          .then(outcome => { if (outcome.ok) noteVerdict() })
       }, 0)
       return { judgeSessionId: 'judge-session-1', messageId: 'judge-msg-1' }
     },
@@ -127,9 +143,9 @@ try {
     if (row.run.status !== 'running') throw new Error(`false BLOCK after a claiming turn: ${row.run.status} / ${row.run.blockReason}`)
     console.log('   turn settled mid-judgment: no false BLOCK ✓')
   }
-  // The scripted judge verdict lands on a macrotask; await it. Because the
-  // worker already settled, the PASS must dispatch the next node immediately.
-  await new Promise(r => setTimeout(r, 20))
+  // The scripted judge verdict lands asynchronously; await its application
+  // (deterministic — no fixed-time sleeps).
+  await waitVerdict()
   let current = await stateHost.get(workspaceKey)
   if (current === undefined) throw new Error('row vanished after verdict')
   console.log('   frame after verdict:', topFrame(current.run).nodeId, '| dispatch:', dispatchLog.at(-1))
@@ -144,7 +160,7 @@ try {
   // Same production ordering: the actor's turn settles before the verdict.
   const settle2 = await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
   if (settle2 !== undefined) throw new Error(`unexpected actor turn settlement: ${JSON.stringify(settle2)}`)
-  await new Promise(r => setTimeout(r, 20))
+  await waitVerdict()
   const final = await stateHost.get(workspaceKey)
   if (final === undefined) throw new Error('row vanished at the end')
   console.log('4. FINAL:', final.run.status, '| callStack:', JSON.stringify(final.run.callStack))

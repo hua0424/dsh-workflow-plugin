@@ -81,14 +81,14 @@ compact 只发生在「进入新 Node」的派发点。同一 Node 内的 BLOCK/
 
 ## 8. 验收标准
 
-- **AC1 边界 compact**：已有历史的 Role Actor 在派发新 Node 前被执行一次 `compactNow`，compact 成功后再派发。
+- **AC1 边界 compact**：已有历史且仍 resident 的 Role Actor 在派发新 Node 前被执行一次 `compactNow`，compact 成功后再派发。**（评审修正：受 DSH continuable 语义限制降级为条件性 AC——continuable child quiescent 后 Activation 被 settlement watcher 自动释放，派发点通常已无 resident Agent，实际触发 compact 的机会有限；未触发时按 AC6 语义跳过。）**
 - **AC2 Manager 豁免**：Manager actor-task 派发前不触发 compact。
 - **AC3 首次创建豁免**：Role Actor 首次创建（无历史）不 compact，直接创建并派发。
 - **AC4 无内容可压**：`compactNow` 返回 `null` 时正常继续派发，不 BLOCK。
 - **AC5 compact 失败 BLOCK**：`compactNow` 抛 `ManualCompactionError` 时 Node BLOCK，`blockReason` 含可读 detail，并通知 Manager。
 - **AC6 cold-resume 跳过**：Actor 无 resident Agent 时跳过 compact，`followup` 走 cold-resume 正常派发。
 - **AC7 Node 内不重复**：同一 Node 的 BLOCK/resume 不触发第二次 compact；进入下一 Node 才再次 compact。
-- **AC8 上下文受控**：连续执行多个 Node 的 Actor，其模型上下文为「checkpoint summary + 当前 Node 内容」，旧 Node 历史被 shadow，不再线性累积。
+- **AC8 上下文受控**：**（评审修正：当前 DSH 语义下不可达成，挂起）** 连续执行多个 Node 的 Actor，其模型上下文为「checkpoint summary + 当前 Node 内容」的理想目标；实际由 DSH pressure-based auto-compaction 兜底。待真实 e2e 数据与 DSH maintenance API 支持后再验收（见 `docs/pending-discussions/a2-compact-residency-premise.md`）。
 - **AC9 回归门禁**：现有单元 / engine / e2e smoke 全过，并新增 Node 边界 compact、compact 失败 BLOCK、cold-resume 跳过的覆盖。
 
 ## 9. 已确认决策
@@ -97,3 +97,4 @@ compact 只发生在「进入新 Node」的派发点。同一 Node 内的 BLOCK/
 2. compact 失败（异常）→ BLOCK；无可压内容（`null`）→ 继续派发。
 3. cold-resume 场景跳过 compact，靠 DSH auto-compaction 兜底。
 4. Manager 不 compact。
+5. **（评审补充）** resident idle Agent 存在时 best-effort compact；resident 不存在时静默跳过（现状），AC1/AC8 的完整达成依赖 DSH 提供 maintenance-resume 类能力，真实 e2e 后再定。

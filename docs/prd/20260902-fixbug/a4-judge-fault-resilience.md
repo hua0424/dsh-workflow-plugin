@@ -120,7 +120,7 @@ judge_respawn({
 
 ### R9：判定阶段持有
 
-Worker 的 `node_claim` 目前是 transient。为保证 spawn 重建能重投完整 Judgment Packet，claim 一旦进入判定阶段即持久化 `{ outcome, summary }`：
+Worker 的 `node_claim` 目前是 transient。为保证 spawn 重建能重投完整 Judgment Packet，claim 一旦进入判定阶段即持久化 `{ outcome, summary, handoffContext? }`：
 
 - 判定阶段开始（claim 接受、进入 Judge 判定）→ 写入 `pendingClaim`；
 - Judge 产出 PASS/FAIL → 清除 `pendingClaim`；
@@ -128,13 +128,24 @@ Worker 的 `node_claim` 目前是 transient。为保证 spawn 重建能重投完
 
 `pendingClaim` 记录的是 **Worker 提交的 claim 结果**，不是 Judge 历史；spawn 重建不读取、不续接任何旧 Judge Session 的内容。
 
+### R10：handoffContext 持久化（评审修正，方案 2）
+
+`handoffContext` 不再走进程内 `handoffByToken` 内存映射，而是随 claim 一并写入 `pendingClaim.handoffContext`：
+
+- `completed` claim 且 `handoffContext` 非空 → 持久化；
+- Host 在判定期间重启 → handoff 不丢失；respawn / spawn 重建后 Judge PASS，handoff 仍能投递到下一 Node；
+- 判定结束（PASS/FAIL）随 `pendingClaim` 一起清除；
+- 判定阶段 BLOCK 后 Worker **重新 claim** 会覆盖 `pendingClaim`（含 handoff）——这正是「重新 claim 必须重新提供 handoff」的语义。
+
 ## 8. 状态模型
 
-在 A1 的 `judgeSessionId` 与 `NodeContextBoundary` 之外，A4 仅新增：
+在 A1 的 `judgeSessionId` 与 `NodeContextBoundary` 之外，A4 新增：
 
 ```ts
-pendingClaim?: { outcome: 'completed' | 'failed'; summary: string }
+pendingClaim?: { outcome: 'completed' | 'failed'; summary: string; handoffContext?: string }
 ```
+
+`handoffContext` 字段只有在 `completed` 且非空时才写入（lossless JSON 序列化要求：不写 `undefined` 值）。
 
 不新增：
 

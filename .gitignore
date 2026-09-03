@@ -1,4 +1,4 @@
-### Windows
+﻿### Windows
 # Windows thumbnail cache files
 Thumbs.db
 
@@ -14,3 +14,6 @@ $RECYCLE.BIN/
 # Node
 node_modules/
 lib/
+
+# Review/diff scratch artifacts
+review-*.txt

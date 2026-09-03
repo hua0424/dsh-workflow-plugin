@@ -22,7 +22,7 @@
 
 ## Judge Agent
 
-根据Judge Role为一次具体Checker判断创建、按Node隔离的continuable Agent。每个Node创建一个全新Judge Session；同一Node内可因信息不足被Manager followup续接；Node PASS/FAIL后释放活跃资源，下一Node创建新Session，不复用。Parent/Child Workflow共享同一个Judge Role配置，但不复用Judge session。Judge只接收当前Node的Node-local projection（从Node实际dispatch边界起，按事件时间戳合并Manager/User/Actor消息，排除system/tool/notice/旧Node历史）；不再注入完整Manager Session投影。Judge通过专用`judge_claim({nodeToken,result,reason})`协议提交`PASS|FAIL|NEED_CONTEXT`；`PASS|FAIL`是唯一Graph结果，`NEED_CONTEXT`进入可恢复BLOCK等待Manager补充。技术故障fail-closed并BLOCK；判定阶段`pendingClaim`持久化`{outcome,summary}`供spawn重建重投Judgment Packet。
+根据Judge Role为一次具体Checker判断创建、按Node隔离的continuable Agent。每个Node创建一个全新Judge Session；同一Node内可因信息不足被Manager followup续接；Node PASS/FAIL后撤销授权（Activation由DSH settlement watcher在Judge turn结束后自动释放；**禁止从Judge自己的judge_claim turn内drain自己**），下一Node创建新Session，不复用。Parent/Child Workflow共享同一个Judge Role配置，但不复用Judge session。Judge只接收当前Node的Node-local projection（从Node实际dispatch边界起，按事件时间戳合并Manager/User/Actor消息，排除system/tool/notice/旧Node历史与引擎注入的`[提交要求]`硬约束）；不再注入完整Manager Session投影。Judge通过专用`judge_claim({nodeToken,result,reason})`协议提交`PASS|FAIL|NEED_CONTEXT`；`PASS|FAIL`是唯一Graph结果，`NEED_CONTEXT`进入可恢复BLOCK等待Manager补充。技术故障fail-closed并BLOCK；判定阶段`pendingClaim`持久化`{outcome,summary,handoffContext?}`供spawn重建重投Judgment Packet。
 
 宿主实现已确认：`toolFilter.allow`过滤整个继承工具面（global+Preset ancestor层），固定allow-list对继承Preset的Judge成立，并额外授予`judge_claim`；两个`workflow_inspect_*` wrapper注册在host行，执行时由`tools.guard()`校验调用者属于当前Judge session；每次spawn后Host对Judge final visible schema做fail-closed断言。
 
@@ -118,11 +118,11 @@ Root END 时 Engine 向 Manager 主会话 steer 一条完成通知（`workflow "
 
 ## Handoff Context
 
-Actor Task在临时completion claim中可提供的opaque文本。Checker PASS后，Engine/Manager把它原样放进发给下一Node或Child Actor的消息，但不持久化。它用于Agent动态选择Issue/仓库等对象，替代typed resolver、变量、output binding和data-flow DSL；发送窗口丢失时重新询问或按真实现场重建。
+Actor Task在completion claim中可提供的opaque文本。Checker PASS后，Engine/Manager把它原样放进发给下一Node或Child Actor的消息。它用于Agent动态选择Issue/仓库等对象，替代typed resolver、变量、output binding和data-flow DSL；发送窗口丢失时重新询问或按真实现场重建。
 
 ## Node Claim
 
-Current Actor Task Worker通过携带current nodeToken的`node_claim`提交的`completed|failed`声明、summary和可选handoffContext。Claim和handoff都必须经过Checker；claim进入判定阶段后其`{outcome,summary}`作为`pendingClaim`持久化（供Judge spawn重建重投Judgment Packet），判定结束清除；handoffContext不持久化，系统中断后让Worker重新claim。
+Current Actor Task Worker通过携带current nodeToken的`node_claim`提交的`completed|failed`声明、summary和可选handoffContext。Claim和handoff都必须经过Checker；claim进入判定阶段后其`{outcome,summary,handoffContext?}`作为`pendingClaim`持久化（供Judge spawn重建重投Judgment Packet；`handoffContext`仅`completed`且非空时写入），判定结束清除。判定阶段BLOCK后Worker重新claim会整体覆盖`pendingClaim`（含handoff）。
 
 ## Node Block
 
@@ -146,9 +146,9 @@ Manager在current Role Actor无active turn时通过`node_resume(nodeToken,resolu
 
 ## Workflow State Store
 
-`${DSH_HOME}/workflows/state.sqlite3`中按current Manager Session cwd的filesystem canonical realpath分Row保存current Run的最小持久化边界。一个Workspace最多一个Run并永久绑定启动managerSessionId，不同Workspace可并发；其他Session不能接管/推进，但同Workspace任意direct-human Session可用`/dsh-flow reset`只删除本地Row；一个connection/queue串行短写。State只包含catalogWorkflowId、immutable Definition Snapshot、Run identity/status、call stack、当前active Node的`NodeContextBoundary`（串行执行下top frame唯一活跃，实现为Run级单字段，离开Node即重置）、Role Actor mappings、current model overrides、blockReason、当前`judgeSessionId`映射和判定阶段`pendingClaim{outcome,summary}`；Root frame.workflowId等于catalogWorkflowId；不保存recentEvents、业务对象状态、Judge历史、Checker evidence、Task/Effect、Recovery状态或精确外部副作用历史。历史完全复用DSH Session log。
+`${DSH_HOME}/workflows/state.sqlite3`中按current Manager Session cwd的filesystem canonical realpath分Row保存current Run的最小持久化边界。一个Workspace最多一个Run并永久绑定启动managerSessionId，不同Workspace可并发；其他Session不能接管/推进，但同Workspace任意direct-human Session可用`/dsh-flow reset`只删除本地Row；一个connection/queue串行短写。State只包含catalogWorkflowId、immutable Definition Snapshot、Run identity/status、call stack、当前active Node的`NodeContextBoundary`（串行执行下top frame唯一活跃，实现为Run级单字段，离开Node即重置；FAIL且无onFail的BLOCK保留边界）、Role Actor mappings、current model overrides、blockReason、当前`judgeSessionId`映射和判定阶段`pendingClaim{outcome,summary,handoffContext?}`；Root frame.workflowId等于catalogWorkflowId；不保存recentEvents、业务对象状态、Judge历史、Checker evidence、Task/Effect、Recovery状态或精确外部副作用历史。历史完全复用DSH Session log。
 
-宿主实现确认：Home路径用`resolveDshHome()`（显式配置>`DSH_HOME`环境变量>`~/.dsh`）；cwd取自`agent.session.header.cwd`，缺失时拒绝start；SQLite用内置`node:sqlite`的`DatabaseSync`（与DSH storage-sqlite同款），owner-only目录/文件、WAL、单连接加短mutation队列。Turn结算订阅`session/event`的durable `turn/end`；`subagent/end`是Activation-epoch级、不能用于Node结果关联。自动BLOCK写入必须defer，不能在`session/event`回调内同步append同一Session。
+宿主实现确认：Home路径用`resolveDshHome()`（显式配置>`DSH_HOME`环境变量>`~/.dsh`）；cwd取自`agent.session.header.cwd`，缺失时拒绝start；SQLite用内置`node:sqlite`的`DatabaseSync`（与DSH storage-sqlite同款），owner-only目录/文件、WAL、单连接加短mutation队列。Turn结算订阅`session/event`的durable `turn/end`；`subagent/end`是Activation-epoch级、不能用于Node结果关联。自动BLOCK写入必须defer，不能在`session/event`回调内同步append同一Session。Judge授权/turn路由在Host重启后从State行durable修复（`judgeSessionId`匹配即重新入映射）；persistence读取失败fail-closed（`judge fault: <detail>` BLOCK），服务缺失时降级（无Actor surface投影）。
 
 ## External Fact
 

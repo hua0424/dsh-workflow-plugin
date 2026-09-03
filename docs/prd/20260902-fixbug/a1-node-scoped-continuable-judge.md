@@ -197,7 +197,7 @@ Judge 提交 PASS/FAIL 后：
 1. Engine 应用对应 Graph edge；
 2. 清除当前 Workflow 的 Judge Session 映射；
 3. 撤销该 Session 的 Judge 专用授权；
-4. 对仍驻留的 continuable child 执行 drain，释放 AgentHandle/Activation；
+4. 不执行显式 drain：**禁止从 Judge 自己的 `judge_claim` tool call 内 drain 自己**（DSH 的 `dispose` 会 cancel 调用者当前 turn 并等待其 idle，形成 self-cancel 死锁）。continuable child 的 Activation 由 DSH settlement watcher 在 Judge turn 自然结束后自动释放；显式 `drainContinuableChildren` 只允许在**其他 Agent 的 turn** 中调用（`judge_respawn`、spawn 陈旧清理路径）；
 5. 保留 DSH 持久化 Session 作为历史记录，但不再 followup。
 
 本 PRD 不要求清理 Web GUI 任务管理区中的历史 Judge 条目。

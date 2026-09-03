@@ -157,8 +157,14 @@ export interface RunState {
   nodeBoundary: NodeContextBoundary
   /** Current active/pending Judge session id for this Node (A1/A4). */
   judgeSessionId?: string
-  /** Worker claim held during the judgment phase for respawn rebuild (A4 R9). */
-  pendingClaim?: { outcome: ClaimOutcome; summary: string }
+  /**
+   * Worker claim held during the judgment phase (A4 R9). The optional
+   * `handoffContext` is persisted together with the claim (20260902-fixbug
+   * review resolution "方案2") so a host restart during judgment cannot
+   * silently drop the handoff; it is cleared together with the claim when
+   * the verdict lands.
+   */
+  pendingClaim?: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
 }
 
 export interface StateRow {
@@ -172,7 +178,7 @@ export interface StateRow {
 /** Claim outcome a worker may submit. */
 export type ClaimOutcome = 'completed' | 'failed'
 
-/** A worker's transient completion claim (never persisted). */
+/** A worker's completion claim. */
 export interface NodeClaim {
   nodeToken: string
   outcome: ClaimOutcome

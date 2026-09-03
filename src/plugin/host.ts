@@ -12,7 +12,7 @@ import type { RunState } from '../types.ts'
 import { WorkflowError } from '../types.ts'
 import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
-import { judgeSpawnPlan, JUDGE_ALLOW, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
+import { judgeSpawnPlan, JUDGE_ALLOW, JUDGE_MACHINERY_EXEMPT, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
 
@@ -37,24 +37,31 @@ interface SessionPersistenceLike {
 }
 
 /**
- * Read one durable session's events without residency (F9). Resolves to a
- * projection source, or undefined when the service is absent or the read
- * fails (the projection then simply lacks the actor surface — fail closed).
+ * Read one durable session's events without residency (F9/S2). Service absent
+ * → undefined (the packet degrades without the actor surface — logged by the
+ * caller). A present-but-failing persistence read is a technical fault (A1
+ * R12 "Session/持久化/读取异常"): it throws so the engine fail-closes into a
+ * `judge fault: <detail>` BLOCK instead of judging from a silently truncated
+ * packet.
  */
 async function inspectPersistedSession(ctx: Context, sessionId: string): Promise<ProjectionSource | undefined> {
+  const persistence = ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
+  if (persistence === undefined || typeof persistence.inspect !== 'function') return undefined
+  let inspection: Awaited<ReturnType<SessionPersistenceLike['inspect']>>
   try {
-    const persistence = ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
-    if (persistence === undefined || typeof persistence.inspect !== 'function') return undefined
-    const inspection = await persistence.inspect(sessionId, new AbortController().signal)
-    if (inspection === undefined || !Array.isArray(inspection.events)) return undefined
-    const events = inspection.events.slice()
-    return {
-      id: inspection.meta.id,
-      events,
-      seq: events.length > 0 ? events[events.length - 1]!.seq + 1 : 0,
-    }
-  } catch {
-    return undefined
+    inspection = await persistence.inspect(sessionId, new AbortController().signal)
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new WorkflowError(`actor session projection failed: ${detail}`)
+  }
+  if (inspection === undefined || !Array.isArray(inspection.events)) {
+    throw new WorkflowError(`actor session projection failed: inspect returned no events for "${sessionId}"`)
+  }
+  const events = inspection.events.slice()
+  return {
+    id: inspection.meta.id,
+    events,
+    seq: events.length > 0 ? events[events.length - 1]!.seq + 1 : 0,
   }
 }
 
@@ -65,11 +72,10 @@ function assertJudgeToolSurface(childAgent: Agent): string | undefined {
   for (const required of JUDGE_ALLOW) {
     if (!visible.has(required)) return `Judge tool surface is missing required tool "${required}"`
   }
-  // Own-scope delegation machinery registered by the in-process driver / report
-  // tool is exempt from the allow-list — it is never visible-filtered (design §2.2).
-  const JUDGE_MACHINERY = new Set(['report', 'structured_output'])
+  // Own-scope delegation machinery registered by the in-process driver is
+  // exempt from the allow-list — it is never visible-filtered (design §2.2).
   for (const name of visible) {
-    if (!(JUDGE_ALLOW as readonly string[]).includes(name) && !JUDGE_MACHINERY.has(name)) {
+    if (!(JUDGE_ALLOW as readonly string[]).includes(name) && !(JUDGE_MACHINERY_EXEMPT as readonly string[]).includes(name)) {
       return `Judge tool surface contains unexpected tool "${name}"`
     }
   }

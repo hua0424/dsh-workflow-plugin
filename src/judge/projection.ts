@@ -12,6 +12,7 @@
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { isAppendSurfaceEvent, deriveEventMessage } from '@deepseek-ai/dsh-session'
 import type { NodeContextBoundary } from '../types.ts'
+import { SUBMISSION_CONSTRAINT } from '../engine/texts.ts'
 
 /** Max projected transcript length in characters (defensive bound). */
 export const PROJECTION_MAX_CHARS = 120_000
@@ -71,20 +72,34 @@ export function projectSessionSurface(session: ProjectionSource, fromSeq: number
     if (event.seq < fromSeq) continue
     if (!isAppendSurfaceEvent(event)) continue
     let message: ReturnType<typeof deriveEventMessage>
+    let entryRole = role
     if (event.type === 'user/message') {
       const source = (event.data as { source?: { kind?: string } }).source
       if (source?.kind !== 'user' && !(role === 'ACTOR' && source?.kind === 'coordinator')) continue
+      // A1 R3: keep the three-way attribution — a real human user message in
+      // the Manager session projects as USER, assistant output as MANAGER.
+      if (role === 'MANAGER' && source?.kind === 'user') entryRole = 'USER'
       message = deriveEventMessage(event)
     } else if (event.type === 'assistant/message') {
       message = deriveEventMessage(event)
     } else {
       continue
     }
-    const text = messageText(message).trim()
+    const text = stripSubmissionConstraint(messageText(message)).trim()
     if (text === '') continue
-    out.push({ time: event.time, seq: event.seq, sessionId: session.id, role, text })
+    out.push({ time: event.time, seq: event.seq, sessionId: session.id, role: entryRole, text })
   }
   return out
+}
+
+/**
+ * A3 R1/AC6: the engine's fixed submission constraint is injected into the
+ * dispatch text but must never reach the Judge. Strip the exact fixed suffix
+ * (instruction/handoff/resolution原文 are preserved verbatim).
+ */
+function stripSubmissionConstraint(text: string): string {
+  if (!text.endsWith(SUBMISSION_CONSTRAINT.trim())) return text
+  return text.slice(0, text.length - SUBMISSION_CONSTRAINT.trim().length)
 }
 
 /**
@@ -137,8 +152,10 @@ export function projectNodeLocal(
 
   parts.sort((a, b) =>
     a.time - b.time
-    || a.seq - b.seq
-    || sessionOrder(a.sessionId, b.sessionId),
+    // A1 R3: seq orders ONLY within one session at equal time; different
+    // sessions at equal time break ties by the stable session id.
+    || sessionOrder(a.sessionId, b.sessionId)
+    || (a.sessionId === b.sessionId ? a.seq - b.seq : 0),
   )
 
   const rendered = parts.map(p => `[${p.role}]\n${p.text}`)

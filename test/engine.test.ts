@@ -512,6 +512,9 @@ test('handoffContext survives NEED_CONTEXT resume token rotation (S3/A4 R9)', as
     nodeToken: token, outcome: 'completed', summary: 'planned',
     handoffContext: 'repo=acme/server',
   }, MANAGER)
+  // A4 R10: the handoff is persisted inside pendingClaim (方案 2) — visible
+  // even while the judgment is pending.
+  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned', handoffContext: 'repo=acme/server' })
   // Judge needs context → BLOCK → Manager resumes (token rotates) → judge PASS.
   await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', 'judge-session-1')
   const resumed = await h.engine.handleResume('ws', token, 'repo is acme/server', MANAGER)
@@ -525,6 +528,52 @@ test('handoffContext survives NEED_CONTEXT resume token rotation (S3/A4 R9)', as
   await h.engine.handleTurnEnded('ws', MANAGER)
   assert.ok(h.actorMessages.length >= 1)
   assert.match(h.actorMessages[0]!, /repo=acme\/server/)
+  // A4 R9/R10: the verdict cleared pendingClaim (handoff included).
+  assert.equal(h.mem.run!.pendingClaim, undefined)
+})
+
+test('handoffContext survives a host-restart-equivalent: a fresh engine over durable state (方案 2)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', {
+    nodeToken: token, outcome: 'completed', summary: 'planned',
+    handoffContext: 'repo=acme/server',
+  }, MANAGER)
+  await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', 'judge-session-1')
+  // "Restart": build a brand-new engine over the SAME durable state (no
+  // in-memory dispatch book, no handoffByToken — the old map is gone).
+  const h2 = makeHarness()
+  h2.mem = h.mem
+  h2.engine = new WorkflowEngine(
+    {
+      async steerManager(_run, text) { h2.steers.push(text) },
+      async sendRoleActor(_run, _role, text) { h2.actorMessages.push(text); return { messageId: `m-${h2.actorMessages.length}` } },
+      managerSessionSeq() { return 0 },
+    },
+    {
+      async ensureRoleActor(_run, _role, initialText) { h2.actorCreated = true; h2.actorMessages.push(initialText); return { childId: 'actor-child-1', messageId: 'msg-actor' } },
+      async startJudge() { h2.judges += 1; return { judgeSessionId: 'judge-session-1', messageId: 'msg-judge' } },
+      async followupJudge() {},
+      async retireJudge() {},
+      async drainJudge() {},
+      async compactRoleActor() { return { ok: true, detail: 'cold-resume skip' } },
+    },
+    { async run() { return { kind: 'ERROR', reason: 'unused' } } },
+    makeStateHost(h2.mem),
+  )
+  h2.engine.cwdResolver = async () => '/workspace'
+  const blockedToken = topFrame(h2.mem.run!).nodeToken
+  const resumed = await h2.engine.handleResume('ws', blockedToken, 'repo is acme/server', MANAGER)
+  assert.ok(resumed.ok)
+  const rotated = topFrame(h2.mem.run!).nodeToken
+  const verdict = await h2.engine.handleJudgeClaim('ws', rotated, 'PASS', 'ok now', 'judge-session-1')
+  assert.ok(verdict.ok)
+  // The handoff persisted in pendingClaim survives the engine restart and
+  // reaches the next node's dispatch.
+  await h2.engine.handleTurnEnded('ws', MANAGER)
+  assert.ok(h2.actorMessages.length >= 1)
+  assert.match(h2.actorMessages[0]!, /repo=acme\/server/)
 })
 
 test('first role creation skips compact (A2 AC3)', async () => {
