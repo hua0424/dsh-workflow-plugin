@@ -119,10 +119,10 @@ function makeHarness(): Harness {
       return { childId: 'actor-child-1', messageId: 'msg-actor' }
     },
     async startJudge(_run, input) {
-      if (h.judgeSpawnFailure !== undefined) throw h.judgeSpawnFailure
-      h.judges += 1
       h.judgeSpawnInputs.push(input)
       if (h.judgeSpawnGate !== undefined) await h.judgeSpawnGate
+      if (h.judgeSpawnFailure !== undefined) throw h.judgeSpawnFailure
+      h.judges += 1
       // The host adapter MUST adopt the Engine-reserved child id (P1): State
       // already names this Judge before the child can run.
       return { judgeSessionId: input.judgeSessionId, messageId: 'msg-judge' }
@@ -301,6 +301,25 @@ test('judge_respawn drains the old judge and spawns a new one (A4 AC5)', async (
   assert.equal(h.judges, 2)
 })
 
+test('judge_respawn preparation failure leaves the old blocked Judge mapping untouched', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+  await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', reservedJudgeId(h))
+  const oldJudge = h.mem.run!.judgeSessionId
+  const drainsBefore = h.drainedJudges.length
+  h.engine.cwdResolver = async () => { throw new Error('cwd unavailable') }
+
+  await assert.rejects(
+    h.engine.handleRespawnJudge('ws', token, 'retry', MANAGER),
+    /cwd unavailable/,
+  )
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.equal(h.mem.run!.judgeSessionId, oldJudge)
+  assert.equal(h.drainedJudges.length, drainsBefore)
+})
+
 test('judge technical fault (spawn failure) blocks with a judge fault detail (A4 AC1)', async () => {
   const h = makeHarness()
   await h.engine.startRun('ws', initialRun())
@@ -311,6 +330,7 @@ test('judge technical fault (spawn failure) blocks with a judge fault detail (A4
   assert.equal(h.mem.run!.status, 'blocked')
   assert.match(h.mem.run!.blockReason ?? '', /judge fault: provider down/)
   assert.ok(h.steers.some(t => /Judge 判定故障/.test(t)))
+  assert.ok(h.steers.some(t => /没有可 followup 的 Judge/.test(t)))
   // A4 R9: pendingClaim persisted at judgment entry survives the spawn fault.
   assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned' })
   // A4 R4/R8: the reserved id belongs to a child that was never successfully
@@ -374,6 +394,32 @@ test('stale judge spawn is drained when the run changes during materialization (
   assert.ok(!outcome.ok)
   assert.match(outcome.reason ?? '', /stale judge spawn/)
   assert.deepEqual(h.drainedJudges, [reservedJudgeId(h)])
+})
+
+test('failed stale respawn cannot block a replacement run', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+  await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing repo', reservedJudgeId(h))
+
+  h.judgeSpawnGate = new Promise<void>(resolve => { h.releaseJudgeSpawn = resolve })
+  const respawnPromise = h.engine.handleRespawnJudge('ws', token, 'model swap', MANAGER)
+  await new Promise(resolve => setImmediate(resolve))
+  h.judgeSpawnFailure = new Error('provider failed late')
+  await h.engine.handleReset('ws')
+  const replacement = initialRun()
+  replacement.runId = crypto.randomUUID()
+  await h.engine.startRun('ws', replacement)
+  const replacementRunId = h.mem.run!.runId
+  h.releaseJudgeSpawn()
+
+  const outcome = await respawnPromise
+  assert.ok(!outcome.ok)
+  assert.match(outcome.reason ?? '', /stale judge respawn/)
+  assert.equal(h.mem.run!.runId, replacementRunId)
+  assert.equal(h.mem.run!.status, 'running')
+  assert.equal(h.mem.run!.blockReason, null)
 })
 
 test('stale judge_claim from an old judge session is rejected (A1 AC9)', async () => {
@@ -501,6 +547,52 @@ test('restart reconciliation keeps an existing Judge session id', async () => {
   assert.ok(reserved !== undefined)
   await h.engine.handleRestartReconcile()
   assert.equal(h.mem.run!.judgeSessionId, reserved)
+})
+
+test('restart reconciliation contains a row conflict and continues with later workspaces', async () => {
+  const runA = initialRun()
+  const runB = initialRun()
+  runB.runId = crypto.randomUUID()
+  const rows = new Map<string, { run: RunState; version: number }>([
+    ['a', { run: structuredClone(runA), version: 1 }],
+    ['b', { run: structuredClone(runB), version: 1 }],
+  ])
+  const state: StateHost = {
+    async get(key) {
+      const row = rows.get(key)
+      return row === undefined ? undefined : { run: structuredClone(row.run), version: row.version }
+    },
+    async put(key, run, expectedVersion) {
+      if (key === 'a') throw new Error('simulated StateVersionError')
+      const row = rows.get(key)!
+      assert.equal(row.version, expectedVersion)
+      rows.set(key, { run: structuredClone(run), version: expectedVersion + 1 })
+    },
+    async create(key, run) { rows.set(key, { run: structuredClone(run), version: 1 }); return 1 },
+    async remove(key) { rows.delete(key) },
+    async listRuns() {
+      return [...rows].map(([workspaceKey, row]) => ({ workspaceKey, run: structuredClone(row.run), version: row.version }))
+    },
+  }
+  const subagents: SubagentHost = {
+    async ensureRoleActor() { return { childId: 'a', messageId: 'm' } },
+    async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'm' } },
+    async followupJudge() {},
+    async judgeSessionExists() { return true },
+    async retireJudge() {},
+    async drainJudge() {},
+    async compactRoleActor() { return { ok: true } },
+  }
+  const engine = new WorkflowEngine(
+    { async steerManager() {}, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } },
+    subagents,
+    { async run() { return { kind: 'ERROR', reason: 'unused' } } },
+    state,
+  )
+
+  await engine.handleRestartReconcile()
+  assert.equal(rows.get('a')!.run.status, 'running', 'conflicted row is left to its winning writer')
+  assert.equal(rows.get('b')!.run.status, 'blocked', 'later row is still reconciled')
 })
 
 test('reset removes the row', async () => {
@@ -642,6 +734,7 @@ test('handoffContext survives a host-restart-equivalent: a fresh engine over dur
       async ensureRoleActor(_run, _role, initialText) { h2.actorCreated = true; h2.actorMessages.push(initialText); return { childId: 'actor-child-1', messageId: 'msg-actor' } },
       async startJudge() { h2.judges += 1; return { judgeSessionId: reservedJudgeId(h), messageId: 'msg-judge' } },
       async followupJudge() {},
+      async judgeSessionExists() { return true },
       async retireJudge() {},
       async drainJudge() {},
       async compactRoleActor() { return { ok: true, detail: 'cold-resume skip' } },
@@ -709,6 +802,7 @@ workflow:
     async ensureRoleActor() { return { childId: 'a', messageId: 'm' } },
     async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'm' } },
     async followupJudge() {},
+    async judgeSessionExists() { return true },
     async retireJudge() {},
     async drainJudge() {},
     async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },

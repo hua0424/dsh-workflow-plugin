@@ -59,6 +59,7 @@ test('node_resolve_program advances to a non-END target without staying blocked'
     async ensureRoleActor() { return { childId: 'a1', messageId: 'm' } },
     async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'm' } },
     async followupJudge() {},
+    async judgeSessionExists() { return true },
     async retireJudge() {},
     async drainJudge() {},
     async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },

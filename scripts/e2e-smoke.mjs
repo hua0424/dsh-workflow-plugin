@@ -105,6 +105,7 @@ try {
       return { judgeSessionId: input.judgeSessionId, messageId: 'judge-msg-1' }
     },
     async followupJudge() {},
+    async judgeSessionExists() { return true },
     async retireJudge() {},
     async drainJudge() {},
     async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },

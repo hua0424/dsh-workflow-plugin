@@ -14,7 +14,13 @@ const COMPACT_FAIL_PREFIX = 'node-boundary compact failed: '
 
 /** A4 R2: fixed template for a judge technical fault (steered to the Manager). */
 function judgeFaultNotice(run: RunState, nodeId: string, detail: string): string {
-  return `⚠️ Judge 判定故障（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 你的补充/指示交给当前 Judge 继续（followup）；\n  2. judge_respawn({nodeToken}) —— 放弃当前 Judge，重建新 Judge 重来一次判定；\n  3. workflow_set_role_model({roleKey:'judge', ...}) 换模型后再 resume/respawn；\n  4. node_block 保留现场等待人工。`
+  const resumeAction = run.judgeSessionId !== undefined
+    ? '你的补充/指示交给当前 Judge 继续（followup）'
+    : '没有可 followup 的 Judge；从 pendingClaim 重建新 Judge'
+  const respawnAction = run.judgeSessionId !== undefined
+    ? '放弃当前 Judge，重建新 Judge 重来一次判定'
+    : '显式重建新 Judge，重来一次判定'
+  return `⚠️ Judge 判定故障（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— ${resumeAction}；\n  2. judge_respawn({nodeToken}) —— ${respawnAction}；\n  3. workflow_set_role_model({roleKey:'judge', ...}) 换模型后再 resume/respawn；\n  4. node_block 保留现场等待人工。`
 }
 
 /** A1 R10: fixed template for a NEED_CONTEXT judgment (steered to the Manager). */
@@ -699,17 +705,19 @@ export class WorkflowEngine {
     if (run.pendingClaim === undefined) {
       return { ok: false, reason: 'no pending judgment to respawn' }
     }
+    // Prepare every fallible packet input before draining the existing Judge or
+    // publishing a replacement id. A preparation fault leaves the blocked run
+    // and its current Judge mapping untouched, so Manager may retry safely.
+    const node = this.nodeAt(run, frame)!
+    const checker = node.checker!
+    const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
+    const cwd = await this.cwdResolver(run)
     // Drain the old judge (if any) and clear the mapping + revoke authz.
     const oldJudge = run.judgeSessionId
     delete run.judgeSessionId
     if (oldJudge !== undefined) {
       await this.subagents.drainJudge(run, oldJudge).catch(() => {})
     }
-    // Prepare every fallible packet input BEFORE publishing the reserved id.
-    const node = this.nodeAt(run, frame)!
-    const checker = node.checker!
-    const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
-    const cwd = await this.cwdResolver(run)
     // Rebuild: reserve and persist the fresh Judge id before child admission,
     // so the Judge can submit judge_claim as soon as DSH accepts its first
     // prompt (P1).
@@ -1034,22 +1042,39 @@ export class WorkflowEngine {
     return undefined
   }
 
-  /** Host-restart reconciliation (design §4.2 H1): every running row BLOCKs. */
+  /** Host-restart reconciliation (design §4.2 H1): every pre-existing running row BLOCKs. */
   async handleRestartReconcile(): Promise<void> {
     this.dispatchBook.clear()
-    for (const row of await this.state.listRuns()) {
-      if (row.run.status !== 'running') continue
-      row.run.status = 'blocked'
-      row.run.blockReason = 'host-restarted-before-node-result'
-      // A reserved Judge id may be durable while its Session is not (the host
-      // can crash between the pre-admission write and materialization). Clear
-      // it so node_resume takes A4 R4's spawn-rebuild branch; pendingClaim
-      // stays for the packet.
-      if (row.run.judgeSessionId !== undefined) {
-        const exists = await this.subagents.judgeSessionExists(row.run.judgeSessionId).catch(() => false)
-        if (!exists) delete row.run.judgeSessionId
+    for (const listed of await this.state.listRuns()) {
+      if (listed.run.status !== 'running') continue
+      try {
+        // The Session probe performs persistence I/O. Re-read afterwards and
+        // mutate only the same pre-restart run/id; a concurrent post-restart
+        // mutation or replacement owns the newer row and must not be clobbered.
+        const listedJudgeId = listed.run.judgeSessionId
+        const judgeExists = listedJudgeId === undefined
+          ? true
+          : await this.subagents.judgeSessionExists(listedJudgeId).catch(() => false)
+        const fresh = await this.state.get(listed.workspaceKey)
+        if (fresh === undefined
+          || fresh.run.runId !== listed.run.runId
+          || fresh.run.status !== 'running'
+          || fresh.run.judgeSessionId !== listedJudgeId) {
+          continue
+        }
+        fresh.run.status = 'blocked'
+        fresh.run.blockReason = 'host-restarted-before-node-result'
+        // A reserved Judge id may be durable while its Session is not (the host
+        // can crash between the pre-admission write and materialization). Clear
+        // it so node_resume takes A4 R4's spawn-rebuild branch; pendingClaim
+        // stays for the packet.
+        if (!judgeExists) delete fresh.run.judgeSessionId
+        await this.state.put(listed.workspaceKey, fresh.run, fresh.version)
+      } catch {
+        // Reconciliation is best-effort per workspace. A concurrent writer may
+        // win the final optimistic put; never abort reconciliation of all
+        // remaining rows or overwrite the newer state.
       }
-      await this.state.put(row.workspaceKey, row.run, row.version)
     }
   }
 

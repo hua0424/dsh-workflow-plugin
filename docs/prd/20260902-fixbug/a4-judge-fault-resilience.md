@@ -73,7 +73,7 @@ A1 已把 Judge 改为「每 Node fresh、Node 内 continuable」，并规定技
 - `judgeSessionId` 存在 → followup 同一 Judge（附 `resolutionContext`），不重派 Actor、不重建；
 - `judgeSessionId` 不存在 → spawn 重建，重投完整 Judgment Packet。
 
-为避免首次 Judge admission 竞态，Engine 在 `startJudge` 调用前预留并持久化 `judgeSessionId`，Host 必须把它作为 caller-reserved `childId`。若 spawn/admission 失败，该未成功建立的 id 必须清除，仍保留 `pendingClaim`；这样后续 `node_resume` 才按 A4 R8 自动 spawn 重建，而不会 followup 不存在的 Judge。
+为避免首次 Judge admission 竞态，Engine 在 `startJudge` 调用前预留并持久化 `judgeSessionId`，Host 必须把它作为 caller-reserved `childId`。若 spawn/admission 失败，该未成功建立的 id 必须清除，仍保留 `pendingClaim`；这样后续 `node_resume` 才按 A4 R8 自动 spawn 重建，而不会 followup 不存在的 Judge。Host restart reconcile 必须查询 durable Session 是否存在：不存在或查询失败则清除该 id、保留 `pendingClaim`；查询瞬时失败可能额外重建一次 Judge，但不会推进错误 Edge（见 `docs/pending-discussions/judge-session-existence-probe.md`）。
 
 `NEED_CONTEXT` 与技术故障的 followup 路径统一：两者都有 `judgeSessionId`，都 followup，仅 followup 文本附注不同。
 
