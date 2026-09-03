@@ -374,7 +374,7 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
 读取current frame/node
 → 有Worker continuable session就发消息让其检查现场并继续
 → Worker session不可用就创建replacement并发送current Node/context
-→ 判定阶段BLOCK：judgeSessionId存在则followup该Judge，不存在则spawn重建；judge_respawn显式重建
+→ 判定阶段BLOCK：judgeSessionId存在则followup该Judge，不存在则spawn重建；judge_respawn显式重建。Engine在admission前预留并持久化judgeSessionId；spawn/admission失败必须清除该id，避免followup不存在的Judge
 → builtin-program无Actor时由Manager重新运行program，或创建fresh Judge/由Manager判断现场是否已成功
 → 成功则推进PASS Edge
 → 未成功则重新执行/继续当前Node

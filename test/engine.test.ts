@@ -76,6 +76,8 @@ interface Harness {
   retiredJudges: string[]
   drainedJudges: string[]
   judgeSpawnFailure: Error | undefined
+  judgeSpawnGate: Promise<void> | undefined
+  releaseJudgeSpawn: () => void
   actorCreated: boolean
   compacts: string[]
   compactResult: { ok: boolean; detail?: string }
@@ -94,6 +96,8 @@ function makeHarness(): Harness {
     retiredJudges: [],
     drainedJudges: [],
     judgeSpawnFailure: undefined,
+    judgeSpawnGate: undefined,
+    releaseJudgeSpawn: () => {},
     actorCreated: false,
     compacts: [],
     compactResult: { ok: true, detail: 'no compactable range' },
@@ -116,6 +120,7 @@ function makeHarness(): Harness {
       if (h.judgeSpawnFailure !== undefined) throw h.judgeSpawnFailure
       h.judges += 1
       h.judgeSpawnInputs.push(input)
+      if (h.judgeSpawnGate !== undefined) await h.judgeSpawnGate
       // The host adapter MUST adopt the Engine-reserved child id (P1): State
       // already names this Judge before the child can run.
       return { judgeSessionId: input.judgeSessionId, messageId: 'msg-judge' }
@@ -305,11 +310,29 @@ test('judge technical fault (spawn failure) blocks with a judge fault detail (A4
   assert.ok(h.steers.some(t => /Judge 判定故障/.test(t)))
   // A4 R9: pendingClaim persisted at judgment entry survives the spawn fault.
   assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned' })
-  // P1: the Engine-reserved Judge id is persisted BEFORE child admission; after
-  // a spawn failure, State keeps that unavailable Judge for the Manager's
-  // resume/respawn decision instead of pretending no Judge exists.
-  assert.notEqual(h.mem.run!.judgeSessionId, undefined)
-  assert.match(h.mem.run!.judgeSessionId!, /^[0-9a-f-]{36}$/)
+  // A4 R4/R8: the reserved id belongs to a child that was never successfully
+  // admitted; clear it so node_resume takes the spawn-rebuild branch rather
+  // than trying to followup a Judge that does not exist.
+  assert.equal(h.mem.run!.judgeSessionId, undefined)
+})
+
+test('spawn failure clears the never-admitted reserved Judge id so node_resume rebuilds (A4 R4/R8)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  h.judgeSpawnFailure = new Error('provider down')
+  const failed = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+  assert.ok(failed.ok)
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.equal(h.mem.run!.judgeSessionId, undefined)
+  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned' })
+
+  h.judgeSpawnFailure = undefined
+  const resumed = await h.engine.handleResume('ws', token, 'spawn again', MANAGER)
+  assert.ok(resumed.ok)
+  assert.equal(h.mem.run!.status, 'running')
+  assert.equal(h.judges, 1)
+  assert.equal(h.mem.run!.judgeSessionId, reservedJudgeId(h))
 })
 
 test('judge turn ended without judge_claim blocks with a fault detail and KEEPS judgeSessionId (A4 R5)', async () => {
@@ -330,6 +353,24 @@ test('judge turn ended without judge_claim blocks with a fault detail and KEEPS 
   assert.ok(resumed.ok)
   assert.equal(h.judgeFollowups.length, 1)
   assert.equal(h.judges, 1) // followup, not spawn-rebuild
+})
+
+test('stale judge spawn is drained when the run changes during materialization (A1 R11)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  // Hold the Judge admission after the Engine has already persisted its
+  // reserved id, then invalidate the row through the non-queued reset path.
+  h.judgeSpawnGate = new Promise<void>(resolve => { h.releaseJudgeSpawn = resolve })
+  const claimPromise = h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.notEqual(h.mem.run!.judgeSessionId, undefined)
+  await h.engine.handleReset('ws')
+  h.releaseJudgeSpawn()
+  const outcome = await claimPromise
+  assert.ok(!outcome.ok)
+  assert.match(outcome.reason ?? '', /stale judge spawn/)
+  assert.deepEqual(h.drainedJudges, [reservedJudgeId(h)])
 })
 
 test('stale judge_claim from an old judge session is rejected (A1 AC9)', async () => {

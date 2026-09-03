@@ -555,13 +555,27 @@ export class WorkflowEngine {
         if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
           return { ok: false, reason: 'stale judge spawn discarded: the node moved or blocked meanwhile' }
         }
-        // pendingClaim was already persisted above (A4 R8/R9); keep the
-        // reserved judgeSessionId too: it names the unavailable Judge for the
-        // Manager's later resume/respawn decision (A4 R5).
+        // The child was never successfully admitted. Clear the reserved id so
+        // node_resume takes A4 R4's spawn-rebuild branch instead of attempting
+        // to followup a Judge that does not exist.
+        delete fresh.run.judgeSessionId
         await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
         return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
       }
-      return { ok: true, run: entered.run, message: `judge spawned for node ${frame.nodeId}` }
+
+      // A1 R11 spawn-cleanup path: reset/start or another non-queued command may
+      // invalidate the row while the child is being materialized. Re-read after
+      // admission and drain the stale Judge if the run moved on.
+      const fresh = await this.state.get(workspaceKey)
+      if (fresh === undefined
+        || fresh.run.runId !== entered.run.runId
+        || fresh.run.judgeSessionId !== reservedJudgeSessionId
+        || fresh.run.status !== 'running'
+        || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
+        await this.subagents.drainJudge(entered.run, reservedJudgeSessionId).catch(() => {})
+        return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
+      }
+      return { ok: true, run: fresh.run, message: `judge spawned for node ${frame.nodeId}` }
     } finally {
       this.inFlight.delete(flightKey)
     }
@@ -684,12 +698,14 @@ export class WorkflowEngine {
     if (oldJudge !== undefined) {
       await this.subagents.drainJudge(run, oldJudge).catch(() => {})
     }
-    // Rebuild: reserve the fresh Judge id before child admission, so the Judge
-    // can submit judge_claim as soon as DSH accepts its first prompt.
+    // Rebuild: reserve and persist the fresh Judge id before child admission,
+    // so the Judge can submit judge_claim as soon as DSH accepts its first
+    // prompt (P1).
     const reservedJudgeSessionId = newNodeToken()
     run.judgeSessionId = reservedJudgeSessionId
     run.status = 'running'
     run.blockReason = null
+    await this.state.put(workspaceKey, run, version)
     const node = this.nodeAt(run, frame)!
     const checker = node.checker!
     const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
@@ -707,14 +723,28 @@ export class WorkflowEngine {
       })
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error)
-      await this.blockOnJudgeFault(workspaceKey, run, version, detail)
-      return { ok: true, run, message: run.blockReason ?? '' }
+      const fresh = await this.state.get(workspaceKey)
+      if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge respawn' }
+      delete fresh.run.judgeSessionId
+      await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
+      return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
     }
-    await this.state.put(workspaceKey, run, version)
+
+    // A1 R11 spawn-cleanup path: validate the post-admission row before the
+    // respawn is allowed to claim success.
+    const fresh = await this.state.get(workspaceKey)
+    if (fresh === undefined
+      || fresh.run.runId !== run.runId
+      || fresh.run.judgeSessionId !== reservedJudgeSessionId
+      || fresh.run.status !== 'running'
+      || topFrame(fresh.run).nodeToken !== nodeToken) {
+      await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
+      return { ok: false, reason: 'stale judge respawn discarded: the run changed while the judge was materializing' }
+    }
     if (reason !== undefined) {
-      this.logLine(run, `JUDGE RESPAWN ${frame.workflowId}/${frame.nodeId}: ${reason}`)
+      this.logLine(fresh.run, `JUDGE RESPAWN ${frame.workflowId}/${frame.nodeId}: ${reason}`)
     }
-    return { ok: true, run, message: `judge respawned for node ${frame.nodeId}` }
+    return { ok: true, run: fresh.run, message: `judge respawned for node ${frame.nodeId}` }
   }
 
   /** Handle node_block (design §5.2 G3). */
@@ -773,6 +803,7 @@ export class WorkflowEngine {
       // its first prompt.
       const reservedJudgeSessionId = newNodeToken()
       run.judgeSessionId = reservedJudgeSessionId
+      await this.state.put(workspaceKey, run, version)
       const node = this.nodeAt(run, frame)!
       const checker = node.checker!
       const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
@@ -790,11 +821,25 @@ export class WorkflowEngine {
         })
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error)
-        await this.blockOnJudgeFault(workspaceKey, run, version, detail)
-        return { ok: true, run, message: run.blockReason ?? '' }
+        const fresh = await this.state.get(workspaceKey)
+        if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge spawn recovery' }
+        delete fresh.run.judgeSessionId
+        await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
+        return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
       }
-      await this.state.put(workspaceKey, run, version)
-      return { ok: true, run, message: `judge respawned for node ${frame.nodeId}` }
+
+      // A1 R11 spawn-cleanup path: validate the post-admission row before the
+      // recovery is allowed to claim success.
+      const fresh = await this.state.get(workspaceKey)
+      if (fresh === undefined
+        || fresh.run.runId !== run.runId
+        || fresh.run.judgeSessionId !== reservedJudgeSessionId
+        || fresh.run.status !== 'running'
+        || topFrame(fresh.run).nodeToken !== frame.nodeToken) {
+        await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
+        return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
+      }
+      return { ok: true, run: fresh.run, message: `judge respawned for node ${frame.nodeId}` }
     }
 
     // F13: never dispatch while the current node's actor has an active turn.
