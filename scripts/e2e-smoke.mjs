@@ -96,12 +96,13 @@ try {
       const reason = ok ? 'content matches criteria' : `content: ${JSON.stringify(content)}`
       // Defer to a macrotask so the verdict lands AFTER handleClaim persists the
       // judgment phase (await continuations are microtasks; setTimeout(0) runs
-      // after them), mirroring a real async judge turn.
+      // after them), mirroring a real async judge turn. The Judge must use the
+      // engine-reserved id already persisted before this child existed (P1).
       setTimeout(() => {
-        void engine.handleJudgeClaim(workspaceKey, input.nodeToken, verdict, reason, 'judge-session-1')
+        void engine.handleJudgeClaim(workspaceKey, input.nodeToken, verdict, reason, input.judgeSessionId)
           .then(outcome => { if (outcome.ok) noteVerdict() })
       }, 0)
-      return { judgeSessionId: 'judge-session-1', messageId: 'judge-msg-1' }
+      return { judgeSessionId: input.judgeSessionId, messageId: 'judge-msg-1' }
     },
     async followupJudge() {},
     async retireJudge() {},

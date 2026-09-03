@@ -97,7 +97,7 @@ judge_respawn({
 1. 校验 `run.status === 'blocked'`、`nodeToken` 匹配当前 top frame token、调用者是 Manager；
 2. 校验当前处于判定阶段（`pendingClaim` 存在）；
 3. drain 旧 Judge（如有 `judgeSessionId`），清掉映射、撤销授权；
-4. 用 `pendingClaim` + `nodeBoundary` 重算 Node-local projection，spawn 新 Judge 并重投完整 packet；
+4. 用 `pendingClaim` 恢复判定阶段并重新计算 Node-local projection，spawn 新 Judge 并重投完整 packet（packet 仍只含 A1 R7 的 outcome/summary；`handoffContext` 保留在 State，PASS 后交给下一 Node）；
 5. 写回新 `judgeSessionId`，`status = 'running'`，`blockReason = null`。
 
 一次调用完成重建，无需再 `node_resume`。
@@ -168,7 +168,7 @@ pendingClaim?: { outcome: 'completed' | 'failed'; summary: string; handoffContex
 - **AC1 诊断可读**：技术故障 BLOCK 时 `blockReason` 以 `judge fault: <detail>` 形式包含具体异常 / stopReason，trace log 记一行。
 - **AC2 无 faultKind**：state 不出现任何故障分类枚举；控制流只读取 `judgeSessionId` 是否存在。
 - **AC3 followup 恢复**：有 `judgeSessionId` 时 `node_resume` → followup 同一 Judge（附 `resolutionContext`），不重派 Actor、不重建。
-- **AC4 spawn 恢复**：无 `judgeSessionId` 时 `node_resume` → spawn 新 Judge 并重投 packet（instruction + criteria + `pendingClaim` + projection）。
+- **AC4 spawn 恢复**：无 `judgeSessionId` 时 `node_resume` → spawn 新 Judge 并重投 packet（instruction + criteria + `pendingClaim` 的 outcome/summary + projection；`handoffContext` 保留在 State，PASS 后交给下一 Node）。
 - **AC5 respawn 重建**：有 `judgeSessionId` 时 `judge_respawn` → 清映射 + drain 旧 Judge + spawn 新 Judge 重投 packet，`status` 转 `running`。
 - **AC6 pendingClaim 生命周期**：claim 进入判定时持久化 `outcome`+`summary`；PASS/FAIL 后清除；BLOCK 期间保留可供重建。
 - **AC7 旧 Judge 退役**：spawn 重建后不再 followup 旧 Judge；旧 Session 仅作历史保留，不再授权。

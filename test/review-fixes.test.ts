@@ -57,7 +57,7 @@ test('node_resolve_program advances to a non-END target without staying blocked'
   const targets: DispatchTargets = { async steerManager() {}, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } }
   const subagents: SubagentHost = {
     async ensureRoleActor() { return { childId: 'a1', messageId: 'm' } },
-    async startJudge() { return { judgeSessionId: 'judge-1', messageId: 'm' } },
+    async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'm' } },
     async followupJudge() {},
     async retireJudge() {},
     async drainJudge() {},
@@ -77,7 +77,7 @@ test('node_resolve_program advances to a non-END target without staying blocked'
   await engine.startRun('ws', run)
   const token1 = topFrame(mem.run!).nodeToken
   await engine.handleClaim('ws', { nodeToken: token1, outcome: 'completed', summary: 'begun' }, 'm')
-  await engine.handleJudgeClaim('ws', token1, 'PASS', 'begun', 'judge-1')
+  await engine.handleJudgeClaim('ws', token1, 'PASS', 'begun', mem.run!.judgeSessionId!)
   await engine.handleTurnEnded('ws', 'm') // deferred dispatch of prog node
   const progToken = topFrame(mem.run!).nodeToken
   // Program ERRORs → BLOCK at prog.

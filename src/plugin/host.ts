@@ -229,6 +229,10 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       const started = await adapters.ctx.subagents.startContinuable({
         provider: 'spawn',
         label: 'workflow-judge',
+        // P1: use the engine-reserved id, which was persisted BEFORE child
+        // admission; the child may begin judging as soon as the prompt is
+        // accepted, so an Engine-returned id would arrive too late.
+        childId: SessionId(input.judgeSessionId),
         request: {
           prompt: textBlocks(prompt),
           parent: manager,
