@@ -25,6 +25,15 @@ export const JUDGE_ALLOW = [
  */
 export const JUDGE_MACHINERY_EXEMPT = ['report', 'structured_output'] as const
 
+/**
+ * Judge subagent display label carrying the current node id, aligned with the
+ * role-actor naming style (`workflow-role:<roleKey>`). Pure so it can be unit
+ * tested without the host.
+ */
+export function judgeLabel(nodeId: string): string {
+  return `workflow-judge:${nodeId}`
+}
+
 /** Resolve a Role's effective model route: override > role def > frozen Manager route. */
 export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: { provider?: string; model?: string }): { provider?: string; model?: string } {
   const override = run.modelOverrides[roleKey]
