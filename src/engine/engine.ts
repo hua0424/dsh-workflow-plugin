@@ -3,7 +3,7 @@
  * the whole engine is testable without a live DSH host. The plugin's `apply()`
  * wires real DSH services into these.
  */
-import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome } from '../types.ts'
+import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome, ClaimCaller, TransientDispatch } from '../types.ts'
 import { WorkflowError, LIMITS } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { createRunLog, appendLine, jsonField, redact, shortId, traceEvent } from './tracelog.ts'
@@ -147,20 +147,39 @@ export interface NodeView {
  *   NEXT node dispatch is deferred until the old turn settles (design §4.2:
  *   "dispatch next Node only after old Turn settles").
  * - transientContext: one-shot context to prepend to the next dispatch
- *   message (handoffContext on PASS / resolutionContext on resume). Never
- *   persisted; consumed by exactly one dispatch (design §2.6/§5.2 G4).
+ *   message (handoff on PASS / resolution on resume / correction evidence on
+ *   REJECT). Never persisted; consumed by exactly one dispatch (design
+ *   §2.6/§5.2 G4).
  * - workerSettled: the dispatched executor's turn already ended while a
  *   judgment was pending (the async-Judge era: the worker's `node_claim` ends
  *   its turn long before the verdict). When true, a later PASS/FAIL verdict
  *   dispatches the next node immediately instead of deferring to a turn/end
  *   that already fired (A1 R9–R11).
+ * - dispatchMessageId + leaseConsumed: the ActorDispatchLease (A1 R2). The
+ *   user message id of THIS node's actual dispatch, consumable exactly once
+ *   by a node_claim/node_block whose calling turn contains that id.
  */
 interface DispatchBook {
   dispatchedToken: string
   executorSessionId: string
   pendingDispatch: boolean
-  transientContext: string | null
+  transientContext: TransientDispatch | null
   workerSettled: boolean
+  /** A1 R2: the dispatch's user message id — the lease principal. `undefined` for lease-less nodes (builtin-program). */
+  dispatchMessageId?: string
+  /** Whether the lease has been consumed by one admitted claim/block. */
+  leaseConsumed: boolean
+}
+
+/**
+ * A1 §3.1: the identity of one real dispatch, returned by `dispatchCurrent`
+ * so `dispatchNow` can publish the lease at its single convergence point.
+ * `undefined` means the node publishes no lease (builtin-program).
+ */
+interface DispatchIdentity {
+  executorSessionId: string
+  /** The steer/followup/startContinuable user message id. */
+  dispatchMessageId: string
 }
 
 /** The current node's precise executor session (design §4 seriality). */
@@ -460,20 +479,24 @@ export class WorkflowEngine {
 
   /**
    * Deliver the current node's prompt to its executor (design §4.1).
-   * A one-shot transientContext (handoff / resolution) is prepended to the
-   * message and consumed. Establishes the NodeContextBoundary at actual
-   * dispatch (A1 R1), performs node-boundary compaction (A2), and injects the
-   * submission hard constraint for actor-tasks (A3 R1). Mutates the run in
-   * memory only (role mapping + child frames + boundary). Throws on dispatch
-   * failure so callers can BLOCK.
+   * A one-shot transientContext (handoff / resolution / correction) is
+   * prepended to the message and consumed. Establishes the NodeContextBoundary
+   * at actual dispatch (A1 R1), performs node-boundary compaction (A2), and
+   * injects the submission hard constraint for actor-tasks (A3 R1). Mutates
+   * the run in memory only (role mapping + child frames + boundary). Throws
+   * on dispatch failure so callers can BLOCK.
+   *
+   * Returns the dispatch identity (A1 §3.1) — the executor session plus the
+   * dispatch message id — for lease publication; `undefined` for lease-less
+   * nodes (builtin-program: they accept no claims).
    */
-  async dispatchCurrent(run: RunState, transientContext: string | null): Promise<void> {
+  async dispatchCurrent(run: RunState, transientContext: TransientDispatch | null): Promise<DispatchIdentity | undefined> {
     const frame = topFrame(run)
     const node = this.nodeAt(run, frame)
     if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
     const execution = node.execution
-    const text = transientContext !== null && transientContext !== ''
-      ? `[handoff]\n${transientContext}\n\n[instruction]\n${execution.instruction ?? ''}`
+    const text = transientContext !== null && transientContext.text !== ''
+      ? `[${transientContext.kind}]\n${transientContext.text}\n\n[instruction]\n${execution.instruction ?? ''}`
       : (execution.instruction ?? '')
 
     if (execution.type === 'actor-task') {
@@ -481,62 +504,79 @@ export class WorkflowEngine {
       const dispatchText = text + SUBMISSION_CONSTRAINT
       if (execution.role === 'manager') {
         // A2 R2: the Manager (user main session) is never compacted.
+        const freshBoundary = run.nodeBoundary.dispatchedAt === 0
         this.establishManagerBoundary(run)
-        await this.targets.steerManager(run, dispatchText)
-      } else {
-        const roleKey = execution.role!
-        const existing = run.roleActors[roleKey]
-        // A2 R6 / A1 R4: compact only on fresh node entry — a retained
-        // boundary for the SAME executor means this is a same-node resume.
-        const isSameNodeResume = run.nodeBoundary.dispatchedAt !== 0
-          && run.nodeBoundary.executorSessionId === existing
-        if (existing !== undefined) {
-          if (!isSameNodeResume) {
-            await this.compactBeforeDispatch(run, roleKey)
-          }
-          // A1 R2: capture the boundary cursors BEFORE the followup await — a
-          // manager message landing during the send belongs to this node's
-          // projection window, exactly like the first-creation path.
-          const dispatchedAt = Date.now()
-          const managerFromSeq = this.targets.managerSessionSeq(run)
-          const { messageId } = await this.targets.sendRoleActor(run, roleKey, dispatchText)
-          if (!isSameNodeResume) {
-            run.nodeBoundary = {
-              dispatchedAt,
-              managerFromSeq,
-              executorSessionId: existing,
-              executorDispatchMessageId: messageId,
-            }
-          }
-          // Same-node resume: RETAIN the original boundary (A1 R4/AC5) so the
-          // Judge projection keeps this node's pre-resume local history; the
-          // resume dispatch itself still projects (it follows the boundary seq).
-        } else {
-          // A2 R3: first creation has no history — create directly, no compact.
-          const dispatchedAt = Date.now()
-          const managerFromSeq = this.targets.managerSessionSeq(run)
-          const { childId, messageId } = await this.subagents.ensureRoleActor(run, roleKey, dispatchText)
-          run.roleActors[roleKey] = childId
-          run.nodeBoundary = { dispatchedAt, managerFromSeq, executorSessionId: childId, executorDispatchMessageId: messageId }
-        }
+        const { messageId } = await this.targets.steerManager(run, dispatchText)
+        // A1 R2: record the Manager dispatch's message id on the boundary too
+        // (the field existed but was previously only written on role paths).
+        if (freshBoundary) run.nodeBoundary.executorDispatchMessageId = messageId
+        return { executorSessionId: run.managerSessionId, dispatchMessageId: messageId }
       }
-    } else if (execution.type === 'builtin-program') {
-      // A3 R1: builtin-program dispatch is NOT injected with the constraint.
+      const roleKey = execution.role!
+      // A1 §6.5: a correction re-dispatch targets the ORIGINAL actor — the
+      // retained boundary names this node's executor truth, so repair a
+      // drifted/missing mapping before the followup decision. A mapping loss
+      // must never silently redirect a correction to a replacement actor.
+      if (transientContext?.kind === 'correction'
+        && run.nodeBoundary.dispatchedAt !== 0
+        && run.nodeBoundary.executorSessionId !== undefined) {
+        run.roleActors[roleKey] = run.nodeBoundary.executorSessionId
+      }
+      const existing = run.roleActors[roleKey]
+      // A2 R6 / A1 R4: compact only on fresh node entry — a retained
+      // boundary for the SAME executor means this is a same-node resume.
+      const isSameNodeResume = run.nodeBoundary.dispatchedAt !== 0
+        && run.nodeBoundary.executorSessionId === existing
+      if (existing !== undefined) {
+        if (!isSameNodeResume) {
+          await this.compactBeforeDispatch(run, roleKey)
+        }
+        // A1 R2: capture the boundary cursors BEFORE the followup await — a
+        // manager message landing during the send belongs to this node's
+        // projection window, exactly like the first-creation path.
+        const dispatchedAt = Date.now()
+        const managerFromSeq = this.targets.managerSessionSeq(run)
+        const { messageId } = await this.targets.sendRoleActor(run, roleKey, dispatchText)
+        if (!isSameNodeResume) {
+          run.nodeBoundary = {
+            dispatchedAt,
+            managerFromSeq,
+            executorSessionId: existing,
+            executorDispatchMessageId: messageId,
+          }
+        }
+        // Same-node resume: RETAIN the original boundary (A1 R4/AC5) so the
+        // Judge projection keeps this node's pre-resume local history; the
+        // resume dispatch itself still projects (it follows the boundary seq).
+        return { executorSessionId: existing, dispatchMessageId: messageId }
+      }
+      // A2 R3: first creation has no history — create directly, no compact.
+      const dispatchedAt = Date.now()
+      const managerFromSeq = this.targets.managerSessionSeq(run)
+      const { childId, messageId } = await this.subagents.ensureRoleActor(run, roleKey, dispatchText)
+      run.roleActors[roleKey] = childId
+      run.nodeBoundary = { dispatchedAt, managerFromSeq, executorSessionId: childId, executorDispatchMessageId: messageId }
+      return { executorSessionId: childId, dispatchMessageId: messageId }
+    }
+    if (execution.type === 'builtin-program') {
+      // A3 R1: builtin-program dispatch is NOT injected with the constraint,
+      // and publishes NO lease (program nodes accept no claims — A1 §5.2).
       this.establishManagerBoundary(run)
       const programText = text !== ''
         ? text
         : 'Run the current builtin program via node_run_program.'
       await this.targets.steerManager(run, programText)
-    } else {
-      const childId = execution.workflowId!
-      const childDef = run.definitionSnapshot.childWorkflows?.[childId]
-      if (childDef === undefined) throw new WorkflowError(`child workflow "${childId}" is missing from the snapshot`)
-      run.callStack.push({ workflowId: childId, nodeId: childDef.startNode, nodeToken: newNodeToken() })
-      // A3 §8: child-workflow entry (push); the return is logged by advance()'s POP.
-      this.logPush(run, frame, childId)
-      // The handoff reaches the Child's start node (design §2.6).
-      await this.dispatchCurrent(run, transientContext)
+      return undefined
     }
+    const childId = execution.workflowId!
+    const childDef = run.definitionSnapshot.childWorkflows?.[childId]
+    if (childDef === undefined) throw new WorkflowError(`child workflow "${childId}" is missing from the snapshot`)
+    run.callStack.push({ workflowId: childId, nodeId: childDef.startNode, nodeToken: newNodeToken() })
+    // A3 §8: child-workflow entry (push); the return is logged by advance()'s POP.
+    this.logPush(run, frame, childId)
+    // The handoff reaches the Child's start node (design §2.6). The lease
+    // belongs to the innermost real actor-task dispatch — propagate it.
+    return await this.dispatchCurrent(run, transientContext)
   }
 
   /** Establish the boundary for a Manager-driven node (no executor session). */
@@ -620,10 +660,11 @@ export class WorkflowEngine {
   }
 
   /** Dispatch the current node NOW (start/resume), then persist. */
-  private async dispatchNow(workspaceKey: string, run: RunState, expectedVersion: number, transientContext: string | null = null): Promise<void> {
+  private async dispatchNow(workspaceKey: string, run: RunState, expectedVersion: number, transientContext: TransientDispatch | null = null): Promise<void> {
+    let identity: DispatchIdentity | undefined
     if (run.status === 'running') {
       try {
-        await this.dispatchCurrent(run, transientContext)
+        identity = await this.dispatchCurrent(run, transientContext)
       } catch (error) {
         run.status = 'blocked'
         // A2 R4/AC5: a node-boundary compact failure gets its own clean
@@ -645,12 +686,20 @@ export class WorkflowEngine {
     }
     await this.state.put(workspaceKey, run, expectedVersion)
     if (run.status === 'running') {
+      // A1 §3.1: publish the dispatch lease at the single convergence point —
+      // every real dispatch funnels through dispatchNow. A failed send throws
+      // out of dispatchCurrent above, so no claimable lease can exist for a
+      // dispatch that did not happen. A lease-less node (builtin-program)
+      // initializes EXPLICITLY: "no lease" is a first-class state, never a
+      // missing field read as "not yet published".
       this.dispatchBook.set(workspaceKey, {
         dispatchedToken: topFrame(run).nodeToken,
-        executorSessionId: executorSessionOf(run),
+        executorSessionId: identity?.executorSessionId ?? executorSessionOf(run),
         pendingDispatch: false,
         transientContext: null,
         workerSettled: false,
+        dispatchMessageId: identity?.dispatchMessageId,
+        leaseConsumed: identity === undefined,
       })
     } else {
       this.dispatchBook.delete(workspaceKey)
@@ -659,7 +708,7 @@ export class WorkflowEngine {
   }
 
   /** Persist an advanced run WITHOUT dispatching (deferred until turn settlement). */
-  private async persistDeferred(workspaceKey: string, run: RunState, version: number, transientContext: string | null = null): Promise<void> {
+  private async persistDeferred(workspaceKey: string, run: RunState, version: number, transientContext: TransientDispatch | null = null): Promise<void> {
     await this.state.put(workspaceKey, run, version)
     if (run.status === 'running') {
       const previous = this.dispatchBook.get(workspaceKey)
@@ -669,6 +718,11 @@ export class WorkflowEngine {
         pendingDispatch: true,
         transientContext,
         workerSettled: false,
+        // A1 §3: the deferred book carries NO lease — the node advanced and
+        // its token rotated, so the old dispatch's claimability is dead by
+        // construction (the admission predicate is the defensive backstop).
+        dispatchMessageId: undefined,
+        leaseConsumed: true,
       })
     } else {
       this.dispatchBook.delete(workspaceKey)
@@ -689,13 +743,32 @@ export class WorkflowEngine {
   }
 
   /**
+   * A1 R2/§3: the dispatch-lease admission predicate. The DispatchBook is
+   * the single source of truth — a claim is admissible only when the current
+   * node has a REAL (not deferred, not consumed) dispatch whose executor is
+   * the caller and whose dispatch message id belongs to the caller's CURRENT
+   * turn. Fail-closed on every mismatch.
+   */
+  private admitLease(workspaceKey: string, run: RunState, caller: ClaimCaller): { ok: true; book: DispatchBook } | { ok: false } {
+    const book = this.dispatchBook.get(workspaceKey)
+    if (book === undefined) return { ok: false }
+    if (book.pendingDispatch) return { ok: false }
+    if (book.leaseConsumed) return { ok: false }
+    if (book.dispatchMessageId === undefined) return { ok: false }
+    if (book.dispatchedToken !== topFrame(run).nodeToken) return { ok: false }
+    if (book.executorSessionId !== caller.sessionId) return { ok: false }
+    if (!caller.turnUserMessageIds.has(book.dispatchMessageId)) return { ok: false }
+    return { ok: true, book }
+  }
+
+  /**
    * Handle a worker node_claim (design §5.2 G2): enter the judgment phase by
    * spawning a fresh continuable Judge with the Node-local Judgment Packet (A1
    * R7/R8) and persist the `pendingClaim` for respawn rebuild (A4 R9). The
    * verdict arrives later via `judge_claim` (handleJudgeClaim) or, on a
    * technical fault, via handleJudgeTurnEnded.
    */
-  async handleClaim(workspaceKey: string, claim: NodeClaim, callerSessionId: string): Promise<EngineOutcome> {
+  async handleClaim(workspaceKey: string, claim: NodeClaim, caller: ClaimCaller): Promise<EngineOutcome> {
     const row = await this.state.get(workspaceKey)
     if (row === undefined) return { ok: false, reason: 'no active run' }
     const { run, version } = row
@@ -705,19 +778,22 @@ export class WorkflowEngine {
     if (this.currentNodeKind(run) !== 'actor-task') {
       return { ok: false, reason: `current node is ${this.currentNodeKind(run)}; only actor-task accepts claims` }
     }
-    // Precise-executor check (design §4 seriality / review F5): only the
-    // current node's mapped executor may claim; the Manager may claim only
-    // Manager nodes.
-    const expectedExecutor = executorSessionOf(run)
-    if (expectedExecutor !== '' && expectedExecutor !== callerSessionId) {
-      return { ok: false, reason: 'only the current node executor may claim' }
-    }
     const node = this.nodeAt(run, frame)!
     const checker = node.checker
     if (checker === undefined) return { ok: false, reason: 'actor-task node has no checker' }
     if (checker.checkerId !== 'judge.goal-satisfied') {
       return { ok: false, reason: `unknown checker ${checker.checkerId}` }
     }
+    // A1 R2/§5.1: dispatch-lease admission. This also subsumes the old
+    // precise-executor check (book.executorSessionId IS the dispatch target)
+    // and rejects the PRD's core failure mode: State advanced but the next
+    // Node never dispatched → book is pendingDispatch / id-less → reject
+    // WITHOUT touching State or spawning a Judge (AC1).
+    const lease = this.admitLease(workspaceKey, run, caller)
+    if (!lease.ok) {
+      return { ok: false, reason: '当前调用无法绑定到一个已 dispatch 的 Node' }
+    }
+    const book = lease.book
     // A1 R9 / single-flight: a node already in judgment phase rejects new claims.
     if (run.pendingClaim !== undefined) {
       return { ok: false, reason: 'a judgment is already pending for this node' }
@@ -738,7 +814,7 @@ export class WorkflowEngine {
       // State must name the Judge before its first judge_claim is possible.
       const entered = await this.state.get(workspaceKey)
       if (entered === undefined) return { ok: false, reason: 'state row vanished during claim' }
-      if (entered.run.status !== 'running' || topFrame(entered.run).nodeToken !== claim.nodeToken) {
+      if (entered.run.status !== 'running' || topFrame(entered.run).nodeToken !== book.dispatchedToken) {
         return { ok: false, reason: 'stale claim discarded: the node moved or blocked meanwhile' }
       }
       const reservedJudgeSessionId = newNodeToken()
@@ -761,6 +837,13 @@ export class WorkflowEngine {
         entered.run.pendingClaim.handoffContext ?? null,
       )
       await this.state.put(workspaceKey, entered.run, entered.version)
+      // A1 §3.2 acceptance boundary: consume the lease only AFTER the durable
+      // put succeeded — a put failure leaves State un-accepted and the lease
+      // unconsumed, so the same Actor can retry verbatim. Workspace
+      // mutations are enqueue-serialized, so no early consumption is needed
+      // against concurrency. A second claim on the same lease is rejected
+      // from here on (AC4).
+      book.leaseConsumed = true
 
       // A4 R1: spawn failure becomes a judge technical fault → BLOCK with detail.
       try {
@@ -874,10 +957,11 @@ export class WorkflowEngine {
     // branch) so we never dispatch into a still-open executor turn.
     const book = this.dispatchBook.get(workspaceKey)
     const workerStillActive = await this.executorActive(run)
+    const handoffTransient = handoff !== undefined ? { kind: 'handoff' as const, text: handoff } : null
     if (workerStillActive || (book !== undefined && !book.workerSettled)) {
-      await this.persistDeferred(workspaceKey, run, version, handoff ?? null)
+      await this.persistDeferred(workspaceKey, run, version, handoffTransient)
     } else {
-      await this.dispatchNow(workspaceKey, run, version, handoff ?? null)
+      await this.dispatchNow(workspaceKey, run, version, handoffTransient)
     }
     return { ok: true, run, message: `checker ${result}` }
   }
@@ -993,8 +1077,8 @@ export class WorkflowEngine {
     return { ok: true, run: fresh.run, message: `judge respawned for node ${frame.nodeId}` }
   }
 
-  /** Handle node_block (design §5.2 G3). */
-  async handleBlock(workspaceKey: string, nodeToken: string, reason: string, callerSessionId: string): Promise<EngineOutcome> {
+  /** Handle node_block (design §5.2 G3 / A1 §5.2 lease classification). */
+  async handleBlock(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
     const row = await this.state.get(workspaceKey)
     if (row === undefined) return { ok: false, reason: 'no active run' }
     const { run, version } = row
@@ -1003,9 +1087,22 @@ export class WorkflowEngine {
     if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
     // Manager may block any current node; a role actor may block only its own.
     const expectedExecutor = executorSessionOf(run)
-    const isManager = run.managerSessionId === callerSessionId
-    if (!isManager && expectedExecutor !== '' && expectedExecutor !== callerSessionId) {
+    const isManager = run.managerSessionId === caller.sessionId
+    if (!isManager && expectedExecutor !== '' && expectedExecutor !== caller.sessionId) {
       return { ok: false, reason: 'only the current node executor or the Manager may block' }
+    }
+    // A1 §5.2: lease binding applies ONLY when the current node is an
+    // actor-task AND the caller is its precise executor (Manager-executor or
+    // the role Actor) — the claim/block pair shares one dispatch lease, so a
+    // second claim/block on the same dispatch and a stale-turn block are both
+    // rejected. Manager blocks on role-executor nodes stay control-plane
+    // (node_resume's sibling), and builtin-program / child-workflow nodes
+    // publish no lease at all (Manager-driven control-plane by design).
+    if (this.currentNodeKind(run) === 'actor-task' && expectedExecutor === caller.sessionId) {
+      const lease = this.admitLease(workspaceKey, run, caller)
+      if (!lease.ok) {
+        return { ok: false, reason: '当前调用无法绑定到一个已 dispatch 的 Node' }
+      }
     }
     run.status = 'blocked'
     run.blockReason = reason
@@ -1013,6 +1110,8 @@ export class WorkflowEngine {
     // node's own Actor).
     this.logBlock(run, frame, isManager ? 'manager' : 'actor', reason)
     await this.state.put(workspaceKey, run, version)
+    // A1 §3.2: BLOCK consumes the lease WITH the book (no consumed residue);
+    // a put failure above leaves the book intact for a verbatim retry.
     this.dispatchBook.delete(workspaceKey)
     return { ok: true, run, message: `blocked: ${reason}` }
   }
@@ -1115,7 +1214,7 @@ export class WorkflowEngine {
     frame.nodeToken = newNodeToken()
     // A3 R6: actor-path resume (re-dispatch with the resolution context).
     this.logResume(run, frame, nodeToken, 'actor', resolutionContext)
-    await this.dispatchNow(workspaceKey, run, version, resolutionContext)
+    await this.dispatchNow(workspaceKey, run, version, { kind: 'handoff', text: resolutionContext })
     return { ok: true, run, message: run.blockReason ?? `resumed: ${resolutionContext.slice(0, 120)}` }
   }
 

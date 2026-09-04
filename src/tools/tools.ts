@@ -5,7 +5,8 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { LIMITS, type ClaimOutcome } from '../types.ts'
+import { LIMITS, type ClaimOutcome, type ClaimCaller } from '../types.ts'
+import { callerTurnUserMessageIds } from '../plugin/turnbind.ts'
 
 /** Length-check a tool text argument per the design bounds. */
 function lengthError(field: string, value: string | undefined, min: number, max: number, required: boolean): string | undefined {
@@ -14,6 +15,31 @@ function lengthError(field: string, value: string | undefined, min: number, max:
   if (trimmed.length < min) return `${field} must be at least ${min} characters after trim`
   if (trimmed.length > max) return `${field} must be at most ${max} characters after trim`
   return undefined
+}
+
+/** Minimal shape of the exec's caller agent the binding needs. */
+interface CallerAgentLike {
+  session: { id: string; events?: unknown }
+}
+
+/**
+ * A1 R3/§2: snapshot the calling turn BEFORE the mutation is enqueued — the
+ * turn's user-message id set only grows, so the snapshot stays valid for the
+ * admission decision. Fail-closed: an un-derivable turn yields an EMPTY set,
+ * which no dispatch message id can match (claim rejected downstream).
+ */
+function claimCallerOf(exec: { agent?: unknown; callId?: string; rootCallId?: string }): ClaimCaller {
+  const agent = typeof exec.agent === 'object' && exec.agent !== null && 'session' in exec.agent
+    ? (exec.agent as CallerAgentLike)
+    : undefined
+  const sessionId = agent?.session.id ?? ''
+  const events = agent?.session.events
+  const callId = typeof exec.callId === 'string' ? exec.callId : ''
+  const rootCallId = typeof exec.rootCallId === 'string' ? exec.rootCallId : callId
+  const ids = Array.isArray(events) && callId !== ''
+    ? callerTurnUserMessageIds(events as ReadonlyArray<{ type: string; seq: number; data: unknown }>, callId, rootCallId)
+    : undefined
+  return { sessionId, turnUserMessageIds: ids ?? new Set<string>() }
 }
 
 /** Host services the tools need (wired by the plugin). */
@@ -25,10 +51,11 @@ export interface ToolHost {
    */
   authorize(agent: unknown, toolName: string): Promise<{ workspaceKey: string } | { workspaceKey: null; reason: string }>
 
-  // Engine mutations (callers already passed authorize; `caller` is the
-  // calling agent's session id for precise-executor enforcement).
-  claim(workspaceKey: string, claim: { nodeToken: string; outcome: ClaimOutcome; summary: string; handoffContext?: string }, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
-  block(workspaceKey: string, nodeToken: string, reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  // Engine mutations (callers already passed authorize; `caller` identifies
+  // the calling agent's session — for claim/block it also carries the calling
+  // turn's user-message id snapshot for dispatch-lease admission, A1 R2/R3).
+  claim(workspaceKey: string, claim: { nodeToken: string; outcome: ClaimOutcome; summary: string; handoffContext?: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
+  block(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -102,7 +129,7 @@ export const workflowTools: ToolDefinition[] = [
         const handoffError = lengthError('handoffContext', args.handoffContext, 1, LIMITS.handoffMax, false)
         if (handoffError !== undefined) return `拒绝：${handoffError}`
       }
-      const outcome = await host.claim(auth.workspaceKey, { nodeToken: args.nodeToken, outcome: args.outcome, summary: args.summary, handoffContext: args.handoffContext }, auth.caller)
+      const outcome = await host.claim(auth.workspaceKey, { nodeToken: args.nodeToken, outcome: args.outcome, summary: args.summary, handoffContext: args.handoffContext }, claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },
@@ -121,7 +148,7 @@ export const workflowTools: ToolDefinition[] = [
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       const reasonError = lengthError('reason', args.reason, 1, LIMITS.blockReasonMax, true)
       if (reasonError !== undefined) return `拒绝：${reasonError}`
-      const outcome = await thisHost().block(auth.workspaceKey, args.nodeToken, args.reason, auth.caller)
+      const outcome = await thisHost().block(auth.workspaceKey, args.nodeToken, args.reason, claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },

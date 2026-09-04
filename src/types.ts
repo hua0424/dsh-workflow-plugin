@@ -186,6 +186,27 @@ export interface StateRow {
 /** Claim outcome a worker may submit. */
 export type ClaimOutcome = 'completed' | 'failed'
 
+/**
+ * A1 R3: who is calling node_claim / node_block — the calling session plus a
+ * snapshot of the CURRENT turn's user/message ids (taken by the tool layer
+ * from the caller's session log BEFORE enqueuing the mutation; ids only grow
+ * within a turn, so the snapshot is stable for the admission decision).
+ */
+export interface ClaimCaller {
+  sessionId: string
+  turnUserMessageIds: ReadonlySet<string>
+}
+
+/**
+ * A1 §3: one-shot transient context for the next dispatch — `handoff`
+ * (PASS edge / resolution) or `correction` (a REJECTed claim re-dispatched to
+ * the same node). Threading the kind through DispatchBook / persistDeferred /
+ * dispatchNow keeps the delayed correction's header distinct from `[handoff]`.
+ */
+export type TransientDispatch =
+  | { kind: 'handoff'; text: string }
+  | { kind: 'correction'; text: string }
+
 /** A worker's completion claim. */
 export interface NodeClaim {
   nodeToken: string
