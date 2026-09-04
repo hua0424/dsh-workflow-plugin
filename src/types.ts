@@ -207,9 +207,11 @@ export type TransientDispatch =
   | { kind: 'handoff'; text: string }
   | { kind: 'correction'; text: string }
 
-/** A worker's completion claim. */
+/**
+ * A worker's completion claim. No nodeToken (A1 AC2): admission binds the
+ * claim to the current dispatch lease, so the claim carries only its payload.
+ */
 export interface NodeClaim {
-  nodeToken: string
   outcome: ClaimOutcome
   summary: string
   handoffContext?: string

@@ -19,7 +19,7 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
       if (toolName === 'workflow_status') return { workspaceKey: 'ws-1' }
       return { workspaceKey: 'ws-1' }
     },
-    claim: async (ws, claim) => { calls.push({ name: 'claim', args: { ws, claim } }); return { ok: true, message: 'claimed' } },
+    claim: async (ws, claim, caller) => { calls.push({ name: 'claim', args: { ws, claim, caller } }); return { ok: true, message: 'claimed' } },
     block: async (ws, nodeToken, reason) => { calls.push({ name: 'block', args: { ws, nodeToken, reason } }); return { ok: true, message: 'blocked' } },
     resume: async (ws, nodeToken, resolutionContext) => { calls.push({ name: 'resume', args: { ws, nodeToken, resolutionContext } }); return { ok: true, message: 'resumed' } },
     runProgram: async (ws, nodeToken, parameters) => { calls.push({ name: 'runProgram', args: { ws, nodeToken, parameters } }); return { ok: true, message: 'ran' } },
@@ -69,13 +69,14 @@ test('node_claim routes to host.claim and concludes the turn on success', async 
   const tool = findTool('node_claim')
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
-  const token = randomUUID()
   const result = await tool.execute(
-    { nodeToken: token, outcome: 'completed', summary: 'did it', handoffContext: 'next: X' },
+    { outcome: 'completed', summary: 'did it', handoffContext: 'next: X' },
     exec as never,
   )
   assert.equal(result, 'claimed')
-  assert.deepEqual(host.calls[0], { name: 'claim', args: { ws: 'ws-1', claim: { nodeToken: token, outcome: 'completed', summary: 'did it', handoffContext: 'next: X' } } })
+  // A1 AC2: no nodeToken — only the payload plus the lease caller snapshot
+  // (EXEC has no agent → fail-closed empty id set, sessionId '').
+  assert.deepEqual(host.calls[0], { name: 'claim', args: { ws: 'ws-1', claim: { outcome: 'completed', summary: 'did it', handoffContext: 'next: X' }, caller: { sessionId: '', turnUserMessageIds: new Set<string>() } } })
   assert.equal(concluded, true)
 })
 
@@ -163,7 +164,7 @@ test('authorize denial surfaces in control tools', async () => {
     authorize: async () => ({ workspaceKey: null, reason: 'only manager' }),
   })
   const tool = findTool('node_claim')
-  const result = await tool.execute({ nodeToken: 'x', outcome: 'completed', summary: 's' }, EXEC as never)
+  const result = await tool.execute({ outcome: 'completed', summary: 's' }, EXEC as never)
   assert.match(result as string, /拒绝：only manager/)
 })
 

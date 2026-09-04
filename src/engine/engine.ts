@@ -774,7 +774,6 @@ export class WorkflowEngine {
     const { run, version } = row
     if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}; claims are rejected` }
     const frame = topFrame(run)
-    if (frame.nodeToken !== claim.nodeToken) return { ok: false, reason: 'nodeToken is stale' }
     if (this.currentNodeKind(run) !== 'actor-task') {
       return { ok: false, reason: `current node is ${this.currentNodeKind(run)}; only actor-task accepts claims` }
     }
@@ -788,7 +787,8 @@ export class WorkflowEngine {
     // precise-executor check (book.executorSessionId IS the dispatch target)
     // and rejects the PRD's core failure mode: State advanced but the next
     // Node never dispatched → book is pendingDispatch / id-less → reject
-    // WITHOUT touching State or spawning a Judge (AC1).
+    // WITHOUT touching State or spawning a Judge (AC1). The claim carries NO
+    // nodeToken (AC2) — the book's dispatchedToken is the token truth.
     const lease = this.admitLease(workspaceKey, run, caller)
     if (!lease.ok) {
       return { ok: false, reason: '当前调用无法绑定到一个已 dispatch 的 Node' }
@@ -799,7 +799,7 @@ export class WorkflowEngine {
       return { ok: false, reason: 'a judgment is already pending for this node' }
     }
     // F14: single-flight per node token — one in-flight Judge per claim.
-    const flightKey = `${workspaceKey}:${claim.nodeToken}`
+    const flightKey = `${workspaceKey}:${book.dispatchedToken}`
     if (this.inFlight.has(flightKey)) {
       return { ok: false, reason: 'a judge evaluation is already in flight for this node' }
     }
@@ -862,7 +862,7 @@ export class WorkflowEngine {
         if (fresh.run.runId !== entered.run.runId
           || fresh.run.judgeSessionId !== reservedJudgeSessionId
           || fresh.run.status !== 'running'
-          || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
+          || topFrame(fresh.run).nodeToken !== book.dispatchedToken) {
           await this.subagents.drainJudge(entered.run, reservedJudgeSessionId).catch(() => {})
           return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
         }
@@ -882,7 +882,7 @@ export class WorkflowEngine {
         || fresh.run.runId !== entered.run.runId
         || fresh.run.judgeSessionId !== reservedJudgeSessionId
         || fresh.run.status !== 'running'
-        || topFrame(fresh.run).nodeToken !== claim.nodeToken) {
+        || topFrame(fresh.run).nodeToken !== book.dispatchedToken) {
         await this.subagents.drainJudge(entered.run, reservedJudgeSessionId).catch(() => {})
         return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
       }

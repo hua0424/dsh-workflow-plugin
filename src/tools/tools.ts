@@ -54,7 +54,7 @@ export interface ToolHost {
   // Engine mutations (callers already passed authorize; `caller` identifies
   // the calling agent's session — for claim/block it also carries the calling
   // turn's user-message id snapshot for dispatch-lease admission, A1 R2/R3).
-  claim(workspaceKey: string, claim: { nodeToken: string; outcome: ClaimOutcome; summary: string; handoffContext?: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
+  claim(workspaceKey: string, claim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   block(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -110,9 +110,8 @@ export const workflowTools: ToolDefinition[] = [
 
   defineTool({
     name: 'node_claim',
-    description: '提交当前 Node 的工作结果声明。completed/failed 之后由 Checker 独立判定 PASS/FAIL。这必须是当前 Turn 的最后一个动作。',
+    description: '提交当前 Node 的工作结果声明（candidate result）。由 Checker 独立确认 ACCEPT/REJECT。无需任何 token——绑定由派发 lease 自动完成。这必须是当前 Turn 的最后一个动作。',
     parameters: {
-      nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken（status 工具返回）' },
       outcome: { type: 'string', required: true, enum: ['completed', 'failed'], description: 'completed | failed' },
       summary: { type: 'string', required: true, description: '工作摘要（1..4000 字符）' },
       handoffContext: { type: 'string', description: '交给下一 Node 的上下文（仅 completed 可用，1..8000 字符）' },
@@ -129,7 +128,7 @@ export const workflowTools: ToolDefinition[] = [
         const handoffError = lengthError('handoffContext', args.handoffContext, 1, LIMITS.handoffMax, false)
         if (handoffError !== undefined) return `拒绝：${handoffError}`
       }
-      const outcome = await host.claim(auth.workspaceKey, { nodeToken: args.nodeToken, outcome: args.outcome, summary: args.summary, handoffContext: args.handoffContext }, claimCallerOf(exec))
+      const outcome = await host.claim(auth.workspaceKey, { outcome: args.outcome, summary: args.summary, handoffContext: args.handoffContext }, claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },
