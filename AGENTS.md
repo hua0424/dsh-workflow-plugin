@@ -36,7 +36,7 @@ ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.
 
 ## Project
 
-DSH Agent-Team Workflow plugin (`dsh-agent-team-workflow`) — a Cordis plugin for DSH that runs configurable serial Manager / Role-Actor team workflows (`agent-workflow/v1`). TypeScript ESM (`module: nodenext`, strict), Node ≥ 22.19, pnpm, Windows dev environment.
+DSH Agent-Team Workflow plugin (`dsh-agent-team-workflow`) — a Cordis plugin for DSH that runs configurable serial Manager / Role-Actor team workflows (`agent-workflow/v2`). TypeScript ESM (`module: nodenext`, strict), Node ≥ 22.19, pnpm, Windows dev environment.
 
 Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages are devDependencies — at runtime they resolve from the DSH installation via the profile fallback. Do not move them into `dependencies`.
 
@@ -55,7 +55,7 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 - `src/state/` — SQLite 状态存储（`node:sqlite` DatabaseSync，WAL，owner-only）+ invariants + nodeToken.
 - `src/engine/` — 串行 Node 推进、token 结算、deferred 派发、best-effort trace log（`tracelog.ts`）.
 - `src/roles/` — role/judge spawn plans、model routes、deny/allow lists.
-- `src/judge/` — Node-local transcript projection + goal-satisfied prompt 与 `judge_claim` 协议.
+- `src/judge/` — Node-local transcript projection + `judge.claim-correct` Judgment Packet 与 `judge_claim` 协议.
 - `src/tools/` — workflow 控制工具 + inspection wrappers；所有调用经 `authz.ts` 校验调用者身份.
 - `src/commands/` — `/dsh-flow list|start|status|reset`.
 - `src/programs/` — git/gh runner + builtin programs.

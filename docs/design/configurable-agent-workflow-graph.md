@@ -4,6 +4,11 @@
   剩余唯一验收项为真实模型 Web GUI e2e（详见 `docs/testing/acceptance-report.md`）
 - 目标：在 DSH 上提供主 Agent + continuable subagents 的串行团队工作流执行能力
 - 替代关系：本文已取代`feature-delivery/v1`业务专用状态机、Effect和Adapter合同；旧文档仅保留在Git历史
+- v2 修订（A1，2026-09-05）：schema 升级`agent-workflow/v2`、checker 更名`judge.claim-correct`、
+  `node_claim`去 nodeToken（dispatch lease 准入）、Judge 改为 ACCEPT/REJECT/NEED_CONTEXT 确认协议
+  （Graph PASS/FAIL 由 claim outcome 映射）、REJECT 触发同 Node correction 重派并新增 CORRECT trace 事件、
+  State 新增 pendingCorrection。机制细节见 `docs/prd/20260903-workflow-hardening/a1-design.md`；
+  本文相应小节已按 v2 语义更新。
 
 ## 1. 产品需求
 
@@ -124,7 +129,7 @@ ${DSH_HOME:-$HOME/.dsh}/workflows/<workflow-id>.yaml
 
 Catalog每次list/start fresh非递归扫描根目录，仅接受lowercase`[a-z][a-z0-9-]*.yaml`普通文件；拒绝symlink/junction和`.yml`，忽略其他扩展/子目录。Invalid文件在list显示diagnostics且只阻塞自身start，不影响其他Workflow。
 
-Schema已确认精确`agent-workflow/v1`，输入使用受限YAML 1.2：单文档，禁止duplicate key、anchor/alias/merge、custom tag、模板/环境插值，未知字段拒绝，不做alias/range/migration。实现用`yaml`库`parseDocument(text,{version:'1.2',uniqueKeys:true,customTags:[]})`并拒绝全部document.errors与warnings，再对AST走查显式拒绝anchor/alias/tag/merge key；库选项不足以保证禁制，必须AST校验加严格schema（未知字段拒绝）双保险。
+Schema已确认精确`agent-workflow/v2`，输入使用受限YAML 1.2：单文档，禁止duplicate key、anchor/alias/merge、custom tag、模板/环境插值，未知字段拒绝，不做alias/range/migration。实现用`yaml`库`parseDocument(text,{version:'1.2',uniqueKeys:true,customTags:[]})`并拒绝全部document.errors与warnings，再对AST走查显式拒绝anchor/alias/tag/merge key；库选项不足以保证禁制，必须AST校验加严格schema（未知字段拒绝）双保险。
 
 启动时把完整normalized配置和definitionHash写入Run State。Active Run之后只读取该snapshot并忽略YAML后续修改；新YAML配置只影响下一个Run，不做hot reload/continuity projection。唯一运行中Role replacement来源是Manager显式`workflow_set_role_model`或Actor session不可恢复。
 
@@ -188,20 +193,24 @@ checker: {
 }
 ```
 
-v1唯一可用Checker是`judge.goal-satisfied`。Catalog只是插件源码内部Map，不提供运行时register API。未来可以在不改变上述YAML结构时由新插件版本增加deterministic或judge-assisted checkerId；这种纯新增ID保持`agent-workflow/v1`，只有配置结构/既有语义不兼容变化才升级v2。
+v2唯一可用Checker是`judge.claim-correct`（A1自`judge.goal-satisfied`更名，语义改为确认协议）。Catalog只是插件源码内部Map，不提供运行时register API。未来可以在不改变上述YAML结构时由新插件版本增加deterministic或judge-assisted checkerId；这种纯新增ID保持`agent-workflow/v2`，只有配置结构/既有语义不兼容变化才升级版本。
 
-### 3.1 `judge.goal-satisfied`
+### 3.1 `judge.claim-correct`
 
-Config只允许非空`criteria`文本。Engine用内置Judge system template包装：独立检查真实现场、不信任Worker自报、禁止修改、只输出strict PASS/FAIL+reason。Node criteria不能覆盖Judge职责、只读toolFilter或output协议。
+Config只允许非空`criteria`文本。Engine用内置Judge system template包装：独立检查真实现场、不信任Worker自报、禁止修改、只输出strict确认结果+reason。Node criteria不能覆盖Judge职责、只读toolFilter或output协议。
 
-Fresh Judge固定接收：global Judge persona、内置template、Node instruction/criteria、Worker transient claim、workspace cwd，以及Host从Manager Session临时投影的USER/MANAGER可见文本conversation。投影是Host内自定义瞬时纯函数：遍历`session.events`选取append-origin的`user/message`（`source.kind==='user'`）与`assistant/message`文本块，排除tool/plugin/替换/hidden事件；不使用`deriveMessages()`（它会混入tool results与插件注入内容）。投影不写State；上次Judge结果只有在Manager明确复述进主会话时才会进入，因而不需要额外Manager注入步骤。
+Fresh Judge固定接收：global Judge persona、内置template、Node instruction/criteria、Worker transient claim、可选的`pendingCorrection`证据段（`[previous rejection]`/`[previous claim]`，来自同Node先前一次REJECT）、workspace cwd，以及Host从当前Node dispatch边界投影的Node-local可见文本conversation（Manager/User/Actor合并，排除tool/plugin/替换/hidden与旧Node历史）。投影是Host内自定义瞬时纯函数；不使用`deriveMessages()`（它会混入tool results与插件注入内容）。投影不写State；Manager路径的correction证据不经projection（plugin source被排除）而经`pendingCorrection`持久化通道进入packet。
 
 ```text
 output = {
-  result: PASS | FAIL,
+  result: ACCEPT | REJECT | NEED_CONTEXT,
   reason
 }
 ```
+
+- ACCEPT：claim可信。Graph verdict由claim outcome映射（completed→PASS、failed→FAIL）——Judge只确认，不改写结果。
+- REJECT：claim不正确或证据不足。reason必须写明应如何修正；Engine退役该Judge、轮换nodeToken、把`[judge rejection]`+`[previous claim]`+`[instruction]`作为correction消息重派给原Actor（同Node、boundary保留），并写CORRECT trace事件。
+- NEED_CONTEXT：无法可靠判定，进入可恢复BLOCK等待Manager补充。
 
 Judge错误、超时、invalid output、缺少读取能力或现场不可读不产生Graph结果，当前Node进入BLOCK。
 
@@ -219,9 +228,10 @@ Judge错误、超时、invalid output、缺少读取能力或现场不可读不�
 进入Node
 ├─ actor-task
 │  → 找到/创建Role Actor
-│  → Worker工作并node_claim(nodeToken,completed|failed,summary,handoffContext?)
-│  → 运行checkerId对应Checker（program/judge-assisted/judge）
-│  → PASS时把opaque handoffContext传给下一个Node/Child frame
+│  → Worker工作并node_claim(completed|failed,summary,handoffContext?)   [无token；dispatch lease准入]
+│  → 运行checkerId对应Checker（judge确认ACCEPT/REJECT）
+│  → ACCEPT时按claim outcome映射PASS/FAIL；PASS把opaque handoffContext传给下一个Node/Child frame
+│  → REJECT时同Node correction重派（token轮换+CORRECT事件）
 │  → PASS | FAIL
 ├─ builtin-program
 │  → Engine运行programId
@@ -308,9 +318,12 @@ Definition Snapshot直接保存在该Row的`snapshot_json.definitionSnapshot`；
   nodeBoundary: NodeContextBoundary,
   judgeSessionId?: string,
   pendingClaim?: { outcome, summary, handoffContext? },
+  pendingCorrection?: { judgeReason, previousClaim: { outcome, summary, handoffContext? } },   // A1: REJECT纠正证据（节点离开时清除）
   traceLogPath?: string   // A3: Run trace log 文件路径（可选派生元数据，仅日志定位；host 重启后事件仍写同一文件；非 workflow 状态）
 }
 ```
+
+ActorDispatchLease（`dispatchMessageId`/`leaseConsumed`）与 deferred 派发簿记是Engine内存中的DispatchBook派生产物，**不持久化**：host重启后running run一律BLOCK，恢复必经resume→重新dispatch→新lease。
 
 Manager不进mapping；Judge只以`judgeSessionId`引用进State（当前active/pending），不保存Judge历史。ModelOverrides只保存current值不保存历史。State不保存lastError或block kind。Strict invariants：running/blocked要求callStack非空，completed要求callStack=[]；blocked iff blockReason非空且对应top frame token，running/completed要求reason=null；每个frame nodeToken是UUID；roleActors keys只能来自Definition roles，modelOverrides keys只能来自roles或judge。SQLite不保存recentEvents；Command/Tool/Manager/Child过程历史完全复用DSH Session log，Status只读current facts。
 
@@ -338,7 +351,7 @@ Direct-human只使用一个`/dsh-flow` Command负责Catalog/list/start/status/re
 
 ```text
 workflow_status()
-node_claim({ nodeToken, outcome: completed | failed, summary, handoffContext? })
+node_claim({ outcome: completed | failed, summary, handoffContext? })   [A1: 无nodeToken，dispatch lease准入]
 node_block({ nodeToken, reason })
 node_resume({ nodeToken, resolutionContext })
 node_run_program({ nodeToken, parameters })
@@ -347,9 +360,9 @@ workflow_set_role_model({ roleKey, provider, modelId })
 judge_respawn({ nodeToken, reason? })
 ```
 
-所有Node mutation tool必须回传current frame nodeToken，过期token拒绝。每次进入新Node、BLOCK后resume同一Node或Actor replacement重新派发时生成新UUID并覆盖；不保存旧token/history。Token是尽力而为的stale防护（防凭记忆用旧token，防不住迟到方实时查`workflow_status`拿新token伪装——已知限制），Actor一律以`workflow_status`为准。Tool description固定要求claim/block为当前Turn最后动作，成功后后续输出/tool语义上忽略；首期不调用DSH interrupt。
+除`node_claim`外的Node mutation tool必须回传current frame nodeToken，过期token拒绝（`workflow_status`的`currentFrame.nodeToken`仍返回，供resume/respawn/resolve使用）。每次进入新Node、BLOCK后resume同一Node、REJECT correction重派或Actor replacement重新派发时生成新UUID并覆盖；不保存旧token/history。Token是尽力而为的stale防护（防凭记忆用旧token，防不住迟到方实时查`workflow_status`拿新token伪装——已知限制）。`node_claim`的admission由ActorDispatchLease承担：当前调用turn的user/message id集合必须包含本次dispatch的message id且lease未消费（Code Mode嵌套调用经`tool/code-dispatch-start`双绑定解析），不匹配拒绝且不改State、不spawn Judge；lease消费时点在持久化成功之后。Tool description固定要求claim/block为当前Turn最后动作，成功后后续输出/tool语义上忽略；首期不调用DSH interrupt。
 
-Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、token匹配、completed|failed、1..4000 summary和仅completed可用的1..8000 handoff；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和非空provider/modelId，目标Worker active时拒绝；Worker override写入后删除current roleActors mapping，旧DSH session保留但不再授权，下一次Node dispatch/resume创建replacement；Judge override只影响下一次Judge重建。Unknown字段拒绝。Judge不调用Workflow Tool，使用专用`judge_claim({nodeToken,result,reason})`提交`PASS|FAIL|NEED_CONTEXT`；`judge_respawn({nodeToken,reason?})`为Manager显式重建当前Judge。claim进入判定阶段后其`{outcome,summary,handoffContext?}`作为`pendingClaim`持久化（判定结束清除；`handoffContext`仅completed且非空时写入，20260902-fixbug 评审方案 2），parameters/resolutionContext/result details均不持久化。
+Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、actor-task节点、`judge.claim-correct` checker、lease绑定、completed|failed、1..4000 summary和仅completed可用的1..8000 handoff；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn——actor-task节点的精确executor须同时通过lease绑定（同一dispatch的第二个claim/block与旧turn迟到block被拒），builtin-program/child节点与Manager对role-executor节点的block为控制面；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext——correction派发失败的BLOCK在resume时从`pendingCorrection`重建完整correction消息；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和trim后非空、provider≤64/modelId≤128的route，目标Worker active时拒绝——当前Node的role在pendingClaim/pendingCorrection期间（running）override被拒（按Node role+boundary判定），blocked+pendingCorrection时接受且重置boundary（replacement逃生通道）；Judge override只影响下一次Judge重建。Unknown字段拒绝。Judge不调用Workflow Tool，使用专用`judge_claim({nodeToken,result,reason})`提交`ACCEPT|REJECT|NEED_CONTEXT`；`judge_respawn({nodeToken,reason?})`为Manager显式重建当前Judge。claim进入判定阶段后其`{outcome,summary,handoffContext?}`作为`pendingClaim`持久化（判定结束清除；`handoffContext`仅completed且非空时写入，20260902-fixbug 评审方案 2），REJECT写入`pendingCorrection`（advance离开Node时清除），parameters/resolutionContext/result details均不持久化。
 
 ### 5.3 BLOCK是当前Node上的可恢复暂停
 
@@ -364,8 +377,9 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
 - **行格式（fmt=2，START行声明）**：每行前缀`[YYYY-MM-DD HH:mm:ss]`（本地时间）+ 事件名 + 空格分隔的`key=value`。标识类值原样书写；自由文本值用JSON string转义（换行/引号不破坏"一事件一行"，可逆可grep），并按协议上限截断（超限追加`…[truncated]`）。事件集：
   - `START workflow= run= fmt=2`；
   - `CLAIM workflow= node= token=<8位> role= outcome= summary=<json> handoff=<json|null>`（被Engine接受的claim，admission之后、Judge spawn之前；stale/duplicate claim不产生）；
-  - `JUDGE workflow= node= token=<8位> result=PASS|FAIL|NEED_CONTEXT reason=<json> judge=<8位>`（被接受的judge_claim）；
-  - `ROUTE workflow= node= token=<8位> result=PASS|FAIL target=<node|END|BLOCK>`（最终采用的Graph Edge方向：Actor completed+Judge PASS合成PASS/onPass，failed+PASS合成FAIL/onFail；Judge REJECT（A1后）不产生ROUTE只产生JUDGE行）；
+  - `JUDGE workflow= node= token=<8位> result=ACCEPT|REJECT|NEED_CONTEXT reason=<json> judge=<8位>`（被接受的judge_claim；A1 v2确认协议取值）；
+  - `ROUTE workflow= node= token=<8位> result=PASS|FAIL target=<node|END|BLOCK>`（最终采用的Graph Edge方向：ACCEPT按claim outcome映射——completed→PASS/onPass、failed→FAIL/onFail；REJECT不产生ROUTE）；
+  - `CORRECT workflow= node= token=<8位新> role= judge=<8位旧> detail=<json>`（A1新增：REJECT重派边界——同Node、token已轮换、旧Judge已退役；在持久化前写入）；
   - `BLOCK workflow= node= token=<8位> source=actor|judge|program|dispatch|compact|restart|manager reason=<json>`（全部BLOCK入口：node_block、actor无结果turn结束、NEED_CONTEXT、Judge技术故障、FAIL无onFail、program ERROR、dispatch失败、compact失败、host重启reconcile）；
   - `RESUME workflow= node= oldToken=<8位> newToken=<8位> target=judge|actor context=<json>`（判定阶段target=judge，否则actor）；`RESPAWN node= token=<8位> judge=<8位> reason=<json|null>`；`RESOLVE node= token=<8位> result= reason=<json>`；`MODEL workflow= role= provider= model=`（只记id不记凭据，provider/model 经定点 redact）；
   - `PROGRAM workflow= node= token=<8位> program= result=PASS|FAIL|ERROR reason=<json|null>`（不记parameters）；
@@ -373,13 +387,13 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
   - `COMPACT workflow= node= token=<8位> role= ok=<bool> detail=<json|null>`。
   内部nodeToken/Judge session只记8位短前缀作去重标识；A1 决议不引入`revision`序号——claim 修正轮次由每次 REJECT 的 token 轮换区分，并新增 `CORRECT` 事件标记重派边界（见 `docs/prd/20260903-workflow-hardening/a1-design.md` §0 D2/§7.2）。
 - **隐私边界**：只记录Engine已接受的协议载荷（summary≤4000、handoff≤8000、judge reason≤2000、BLOCK reason≤4000、resolutionContext≤8000）；不记reasoning、普通tool调用、Node-local transcript、program parameters；AUTH/credential错误沿用Host安全化文案，且trace边界（`jsonField`）另有一组固定模式的credential redact兜底（Bearer/sk-*/api_key类），双保险确保凭据形态文本不落盘。
-- **一致性语义（at-least-once）**：事件写入顺序固定为「业务校验→写trace→持久化状态转换」（A3 §10），包括 START（workspace 唯一性预检查通过后先写 START 再 create，仅并发竞态/create 抛错可产生孤立文件）与 RESPAWN（put 前写）；trace与State之间无法做到exactly-once，崩溃缝隙允许产生孤立事件行，**node 级事件（CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）均携带 nodeToken 短前缀用于去重**——循环回到同一 Node 会铸新 token，合法重复与崩溃重复由此可分；run 级事件以 runId（START）或 role（MODEL）标识；State/Git/GitHub始终是权威。反向缺口（State已接受而trace缺失）不存在于正常路径。
+- **一致性语义（at-least-once）**：事件写入顺序固定为「业务校验→写trace→持久化状态转换」（A3 §10），包括 START（workspace 唯一性预检查通过后先写 START 再 create，仅并发竞态/create 抛错可产生孤立文件）、RESPAWN（put 前写）与 CORRECT（correction 持久化前写）；trace与State之间无法做到exactly-once，崩溃缝隙允许产生孤立事件行，**node 级事件（CLAIM/JUDGE/ROUTE/CORRECT/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）均携带 nodeToken 短前缀用于去重**——循环回到同一 Node 与 REJECT 重派都会铸新 token，合法重复与崩溃重复由此可分；run 级事件以 runId（START）或 role（MODEL）标识；State/Git/GitHub始终是权威。反向缺口（State已接受而trace缺失）不存在于正常路径。
 - **失败容忍（R4）**：tracelog模块所有函数绝不抛错——目录/文件创建失败返回`undefined`、追加失败静默返回`false`，日志问题永不影响Run推进。首个失败通过Host logger warning一次（不循环刷warning）；State/Git/GitHub与trace冲突时前者权威。
 - **不做**日志轮转/清理/归档、Web UI展示、turn级对话内容记录、用户自定义格式/路径（本期格式固定）。
 
 ## 6. 中断恢复
 
-已确认不区分working/checking/interrupted/recovery phase。Active Run始终只停在current Node。判定阶段的`pendingClaim`持久化供Judge重建；其余claim/Judge过程存在于当前DSH对话和调用过程，中断窗口丢失就让Worker重新claim。PASS后只把handoffContext发送给下一Actor/Manager，不持久化；发送窗口丢失时重新询问或重建。
+已确认不区分working/checking/interrupted/recovery phase。Active Run始终只停在current Node。判定阶段的`pendingClaim`持久化供Judge重建；correction阶段的`pendingCorrection`持久化供resume重建correction消息（派发失败/重启后证据不丢）；其余claim/Judge过程存在于当前DSH对话和调用过程，中断窗口丢失就让Worker重新claim。PASS后只把handoffContext发送给下一Actor/Manager，不持久化；发送窗口丢失时重新询问或重建。
 
 中断后Manager统一处理：
 
@@ -444,10 +458,11 @@ all-issues-complete?
 文件：`${DSH_HOME}/workflows/milestone-delivery.yaml`
 
 ```yaml
-# Hardened milestone-delivery config (PRD 20260903-workflow-hardening A2).
-# v1-protocol compatible: Judge verdicts stay PASS|FAIL|NEED_CONTEXT; FAIL
-# routes the onFail edge. REJECT/correction-feedback wording lands with A1.
-schemaVersion: agent-workflow/v1
+# Hardened milestone-delivery config (PRD 20260903-workflow-hardening A2 + A1).
+# A1 (agent-workflow/v2): Judge confirms claims via ACCEPT/REJECT/NEED_CONTEXT;
+# REJECT re-dispatches the same node to the original actor with the rejection
+# as the correction instruction. node_claim carries no nodeToken (dispatch lease).
+schemaVersion: agent-workflow/v2
 
 roles:
   developer:
@@ -482,8 +497,11 @@ judgeRole:
   persona: |
     Independently inspect the current claim and real workspace/remote facts.
     Never modify evaluated artifacts. Submit your verdict ONLY through
-    judge_claim({nodeToken, result: PASS|FAIL|NEED_CONTEXT, reason}).
-    Prefer PASS/FAIL; use NEED_CONTEXT only when information is genuinely missing.
+    judge_claim({nodeToken, result: ACCEPT|REJECT|NEED_CONTEXT, reason}).
+    ACCEPT confirms the claim as trustworthy (the node concludes exactly as
+    claimed); REJECT requires a reason stating concretely how to correct the
+    work (it reaches the worker verbatim); use NEED_CONTEXT only when
+    information is genuinely missing.
 
 workflow:
   startNode: plan-milestone
@@ -501,7 +519,7 @@ workflow:
           URL), milestoneTitle, branchName, and a short restatement of the
           user goal.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             The user goal is clear enough to deliver. The handoff identifies
@@ -534,7 +552,7 @@ workflow:
           carry PRD path, PRD commit, repository, branch, milestoneTitle and
           milestoneNumber.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             A PRD exists under docs/prd/ and covers the user goal, scope,
@@ -557,7 +575,7 @@ workflow:
           number. On completed claim, carry milestoneTitle and milestoneNumber
           forward in handoffContext.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             Inspect the PRD, Milestone and Issues. PASS only when the required
@@ -585,7 +603,7 @@ workflow:
           (yes/no), blocking findings (empty when satisfied), PRD path,
           Milestone number/title, and the default-branch revision reviewed.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             PASS only when the review was actually performed on the remote
@@ -611,7 +629,7 @@ workflow:
           URL, number, title, final state, and the default-branch integrated
           revision.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             The GitHub Milestone state is closed, open_issues is 0, every
@@ -632,7 +650,7 @@ workflow:
           Issues in the current Milestone. On completed claim, carry the
           remediation Issue URLs forward in handoffContext.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             PASS only when every blocking finding from the handoff is covered
@@ -653,7 +671,7 @@ childWorkflows:
             repository, the milestone branch and the milestone number the
             delivery will target.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               PASS only when the selected Issue exists, is unfinished, belongs
@@ -694,7 +712,7 @@ childWorkflows:
             repository, branch and implementation commit forward in
             handoffContext for Reviewer.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the Issue discussion, repository and commits. PASS only
@@ -718,7 +736,7 @@ childWorkflows:
             approved), Issue URL, repository, branch and reviewed commit, for
             Tester.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the Issue, the reviewed commit's diff and the
@@ -744,7 +762,7 @@ childWorkflows:
             completed claim, carry the implementation commit, report path and
             report commit forward in handoffContext for Manager delivery.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the test report and repository state. PASS only when the
@@ -775,7 +793,7 @@ childWorkflows:
             branch, integrated revision or merged PR URL, and closure state
             in handoffContext.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the Issue, repository and delivered revision. PASS only
@@ -831,13 +849,13 @@ Program parameters/details不持久化；ERROR当前Node BLOCK，重跑时先ins
 
 ### 10.2 Builtin Catalog不可运行时扩展
 
-Program/Checker Catalog只是插件源码内部固定ID→implementation/schema Map，不向Cordis或其他插件提供register API。新增ID但保持现有YAML结构/语义时可留在`agent-workflow/v1`，只需修改插件、测试并发布新版本；只有结构或既有语义不兼容变化才升级v2。恢复时Host不支持Definition Snapshot中的ID则停止Run，用户恢复兼容插件版本或Reset，不做动态fallback。
+Program/Checker Catalog只是插件源码内部固定ID→implementation/schema Map，不向Cordis或其他插件提供register API。新增ID但保持现有YAML结构/语义时可留在`agent-workflow/v2`，只需修改插件、测试并发布新版本；只有结构或既有语义不兼容变化才升级版本。恢复时Host不支持Definition Snapshot中的ID则停止Run，用户恢复兼容插件版本或Reset，不做动态fallback。
 
-### 10.3 `judge.goal-satisfied`合同
+### 10.3 `judge.claim-correct`合同
 
-Node config只允许`{criteria}`文本，trim后1..8000字符。每次fresh Judge收到global persona、内置独立只读判断template、Node instruction/criteria、Worker transient claim、workspace cwd，以及Host临时生成的Manager Session USER/MANAGER可见文本projection；projection排除system/tool/subagent/hidden内容且不写State。上次Judge只有被Manager明确复述到主会话时才会进入。
+Node config只允许`{criteria}`文本，trim后1..8000字符。每次fresh Judge收到global persona、内置独立只读判断template、Node instruction/criteria、Worker transient claim、可选的`pendingCorrection`证据段（同Node先前REJECT的`[previous rejection]`/`[previous claim]`）、workspace cwd，以及Host按当前Node dispatch边界生成的Node-local projection（Manager/User/Actor合并）；projection排除system/tool/subagent/hidden内容与引擎注入的`[提交要求]`且不写State。Manager路径的correction证据经`pendingCorrection`持久化通道进入packet（projection的plugin source过滤不放宽）。
 
-Structured output固定`{result:PASS|FAIL,reason}`，reason必填，trim后1..2000字符，不能返回nextNode/tool/handoff。Judge provider/timeout/invalid output/缺read能力/现场不可读不产生Graph结果，当前Node BLOCK并可由Manager创建fresh Judge重试。Worker即使claim failed，Judge仍按真实criteria独立判断。
+`judge_claim({nodeToken,result,reason})`协议固定`{result:ACCEPT|REJECT|NEED_CONTEXT,reason}`，reason必填，trim后1..2000字符，不能返回nextNode/tool/handoff。ACCEPT按claim outcome映射Graph PASS/FAIL（Judge不改写结果）；REJECT必须写明如何修正并触发同Node correction重派（原Actor、boundary保留、token轮换、CORRECT事件）；NEED_CONTEXT进入可恢复BLOCK。Judge provider/timeout/invalid output/缺read能力/现场不可读不产生Graph结果，当前Node BLOCK并可由Manager创建fresh Judge重试。
 
 ## 11. 后续工作
 

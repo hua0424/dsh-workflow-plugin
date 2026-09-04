@@ -2,7 +2,7 @@
 
 - 日期：2026-09-05
 - 上游 PRD：`a1-claim-admission-and-judge-confirmation.md`（核心语义以 PRD 为准，本文只定机制）
-- 状态：已定稿（两轮设计评审修正后，2026-09-05）
+- 状态：已定稿并实现（两轮设计评审修正后定稿，2026-09-05；同日按 §11 落地，实现记录见 PRD §13）
 - 范围：Dispatch Lease 与 claim admission、caller turn 绑定、Judge ACCEPT/REJECT 协议、REJECT correction 流、v2 原地升级落地
 
 ## 0. 决策记录

@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-team-workflow",
   "version": "0.1.0",
-  "description": "DSH Agent-Team Workflow plugin: configurable serial agent/subagent team workflows (agent-workflow/v1).",
+  "description": "DSH Agent-Team Workflow plugin: configurable serial agent/subagent team workflows (agent-workflow/v2).",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

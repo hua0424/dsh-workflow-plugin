@@ -1,6 +1,8 @@
-# Hardened milestone-delivery config (PRD 20260903-workflow-hardening A2).
-# v1-protocol compatible: Judge verdicts stay PASS|FAIL|NEED_CONTEXT; FAIL
-# routes the onFail edge. REJECT/correction-feedback wording lands with A1.
+# Hardened milestone-delivery config (PRD 20260903-workflow-hardening A2, migrated to v2 by A1).
+# A1 (agent-workflow/v2): Judge CONFIRMS claims via ACCEPT|REJECT|NEED_CONTEXT —
+# ACCEPT concludes the node exactly as claimed; REJECT re-dispatches the SAME
+# node with the reason as the correction instruction. node_claim carries no
+# nodeToken (the dispatch lease binds the calling turn).
 schemaVersion: agent-workflow/v2
 
 roles:
@@ -36,8 +38,11 @@ judgeRole:
   persona: |
     Independently inspect the current claim and real workspace/remote facts.
     Never modify evaluated artifacts. Submit your verdict ONLY through
-    judge_claim({nodeToken, result: PASS|FAIL|NEED_CONTEXT, reason}).
-    Prefer PASS/FAIL; use NEED_CONTEXT only when information is genuinely missing.
+    judge_claim({nodeToken, result: ACCEPT|REJECT|NEED_CONTEXT, reason}).
+    ACCEPT confirms the claim as trustworthy (the node then concludes exactly
+    as the worker claimed); REJECT requires a reason stating concretely how
+    to correct the work — it reaches the worker verbatim as the correction
+    instruction; use NEED_CONTEXT only when information is genuinely missing.
 
 workflow:
   startNode: plan-milestone

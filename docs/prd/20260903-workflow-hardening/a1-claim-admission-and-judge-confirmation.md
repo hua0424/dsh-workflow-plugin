@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：已决策（见 §7），机制设计见 `a1-design.md`，待实现
+- 状态：已实现（2026-09-05，分支 `a1-claim-admission`，按 `a1-design.md` §11 七步落地；§13 结项记录见文末；部署与运行时验证随本批 PRD 统一进行）
 - 关联问题：未实际 dispatch 的节点可以提前 claim；Judge REJECT 原因未传回 Actor；Actor 不应手工填写 nodeToken
 
 ## 1. 背景
@@ -226,3 +226,17 @@ REJECT 属于同一业务 Node 的 claim revision，而不是 Graph 自环：
 5. 实现 REJECT correction context。
 6. 更新日志事件（与 A3 PRD 协同）。
 7. 更新 schema/version、CONTEXT、设计文档与 milestone 配置。
+
+## 13. 结项记录（2026-09-05）
+
+实现按 `a1-design.md` §11 顺序分七个提交落在分支 `a1-claim-admission`（922274c → b373014 → e8a57b5 → 794d32a → 567f93d → 文档收口提交）：
+
+- **turnbind seam**：`src/plugin/turnbind.ts` 纯函数双路径（native `tool/call`；Code Mode `tool/code-dispatch-start` subCallId+rootCallId 双绑定→根 `run_code`）；`steerManager` 返回 `createUserMessage` 同步分配的 messageId。13 个独立单测。
+- **DispatchBook lease**（D5）：`dispatchCurrent` 返回 `DispatchIdentity`（child 递归透传；builtin-program 显式无 lease 态）；`dispatchNow` 单点发布；`persistDeferred` 覆盖时旧 lease 随之消亡；claim 的 lease 消费时点在 `state.put` 成功之后（put 失败可重试）；block 的消费随 book 删除。
+- **token-less node_claim**（AC2）：schema/NodeClaim 去 nodeToken；admission 拒文案统一为「当前调用无法绑定到一个已 dispatch 的 Node」；`workflow_status` 保留 `currentFrame.nodeToken`（R5）。
+- **judge v2**（D1 原地升级）：`JudgeVerdict=ACCEPT|REJECT|NEED_CONTEXT`；ACCEPT 的 Graph verdict 由 claim outcome 映射；`pendingCorrection` 持久化证据进 packet `[previous rejection]` 段；REJECT 流=retire→清判定态→写证据→token 轮换→CORRECT 事件→correction 重派（原 Actor、boundary 保留、`TransientDispatch{correction}` 贯穿延迟派发）；resume 重建完整 `[judge rejection]+[previous claim]+[manager resolution]+[instruction]` 消息。
+- **override 守卫**（§6.5）：Node role+boundary 判定（不依赖 roleActors 映射），running 且 pendingClaim/pendingCorrection 期间拒绝；blocked+pendingCorrection 逃生通道（override 接受且 boundary 重置→replacement）。
+- **v2 迁移**：`SCHEMA_VERSION=agent-workflow/v2`、checker `judge.claim-correct`、MODEL 上限 provider≤64/modelId≤128（`normalizeModelRoute` 统一 trim-后-规范化，D3）；milestone-delivery.yaml、全部测试夹具、e2e、CONTEXT/README/设计文档/AGENTS 同步；A3 revision 事项收口（§8.4）。
+- **验证**：build 干净；unit 202/202（含新增 turnbind 13 + lease/admission 8 + correction/守卫 9 + v2/上限等）；e2e 重写为内嵌 v2 catalog 的 Manager+Role 双 REJECT→correction→再 ACCEPT 全链路（`E2E SMOKE PASS`）。
+
+**遗留到批末统一处理**：`pnpm run build && node scripts/deploy-web.mjs` 部署 + 真实 `~/.dsh/workflows/milestone-delivery.yaml` 重新生成（definitionHash 变化只影响新 run）；旧 v1 运行行 fail-closed（claim → `unknown checker`），退出路径 `/dsh-flow reset`。

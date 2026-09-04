@@ -1,9 +1,18 @@
 # dsh-workflow-plugin
 
 DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
-workflows (`agent-workflow/v1`). Implementation complete; offline-verifiable
-acceptance items all pass (103 unit tests + isolated smoke e2e). The one
+workflows (`agent-workflow/v2`). Implementation complete; offline-verifiable
+acceptance items all pass (unit tests + isolated smoke e2e). The one
 remaining item is the live-model Web GUI e2e after a DSH restart.
+
+v2 (PRD 20260903-workflow-hardening A1, breaking semantic change): `node_claim`
+carries no nodeToken (admission binds to the one-shot dispatch lease of the
+calling turn); the Judge only **confirms** the Actor's claim via
+`ACCEPT | REJECT | NEED_CONTEXT` — the Graph PASS/FAIL verdict is derived from
+the claimed outcome, and a REJECT re-dispatches the SAME node to the ORIGINAL
+actor with the rejection as the correction instruction (`CORRECT` trace event).
+v1 catalogs are rejected by the loader; old v1 run rows fail closed (exit via
+`/dsh-flow reset`).
 
 ## Current documentation
 
@@ -24,7 +33,7 @@ src/
   state/              SQLite store (node:sqlite) + invariants + nodeToken
   engine/             serial node advancement, token settlement, deferred dispatch
   roles/              role/judge spawn plans, model routes, deny/allow lists
-  judge/              transcript projection + goal-satisfied prompt/output protocol
+  judge/              transcript projection + judge.claim-correct Judgment Packet + judge_claim protocol
   tools/              7 workflow tools + 2 inspection wrappers
   commands/           /dsh-flow list|start|status|reset
   programs/           git/gh runner + 2 builtin programs
@@ -73,9 +82,10 @@ config file (`src/engine/tracelog.ts`):
   values are JSON-string escaped (newlines never break the one-line rule)
   and bounded at their protocol max (over-bound text gets `…[truncated]`):
   - `[ts] START workflow=<id> run=<runId> fmt=2`
-  - `[ts] CLAIM workflow=<id> node=<node> token=<8> role=<role> outcome=<completed|failed> summary=<json> handoff=<json|null>` — every accepted Actor claim (after admission, before Judge spawn).
-  - `[ts] JUDGE workflow=<id> node=<node> token=<8> result=<PASS|FAIL|NEED_CONTEXT> reason=<json> judge=<8>` — every accepted Judge verdict.
-  - `[ts] ROUTE workflow=<id> node=<node> token=<8> result=<PASS|FAIL> target=<node|END|BLOCK>` — the finally-adopted Graph edge direction.
+  - `[ts] CLAIM workflow=<id> node=<node> token=<8> role=<role> outcome=<completed|failed> summary=<json> handoff=<json|null>` — every accepted Actor claim (after lease admission, before Judge spawn).
+  - `[ts] JUDGE workflow=<id> node=<node> token=<8> result=<ACCEPT|REJECT|NEED_CONTEXT> reason=<json> judge=<8>` — every accepted Judge confirmation (v2).
+  - `[ts] ROUTE workflow=<id> node=<node> token=<8> result=<PASS|FAIL> target=<node|END|BLOCK>` — the finally-adopted Graph edge direction (ACCEPT maps the claimed outcome; REJECT routes nothing).
+  - `[ts] CORRECT workflow=<id> node=<node> token=<8 new> role=<role> judge=<8 old> detail=<json>` — the REJECT re-dispatch boundary (same node, rotated token, retired judge).
   - `[ts] BLOCK workflow=<id> node=<node> token=<8> source=<actor|judge|program|dispatch|compact|restart|manager> reason=<json>` — every BLOCK entrance.
   - `[ts] RESUME workflow=<id> node=<node> oldToken=<8> newToken=<8> target=<judge|actor> context=<json>` / `RESPAWN` / `RESOLVE` / `MODEL` — recovery actions (node_resume, judge_respawn, node_resolve_program, workflow_set_role_model).
   - `[ts] PROGRAM workflow=<id> node=<node> token=<8> program=<id> result=<PASS|FAIL|ERROR> reason=<json|null>` — builtin-program outcomes (parameters are never logged).
@@ -98,13 +108,15 @@ config file (`src/engine/tracelog.ts`):
 - **Consistency**: events are written validate → trace → persist, so the log
   is **at-least-once** — a crash at the seam may leave an orphan line.
   Node-scoped events carry a nodeToken prefix for dedup (looping back to the
-  same node mints a fresh token, so legit repeats differ from crash dupes);
-  State/Git/GitHub stay authoritative.
+  same node AND correction re-dispatches both mint fresh tokens, so legit
+  repeats differ from crash dupes); State/Git/GitHub stay authoritative.
 - **Best-effort**: log directory/file creation or appends never fail the run.
   The FIRST failure per run surfaces once as a Host logger warning; further
   failures stay silent. State/Git/GitHub remain authoritative when they
   disagree with a trace.
 
-The e2e smoke (`pnpm run test:e2e`) asserts the START line and both PASS
-routing lines of the smoke-test workflow in an isolated temporary DSH home
-(the real `~/.dsh` is never touched).
+The e2e smoke (`pnpm run test:e2e`) drives the full v2 loop on production code
+paths — wrong work → claim → async REJECT → correction re-dispatch → corrected
+work → re-claim → ACCEPT → next node — for BOTH a Manager node and a Role node
+(embedded v2 catalog, isolated temporary DSH home; the real `~/.dsh` is never
+touched).

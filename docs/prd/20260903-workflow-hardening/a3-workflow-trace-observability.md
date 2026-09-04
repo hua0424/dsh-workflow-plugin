@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；AC4 的 revision 序号经 A1 决议改为以 token 前缀 + CORRECT 事件覆盖（见 §5 R2 决议注），其余 AC 已实现；部署与运行时验证随本批 PRD 统一进行）
+- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；AC4 的 revision 序号经 A1 决议并以 A1 落地的 token 前缀 + CORRECT 事件覆盖（见 §5 R2 决议注），其余 AC 已实现；A1 落地后 JUDGE 取值为 ACCEPT/REJECT/NEED_CONTEXT；部署与运行时验证随本批 PRD 统一进行）
 - 关联需求：记录每个 Node 的 Actor claim、Judge 输出、BLOCK/RESUME
 
 ## 1. 背景
@@ -241,7 +241,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 ### 13.1 实现时选定的决策
 
 - **§3 格式**：选定**迁移为 ROUTE**（不保留旧 `NODE ... PASS -> ...`），全套事件统一为单行 `key=value` + JSON string escaping，`START` 行声明 `fmt=2` 作版本标记；README/设计文档/单元测试/e2e 断言同步更新，无双格式并存。
-- **§3 JUDGE 取值**：`result` 沿用现行 judge_claim 协议的 `PASS|FAIL|NEED_CONTEXT`（本 PRD 草案中的 `ACCEPT|REJECT` 是 A1 新协议术语）；A1 落地时同步改枚举（2026-09-05 决议：不加 `revision` 字段，token 8 位短前缀 + A1 新增 CORRECT 事件满足 §10 去重诉求，见 `a1-design.md` §0 D2）。
+- **§3 JUDGE 取值**：`result` 已随 A1 落地改为 `ACCEPT|REJECT|NEED_CONTEXT`（v2 确认协议；本 PRD 草案时的 `PASS|FAIL|NEED_CONTEXT` 为 v1 术语）；`revision` 字段经决议不引入，token 8 位短前缀 + A1 新增 CORRECT 事件满足 §10 去重诉求（见 `a1-design.md` §0 D2）。
 - **traceLogPath 持久化（R5 restart 覆盖的前提）**：原实现日志路径只存 Engine 内存 map，host 重启即丢，restart-reconcile BLOCK 无法落盘。现将可选字段 `traceLogPath` 随 RunState 行持久化（state store 为宽松 JSON 序列化，向后兼容；pre-A3 旧行无此字段，日志 no-op）。日志本身仍是派生产物，不进 SQLite 之外的任何状态语义。代价（复审后修正措辞）：workspace 冲突的常见路径由 `startRun` 预检查拦截、不产生任何文件；仅并发竞态或 `state.create` 异常会残留孤儿文件，且因 START 先于 create 写入，孤儿文件内含一条 START 行（at-least-once 声明允许，见 §13.1 一致性语义与 §16）。
 - **§10 告警**：`appendLine` 改为返回布尔；Engine 新增可注入 `traceWarn`（插件接线到 `ctx.logger.warn`），每 run 首次创建/追加失败各告警一次，之后静默。
 
@@ -250,8 +250,9 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | 事件 | 写入点（engine.ts） | 验收 |
 | --- | --- | --- |
 | CLAIM | `handleClaim` admission+lease 校验+最终 re-read 后、pendingClaim 持久化**前**（at-least-once）、startJudge 前 | AC1/AC2/AC9 |
-| JUDGE | `handleJudgeClaim` 校验通过后、任何状态转换前（NEED_CONTEXT/PASS/FAIL 均记） | AC3/AC4 |
+| JUDGE | `handleJudgeClaim` 校验通过后、任何状态转换前（NEED_CONTEXT/ACCEPT/REJECT 均记；A1 v2 取值） | AC3/AC4 |
 | ROUTE | `advance()`（含 child END→pop→parent 递归路由） | §3 |
+| CORRECT（A1 新增） | `handleJudgeClaim` REJECT 分支：token 轮换后、correction 持久化前写入；`role=`节点role、`judge=`旧 Judge id 前缀、`detail=`rejection reason | A1 AC7/AC8 |
 | BLOCK | `handleBlock`(actor/manager)、NEED_CONTEXT(judge)、`blockOnJudgeFault`(judge)、advance FAIL 无 onFail(judge/program/manager)、program ERROR(program)、`dispatchNow` compact 失败(compact)/dispatch 失败(dispatch)、`handleTurnEnded` 无结果(actor)、`handleRestartReconcile`(restart) | AC5 |
 | RESUME | `handleResume` 判定阶段(judge)/普通路径(actor)，token 轮换后、执行前 | AC6 |
 | RESPAWN | `handleRespawnJudge` 校验+drain 旧 Judge 后、持久化 put **前**（at-least-once；spawn 失败由随后的 judge-fault BLOCK 行覆盖） | AC6 |
@@ -261,7 +262,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | PUSH/POP | `dispatchCurrent` child 分支 / `advance` pop 分支（显式配对） | AC7 |
 | COMPACT | `compactBeforeDispatch` 成败均记（A2 R7 原有语义升级为 fmt=2） | §9 外延 |
 
-- **§10 去重标识落地（复审后补齐）**：§3 示例中的 ROUTE/PUSH/POP/COMPACT 原本无 token；复审后所有 node 级事件（CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）统一携带 nodeToken 8 位短前缀——循环回到同一 Node 会铸新 token，合法重复与崩溃重试重复由此可分。START 以 runId 标识，MODEL 是 run 级事件（role 标识）。
+- **§10 去重标识落地（复审后补齐）**：§3 示例中的 ROUTE/PUSH/POP/COMPACT 原本无 token；复审后所有 node 级事件（CLAIM/JUDGE/ROUTE/CORRECT/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）统一携带 nodeToken 8 位短前缀——循环回到同一 Node 与 A1 的 REJECT 重派均铸新 token，合法重复与崩溃重试重复由此可分。START 以 runId 标识，MODEL 是 run 级事件（role 标识）。
 - **§10 一致性语义（审查后修正为 at-least-once）**：初版 CLAIM 写在 acceptance 持久化之后（at-most-once，崩溃即缺行）；按 §10 规定的「校验→trace→持久化」顺序修正为 put 之前写 CLAIM。语义声明：**at-least-once**——崩溃缝隙可产生孤立事件行（如 CLAIM 已写但 acceptance 未落盘），以 token 短前缀去重，State/Git/GitHub 权威；正常路径不存在反向缺口（State 已接受而 trace 缺失）。其余事件（JUDGE/ROUTE/BLOCK/RESUME/PROGRAM 等）初版即遵循该顺序，crash-seam 语义由 put 故障注入测试固化。
 
 ### 13.3 验证情况
