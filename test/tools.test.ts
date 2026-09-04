@@ -136,9 +136,9 @@ test('judge_claim routes to host.judgeClaim and concludes the turn on success', 
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
   const token = randomUUID()
-  const result = await tool.execute({ nodeToken: token, result: 'PASS', reason: 'verified' }, exec as never)
+  const result = await tool.execute({ nodeToken: token, result: 'ACCEPT', reason: 'verified' }, exec as never)
   assert.equal(result, 'claimed')
-  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'PASS', reason: 'verified', judgeSessionId: '' } })
+  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'ACCEPT', reason: 'verified', judgeSessionId: '' } })
   assert.equal(concluded, true)
 })
 

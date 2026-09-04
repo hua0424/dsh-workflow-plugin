@@ -104,6 +104,8 @@ interface Harness {
   programResults: Map<string, { kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string }>
   /** A3 review S4: throw from the Manager steer (dispatch failure injection). */
   steerFailure: Error | undefined
+  /** A1: throw from the role-actor followup (correction dispatch failure injection). */
+  sendFailure: Error | undefined
   /** A3 review S4: next N state.put calls throw (crash-seam injection). */
   failNextPuts: number
   /** A3 review round 3: next N state.create calls throw (START seam injection). */
@@ -132,6 +134,7 @@ function makeHarness(memArg?: MemState): Harness {
     compactResult: { ok: true, detail: 'no compactable range' },
     programResults: new Map(),
     steerFailure: undefined,
+    sendFailure: undefined,
     failNextPuts: 0,
     failNextCreates: 0,
   }
@@ -144,6 +147,7 @@ function makeHarness(memArg?: MemState): Harness {
       return { messageId }
     },
     async sendRoleActor(_run, _role, text) {
+      if (h.sendFailure !== undefined) throw h.sendFailure
       h.actorMessages.push(text)
       const messageId = `msg-role-${h.actorMessages.length}`
       h.messageIds.push(messageId)
@@ -237,7 +241,7 @@ test('claim spawns a judge, judge_claim PASS advances and defers next dispatch u
   assert.deepEqual(h.judgeSpawnInputs[0]!.claim, { outcome: 'completed', summary: 'planned' })
   assert.equal(h.mem.run!.status, 'running')
   // Judge submits PASS BEFORE the worker's turn settles (fast-verdict ordering).
-  const verdict = await h.engine.handleJudgeClaim('ws', token, 'PASS', 'planned ok', judgeSessionId)
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'planned ok', judgeSessionId)
   assert.ok(verdict.ok)
   assert.equal(topFrame(h.mem.run!).nodeId, 'build')
   assert.equal(h.mem.run!.judgeSessionId, undefined)
@@ -269,19 +273,19 @@ test('real ordering: worker turn settles before the verdict — no false BLOCK, 
   // The late verdict is accepted (run still running) and — because the worker
   // already settled — dispatches the next node IMMEDIATELY (no pendingDispatch
   // stall).
-  const verdict = await h.engine.handleJudgeClaim('ws', token, 'PASS', 'planned ok', reservedJudgeId(h))
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'planned ok', reservedJudgeId(h))
   assert.ok(verdict.ok)
   assert.equal(topFrame(h.mem.run!).nodeId, 'build')
   assert.equal(h.actorMessages.length, 1)
   assert.match(h.actorMessages[0]!, /Build/)
 })
 
-test('claim with FAIL verdict and no onFail edge blocks', async () => {
+test('claim outcome failed + ACCEPT maps to the FAIL edge; no onFail edge blocks (AC6)', async () => {
   const h = makeHarness()
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
-  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  const verdict = await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not planned', reservedJudgeId(h))
+  await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'planned badly' }, mgr(h))
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'not planned', reservedJudgeId(h))
   assert.ok(verdict.ok)
   assert.equal(h.mem.run!.status, 'blocked')
   assert.match(h.mem.run!.blockReason ?? '', /FAIL/)
@@ -472,7 +476,7 @@ test('stale judge_claim from an old judge session is rejected (A1 AC9)', async (
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  const stale = await h.engine.handleJudgeClaim('ws', token, 'PASS', 'late', 'some-other-judge')
+  const stale = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'late', 'some-other-judge')
   assert.ok(!stale.ok)
   assert.match(stale.reason ?? '', /judge session/)
 })
@@ -486,7 +490,7 @@ test('claims carry no token — the lease is the token truth (A1 AC2)', async ()
   // longer bind to the dead dispatch.
   const first = await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'x' }, mgr(h))
   assert.ok(first.ok)
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   await h.engine.handleTurnEnded('ws', MANAGER)
   const late = await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'late' }, { sessionId: MANAGER, turnUserMessageIds: new Set(['msg-steer-1']) })
   assert.ok(!late.ok)
@@ -553,7 +557,7 @@ test('AC1: a claim against a pendingDispatch book (node advanced, dispatch defer
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
   // PASS while the worker's turn is still open → deferred dispatch (pendingDispatch book).
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   const versionBefore = h.mem.version
   const judgesBefore = h.judges
   // The actor's same turn tries to claim again (e.g. a second node_claim).
@@ -571,7 +575,7 @@ test('AC3: a stale turn (old dispatch id only) cannot claim the new dispatch', a
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   // The worker's turn settles → the build node dispatches to the developer
   // actor with a NEW message id.
   await h.engine.handleTurnEnded('ws', MANAGER)
@@ -687,7 +691,7 @@ workflow:
   await engine.startRun('ws', run)
   const token = topFrame(run).nodeToken
   await engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, { sessionId: MANAGER, turnUserMessageIds: new Set(['msg-steer-1']) })
-  await engine.handleJudgeClaim('ws', token, 'PASS', 'ok', h.mem.run!.judgeSessionId!)
+  await engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', h.mem.run!.judgeSessionId!)
   await engine.handleTurnEnded('ws', MANAGER)
   // Now on the builtin-program node: the Manager blocks it WITHOUT any lease
   // (program nodes publish none) — only status/token/caller checks apply.
@@ -702,7 +706,7 @@ test('A1 §5.2: Manager node_block on a role-executor actor node is control-plan
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   await h.engine.handleTurnEnded('ws', MANAGER)
   const buildToken = topFrame(h.mem.run!).nodeToken
   // The build node's precise executor is the developer actor; the Manager's
@@ -855,7 +859,7 @@ test('role model override is rejected while the role actor turn is active; idle 
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   await h.engine.handleTurnEnded('ws', MANAGER)
   assert.ok(h.mem.run!.roleActors['developer'] !== undefined)
   // Simulate an ACTIVE actor turn → override rejected.
@@ -878,7 +882,7 @@ test('node-boundary compact runs before dispatching a fresh role node (A2 AC1)',
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   // Pre-seed the role mapping so the developer node dispatches to an EXISTING actor.
   h.mem.run!.roleActors['developer'] = 'actor-child-1'
   await h.engine.handleTurnEnded('ws', MANAGER)
@@ -891,7 +895,7 @@ test('compact failure blocks the node and notifies the Manager (A2 AC5/R4)', asy
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   h.mem.run!.roleActors['developer'] = 'actor-child-1'
   h.compactResult = { ok: false, detail: 'compaction busy: agent active' }
   const settled = await h.engine.handleTurnEnded('ws', MANAGER)
@@ -908,7 +912,7 @@ test('same-node resume of a role actor retains the boundary and skips compact (A
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   await h.engine.handleTurnEnded('ws', MANAGER)
   // The build node dispatched to the freshly created developer actor.
   const firstBoundary = { ...h.mem.run!.nodeBoundary }
@@ -948,7 +952,7 @@ test('handoffContext survives NEED_CONTEXT resume token rotation (S3/A4 R9)', as
   assert.ok(resumed.ok)
   const rotated = topFrame(h.mem.run!).nodeToken
   assert.notEqual(rotated, token)
-  const verdict = await h.engine.handleJudgeClaim('ws', rotated, 'PASS', 'ok now', reservedJudgeId(h))
+  const verdict = await h.engine.handleJudgeClaim('ws', rotated, 'ACCEPT', 'ok now', reservedJudgeId(h))
   assert.ok(verdict.ok)
   // The handoff keyed under the PRE-rotation token must still reach the next
   // node's dispatch message.
@@ -995,7 +999,7 @@ test('handoffContext survives a host-restart-equivalent: a fresh engine over dur
   const resumed = await h2.engine.handleResume('ws', blockedToken, 'repo is acme/server', MANAGER)
   assert.ok(resumed.ok)
   const rotated = topFrame(h2.mem.run!).nodeToken
-  const verdict = await h2.engine.handleJudgeClaim('ws', rotated, 'PASS', 'ok now', reservedJudgeId(h))
+  const verdict = await h2.engine.handleJudgeClaim('ws', rotated, 'ACCEPT', 'ok now', reservedJudgeId(h))
   assert.ok(verdict.ok)
   // The handoff persisted in pendingClaim survives the engine restart and
   // reaches the next node's dispatch.
@@ -1009,7 +1013,7 @@ test('first role creation skips compact (A2 AC3)', async () => {
   await h.engine.startRun('ws', initialRun())
   const token = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
   // First creation has no existing mapping → ensureRoleActor, no compact.
   await h.engine.handleTurnEnded('ws', MANAGER)
   assert.deepEqual(h.compacts, [])
@@ -1068,7 +1072,7 @@ workflow:
   // Advance plan → run (builtin-program) via a PASS verdict.
   const token = topFrame(run).nodeToken
   await engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, { sessionId: MANAGER, turnUserMessageIds: new Set(['msg-steer-1']) })
-  await engine.handleJudgeClaim('ws', token, 'PASS', 'ok', h.mem.run!.judgeSessionId!)
+  await engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', h.mem.run!.judgeSessionId!)
   await engine.handleTurnEnded('ws', MANAGER)
   // The builtin-program dispatch must not carry the constraint.
   const programSteer = h.steers.find(t => /Run the current builtin program|initialize-milestone/.test(t))
@@ -1125,7 +1129,7 @@ test('child-workflow pushes a frame and dispatches the child start node', async 
   await h.engine.startRun('ws', h.childRun())
   const beginToken = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'begun' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', beginToken, 'ACCEPT', 'begun', reservedJudgeId(h))
   await h.engine.handleTurnEnded('ws', MANAGER)
   assert.equal(h.mem.run!.callStack.length, 2)
   assert.equal(topFrame(h.mem.run!).workflowId, 'child-a')
@@ -1138,11 +1142,11 @@ test('child END pops the frame and treats the parent node as PASS', async () => 
   await h.engine.startRun('ws', h.childRun())
   const beginToken = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'begun' }, mgr(h))
-  await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', reservedJudgeId(h))
+  await h.engine.handleJudgeClaim('ws', beginToken, 'ACCEPT', 'begun', reservedJudgeId(h))
   await h.engine.handleTurnEnded('ws', MANAGER)
   const childToken = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'done' }, actorCaller(h))
-  const outcome = await h.engine.handleJudgeClaim('ws', childToken, 'PASS', 'child done', reservedJudgeId(h))
+  const outcome = await h.engine.handleJudgeClaim('ws', childToken, 'ACCEPT', 'child done', reservedJudgeId(h))
   assert.ok(outcome.ok)
   assert.equal(h.mem.run!.status, 'completed')
   assert.equal(h.mem.run!.callStack.length, 0)
@@ -1199,10 +1203,10 @@ test('accepted claim and judge verdict produce CLAIM + JUDGE + ROUTE lines (AC1/
     await h.engine.startRun('ws', initialRun(), configPath)
     const token = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned', handoffContext: 'notes for build' }, mgr(h))
-    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'planned ok', reservedJudgeId(h))
+    await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'planned ok', reservedJudgeId(h))
     const log = readRunLog(configPath, 'eng-test')
     assert.match(log, new RegExp(`${TS} CLAIM workflow=eng-test node=plan token=${TOK} role=manager outcome=completed summary="planned" handoff="notes for build"\\n`))
-    assert.match(log, new RegExp(`${TS} JUDGE workflow=eng-test node=plan token=${TOK} result=PASS reason="planned ok" judge=${TOK}\\n`))
+    assert.match(log, new RegExp(`${TS} JUDGE workflow=eng-test node=plan token=${TOK} result=ACCEPT reason="planned ok" judge=${TOK}\\n`))
     assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan token=${TOK} result=PASS target=build\\n`))
   })
 })
@@ -1272,7 +1276,7 @@ workflow:
     await h.engine.startRun('ws', failRun(), configPath)
     const token = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'failed' }, mgr(h))
-    const outcome = await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not good', reservedJudgeId(h))
+    const outcome = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'not good', reservedJudgeId(h))
     assert.ok(outcome.ok)
     assert.equal(topFrame(h.mem.run!).nodeId, 'retry')
     const log = readRunLog(configPath, 'fail-test')
@@ -1284,7 +1288,7 @@ workflow:
     await h.engine.startRun('ws', initialRun(), configPath)
     const token = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'failed' }, mgr(h))
-    await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not planned', reservedJudgeId(h))
+    await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'not planned', reservedJudgeId(h))
     assert.equal(h.mem.run!.status, 'blocked')
     const log = readRunLog(configPath, 'eng-test')
     assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan token=${TOK} result=FAIL target=BLOCK\\n`))
@@ -1361,14 +1365,14 @@ test('trace log covers child PUSH/POP with explicit pairing (AC7)', async () => 
     await h.engine.startRun('ws', h.childRun(), configPath)
     const beginToken = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'begun' }, mgr(h))
-    await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', reservedJudgeId(h))
+    await h.engine.handleJudgeClaim('ws', beginToken, 'ACCEPT', 'begun', reservedJudgeId(h))
     await h.engine.handleTurnEnded('ws', MANAGER)
     let log = readRunLog(configPath, 'child-test')
     assert.match(log, new RegExp(`${TS} ROUTE workflow=child-test node=begin token=${TOK} result=PASS target=call-child\\n`))
     assert.match(log, new RegExp(`${TS} PUSH parent=child-test/call-child token=${TOK} child=child-a\\n`))
     const childToken = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'done' }, actorCaller(h))
-    await h.engine.handleJudgeClaim('ws', childToken, 'PASS', 'child done', reservedJudgeId(h))
+    await h.engine.handleJudgeClaim('ws', childToken, 'ACCEPT', 'child done', reservedJudgeId(h))
     log = readRunLog(configPath, 'child-test')
     assert.match(log, new RegExp(`${TS} ROUTE workflow=child-a node=child-step token=${TOK} result=PASS target=END\\n`))
     assert.match(log, new RegExp(`${TS} POP child=child-a result=PASS parent=child-test/call-child token=${TOK}\\n`))
@@ -1408,7 +1412,7 @@ workflow:
     await h.engine.startRun('ws', run, configPath)
     const token = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'begun' }, mgr(h))
-    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'begun', reservedJudgeId(h))
+    await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'begun', reservedJudgeId(h))
     await h.engine.handleTurnEnded('ws', MANAGER)
     const progToken = topFrame(h.mem.run!).nodeToken
     // ERROR → PROGRAM + BLOCK source=program.
@@ -1471,7 +1475,7 @@ test('log creation/append failure never breaks run startup or routing, and warns
     const token = topFrame(h.mem.run!).nodeToken
     const claim = await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'x' }, mgr(h))
     assert.ok(claim.ok)
-    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+    await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
     assert.equal(topFrame(h.mem.run!).nodeId, 'build')
     // No further warnings (no spam loop).
     assert.equal(warnings.length, 1)
@@ -1623,7 +1627,7 @@ workflow:
     await h.engine.startRun('ws', run, configPath)
     const token = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'ok' }, mgr(h))
-    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+    await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
     const log = readRunLog(configPath, 'sk-abcdefgh')
     assert.match(log, /START workflow=sk-abcdefgh run=/)
     assert.match(log, /CLAIM workflow=sk-abcdefgh node=sk-abcdefgh /)
@@ -1645,4 +1649,248 @@ test('crash seam: START is written BEFORE state.create — failure leaves a decl
     assert.match(log, new RegExp(`^${TS} START workflow=eng-test run=${run.runId} fmt=2\\n`))
     assert.equal(log.trim().split('\n').length, 1, 'orphan file holds only the START line')
   })
+})
+
+// ---- A1 §6: REJECT → Actor Correction (AC7/AC8 + review supplements) ----
+
+/** Drive a harness onto the build (developer) node with the actor dispatched. */
+async function ontoBuildNode(h: Harness): Promise<void> {
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+}
+
+test('AC7/AC8: REJECT re-dispatches the SAME node to the ORIGINAL actor with full evidence', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    await ontoBuildNode(h)
+    const buildToken = topFrame(h.mem.run!).nodeToken
+    const boundaryBefore = { ...h.mem.run!.nodeBoundary }
+    await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
+    const judgeBefore = h.mem.run!.judgeSessionId
+    // REJECT while the actor's turn is still open → deferred correction.
+    const rejected = await h.engine.handleJudgeClaim('ws', buildToken, 'REJECT', 'tests missing', judgeBefore!)
+    assert.ok(rejected.ok)
+    // Same node, rotated token; no judgment phase left; evidence persisted.
+    assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+    assert.equal(topFrame(h.mem.run!).workflowId, 'eng-test')
+    assert.notEqual(topFrame(h.mem.run!).nodeToken, buildToken)
+    assert.equal(h.mem.run!.judgeSessionId, undefined)
+    assert.equal(h.mem.run!.pendingClaim, undefined)
+    assert.deepEqual(h.mem.run!.pendingCorrection, { judgeReason: 'tests missing', previousClaim: { outcome: 'completed', summary: 'built v1' } })
+    assert.ok(h.retiredJudges.includes(judgeBefore!), 'old judge retired')
+    // Boundary retained (R8) — the correction re-dispatch is a same-node resume.
+    assert.equal(h.mem.run!.nodeBoundary.dispatchedAt, boundaryBefore.dispatchedAt)
+    assert.equal(h.mem.run!.nodeBoundary.executorSessionId, boundaryBefore.executorSessionId)
+    // Simulate mapping drift (§6.5): the correction must still return to the
+    // boundary's executor, never to a replacement.
+    delete h.mem.run!.roleActors['developer']
+    await h.engine.handleTurnEnded('ws', 'actor-child-1')
+    // The correction message: [correction] + [judge rejection] + [previous
+    // claim] + [instruction] (R7), delivered to the ORIGINAL actor session.
+    const correction = h.actorMessages.at(-1)!
+    assert.match(correction, /^\[correction\]\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nsummary: built v1\n\n\[instruction\]\nBuild\./)
+    assert.ok(correction.includes('[提交要求]'), 'constraint re-appended')
+    assert.equal(h.mem.run!.nodeBoundary.dispatchedAt, boundaryBefore.dispatchedAt, 'boundary still retained after re-dispatch')
+    assert.equal(h.mem.run!.roleActors['developer'], boundaryBefore.executorSessionId, 'mapping repaired from the boundary')
+    // Trace: JUDGE result=REJECT + CORRECT; NO ROUTE, NO "NODE FAIL" (R6.6).
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} JUDGE workflow=eng-test node=build token=${TOK} result=REJECT reason="tests missing" judge=${TOK}\\n`))
+    assert.match(log, new RegExp(`${TS} CORRECT workflow=eng-test node=build token=${TOK} role=developer judge=${TOK} detail="tests missing"\\n`))
+    assert.ok(!/ROUTE workflow=eng-test node=build/.test(log), 'REJECT reads no Edge')
+    // The re-claim after the correction spawns a Judge carrying the evidence.
+    const rebuildToken = topFrame(h.mem.run!).nodeToken
+    const reclaim = await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v2 with tests' }, actorCaller(h))
+    assert.ok(reclaim.ok)
+    const lastInput = h.judgeSpawnInputs.at(-1)!
+    assert.deepEqual(lastInput.previousRejection, { judgeReason: 'tests missing', previousClaim: { outcome: 'completed', summary: 'built v1' } })
+    // ACCEPT concludes: evidence cleared with the judgment phase (§6.4).
+    await h.engine.handleJudgeClaim('ws', rebuildToken, 'ACCEPT', 'now correct', reservedJudgeId(h))
+    assert.equal(h.mem.run!.pendingCorrection, undefined)
+    assert.equal(h.mem.run!.status, 'completed')
+  })
+})
+
+test('AC10: the retired Judge cannot submit again after a REJECT (token + session double rejection)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  const judgeId = h.mem.run!.judgeSessionId!
+  await h.engine.handleJudgeClaim('ws', token, 'REJECT', 'redo', judgeId)
+  // Old token → stale; even with the (never-rotated) token string the session
+  // mapping is gone. Both paths fail closed (D2).
+  const staleToken = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'late accept', judgeId)
+  assert.ok(!staleToken.ok)
+  assert.match(staleToken.reason ?? '', /stale|not the current node judge/)
+  const staleSession = await h.engine.handleJudgeClaim('ws', topFrame(h.mem.run!).nodeToken, 'ACCEPT', 'late accept', judgeId)
+  assert.ok(!staleSession.ok)
+  assert.match(staleSession.reason ?? '', /not the current node judge/)
+})
+
+test('AC9 regression: NEED_CONTEXT and judge faults keep pendingCorrection for packet rebuilds', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  await ontoBuildNode(h)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
+  await h.engine.handleJudgeClaim('ws', buildToken, 'REJECT', 'tests missing', reservedJudgeId(h))
+  await h.engine.handleTurnEnded('ws', 'actor-child-1')
+  const token2 = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v2' }, actorCaller(h))
+  // NEED_CONTEXT BLOCK keeps BOTH the pendingClaim and the correction evidence.
+  await h.engine.handleJudgeClaim('ws', token2, 'NEED_CONTEXT', 'need ci log', reservedJudgeId(h))
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'built v2' })
+  assert.equal(h.mem.run!.pendingCorrection?.judgeReason, 'tests missing')
+  // Resume followups the SAME judge (token rotates) — a later REJECT on the
+  // SAME judge then overwrites the evidence (§6.4 lifecycle).
+  await h.engine.handleResume('ws', token2, 'ci log at .github', MANAGER)
+  const token3 = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleJudgeClaim('ws', token3, 'REJECT', 'still flaky', reservedJudgeId(h))
+  // The second REJECT OVERWRITES the evidence (§6.4 lifecycle).
+  assert.deepEqual(h.mem.run!.pendingCorrection, { judgeReason: 'still flaky', previousClaim: { outcome: 'completed', summary: 'built v2' } })
+})
+
+test('Manager-path correction evidence: the next packet carries [previous rejection] without projection (review 补充4)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned v1' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'REJECT', 'missing acceptance criteria', reservedJudgeId(h))
+  // Manager turn settles → correction steered into the Manager session.
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  assert.match(h.steers.at(-1)!, /^\[correction\]\n\[judge rejection\]\nmissing acceptance criteria\n\n\[previous claim\]\noutcome: completed\nsummary: planned v1\n\n\[instruction\]\nPlan\./)
+  const token2 = topFrame(h.mem.run!).nodeToken
+  const reclaim = await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned v2' }, mgr(h))
+  assert.ok(reclaim.ok)
+  // MANAGER projection would never show the plugin-sourced correction — the
+  // packet's previousRejection channel is the evidence (D4).
+  const lastInput = h.judgeSpawnInputs.at(-1)!
+  assert.deepEqual(lastInput.previousRejection, { judgeReason: 'missing acceptance criteria', previousClaim: { outcome: 'completed', summary: 'planned v1' } })
+  await h.engine.handleJudgeClaim('ws', token2, 'ACCEPT', 'ok now', reservedJudgeId(h))
+  assert.equal(h.mem.run!.pendingCorrection, undefined)
+})
+
+test('correction dispatch failure BLOCKs with the evidence intact; resume rebuilds the full message (review 补充4/中5)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  // Worker (Manager) settles FIRST → the REJECT dispatches immediately.
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  h.steerFailure = new Error('manager session gone (injected)')
+  const rejected = await h.engine.handleJudgeClaim('ws', token, 'REJECT', 'must add criteria', reservedJudgeId(h))
+  assert.ok(rejected.ok)
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.match(h.mem.run!.blockReason ?? '', /dispatch-failed/)
+  assert.deepEqual(h.mem.run!.pendingCorrection, { judgeReason: 'must add criteria', previousClaim: { outcome: 'completed', summary: 'planned' } })
+  // Resume rebuilds [judge rejection] + [previous claim] + [manager
+  // resolution] + [instruction] from the durable evidence alone.
+  h.steerFailure = undefined
+  const blockedToken = topFrame(h.mem.run!).nodeToken
+  const resumed = await h.engine.handleResume('ws', blockedToken, 'provider recovered; plan again', MANAGER)
+  assert.ok(resumed.ok)
+  assert.match(h.steers.at(-1)!, /^\[correction\]\n\[judge rejection\]\nmust add criteria\n\n\[previous claim\]\noutcome: completed\nsummary: planned\n\n\[manager resolution\]\nprovider recovered; plan again\n\n\[instruction\]\nPlan\./)
+})
+
+test('correction × host restart: reconcile BLOCKs, resume rebuilds the evidence (review 第二轮)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  await ontoBuildNode(h)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
+  await h.engine.handleJudgeClaim('ws', buildToken, 'REJECT', 'tests missing', reservedJudgeId(h))
+  // Deferred correction pending → the host "restarts": a fresh engine (empty
+  // dispatch book) over the SAME durable state reconciles the running row
+  // into BLOCK; pendingCorrection travelled ON the durable row.
+  const h2 = makeHarness(h.mem)
+  await h2.engine.handleRestartReconcile()
+  assert.equal(h2.mem.run!.status, 'blocked')
+  assert.equal(h2.mem.run!.blockReason, 'host-restarted-before-node-result')
+  assert.equal(h2.mem.run!.pendingCorrection?.judgeReason, 'tests missing')
+  const blockedToken = topFrame(h2.mem.run!).nodeToken
+  const resumed = await h2.engine.handleResume('ws', blockedToken, 'restart recovered', MANAGER)
+  assert.ok(resumed.ok)
+  const correction = h2.actorMessages.at(-1)!
+  assert.match(correction, /^\[correction\]\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nsummary: built v1\n\n\[manager resolution\]\nrestart recovered\n\n\[instruction\]\nBuild\./)
+})
+
+// ---- A1 §6.5: model-override guard while judgment/correction is pending ----
+
+test('override guard: pendingClaim/pendingCorrection reject overrides for the CURRENT node role (mapping-independent)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  await ontoBuildNode(h)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
+  // Mapping present → guard trips.
+  const duringClaim = await h.engine.handleSetRoleModel('ws', 'developer', 'p2', 'm2')
+  assert.ok(!duringClaim.ok)
+  assert.match(duringClaim.reason ?? '', /正在等待判定\/修正/)
+  // Mapping DELETED (drift construction) → the node-role + boundary guard
+  // must STILL trip (never compare the roleActors mapping).
+  delete h.mem.run!.roleActors['developer']
+  const drifted = await h.engine.handleSetRoleModel('ws', 'developer', 'p2', 'm2')
+  assert.ok(!drifted.ok)
+  assert.match(drifted.reason ?? '', /正在等待判定\/修正/)
+  // A different role is unaffected.
+  const other = await h.engine.handleSetRoleModel('ws', 'judge', 'p3', 'm3')
+  assert.ok(other.ok)
+  // REJECT → pendingCorrection phase: the guard still applies.
+  await h.engine.handleJudgeClaim('ws', buildToken, 'REJECT', 'tests missing', reservedJudgeId(h))
+  const duringCorrection = await h.engine.handleSetRoleModel('ws', 'developer', 'p2', 'm2')
+  assert.ok(!duringCorrection.ok)
+  assert.match(duringCorrection.reason ?? '', /正在等待判定\/修正/)
+})
+
+test('blocked escape hatch: correction BLOCK + override resets the boundary → resume spawns a replacement with the evidence (review 第二轮)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  await ontoBuildNode(h)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
+  // Worker settles first, dispatch of the correction FAILS → blocked with
+  // pendingCorrection (no pendingClaim).
+  await h.engine.handleTurnEnded('ws', 'actor-child-1')
+  h.sendFailure = new Error('send failed (injected)')
+  await h.engine.handleJudgeClaim('ws', buildToken, 'REJECT', 'tests missing', reservedJudgeId(h))
+  h.sendFailure = undefined
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.ok(h.mem.run!.nodeBoundary.dispatchedAt !== 0)
+  // blocked + pendingCorrection: the override is ACCEPTED and resets the
+  // boundary — the resume's correction re-dispatch creates a replacement
+  // actor on the new route while the evidence still reaches it.
+  const override = await h.engine.handleSetRoleModel('ws', 'developer', 'p9', 'm9')
+  assert.ok(override.ok)
+  assert.deepEqual(h.mem.run!.modelOverrides['developer'], { provider: 'p9', modelId: 'm9' })
+  assert.equal(h.mem.run!.nodeBoundary.dispatchedAt, 0, 'boundary reset')
+  assert.equal(h.mem.run!.roleActors['developer'], undefined, 'mapping deleted for replacement')
+  const blockedToken = topFrame(h.mem.run!).nodeToken
+  const resumed = await h.engine.handleResume('ws', blockedToken, 'switch to the new provider', MANAGER)
+  assert.ok(resumed.ok)
+  const replacement = h.actorMessages.at(-1)!
+  assert.match(replacement, /^\[correction\]\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nsummary: built v1\n\n\[manager resolution\]\nswitch to the new provider\n\n\[instruction\]\nBuild\./)
+  assert.equal(h.mem.run!.nodeBoundary.executorSessionId, 'actor-child-1', 'replacement boundary established')
+})
+
+test('NEED_CONTEXT BLOCK + override keeps the boundary (idle-replacement semantics, corner recorded)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  await ontoBuildNode(h)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
+  await h.engine.handleJudgeClaim('ws', buildToken, 'NEED_CONTEXT', 'need ci log', reservedJudgeId(h))
+  assert.equal(h.mem.run!.status, 'blocked')
+  const boundaryAt = h.mem.run!.nodeBoundary.dispatchedAt
+  // blocked + pendingClaim (no pendingCorrection): the current-node guard is
+  // off; the idle-replacement path applies and does NOT reset the boundary —
+  // the ongoing judgment resolves through the current judge.
+  const override = await h.engine.handleSetRoleModel('ws', 'developer', 'p2', 'm2')
+  assert.ok(override.ok)
+  assert.equal(h.mem.run!.nodeBoundary.dispatchedAt, boundaryAt, 'boundary untouched')
+  assert.equal(h.mem.run!.roleActors['developer'], undefined, 'idle mapping removed for later nodes')
 })

@@ -3,7 +3,7 @@
  * the whole engine is testable without a live DSH host. The plugin's `apply()`
  * wires real DSH services into these.
  */
-import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome, ClaimCaller, TransientDispatch } from '../types.ts'
+import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome, ClaimCaller, TransientDispatch, PendingCorrection } from '../types.ts'
 import { WorkflowError, LIMITS } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { createRunLog, appendLine, jsonField, redact, shortId, traceEvent } from './tracelog.ts'
@@ -38,6 +38,18 @@ function compactFaultNotice(run: RunState, nodeId: string, detail: string): stri
   return `⚠️ Node 边界 compact 失败（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未派发。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 重试派发（compact 会再次尝试）；\n  2. workflow_set_role_model 换 summarization 模型后 resume；\n  3. node_block 保留现场等待人工。`
 }
 
+/**
+ * A1 R7/§6.3: the correction message's evidence sections — `[judge rejection]`
+ * + `[previous claim]`. The dispatch wrapper prepends `[correction]` and
+ * appends `[instruction]`; a resume rebuild additionally appends
+ * `[manager resolution]`. Lengths are bounded by the entry LIMITS chain.
+ */
+export function correctionEvidence(pc: { judgeReason: string; previousClaim: { outcome: ClaimOutcome; summary: string; handoffContext?: string } }): string {
+  const claim = `[previous claim]\noutcome: ${pc.previousClaim.outcome}\nsummary: ${pc.previousClaim.summary}`
+    + (pc.previousClaim.handoffContext !== undefined ? `\nhandoffContext: ${pc.previousClaim.handoffContext}` : '')
+  return `[judge rejection]\n${pc.judgeReason}\n\n${claim}`
+}
+
 /** Deliverable messages to Manager / Role Actors. */
 export interface DispatchTargets {
   /**
@@ -59,6 +71,8 @@ export interface JudgeSpawnInput {
   criteria: string
   /** A1 R7: the Judge sees only the worker's claim outcome/summary. */
   claim: { outcome: ClaimOutcome; summary: string }
+  /** A1 §7.1: REJECT evidence from a previous correction round on this node, when present. */
+  previousRejection?: PendingCorrection
   cwd: string
   /**
    * Engine-reserved Judge session id. The Host must use it as the continuable
@@ -339,8 +353,8 @@ export class WorkflowEngine {
     }))
   }
 
-  /** A3 R3: an accepted Judge verdict (current protocol: PASS/FAIL/NEED_CONTEXT; A1 renames). */
-  private logJudge(run: RunState, frame: CallFrame, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): void {
+  /** A1 v2: the Judge's confirmation (ACCEPT/REJECT/NEED_CONTEXT), recorded before any state transition. */
+  private logJudge(run: RunState, frame: CallFrame, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): void {
     this.logLine(run, traceEvent('JUDGE', {
       workflow: frame.workflowId,
       node: frame.nodeId,
@@ -348,6 +362,20 @@ export class WorkflowEngine {
       result,
       reason: jsonField(reason, LIMITS.reasonMax),
       judge: shortId(judgeSessionId),
+    }))
+  }
+
+  /** A1 §7.2: the REJECT re-dispatch boundary — same node, rotated token,
+   * retired judge. Marks where a correction cycle began (never a ROUTE: no
+   * Edge was read). */
+  private logCorrect(run: RunState, frame: CallFrame, role: string, oldJudgeId: string, detail: string): void {
+    this.logLine(run, traceEvent('CORRECT', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      role,
+      judge: shortId(oldJudgeId),
+      detail: jsonField(detail, LIMITS.reasonMax),
     }))
   }
 
@@ -611,9 +639,11 @@ export class WorkflowEngine {
     const frame = topFrame(run)
     const node = this.nodeAt(run, frame)
     if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
-    // The verdict always ends the judgment phase.
+    // The verdict always ends the judgment phase — and any correction cycle:
+    // an accepted conclusion supersedes the previous rejection evidence.
     delete run.judgeSessionId
     delete run.pendingClaim
+    delete run.pendingCorrection
     if (verdict === 'PASS') {
       const target = node.onPass
       if (target === 'END') {
@@ -852,6 +882,8 @@ export class WorkflowEngine {
           instruction: node.execution.instruction ?? '',
           criteria,
           claim: { outcome: claim.outcome, summary: claim.summary },
+          // A1 §7.1: a re-claim after a REJECT carries the prior evidence.
+          previousRejection: entered.run.pendingCorrection,
           cwd,
           judgeSessionId: reservedJudgeSessionId,
         })
@@ -913,11 +945,15 @@ export class WorkflowEngine {
   }
 
   /**
-   * Handle the Judge's `judge_claim` tool call (A1 R9–R11, A4 R4).
-   * PASS/FAIL advance the node and release the judge; NEED_CONTEXT BLOCKs and
-   * keeps the judge session for a followup.
+   * Handle the Judge's `judge_claim` tool call (A1 v2 truth table):
+   * - ACCEPT → advance with the ACTOR's claimed outcome (completed→PASS,
+   *   failed→FAIL); the Judge confirms, it never rewrites the result.
+   * - REJECT → correction flow: retire the Judge, persist the rejection
+   *   evidence, rotate the token, re-dispatch the SAME node to the ORIGINAL
+   *   actor with the evidence (§6.2).
+   * - NEED_CONTEXT → BLOCK and keep the judge session for a followup.
    */
-  async handleJudgeClaim(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<EngineOutcome> {
+  async handleJudgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<EngineOutcome> {
     const row = await this.state.get(workspaceKey)
     if (row === undefined) return { ok: false, reason: 'no active run' }
     const { run, version } = row
@@ -936,6 +972,8 @@ export class WorkflowEngine {
     this.logJudge(run, frame, result, reason, judgeSessionId)
     if (result === 'NEED_CONTEXT') {
       // A1 R10: BLOCK, keep the judge session + pendingClaim + boundary.
+      // A1 §6.4: pendingCorrection is RETAINED through the BLOCK so the
+      // respawn/spawn-rebuild packet still carries the previous rejection.
       run.status = 'blocked'
       run.blockReason = reason.slice(0, LIMITS.blockReasonMax)
       this.logBlock(run, frame, 'judge', reason)
@@ -944,9 +982,51 @@ export class WorkflowEngine {
       await this.targets.steerManager(run, needContextNotice(run, frame.nodeId, reason)).catch(() => {})
       return { ok: true, run, message: run.blockReason }
     }
+    if (result === 'REJECT') {
+      // A1 §6.2 correction flow — no Edge is read, no ROUTE is logged (R6.6).
+      const node = this.nodeAt(run, frame)!
+      const role = node.execution.type === 'actor-task' ? (node.execution.role ?? 'manager') : 'manager'
+      // 2. Snapshot BEFORE clearing (the packet and the correction message
+      //    both quote the rejected claim).
+      const previousClaim = { ...run.pendingClaim }
+      const oldJudgeId = judgeSessionId
+      // 3. Retire the Judge (revoke authorization; DSH's settlement watcher
+      //    releases the Activation) and end the judgment phase.
+      await this.subagents.retireJudge(run, oldJudgeId).catch(() => {})
+      delete run.judgeSessionId
+      delete run.pendingClaim
+      // 4. Persist the durable REJECT evidence (D4): feeds the next
+      //    Judgment Packet's [previous rejection] section and survives a
+      //    correction-dispatch failure + resume rebuild.
+      run.pendingCorrection = { judgeReason: reason, previousClaim }
+      // 5. Same node, fresh token (D2: rotation retires the stale-judge
+      //    rejection path; workflowId/nodeId unchanged — R6.3).
+      frame.nodeToken = newNodeToken()
+      // 6. nodeBoundary is RETAINED (R8): the correction re-dispatch resolves
+      //    the ORIGINAL actor through nodeBoundary.executorSessionId (§6.5),
+      //    isSameNodeResume skips compaction, and the projection window
+      //    keeps this node's local history.
+      // 7. Trace the re-dispatch boundary BEFORE persistence (§10 order).
+      this.logCorrect(run, frame, role, oldJudgeId, reason)
+      // 8–9. Correction message + dispatch decision, exactly like a PASS's
+      // next-node dispatch: defer while the executor's turn is still open,
+      // dispatch now when it already settled.
+      const correction = { kind: 'correction' as const, text: correctionEvidence(run.pendingCorrection) }
+      const book = this.dispatchBook.get(workspaceKey)
+      const workerStillActive = await this.executorActive(run)
+      if (workerStillActive || (book !== undefined && !book.workerSettled)) {
+        await this.persistDeferred(workspaceKey, run, version, correction)
+      } else {
+        await this.dispatchNow(workspaceKey, run, version, correction)
+      }
+      return { ok: true, run, message: 'checker REJECT; correction dispatched' }
+    }
+    // ACCEPT: the Graph verdict is the ACTOR's claimed outcome (AC5/AC6) —
+    // the Judge confirmed, it did not rewrite the result.
+    const verdict = run.pendingClaim.outcome === 'completed' ? 'PASS' : 'FAIL'
     // PASS/FAIL: apply the edge and retire the judge.
     const handoff = run.pendingClaim?.handoffContext
-    this.advance(run, result, reason, 'judge')
+    this.advance(run, verdict, reason, 'judge')
     // A1 R11: retire the judge (revoke authorization; the resident Activation
     // is released by DSH's settlement watcher once its turn ends). Never drain
     // from inside the judge's own tool call — see SubagentHost.retireJudge.
@@ -1042,6 +1122,9 @@ export class WorkflowEngine {
         // A1 R7: the Judgment Packet receives only outcome/summary; handoff
         // remains persisted in pendingClaim for the next node after PASS.
         claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
+        // A1 §6.4: judge-fault/NEED_CONTEXT BLOCKs keep the correction
+        // evidence — the rebuilt packet still sees what was rejected.
+        previousRejection: run.pendingCorrection,
         cwd,
         judgeSessionId: reservedJudgeSessionId,
       })
@@ -1168,6 +1251,8 @@ export class WorkflowEngine {
           // A1 R7: only outcome/summary enter the rebuilt Judgment Packet;
           // handoff stays in pendingClaim for delivery after a PASS.
           claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
+          // A1 §6.4: the spawn-rebuild keeps the prior rejection evidence.
+          previousRejection: run.pendingCorrection,
           cwd,
           judgeSessionId: reservedJudgeSessionId,
         })
@@ -1214,7 +1299,14 @@ export class WorkflowEngine {
     frame.nodeToken = newNodeToken()
     // A3 R6: actor-path resume (re-dispatch with the resolution context).
     this.logResume(run, frame, nodeToken, 'actor', resolutionContext)
-    await this.dispatchNow(workspaceKey, run, version, { kind: 'handoff', text: resolutionContext })
+    // A1 §6.4: resuming a correction-dispatch failure (pendingCorrection set,
+    // no pendingClaim) rebuilds the FULL R7 evidence so the Actor receives
+    // [judge rejection] + [previous claim] + [manager resolution] + the
+    // [instruction] wrapper — independent of the Manager copying from trace.
+    const transient: TransientDispatch = run.pendingCorrection !== undefined && run.pendingClaim === undefined
+      ? { kind: 'correction', text: `${correctionEvidence(run.pendingCorrection)}\n\n[manager resolution]\n${resolutionContext}` }
+      : { kind: 'handoff', text: resolutionContext }
+    await this.dispatchNow(workspaceKey, run, version, transient)
     return { ok: true, run, message: run.blockReason ?? `resumed: ${resolutionContext.slice(0, 120)}` }
   }
 
@@ -1295,7 +1387,7 @@ export class WorkflowEngine {
     return { ok: true, run, message: `resolved ${result}` }
   }
 
-  /** Handle workflow_set_role_model (design §5.2 G7 / review F12). */
+  /** Handle workflow_set_role_model (design §5.2 G7 / review F12 / A1 §6.5). */
   async handleSetRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<EngineOutcome> {
     const row = await this.state.get(workspaceKey)
     if (row === undefined) return { ok: false, reason: 'no active run' }
@@ -1303,9 +1395,22 @@ export class WorkflowEngine {
     if (roleKey !== 'judge' && !Object.prototype.hasOwnProperty.call(run.definitionSnapshot.roles, roleKey)) {
       return { ok: false, reason: `unknown role key "${roleKey}"` }
     }
-    // Reject only while the mapped actor has a live ACTIVE turn; an idle actor
-    // is replaceable (design §5.2: "目标 Worker active 时拒绝").
     if (roleKey !== 'judge') {
+      // A1 §6.5 guard (main): while the CURRENT node's actor awaits a
+      // judgment or a correction re-dispatch, an override would delete the
+      // mapping and silently redirect the correction to a replacement — the
+      // REJECT flow would then resurrect the OLD actor mapping. Judged by
+      // Node role + boundary (NOT the roleActors mapping): a drifted/missing
+      // mapping must still trip the guard.
+      const node = this.nodeAt(run, topFrame(run))
+      if (run.status === 'running'
+        && node !== undefined && node.execution.type === 'actor-task' && node.execution.role === roleKey
+        && run.nodeBoundary.dispatchedAt !== 0 && run.nodeBoundary.executorSessionId !== undefined
+        && (run.pendingClaim !== undefined || run.pendingCorrection !== undefined)) {
+        return { ok: false, reason: `role "${roleKey}" 的 actor 正在等待判定/修正；override 被拒绝` }
+      }
+      // Reject only while the mapped actor has a live ACTIVE turn; an idle actor
+      // is replaceable (design §5.2: "目标 Worker active 时拒绝").
       const actorId = run.roleActors[roleKey]
       if (actorId !== undefined) {
         const activity = await this.actorActivity(actorId)
@@ -1315,6 +1420,17 @@ export class WorkflowEngine {
         // Remove the idle mapping so the next dispatch creates a replacement
         // with the new route (design §5.2).
         delete run.roleActors[roleKey]
+      }
+      // A1 §6.5 blocked escape hatch: a correction-dispatch failure BLOCK is
+      // the Manager's disposal point — an override here is ACCEPTED and the
+      // boundary is reset so the resume's correction re-dispatch takes the
+      // ensureRoleActor path (replacement with the new route) while the
+      // correction evidence still reaches it. The MODEL trace line plus the
+      // boundary reset are the durable record of the explicit replacement.
+      if (run.status === 'blocked' && run.pendingCorrection !== undefined && run.pendingClaim === undefined
+        && node !== undefined && node.execution.type === 'actor-task' && node.execution.role === roleKey
+        && run.nodeBoundary.dispatchedAt !== 0) {
+        run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
       }
     }
     run.modelOverrides[roleKey] = { provider, modelId }

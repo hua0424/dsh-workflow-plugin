@@ -27,18 +27,21 @@ function makeSource(id: string, events: Array<{ time: number; seq: number; type:
   }
 }
 
-test('parseJudgeClaim accepts PASS/FAIL/NEED_CONTEXT', () => {
-  assert.deepEqual(parseJudgeClaim({ result: 'PASS', reason: 'good' }), { result: 'PASS', reason: 'good' })
-  assert.deepEqual(parseJudgeClaim({ result: 'FAIL', reason: 'bad' }), { result: 'FAIL', reason: 'bad' })
+test('parseJudgeClaim accepts ACCEPT/REJECT/NEED_CONTEXT (A1 v2)', () => {
+  assert.deepEqual(parseJudgeClaim({ result: 'ACCEPT', reason: 'good' }), { result: 'ACCEPT', reason: 'good' })
+  assert.deepEqual(parseJudgeClaim({ result: 'REJECT', reason: 'bad' }), { result: 'REJECT', reason: 'bad' })
   assert.deepEqual(parseJudgeClaim({ result: 'NEED_CONTEXT', reason: 'need repo' }), { result: 'NEED_CONTEXT', reason: 'need repo' })
+  // The v1 values are gone for good (D1: no dual-track).
+  assert.equal(parseJudgeClaim({ result: 'PASS', reason: 'good' }), undefined)
+  assert.equal(parseJudgeClaim({ result: 'FAIL', reason: 'bad' }), undefined)
 })
 
 test('parseJudgeClaim rejects invalid shapes', () => {
   assert.equal(parseJudgeClaim({ result: 'MAYBE', reason: 'x' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'PASS' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'PASS', reason: '' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'PASS', reason: '  ' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'PASS', reason: 'x'.repeat(2001) }), undefined)
+  assert.equal(parseJudgeClaim({ result: 'ACCEPT' }), undefined)
+  assert.equal(parseJudgeClaim({ result: 'ACCEPT', reason: '' }), undefined)
+  assert.equal(parseJudgeClaim({ result: 'ACCEPT', reason: '  ' }), undefined)
+  assert.equal(parseJudgeClaim({ result: 'ACCEPT', reason: 'x'.repeat(2001) }), undefined)
   assert.equal(parseJudgeClaim(null), undefined)
 })
 
@@ -59,6 +62,31 @@ test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_
   assert.match(text, /USER\nhello/)
   assert.match(text, /judge_claim/)
   assert.match(text, /tok-1/)
+  // A1 v2 protocol vocabulary.
+  assert.match(text, /"ACCEPT" \| "REJECT" \| "NEED_CONTEXT"/)
+  assert.doesNotMatch(text, /"PASS" \| "FAIL"/)
+  // No previous-rejection section without evidence.
+  assert.doesNotMatch(text, /Previous judgment on this node/)
+})
+
+test('renderJudgePrompt renders the [previous rejection] evidence before the claim (A1 §7.1)', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-1',
+    nodeInstruction: 'Build it',
+    criteria: 'PASS when built',
+    workerSummary: 'I built it',
+    workerOutcome: 'completed',
+    workspaceCwd: 'C:\\ws',
+    transcript: '',
+    previousRejection: {
+      judgeReason: 'tests missing',
+      previousClaim: { outcome: 'completed', summary: 'built v1', handoffContext: 'notes' },
+    },
+  })
+  assert.match(text, /# Previous judgment on this node \(REJECTED\)\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nsummary: built v1\nhandoffContext: notes\n/)
+  const evidenceAt = text.indexOf('[judge rejection]')
+  const claimAt = text.indexOf('Worker claimed outcome')
+  assert.ok(evidenceAt !== -1 && claimAt !== -1 && evidenceAt < claimAt, 'evidence precedes the worker claim')
 })
 
 test('renderJudgePrompt renders an empty transcript placeholder', () => {

@@ -252,6 +252,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         workerSummary: input.claim.summary,
         workspaceCwd: input.cwd,
         transcript,
+        // A1 §7.1: prior REJECT evidence for this same node, when present.
+        previousRejection: input.previousRejection,
       })
 
       const started = await adapters.ctx.subagents.startContinuable({

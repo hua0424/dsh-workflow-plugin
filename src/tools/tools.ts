@@ -61,7 +61,7 @@ export interface ToolHost {
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
-  judgeClaim(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  judgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   respawnJudge(workspaceKey: string, nodeToken: string, reason: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
 
   // Inspection wrappers (read-only, enum operations)
@@ -236,10 +236,10 @@ export const workflowTools: ToolDefinition[] = [
 
   defineTool({
     name: 'judge_claim',
-    description: 'Judge 提交当前 Node 的判定结果（PASS | FAIL | NEED_CONTEXT）。这必须是当前 Turn 的最后一个动作。',
+    description: 'Judge 确认当前 Node 的 Actor 声明是否可信（ACCEPT | REJECT | NEED_CONTEXT）。ACCEPT = 声明与事实/instruction/criteria 一致；REJECT = 不正确或证据不足，reason 必须写明如何修正。这必须是当前 Turn 的最后一个动作。',
     parameters: {
       nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
-      result: { type: 'string', required: true, enum: ['PASS', 'FAIL', 'NEED_CONTEXT'], description: 'PASS | FAIL | NEED_CONTEXT' },
+      result: { type: 'string', required: true, enum: ['ACCEPT', 'REJECT', 'NEED_CONTEXT'], description: 'ACCEPT | REJECT | NEED_CONTEXT' },
       reason: { type: 'string', required: true, description: '判定理由（1..2000 字符）' },
     },
     output: stringOut,

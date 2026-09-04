@@ -124,8 +124,12 @@ export interface NodeContextBoundary {
   executorDispatchMessageId?: string
 }
 
-/** Judge verdict + protocol (A1 R9). PASS/FAIL are the only Graph results. */
-export type JudgeVerdict = 'PASS' | 'FAIL' | 'NEED_CONTEXT'
+/**
+ * Judge confirmation protocol (A1 v2): the Judge only CONFIRMS whether the
+ * Actor's claim is trustworthy — ACCEPT/REJECT. The Graph verdict (PASS/FAIL)
+ * is derived from the Actor's claim outcome, never from the Judge result.
+ */
+export type JudgeVerdict = 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT'
 
 export interface CallFrame {
   workflowId: string
@@ -165,6 +169,15 @@ export interface RunState {
    * the verdict lands.
    */
   pendingClaim?: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
+  /**
+   * A1 §6.4 (D4): the durable REJECT evidence for the current node — the
+   * Judge's rejection reason plus a snapshot of the claim it rejected.
+   * Written on every REJECT (overwriting), retained through re-claims /
+   * NEED_CONTEXT / judge-fault BLOCKs / correction-dispatch-failure BLOCKs
+   * (resume rebuilds the correction message from it), and cleared by
+   * `advance()` when the node finally leaves.
+   */
+  pendingCorrection?: PendingCorrection
   /**
    * Absolute path of this run's trace log file (A3). Persisted so events
    * after a host restart (restart-reconcile BLOCK, post-restart resume)
@@ -207,14 +220,20 @@ export type TransientDispatch =
   | { kind: 'handoff'; text: string }
   | { kind: 'correction'; text: string }
 
-/**
- * A worker's completion claim. No nodeToken (A1 AC2): admission binds the
- * claim to the current dispatch lease, so the claim carries only its payload.
- */
+/** A worker's completion claim. No nodeToken (A1 AC2): admission binds the
+ * claim to the current dispatch lease, so the claim carries only its payload. */
 export interface NodeClaim {
   outcome: ClaimOutcome
   summary: string
   handoffContext?: string
+}
+
+/** A1 §6.4: persisted REJECT evidence for the current node's correction cycle. */
+export interface PendingCorrection {
+  /** The Judge's REJECT reason (≤ reasonMax) — reused verbatim as the correction instruction. */
+  judgeReason: string
+  /** Snapshot of the claim the Judge rejected. */
+  previousClaim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
 }
 
 /** Judge decision submitted through the `judge_claim` protocol (A1 R9). */
