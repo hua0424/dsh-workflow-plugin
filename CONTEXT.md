@@ -14,7 +14,7 @@
 
 ## Role Actor
 
-某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用（Session级复用：DSH continuable child在quiescent时Activation被自动释放，后续followup自动cold-resume）；每次派发新Node前Engine对其执行Node边界compact（`ctx.compaction.compactNow`，要求resident idle Agent；实践中派发点Actor通常已被DSH自动settle，compact多为跳过，实际上下文控制依赖DSH auto-compaction兜底——见`docs/pending-discussions/`的A2前提记录），compact异常进入BLOCK；不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping，也不被compact。
+某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用（Session级复用：DSH continuable child在quiescent时Activation被自动释放，后续followup自动cold-resume）；每次派发新Node前Engine对其执行Node边界compact（A4方案A：cold Actor先经`ctx.agents.resume`无prompt物化，`ctx.compaction.compactNow`压缩后`dispose`释放，随后followup重放已压缩surface；resident窄竞态下的`busy`降级跳过），compact异常进入BLOCK；不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping，也不被compact。
 
 ## Judge Role
 

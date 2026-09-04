@@ -2,7 +2,7 @@
 
 - 日期：2026-09-02
 - 来源问题：`docs/pending-discussions/live-e2e-issues.md` A2
-- 状态：方案已确认，等待与其他问题统一梳理后开发
+- 状态：**R5 已被 A4 方案 A 取代（2026-09-04）**——cold Actor 不再跳过，改为 `ctx.agents.resume` 无 prompt 物化 → `compactNow` → `dispose` 后再 followup（见 `docs/pending-discussions/a2-compact-residency-premise.md` 解决记录与 `docs/prd/20260903-workflow-hardening/a4-code-findings.md`）；AC1/AC8 解除挂起，验收移至 A4 隔离 harness
 
 ## 1. 背景
 

@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：20260902-fixbug A1–A4 修复的 review 核实（对照 `deepseek-harness` 源码）
-- 状态：待议（当前决策：保留代码 + 记录，真实 e2e 验证后再定）
+- 状态：**已解决（2026-09-04）**——方案 (c) 的前提已由现有公开 API 满足（`ctx.agents.resume` 即 maintenance-resume），按 A4 方案 A 实现（分支 `a4-cold-compact`）；见下方「解决记录」
 
 ## 问题
 
@@ -45,3 +45,11 @@ A2 PRD（`docs/prd/20260902-fixbug/a2-node-boundary-actor-compaction.md`）的�
 
 - `CONTEXT.md` → Role Actor 词条已按现状更新；
 - A2 PRD 的 AC1/AC8 在方向确定前视为「受框架能力限制」。
+
+## 解决记录（2026-09-04）
+
+真实 e2e（milestone-delivery run `b2697138…`）确认了本讨论的预测：compact 检查点处 Actor 恒为 cold，trace 出现 `cold-resume skip` 常态化。A4 代码层调研（`docs/prd/20260903-workflow-hardening/a4-code-findings.md`）进一步证实：
+
+- 备选 (c) 所设想的「maintenance-resume API」**已存在**：`ctx.agents.resume({ resumeSessionId })`（agent/src/index.ts:424）即可无 prompt 冷物化 Agent；`AgentHandle.dispose()` 只拆内存 residency、不动持久数据；`compactNow` resolve 前自带 durable flush。
+- 据此按**方案 A（cold materialize → compactNow → dispose → followup）**实现：`src/plugin/host.ts` `compactRoleActor` 的 cold 分支改为 resume→compact→dispose；resume/compact/teardown 失败 fail-closed BLOCK（复用 A2 R4 框架）；resident 窄竞态（Judge 先于 Actor turn 尾声完成）下的 `busy` 降级为跳过。
+- 备选 (a)（移除 compact）与 (b)（结算点竞速）不再需要；A2(0902) AC1/AC8 解除挂起，验收移至 A4 的隔离 harness 运行时数据（AC1/AC3/AC4/AC6）。

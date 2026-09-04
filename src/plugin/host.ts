@@ -2,7 +2,7 @@
  * Host adapters: wire the real DSH services into the engine's narrow
  * interfaces (design §2.3 deployment / §4 runtime).
  */
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -97,6 +97,17 @@ function assertJudgeToolSurface(childAgent: Agent): string | undefined {
 
 function textBlocks(text: string) {
   return [{ type: 'text' as const, text }]
+}
+
+/** Readable detail for a compaction-path failure (never wraps WorkflowError). */
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** ManualCompactionError detail (`compaction <code>: <message>`), else the plain message. */
+function compactErrorDetail(error: unknown): string {
+  if (isManualCompactionError(error)) return `compaction ${error.code}: ${error.message}`
+  return errorDetail(error)
 }
 
 export function makeStateHost(store: StateStore): StateHost {
@@ -310,24 +321,65 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async compactRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
-      // A2 R5: cold-resume (no resident agent) skips compact.
-      const agent = adapters.ctx.agents.get(childId as SessionId)
-      if (agent === undefined) return { ok: true, detail: 'cold-resume skip' }
       const compaction = adapters.ctx.get('compaction') as CompactionService | undefined
       if (compaction === undefined || typeof compaction.compactNow !== 'function') {
         return { ok: true, detail: 'no compaction service' }
       }
-      try {
-        const result = await compaction.compactNow(agent, new AbortController().signal)
-        if (result === null) return { ok: true, detail: 'no compactable range' }
-        return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
-      } catch (error) {
-        if (isManualCompactionError(error)) {
-          return { ok: false, detail: `compaction ${error.code}: ${error.message}` }
+      const signal = new AbortController().signal
+      // A4 plan A (docs/prd/20260903-workflow-hardening/a4-code-findings.md §3):
+      // the settlement watcher releases the actor's Activation right after its
+      // turn, and the next dispatch always follows a full Judge cycle, so the
+      // actor is cold at this point on every cross-node path. Compact a COLD
+      // actor by materializing it WITHOUT a prompt (no turn starts), running
+      // compactNow on the idle agent (its result is durably flushed before it
+      // resolves), then releasing the handle so the dispatch followup
+      // cold-resumes the compacted surface.
+      const resident = adapters.ctx.agents.get(childId as SessionId)
+      if (resident !== undefined) {
+        // Rare race (findings §1): the Judge finished while the actor's own
+        // turn is still draining. Compact in place; a busy actor degrades to a
+        // skip — the dispatch message queues FIFO behind the running turn
+        // exactly as it did before plan A.
+        try {
+          const result = await compaction.compactNow(resident, signal)
+          if (result === null) return { ok: true, detail: 'no compactable range' }
+          return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+        } catch (error) {
+          if (isManualCompactionError(error) && error.code === 'busy') {
+            return { ok: true, detail: 'resident actor busy; skipped' }
+          }
+          return { ok: false, detail: compactErrorDetail(error) }
         }
-        const message = error instanceof Error ? error.message : String(error)
-        return { ok: false, detail: message }
       }
+      const route = resolveRoleModel(run, roleKey, frozenRoute())
+      let handle: AgentHandle
+      try {
+        handle = await adapters.ctx.agents.resume({
+          resumeSessionId: childId as SessionId,
+          // Keep the summarizer on the role's own route (the same options the
+          // continuation manager re-applies when IT cold-resumes this child).
+          agentOptions: route.provider !== undefined || route.model !== undefined ? route : undefined,
+        })
+      } catch (error) {
+        return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
+      }
+      let outcome: { ok: boolean; detail: string }
+      try {
+        const result = await compaction.compactNow(handle.agent, signal)
+        outcome = result === null
+          ? { ok: true, detail: 'cold: no compactable range' }
+          : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+      } catch (error) {
+        outcome = { ok: false, detail: compactErrorDetail(error) }
+      }
+      // ALWAYS tear the materialization down: a leaked resident agent would
+      // collide on the registry id inside the dispatch followup's cold resume.
+      try {
+        await handle.dispose()
+      } catch (error) {
+        return { ok: false, detail: `cold materialize teardown failed: ${errorDetail(error)}` }
+      }
+      return outcome
     },
   }
 }

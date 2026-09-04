@@ -2,6 +2,7 @@
 
 - 日期：2026-09-04
 - 性质：静态代码证据（DSH 源码 `D:\project\github\deepseek-harness` @ master + 本插件源码）；**未运行隔离 harness**，运行时数据（token 曲线、复现次数）仍需 A4 PRD §4 的 feedback loop 补充
+- **实现状态：方案 A 已实现（2026-09-04，分支 `a4-cold-compact`，`src/plugin/host.ts` `compactRoleActor` + `test/host-compact.test.ts`）**；部署与运行时验证待做
 - 来源：[a4-cold-resume-compaction-investigation.md](a4-cold-resume-compaction-investigation.md)；进度登记见 [TODO.md](TODO.md) §3
 - 源码引用格式：`<harness包>/<文件>:行号`（harness 源码）、`src/<文件>:行号`（本插件）
 

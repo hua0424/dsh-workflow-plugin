@@ -90,7 +90,12 @@ export interface SubagentHost {
    * is an accepted no-op.
    */
   drainJudge(run: RunState, judgeSessionId: string): Promise<void>
-  /** Node-boundary compact of a resident role actor (A2). */
+  /**
+   * Node-boundary compact of a role actor (A2; A4 plan A). A cold actor is
+   * materialized without a prompt, compacted while idle, and released before
+   * the dispatch followup cold-resumes the compacted surface. Failure returns
+   * ok:false so the caller BLOCKs with a clean reason (A2 R4).
+   */
   compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
 }
 
