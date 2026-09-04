@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createRunLog, appendLine, lineTimestamp, runLogDir, shortId, bounded, jsonField, traceEvent } from '../src/engine/tracelog.ts'
+import { createRunLog, appendLine, lineTimestamp, runLogDir, shortId, bounded, jsonField, traceEvent, redact, Escaped } from '../src/engine/tracelog.ts'
 
 function withTempDir(fn: (dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), 'tracelog-test-'))
@@ -90,22 +90,42 @@ test('bounded: clamps to the protocol bound and marks truncation (A3 §4)', () =
 })
 
 test('jsonField: escapes free text onto one line; null for absent (A3 §3)', () => {
-  assert.equal(jsonField('planned', 100), '"planned"')
-  assert.equal(jsonField('multi\nline "quoted" \\ path', 100), '"multi\\nline \\"quoted\\" \\\\ path"')
-  assert.equal(jsonField(null, 100), 'null')
-  assert.equal(jsonField(undefined, 100), 'null')
+  assert.equal(jsonField('planned', 100).text, '"planned"')
+  assert.equal(jsonField('multi\nline "quoted" \\ path', 100).text, '"multi\\nline \\"quoted\\" \\\\ path"')
+  assert.equal(jsonField(null, 100).text, 'null')
+  assert.equal(jsonField(undefined, 100).text, 'null')
   // Over-bound text is truncated inside the quotes.
-  assert.equal(jsonField('y'.repeat(12), 10), `"${'y'.repeat(10)}…[truncated]"`)
+  assert.equal(jsonField('y'.repeat(12), 10).text, `"${'y'.repeat(10)}…[truncated]"`)
 })
 
 test('traceEvent: key=value tokens in insertion order; undefined omitted, null kept', () => {
   assert.equal(
-    traceEvent('CLAIM', { workflow: 'eng-test', node: 'plan', token: 'ab12cd34', role: 'manager', outcome: 'completed', summary: '"planned"', handoff: 'null' }),
+    traceEvent('CLAIM', { workflow: 'eng-test', node: 'plan', token: 'ab12cd34', role: 'manager', outcome: 'completed', summary: jsonField('planned', 100), handoff: jsonField(null, 100) }),
     'CLAIM workflow=eng-test node=plan token=ab12cd34 role=manager outcome=completed summary="planned" handoff=null',
   )
   assert.equal(traceEvent('MODEL', { workflow: 'w', role: 'judge', provider: undefined, model: 'm1' }), 'MODEL workflow=w role=judge model=m1')
-  assert.equal(traceEvent('COMPACT', { ok: true, detail: 'null' }), 'COMPACT ok=true detail=null')
+  assert.equal(traceEvent('COMPACT', { ok: true, detail: jsonField(null, 100) }), 'COMPACT ok=true detail=null')
   // Unexpected whitespace in a raw identifier falls back to JSON quoting so
   // the one-event-per-line invariant holds.
   assert.equal(traceEvent('MODEL', { provider: 'a b' }), 'MODEL provider="a b"')
+})
+
+test('traceEvent: a raw string LOOKING like escaped JSON is re-checked (A3 review S1: no multi-line injection)', () => {
+  // A Manager-supplied provider id containing a quote + newline must never
+  // pass through as-is and forge a second event line.
+  const line = traceEvent('MODEL', { workflow: 'w', role: 'judge', provider: '"evil\nINJECTED model=m' })
+  assert.equal(line, 'MODEL workflow=w role=judge provider="\\"evil\\nINJECTED model=m"')
+  assert.ok(!line.includes('\n'), 'single line preserved')
+  // Only the Escaped wrapper passes through untouched.
+  assert.ok(jsonField('x', 10) instanceof Escaped)
+})
+
+test('redact: credential-shaped substrings never survive jsonField (A3 AC10)', () => {
+  assert.equal(jsonField('key is sk-abc123XYZ789def456 here', 200).text, '"key is [redacted] here"')
+  assert.equal(jsonField('Authorization: Bearer tok1234567890', 200).text, '"Authorization: [redacted]"')
+  assert.equal(jsonField('ghp_AbCdEfGhIjKlMnOpQrStUv failed', 200).text, '"[redacted] failed"')
+  assert.equal(jsonField('api_key=abc123456789secretXYZ', 200).text, '"api_key=[redacted]"')
+  assert.equal(jsonField('GitHub token github_pat_11ABCDEFG0123456789abcdefghijklmnopqrstuv', 200).text, '"GitHub token [redacted]"')
+  // Ordinary text is untouched.
+  assert.equal(jsonField('no secrets here: token rotation discussed', 200).text, '"no secrets here: token rotation discussed"')
 })

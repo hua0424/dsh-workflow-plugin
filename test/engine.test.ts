@@ -35,13 +35,16 @@ interface MemState {
   version: number
 }
 
-function makeStateHost(mem: MemState): StateHost {
+function makeStateHost(mem: MemState, shouldFailPut?: () => boolean): StateHost {
   return {
     async get() {
       if (mem.run === undefined) return undefined
       return { run: structuredClone(mem.run), version: mem.version }
     },
     async put(_ws, run, expectedVersion) {
+      // A3 review S4 fault injection: a persistence failure AFTER the trace
+      // write makes the at-least-once crash seam observable in tests.
+      if (shouldFailPut?.()) throw new Error('disk full (injected)')
       assert.equal(mem.version, expectedVersion, 'state version mismatch')
       mem.run = structuredClone(run)
       mem.version += 1
@@ -84,6 +87,10 @@ interface Harness {
   compactResult: { ok: boolean; detail?: string }
   /** A3: scriptable program outcomes by programId (default: ERROR no stub result). */
   programResults: Map<string, { kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string }>
+  /** A3 review S4: throw from the Manager steer (dispatch failure injection). */
+  steerFailure: Error | undefined
+  /** A3 review S4: next N state.put calls throw (crash-seam injection). */
+  failNextPuts: number
 }
 
 function makeHarness(memArg?: MemState): Harness {
@@ -106,9 +113,14 @@ function makeHarness(memArg?: MemState): Harness {
     compacts: [],
     compactResult: { ok: true, detail: 'no compactable range' },
     programResults: new Map(),
+    steerFailure: undefined,
+    failNextPuts: 0,
   }
   const targets: DispatchTargets = {
-    async steerManager(_run, text) { h.steers.push(text) },
+    async steerManager(_run, text) {
+      if (h.steerFailure !== undefined) throw h.steerFailure
+      h.steers.push(text)
+    },
     async sendRoleActor(_run, _role, text) {
       h.actorMessages.push(text)
       return { messageId: `msg-role-${h.actorMessages.length}` }
@@ -141,7 +153,10 @@ function makeHarness(memArg?: MemState): Harness {
       return h.programResults.get(programId) ?? { kind: 'ERROR', reason: 'no stub result' }
     },
   }
-  h.engine = new WorkflowEngine(targets, subagents, programs, makeStateHost(mem))
+  h.engine = new WorkflowEngine(targets, subagents, programs, makeStateHost(mem, () => {
+    if (h.failNextPuts > 0) { h.failNextPuts -= 1; return true }
+    return false
+  }))
   h.engine.cwdResolver = async () => '/workspace'
   return h
 }
@@ -1232,4 +1247,68 @@ test('log creation/append failure never breaks run startup or routing, and warns
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ---- A3 review fixes (S1 injection / AC10 credential fixture / S4 crash seam) ----
+
+test('untrusted raw identifier values cannot inject extra log lines (A3 review S1 / AC9)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    // A provider id starting with a quote and containing a newline tried to
+    // pass the old prefix heuristic as "already escaped".
+    const outcome = await h.engine.handleSetRoleModel('ws', 'judge', '"evil\nINJECTED model=m', 'real-model', MANAGER)
+    assert.ok(outcome.ok)
+    const log = readRunLog(configPath, 'eng-test')
+    // Single MODEL line, JSON-quoted; no forged second event line.
+    assert.match(log, /MODEL workflow=eng-test role=judge provider="\\"evil\\nINJECTED model=m" model=real-model\n/)
+    assert.ok(!/\nINJECTED/.test(log), 'no injected line')
+    assert.equal(log.split('\n').filter(l => l.includes('MODEL')).length, 1)
+  })
+})
+
+test('credential-like text is redacted at the trace boundary (A3 AC10 fixture)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    // Claim summary carrying credential-shaped provider text.
+    await h.engine.handleClaim('ws', {
+      nodeToken: token,
+      outcome: 'failed',
+      summary: 'provider replied 401 for sk-abc123XYZ789def456ghi; Authorization: Bearer tokABCDEF0123456789',
+    }, MANAGER)
+    let log = readRunLog(configPath, 'eng-test')
+    assert.ok(!log.includes('sk-abc123XYZ789def456ghi'), 'api-key-shaped text redacted')
+    assert.ok(!log.includes('tokABCDEF0123456789'), 'bearer token redacted')
+    assert.match(log, /summary="provider replied 401 for \[redacted\]; Authorization: \[redacted\]"/)
+    // Dispatch-failure BLOCK with credential-shaped error text is redacted too.
+    const h2 = makeHarness()
+    h2.steerFailure = new Error('provider api_key=SUPERSECRETKEY12345 rejected')
+    const outcome = await h2.engine.startRun('ws2', initialRun(), configPath)
+    assert.ok(outcome.ok)
+    assert.equal(h2.mem.run!.status, 'blocked')
+    log = readFileSync(h2.mem.run!.traceLogPath!, 'utf8')
+    assert.ok(!log.includes('SUPERSECRETKEY12345'), 'block reason redacted')
+    assert.match(log, /source=dispatch reason="dispatch-failed: Error: provider api_key=\[redacted\] rejected"/)
+  })
+})
+
+test('crash seam: CLAIM is written BEFORE persistence — at-least-once with a distinguishable orphan (A3 review S4 / PRD §10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    // The acceptance put fails (host crash stand-in): the validated claim was
+    // already traced, so the log holds an orphan CLAIM line while State never
+    // accepted the claim. Declared semantics: at-least-once; the token prefix
+    // distinguishes the orphan and State/Git/GitHub stay authoritative.
+    h.failNextPuts = 1
+    await assert.rejects(h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'orphan claim' }, MANAGER), /disk full/)
+    assert.equal(h.mem.run!.pendingClaim, undefined, 'state never accepted the claim')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} CLAIM workflow=eng-test node=plan token=${TOK} role=manager outcome=completed summary="orphan claim" handoff=null\\n`))
+    // No JUDGE/ROUTE follows the orphan.
+    assert.ok(!log.includes('JUDGE'), 'orphan CLAIM has no verdict')
+  })
 })

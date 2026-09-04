@@ -371,7 +371,8 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
   - `PUSH parent=<wf>/<node> child=<childWf>` / `POP child=<childWf> result=PASS parent=<wf>/<node>`（子流程进出显式配对，不再靠parent PASS行间接推断）；
   - `COMPACT workflow= node= role= ok=<bool> detail=<json|null>`。
   内部nodeToken/Judge session只记8位短前缀作去重标识；`revision`序号留给A1 claim修正协议落地后补充。
-- **隐私边界**：只记录Engine已接受的协议载荷（summary≤4000、handoff≤8000、judge reason≤2000、BLOCK reason≤4000、resolutionContext≤8000）；不记reasoning、普通tool调用、Node-local transcript、program parameters；AUTH/credential错误沿用Host安全化文案。
+- **隐私边界**：只记录Engine已接受的协议载荷（summary≤4000、handoff≤8000、judge reason≤2000、BLOCK reason≤4000、resolutionContext≤8000）；不记reasoning、普通tool调用、Node-local transcript、program parameters；AUTH/credential错误沿用Host安全化文案，且trace边界（`jsonField`）另有一组固定模式的credential redact兜底（Bearer/sk-*/api_key类），双保险确保凭据形态文本不落盘。
+- **一致性语义（at-least-once）**：事件写入顺序固定为「业务校验→写trace→持久化状态转换」（A3 §10）；trace与State之间无法做到exactly-once，崩溃缝隙允许产生孤立事件行（例如CLAIM已写而acceptance持久化失败），每行的nodeToken/Judge短前缀用于事后去重，State/Git/GitHub始终是权威。反向缺口（State已接受而trace缺失）不存在于正常路径。
 - **失败容忍（R4）**：tracelog模块所有函数绝不抛错——目录/文件创建失败返回`undefined`、追加失败静默返回`false`，日志问题永不影响Run推进。首个失败通过Host logger warning一次（不循环刷warning）；State/Git/GitHub与trace冲突时前者权威。
 - **不做**日志轮转/清理/归档、Web UI展示、turn级对话内容记录、用户自定义格式/路径（本期格式固定）。
 

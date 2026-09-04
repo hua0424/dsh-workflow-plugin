@@ -11,7 +11,7 @@
 | [A2](a2-milestone-delivery-config-hardening.md) | milestone-delivery 配置强化 | ✅ 已完成（v1 兼容版，已部署） | 3、4、5、6、10 | 2026-09-04 | 本目录 `milestone-delivery.yaml`（新配置）、`milestone-delivery.orig.yaml`（旧版备份）、[a2-config-review.md](a2-config-review.md)（语义评审）；线上 catalog definitionHash `7961a32a…` 与评审副本一致 |
 | [A4](a4-cold-resume-compaction-investigation.md) | Cold-resume Compaction 调查 | ✅ 方案 A 已实现并合并 main（PRD 已审查）；部署与运行时验证延后统一进行 | 11 | — | 见 §3 与 [a4-code-findings.md](a4-code-findings.md) |
 | [A1](a1-claim-admission-and-judge-confirmation.md) | Claim Admission 与 Judge 确认协议 | ⬜ 未开始（语义已确认） | 1、2、7 | — | PRD 已定稿，待实现 |
-| [A3](a3-workflow-trace-observability.md) | Workflow Trace 可观测性 | ✅ 方案已实现（分支 a3-trace-observability）；部署与运行时验证延后统一进行 | 9 | 2026-09-04 | 见 §3.1 与 PRD §13 实现记录 |
+| [A3](a3-workflow-trace-observability.md) | Workflow Trace 可观测性 | ✅ 已实现（分支 a3-trace-observability；AC4 revision 待 A1；审查 7 项已全部修正）；部署与运行时验证延后统一进行 | 9 | 2026-09-04 | 见 §3.1 与 PRD §13/§14 实现与审查记录 |
 | [A5](a5-provider-retry-boundary.md) | Provider Retry 边界 | ⬜ 未开始（跨插件依赖） | 8 + 额度问题 | — | 需在 commandcode provider 侧建立 retry 有界化 Issue，Workflow 侧只保留通用恢复 |
 
 实施顺序依据 README §4：A1（Phase 1）→ A3/A4/A5（Phase 2，可并行）→ A2 定稿 + 隔离验收 run（Phase 3）。
@@ -47,7 +47,8 @@
 ## 3.1 A3 实现登记
 
 - 2026-09-04 **A3 已实现**（分支 `a3-trace-observability`，自 main 新建）：trace log 迁移到 fmt=2 统一 `key=value` + JSON escaping 事件格式，新增 CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/MODEL/PUSH/POP 事件，COMPACT 升级为 fmt=2；R5 全部 BLOCK 入口覆盖（含 restart-reconcile，前提为 `traceLogPath` 可选字段随 RunState 持久化）；每 run 首次日志失败经 `engine.traceWarn` → `ctx.logger.warn` 告警一次。实现决策与覆盖对照见 A3 PRD §13。
-- 验证：`pnpm test` 159/159、`pnpm run build` 干净、`pnpm run test:e2e` fmt=2 六行断言全过（隔离临时 home）。
+- 2026-09-04 **审查修正（7 项全部接纳，PRD §14）**：Escaped 类型化包装修复 MODEL 多行注入（S1/AC9）、trace 边界 redact 凭据兜底 + fixture（AC10）、CONTEXT.md State 闭集同步（S2）、traceWarnedRuns 清理（S3）、CLAIM 顺序改为 put 前并声明 at-least-once（S4）、AC4 状态措辞（revision 待 A1）。
+- 验证：`pnpm test` 164/164、`pnpm run build` 干净、`pnpm run test:e2e` fmt=2 六行断言全过（隔离临时 home）。
 - 部署策略与 A4 一致：本批 PRD 完成后统一 build+deploy，运行时验证项（52 分钟空白回放、warning 实际输出、COMPACT 真实文案）见 PRD §13.3。
 
 ## 4. 待办清单

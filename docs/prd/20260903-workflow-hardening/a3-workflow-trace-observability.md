@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；部署与运行时验证随本批 PRD 统一进行）
+- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；AC4 revision 待 A1 claim 修正协议落地后补，其余 AC 已实现；部署与运行时验证随本批 PRD 统一进行）
 - 关联需求：记录每个 Node 的 Actor claim、Judge 输出、BLOCK/RESUME
 
 ## 1. 背景
@@ -259,9 +259,25 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | PUSH/POP | `dispatchCurrent` child 分支 / `advance` pop 分支（显式配对） | AC7 |
 | COMPACT | `compactBeforeDispatch` 成败均记（A2 R7 原有语义升级为 fmt=2） | §9 外延 |
 
+- **§10 一致性语义（审查后修正为 at-least-once）**：初版 CLAIM 写在 acceptance 持久化之后（at-most-once，崩溃即缺行）；按 §10 规定的「校验→trace→持久化」顺序修正为 put 之前写 CLAIM。语义声明：**at-least-once**——崩溃缝隙可产生孤立事件行（如 CLAIM 已写但 acceptance 未落盘），以 token 短前缀去重，State/Git/GitHub 权威；正常路径不存在反向缺口（State 已接受而 trace 缺失）。其余事件（JUDGE/ROUTE/BLOCK/RESUME/PROGRAM 等）初版即遵循该顺序，crash-seam 语义由 put 故障注入测试固化。
+
 ### 13.3 验证情况
 
-- 单元测试：`test/tracelog.test.ts`（fmt=2 助手：转义/截断/null/原始值白名单）+ `test/engine.test.ts` trace 段（START fmt=2、CLAIM/JUDGE/ROUTE、REJECT 不产生 CLAIM、FAIL→BLOCK source、NEED_CONTEXT→RESUME(judge)、node_block→RESUME(actor)、actor 无结果 BLOCK、RESPAWN、PUSH/POP 配对、PROGRAM ERROR→RESOLVE、MODEL、restart-reconcile 跨 engine 实例写入同一日志、日志目录不可写时 warn 一次且 Run 行为不变、超限截断单行）。159/159 通过。
+- 单元测试：`test/tracelog.test.ts`（fmt=2 助手：转义/截断/null/Escaped 包装防注入/redact 凭据模式）+ `test/engine.test.ts` trace 段（START fmt=2、CLAIM/JUDGE/ROUTE、stale/duplicate claim 不产生 CLAIM（AC2）、FAIL→BLOCK source、NEED_CONTEXT→RESUME(judge)、node_block→RESUME(actor)、actor 无结果 BLOCK、RESPAWN、PUSH/POP 配对、PROGRAM ERROR→RESOLVE、MODEL、restart-reconcile 跨 engine 实例写入同一日志、日志目录不可写时 warn 一次且 Run 行为不变、超限截断单行；审查回归：raw 标识符注入、credential fixture、put 故障 at-least-once crash seam）。164/164 通过。
 - e2e：`scripts/e2e-smoke.mjs` 断言升级为 fmt=2 六行（START/CLAIM/JUDGE/ROUTE×2/CLAIM），隔离临时 home，`E2E SMOKE PASS`。
-- 文档：README "Run trace logs"、设计文档 §5.4 已同步（AC13）。
+- 文档：README "Run trace logs"、设计文档 §5.4（含 at-least-once 一致性语义与 redact 兜底）、CONTEXT.md State 闭集已同步（AC13）。
 - 待运行时验证（随本批统一部署）：真实 milestone-delivery run 的 52 分钟空白场景回放、Host logger warning 实际输出、COMPACT detail 真实文案。
+
+## 14. 审查修正记录（2026-09-04 同批 review，7 项全部接纳）
+
+| 审查项 | 结论与修复 |
+| --- | --- |
+| S1/AC9 高：MODEL 多行日志注入 | 属实（已复现）。`jsonField` 改为返回 `Escaped` 包装类型，`traceEvent` 仅对 `instanceof Escaped` 透传；raw 字符串统一重新过 `[\s"\\]` 检查并 JSON quoting，「以引号开头即已转义」启发式删除。补注入回归测试。 |
+| S2 中：CONTEXT.md State 闭集未列 `traceLogPath` | 属实。已补列为「可选派生元数据」。 |
+| S3 低：`traceWarnedRuns` 只增不减 | 属实。completed/reset 时删除。 |
+| AC9 Spec：单行保证测试缺口 | 属实。补 raw 标识符含引号/换行的注入测试（engine 级 + 助手级）。 |
+| AC10 中高：凭据净化无实现保证与 fixture | 属实。trace 边界 `redact()` 兜底 + credential-like fixture（claim summary、dispatch BLOCK reason 两条路径）；主防线仍为 Host 安全化文案。 |
+| AC4 中：revision 未实现但状态写「已实现」 | 属实。状态改为「AC4 revision 待 A1 claim 修正协议落地，其余 AC 已实现」。 |
+| S4 中：crash seam 语义未定义 | 属实。CLAIM 移到 acceptance put 之前（§10 规定顺序），语义显式声明 at-least-once；put 故障注入测试固化该语义。 |
+
+修正后验证：`pnpm test` 164/164、`pnpm run build` 干净、`pnpm run test:e2e` PASS。

@@ -97,23 +97,56 @@ export function bounded(text: string, max: number): string {
 }
 
 /**
- * Free-text field value: JSON-string escaped (newlines/quotes stay on one
- * line and reversible) and bounded to the field's protocol max. `null` /
- * `undefined` render as the JSON `null` literal.
+ * A3 AC10 backstop: redact credential-shaped substrings from free text
+ * before it enters the trace. The PRIMARY defense stays the Host's
+ * sanitized error wording; this fixed, linear-time pattern list is the
+ * trace-boundary backstop so a stray key in any error message never lands
+ * in the log. Best-effort heuristics — not a secret scanner.
  */
-export function jsonField(text: string | null | undefined, max: number): string {
-  if (text === null || text === undefined) return 'null'
-  return JSON.stringify(bounded(text, max))
+const REDACT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
+  // key=value / key: value assignments; an Authorization value may itself be
+  // `Bearer <token>`, so consume an optional Bearer prefix inside the value.
+  [/\b(api[_-]?key|apikey|access[_-]?token|secret|password|authorization)(\s*[:=]\s*)(?:Bearer\s+)?\S+/gi, '$1$2[redacted]'],
+  [/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]'],
+  [/\b(?:sk|ghp|gho|ghu|ghs|ghr|glpat|github_pat)[-_][A-Za-z0-9_-]{8,}\b/g, '[redacted]'],
+]
+
+/** Redact credential-shaped substrings (see REDACT_PATTERNS). */
+export function redact(text: string): string {
+  let out = text
+  for (const [re, replacement] of REDACT_PATTERNS) out = out.replace(re, replacement)
+  return out
 }
 
-/** A raw (identifier-like) field value; whitespace forces JSON quoting. */
+/**
+ * A pre-escaped free-text field value. Only `jsonField` constructs these;
+ * `traceEvent` trusts ONLY this wrapper to pass through untouched — a plain
+ * string is ALWAYS treated as a raw identifier and re-checked, so untrusted
+ * input (e.g. a provider id containing quotes/newlines) can never inject a
+ * second log line (A3 review S1: multi-line injection).
+ */
+export class Escaped {
+  readonly text: string
+  constructor(text: string) {
+    this.text = text
+  }
+}
+
+/**
+ * Free-text field value: redacted (AC10), bounded to the field's protocol
+ * max (§4), JSON-string escaped (newlines/quotes stay on one line and
+ * reversible). `null` / `undefined` render as the JSON `null` literal.
+ */
+export function jsonField(text: string | null | undefined, max: number): Escaped {
+  if (text === null || text === undefined) return new Escaped('null')
+  return new Escaped(JSON.stringify(bounded(redact(text), max)))
+}
+
+/** A raw (identifier-like) field value; any whitespace/quote/backslash forces JSON quoting. */
 function rawField(value: string | number | boolean): string {
   const text = String(value)
-  // Values pre-escaped by `jsonField` (free text) always start with a quote;
-  // pass them through untouched. Raw identifiers never start with a quote.
-  if (text.startsWith('"')) return text
-  // Identifiers never contain whitespace; if unexpected data does, keep the
-  // line single-line by falling back to JSON quoting.
+  // Legit identifiers never contain these; if unexpected input does, keep
+  // the one-event-per-line invariant by falling back to JSON quoting.
   if (/[\s"\\]/.test(text)) return JSON.stringify(text)
   return text
 }
@@ -122,12 +155,17 @@ function rawField(value: string | number | boolean): string {
  * Build one fmt=2 event line: `EVENT k=v k=v …` in field insertion order.
  * - `undefined` fields are omitted entirely;
  * - `null` renders as `null`;
- * - free-text fields must be pre-escaped via `jsonField`.
+ * - plain strings/numbers/booleans are raw identifiers (re-checked);
+ * - free-text fields MUST be wrapped by `jsonField` (see `Escaped`).
  */
-export function traceEvent(event: string, fields: Record<string, string | number | boolean | null | undefined>): string {
+export function traceEvent(event: string, fields: Record<string, string | number | boolean | null | undefined | Escaped>): string {
   const parts: string[] = [event]
   for (const [key, value] of Object.entries(fields)) {
     if (value === undefined) continue
+    if (value instanceof Escaped) {
+      parts.push(`${key}=${value.text}`)
+      continue
+    }
     parts.push(`${key}=${value === null ? 'null' : rawField(value)}`)
   }
   return parts.join(' ')

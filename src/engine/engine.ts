@@ -653,8 +653,8 @@ export class WorkflowEngine {
   /** When a run reaches Root END, notify the Manager (the user's main session). */
   private async notifyCompletion(run: RunState): Promise<void> {
     if (run.status !== 'completed') return
-    // The run's final ROUTE PASS->END line is already written; the trace-log
-    // path lives on the durable row, so there is no in-memory mapping to drop.
+    // A3 review S3: release the one-warning marker — a completed run's log is final.
+    this.traceWarnedRuns.delete(run.runId)
     try {
       await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。`)
     } catch {
@@ -721,9 +721,11 @@ export class WorkflowEngine {
         entered.run.pendingClaim.handoffContext = claim.handoffContext.trim()
       }
       entered.run.judgeSessionId = reservedJudgeSessionId
-      await this.state.put(workspaceKey, entered.run, entered.version)
-      // A3 R1: the claim is accepted and durable — record it BEFORE the Judge
-      // spawn, so even a spawn fault still proves the Actor submitted.
+      // A3 R1 + §10 crash-seam order: validate → trace → persist. The CLAIM
+      // line is written BEFORE the durable acceptance (at-least-once: a
+      // crash between leaves an orphan CLAIM whose token prefix is
+      // distinguishable; State remains authoritative). Logging here also
+      // guarantees the line survives a Judge spawn fault (§5 R1 reason).
       this.logClaim(
         entered.run,
         topFrame(entered.run),
@@ -732,6 +734,7 @@ export class WorkflowEngine {
         claim.summary,
         entered.run.pendingClaim.handoffContext ?? null,
       )
+      await this.state.put(workspaceKey, entered.run, entered.version)
 
       // A4 R1: spawn failure becomes a judge technical fault → BLOCK with detail.
       try {
@@ -1292,6 +1295,9 @@ export class WorkflowEngine {
 
   /** Reset: remove the workspace row (design A5). */
   async handleReset(workspaceKey: string): Promise<void> {
+    const row = await this.state.get(workspaceKey)
+    // A3 review S3: release the one-warning marker for the removed run.
+    if (row !== undefined) this.traceWarnedRuns.delete(row.run.runId)
     await this.state.remove(workspaceKey)
     this.dispatchBook.delete(workspaceKey)
   }

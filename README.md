@@ -88,7 +88,12 @@ config file (`src/engine/tracelog.ts`):
 - **Privacy**: only Engine-accepted protocol payloads are logged (summary /
   handoff / judge reason / block reason / resolution context, bounded). No
   reasoning, no tool transcripts, no program parameters, no credentials;
-  auth/credential errors keep the Host's sanitized wording.
+  auth/credential errors keep the Host's sanitized wording, and the trace
+  boundary additionally redacts credential-shaped patterns (Bearer tokens,
+  `sk-…`/`ghp_…`/`github_pat_…`, `api_key=…`-style assignments) as a backstop.
+- **Consistency**: events are written validate → trace → persist, so the log
+  is **at-least-once** — a crash at the seam may leave an orphan line (the
+  token prefixes dedupe it); State/Git/GitHub stay authoritative.
 - **Best-effort**: log directory/file creation or appends never fail the run.
   The FIRST failure per run surfaces once as a Host logger warning; further
   failures stay silent. State/Git/GitHub remain authoritative when they
