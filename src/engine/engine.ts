@@ -6,7 +6,7 @@
 import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome } from '../types.ts'
 import { WorkflowError, LIMITS } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
-import { createRunLog, appendLine } from './tracelog.ts'
+import { createRunLog, appendLine, jsonField, redact, shortId, traceEvent } from './tracelog.ts'
 import { SUBMISSION_CONSTRAINT } from './texts.ts'
 
 /** A2 R4: marker prefix compactBeforeDispatch throws with (for clean BLOCK routing). */
@@ -188,8 +188,13 @@ export class WorkflowEngine {
 
   private readonly dispatchBook = new Map<string, DispatchBook>()
   private readonly inFlight = new Map<string, string>() // workspaceKey → operation kind
-  /** runId → trace-log file path (PRD workflow-run-logging R1; in-memory only). */
-  private readonly logFiles = new Map<string, string>()
+  /**
+   * A3 §10: ONE warning per run on the first trace-log failure, so
+   * best-effort still has a diagnosis without a warning loop. Wired to the
+   * Host logger by the plugin; absent in tests.
+   */
+  traceWarn: ((message: string) => void) | undefined
+  private readonly traceWarnedRuns = new Set<string>()
   private readonly targets: DispatchTargets
   private readonly subagents: SubagentHost
   private readonly programs: ProgramHost
@@ -223,24 +228,43 @@ export class WorkflowEngine {
 
   /** Start a run: persist the initial row, then dispatch the root start node immediately. */
   async startRun(workspaceKey: string, run: RunState, configPath?: string): Promise<EngineOutcome> {
+    // A3 review round 2: the workspace-uniqueness check is atomic with the
+    // row creation (state.create). Pre-check it so the COMMON conflict (user
+    // error, not a crash) rejects cleanly BEFORE any trace artifact exists —
+    // only a genuine race between this check and create can leave an orphan
+    // START line + file (declared at-least-once semantics).
+    const existing = await this.state.get(workspaceKey)
+    if (existing !== undefined && existing.run.status !== 'completed') {
+      return { ok: false, reason: `workspace already has a ${existing.run.status} run (key: ${workspaceKey})` }
+    }
+    // A3: create the trace log BEFORE the state row and persist its path on
+    // the row, so every later event (including after a host restart) appends
+    // to the same file. Best-effort — tracelog never throws, so logging can
+    // never block run startup (R4); a create failure leaves traceLogPath
+    // unset and the run simply runs unlogged.
+    if (configPath !== undefined) {
+      const logPath = createRunLog(configPath, run.catalogWorkflowId, run.runId)
+      if (logPath !== undefined) {
+        run.traceLogPath = logPath
+      } else {
+        this.warnTraceOnce(run.runId, `workflow trace log creation failed for run ${shortId(run.runId)}; the run continues without a trace log`)
+      }
+    }
+    // R1/R2: the START line announces the event-line format version (A3 §3).
+    // Written BEFORE the row creation per the §10 order (validate → trace →
+    // persist): a crash between leaves an orphan START in an orphan file
+    // (at-least-once); the reverse gap (row without START) does not exist.
+    this.logLine(run, traceEvent('START', { workflow: run.catalogWorkflowId, run: run.runId, fmt: 2 }))
     let version: number
     try {
       version = await this.state.create(workspaceKey, run)
     } catch (error) {
+      // A3 review S4: a failed start leaves no run to clean the marker later.
+      this.traceWarnedRuns.delete(run.runId)
       if (error instanceof Error && error.name === 'StateConflictError') {
         return { ok: false, reason: error.message }
       }
       throw error
-    }
-    // R1/R2: create the run trace log beside the catalog config and write the
-    // START line. Best-effort — tracelog never throws, so logging can never
-    // block run startup (R4).
-    if (configPath !== undefined) {
-      const logPath = createRunLog(configPath, run.catalogWorkflowId, run.runId)
-      if (logPath !== undefined) {
-        this.logFiles.set(run.runId, logPath)
-        this.logLine(run, `START workflow=${run.catalogWorkflowId} run=${run.runId}`)
-      }
     }
     // F22: freeze the Manager's current route as the inherited fallback at Run
     // start, so later Manager UI model switches do not change first-time
@@ -252,12 +276,167 @@ export class WorkflowEngine {
 
   /**
    * Append one line to this run's trace log (best-effort, R4). No-op when the
-   * run has no log file (no configPath at start, or log creation failed).
+   * run has no trace-log path (no configPath at start, log creation failed,
+   * or a pre-A3 durable row). The path travels ON the durable row, so events
+   * after a host restart reach the same file (A3 R5 restart coverage).
    */
   private logLine(run: RunState, line: string): void {
-    const logPath = this.logFiles.get(run.runId)
+    const logPath = run.traceLogPath
     if (logPath === undefined) return
-    appendLine(logPath, line)
+    if (!appendLine(logPath, line)) {
+      this.warnTraceOnce(run.runId, `workflow trace log append failed for run ${shortId(run.runId)} (path: ${logPath}); further trace failures for this run stay silent`)
+    }
+  }
+
+  /** A3 §10: surface the FIRST trace failure of a run once, never in a loop. */
+  private warnTraceOnce(runId: string, message: string): void {
+    if (this.traceWarnedRuns.has(runId)) return
+    this.traceWarnedRuns.add(runId)
+    try {
+      this.traceWarn?.(message)
+    } catch {
+      // even the warning is best-effort
+    }
+  }
+
+  // ---- A3 trace events (fmt=2). Free-text fields go through `jsonField`
+  // at their protocol bounds (§4); ids use short prefixes (§5/§10). ----
+
+  /** A3 R1: an accepted Actor claim, logged after admission, before Judge spawn. */
+  private logClaim(run: RunState, frame: CallFrame, role: string, outcome: ClaimOutcome, summary: string, handoff: string | null): void {
+    this.logLine(run, traceEvent('CLAIM', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      role,
+      outcome,
+      summary: jsonField(summary, LIMITS.summaryMax),
+      handoff: jsonField(handoff, LIMITS.handoffMax),
+    }))
+  }
+
+  /** A3 R3: an accepted Judge verdict (current protocol: PASS/FAIL/NEED_CONTEXT; A1 renames). */
+  private logJudge(run: RunState, frame: CallFrame, result: 'PASS' | 'FAIL' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): void {
+    this.logLine(run, traceEvent('JUDGE', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      result,
+      reason: jsonField(reason, LIMITS.reasonMax),
+      judge: shortId(judgeSessionId),
+    }))
+  }
+
+  /** A3 §3: the finally-adopted Graph edge direction (verdict synthesis, not the verdict itself). */
+  private logRoute(run: RunState, frame: CallFrame, result: 'PASS' | 'FAIL', target: string): void {
+    this.logLine(run, traceEvent('ROUTE', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      result,
+      target,
+    }))
+  }
+
+  /** A3 R5: every BLOCK entrance with its source and normalized reason. */
+  private logBlock(run: RunState, frame: CallFrame, source: 'actor' | 'judge' | 'program' | 'dispatch' | 'compact' | 'restart' | 'manager', reason: string): void {
+    this.logLine(run, traceEvent('BLOCK', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      source,
+      reason: jsonField(reason, LIMITS.blockReasonMax),
+    }))
+  }
+
+  /** A3 R6: node_resume — target=judge in the judgment phase, else target=actor. */
+  private logResume(run: RunState, frame: CallFrame, oldToken: string, target: 'judge' | 'actor', resolutionContext: string): void {
+    this.logLine(run, traceEvent('RESUME', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      oldToken: shortId(oldToken),
+      newToken: shortId(frame.nodeToken),
+      target,
+      context: jsonField(resolutionContext, LIMITS.resolutionMax),
+    }))
+  }
+
+  /** A3 R6: judge_respawn — the fresh Judge id prefix links back to its JUDGE line. */
+  private logRespawn(run: RunState, frame: CallFrame, judgeSessionId: string, reason: string | null): void {
+    this.logLine(run, traceEvent('RESPAWN', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      judge: shortId(judgeSessionId),
+      reason: jsonField(reason, LIMITS.reasonMax),
+    }))
+  }
+
+  /** A3 R6: node_resolve_program — the Manager's manual verdict on a blocked program node. */
+  private logResolve(run: RunState, frame: CallFrame, result: 'PASS' | 'FAIL', reason: string): void {
+    this.logLine(run, traceEvent('RESOLVE', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      result,
+      reason: jsonField(reason, LIMITS.blockReasonMax),
+    }))
+  }
+
+  /** A3 §9: builtin program outcome. Parameters are never logged (§9 privacy). */
+  private logProgram(run: RunState, frame: CallFrame, programId: string, result: 'PASS' | 'FAIL' | 'ERROR', reason: string | null): void {
+    this.logLine(run, traceEvent('PROGRAM', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      program: programId,
+      result,
+      reason: jsonField(reason, LIMITS.reasonMax),
+    }))
+  }
+
+  /** A3 R6: model override — ids only, never credentials. provider/modelId
+   * are untrusted Manager tool input: redact credential shapes pointwise
+   * (other raw identifiers are catalog-validated and intentionally exempt,
+   * A3 review round 3 S1). */
+  private logModel(run: RunState, roleKey: string, provider: string, modelId: string): void {
+    this.logLine(run, traceEvent('MODEL', {
+      workflow: run.catalogWorkflowId,
+      role: roleKey,
+      provider: redact(provider),
+      model: redact(modelId),
+    }))
+  }
+
+  /** A3 §8: child-workflow entry (push). Token pairs with the POP of the same node. */
+  private logPush(run: RunState, frame: CallFrame, childWorkflowId: string): void {
+    this.logLine(run, traceEvent('PUSH', {
+      parent: `${frame.workflowId}/${frame.nodeId}`,
+      token: shortId(frame.nodeToken),
+      child: childWorkflowId,
+    }))
+  }
+
+  /** A3 §8: child-workflow return (pop) — explicit, not inferred from the parent PASS. */
+  private logPop(run: RunState, childWorkflowId: string, result: 'PASS' | 'FAIL', parentFrame: CallFrame): void {
+    this.logLine(run, traceEvent('POP', {
+      child: childWorkflowId,
+      result,
+      parent: `${parentFrame.workflowId}/${parentFrame.nodeId}`,
+      token: shortId(parentFrame.nodeToken),
+    }))
+  }
+
+  /** A2 R7: node-boundary compact outcome. */
+  private logCompact(run: RunState, frame: CallFrame, roleKey: string, ok: boolean, detail: string | null): void {
+    this.logLine(run, traceEvent('COMPACT', {
+      workflow: frame.workflowId,
+      node: frame.nodeId,
+      token: shortId(frame.nodeToken),
+      role: roleKey,
+      ok,
+      detail: jsonField(detail, LIMITS.blockReasonMax),
+    }))
   }
 
   nodeAt(run: RunState, frame: CallFrame): NodeView | undefined {
@@ -348,8 +527,8 @@ export class WorkflowEngine {
       const childDef = run.definitionSnapshot.childWorkflows?.[childId]
       if (childDef === undefined) throw new WorkflowError(`child workflow "${childId}" is missing from the snapshot`)
       run.callStack.push({ workflowId: childId, nodeId: childDef.startNode, nodeToken: newNodeToken() })
-      // R3: child-workflow push routing (the pop side is logged by advance()).
-      this.logLine(run, `NODE ${frame.workflowId}/${frame.nodeId} PUSH -> ${childId}`)
+      // A3 §8: child-workflow entry (push); the return is logged by advance()'s POP.
+      this.logPush(run, frame, childId)
       // The handoff reaches the Child's start node (design §2.6).
       await this.dispatchCurrent(run, transientContext)
     }
@@ -367,29 +546,33 @@ export class WorkflowEngine {
   private async compactBeforeDispatch(run: RunState, roleKey: string): Promise<void> {
     // Fresh-node-entry decision is the caller's (dispatchCurrent): same-node
     // resume and first creation never reach here (A2 R3/R6).
+    const frame = topFrame(run)
     const result = await this.subagents.compactRoleActor(run, roleKey)
     if (!result.ok) {
       const detail = result.detail ?? 'unknown compaction failure'
-      this.logLine(run, `COMPACT ${topFrame(run).workflowId}/${topFrame(run).nodeId} role=${roleKey} FAIL: ${detail}`)
+      this.logCompact(run, frame, roleKey, false, detail)
       throw new WorkflowError(`${COMPACT_FAIL_PREFIX}${detail}`)
     }
-    this.logLine(run, `COMPACT ${topFrame(run).workflowId}/${topFrame(run).nodeId} role=${roleKey} ${result.detail ?? 'ok'}`)
+    this.logCompact(run, frame, roleKey, true, result.detail ?? null)
   }
 
-  /** Mutate the run along a PASS/FAIL edge (no persistence). */
-  private advance(run: RunState, verdict: 'PASS' | 'FAIL', reason: string): void {
+  /**
+   * Mutate the run along a PASS/FAIL edge (no persistence). Emits ROUTE (the
+   * finally-adopted edge direction, A3 §3), POP on a child-workflow return
+   * (§8), and BLOCK when a FAIL finds no onFail edge (R5) — `blockSource`
+   * names the component whose verdict ran out of edges.
+   */
+  private advance(run: RunState, verdict: 'PASS' | 'FAIL', reason: string, blockSource: 'judge' | 'program' | 'manager'): void {
     const frame = topFrame(run)
     const node = this.nodeAt(run, frame)
     if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
     // The verdict always ends the judgment phase.
     delete run.judgeSessionId
     delete run.pendingClaim
-    // R3: log the routing decision as `NODE <workflowId>/<nodeId> <verdict> -> <target>`.
-    const route = (line: string) => this.logLine(run, `NODE ${frame.workflowId}/${frame.nodeId} ${line}`)
     if (verdict === 'PASS') {
       const target = node.onPass
       if (target === 'END') {
-        route('PASS -> END')
+        this.logRoute(run, frame, 'PASS', 'END')
         if (run.callStack.length === 1) {
           run.status = 'completed'
           run.callStack = []
@@ -398,11 +581,15 @@ export class WorkflowEngine {
           run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
           return
         }
+        const childWorkflowId = frame.workflowId
         run.callStack.pop()
-        this.advance(run, 'PASS', '')
+        // A3 §8: the child's return is explicit, not inferred from the
+        // parent's next PASS line.
+        this.logPop(run, childWorkflowId, 'PASS', topFrame(run))
+        this.advance(run, 'PASS', '', blockSource)
         return
       }
-      route(`PASS -> ${target}`)
+      this.logRoute(run, frame, 'PASS', target)
       frame.nodeId = target
       frame.nodeToken = newNodeToken()
       // A1 R4: the node has left; the next dispatch establishes a fresh boundary.
@@ -411,14 +598,16 @@ export class WorkflowEngine {
     }
     const target = node.onFail
     if (target === undefined || target === 'END') {
-      route('FAIL -> BLOCK')
+      const blockReason = `checker FAIL${reason.trim() !== '' ? `: ${reason.trim()}` : ''} and no onFail edge`
+      this.logRoute(run, frame, 'FAIL', 'BLOCK')
+      this.logBlock(run, frame, blockSource, blockReason)
       run.status = 'blocked'
-      run.blockReason = `checker FAIL${reason.trim() !== '' ? `: ${reason.trim()}` : ''} and no onFail edge`
+      run.blockReason = blockReason
       // A1 R4: FAIL with no onFail keeps the node — the boundary is RETAINED so
       // a resume preserves this node's local history (and A2 R6 skips compact).
       return
     }
-    route(`FAIL -> ${target}`)
+    this.logRoute(run, frame, 'FAIL', target)
     frame.nodeId = target
     frame.nodeToken = newNodeToken()
     // A1 R4: the node has left via the onFail edge.
@@ -437,13 +626,16 @@ export class WorkflowEngine {
         // reusing the A4 BLOCK-steer framework.
         if (error instanceof WorkflowError && error.message.startsWith(COMPACT_FAIL_PREFIX)) {
           run.blockReason = error.message.slice(0, LIMITS.blockReasonMax)
+          // A3 R5: compact-failure BLOCK (before persistence, per §10 order).
+          this.logBlock(run, topFrame(run), 'compact', run.blockReason)
           await this.state.put(workspaceKey, run, expectedVersion)
           this.dispatchBook.delete(workspaceKey)
-          this.logLine(run, `DISPATCH BLOCKED ${topFrame(run).workflowId}/${topFrame(run).nodeId}: ${run.blockReason}`)
           await this.targets.steerManager(run, compactFaultNotice(run, topFrame(run).nodeId, error.message.slice(COMPACT_FAIL_PREFIX.length))).catch(() => {})
           return
         }
         run.blockReason = `dispatch-failed: ${String(error)}`.slice(0, LIMITS.blockReasonMax)
+        // A3 R5: dispatch-failure BLOCK.
+        this.logBlock(run, topFrame(run), 'dispatch', run.blockReason)
       }
     }
     await this.state.put(workspaceKey, run, expectedVersion)
@@ -482,8 +674,8 @@ export class WorkflowEngine {
   /** When a run reaches Root END, notify the Manager (the user's main session). */
   private async notifyCompletion(run: RunState): Promise<void> {
     if (run.status !== 'completed') return
-    // The run's trace log is complete; drop the in-memory mapping.
-    this.logFiles.delete(run.runId)
+    // A3 review S3: release the one-warning marker — a completed run's log is final.
+    this.traceWarnedRuns.delete(run.runId)
     try {
       await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。`)
     } catch {
@@ -550,6 +742,19 @@ export class WorkflowEngine {
         entered.run.pendingClaim.handoffContext = claim.handoffContext.trim()
       }
       entered.run.judgeSessionId = reservedJudgeSessionId
+      // A3 R1 + §10 crash-seam order: validate → trace → persist. The CLAIM
+      // line is written BEFORE the durable acceptance (at-least-once: a
+      // crash between leaves an orphan CLAIM whose token prefix is
+      // distinguishable; State remains authoritative). Logging here also
+      // guarantees the line survives a Judge spawn fault (§5 R1 reason).
+      this.logClaim(
+        entered.run,
+        topFrame(entered.run),
+        node.execution.role ?? 'manager',
+        claim.outcome,
+        claim.summary,
+        entered.run.pendingClaim.handoffContext ?? null,
+      )
       await this.state.put(workspaceKey, entered.run, entered.version)
 
       // A4 R1: spawn failure becomes a judge technical fault → BLOCK with detail.
@@ -611,9 +816,11 @@ export class WorkflowEngine {
     const reason = `judge fault: ${detail}`.slice(0, LIMITS.blockReasonMax)
     run.status = 'blocked'
     run.blockReason = reason
+    // A3 R4/R5: judge technical fault → BLOCK with source=judge (before the
+    // persistence, per §10 order). The reason mirrors the durable blockReason.
+    this.logBlock(run, frame, 'judge', reason)
     await this.state.put(workspaceKey, run, version)
     this.dispatchBook.delete(workspaceKey)
-    this.logLine(run, `JUDGE FAULT ${frame.workflowId}/${frame.nodeId}: ${detail}`)
     await this.targets.steerManager(run, judgeFaultNotice(run, frame.nodeId, detail)).catch(() => {})
   }
 
@@ -636,19 +843,22 @@ export class WorkflowEngine {
     if (run.pendingClaim === undefined) {
       return { ok: false, reason: 'no pending judgment for this node' }
     }
+    // A3 R3: the verdict is validated against the pending claim — record it
+    // before any state transition (§10 order).
+    this.logJudge(run, frame, result, reason, judgeSessionId)
     if (result === 'NEED_CONTEXT') {
       // A1 R10: BLOCK, keep the judge session + pendingClaim + boundary.
       run.status = 'blocked'
       run.blockReason = reason.slice(0, LIMITS.blockReasonMax)
+      this.logBlock(run, frame, 'judge', reason)
       await this.state.put(workspaceKey, run, version)
       this.dispatchBook.delete(workspaceKey)
-      this.logLine(run, `JUDGE NEED_CONTEXT ${frame.workflowId}/${frame.nodeId}: ${reason}`)
       await this.targets.steerManager(run, needContextNotice(run, frame.nodeId, reason)).catch(() => {})
       return { ok: true, run, message: run.blockReason }
     }
     // PASS/FAIL: apply the edge and retire the judge.
     const handoff = run.pendingClaim?.handoffContext
-    this.advance(run, result, reason)
+    this.advance(run, result, reason, 'judge')
     // A1 R11: retire the judge (revoke authorization; the resident Activation
     // is released by DSH's settlement watcher once its turn ends). Never drain
     // from inside the judge's own tool call — see SubagentHost.retireJudge.
@@ -730,6 +940,10 @@ export class WorkflowEngine {
     run.judgeSessionId = reservedJudgeSessionId
     run.status = 'running'
     run.blockReason = null
+    // A3 R6 + review round 2: record the rebuild BEFORE persistence (§10
+    // validate → trace → persist; at-least-once). A spawn failure afterwards
+    // is covered by the following judge-fault BLOCK line.
+    this.logRespawn(run, frame, reservedJudgeSessionId, reason ?? null)
     await this.state.put(workspaceKey, run, version)
     try {
       await this.subagents.startJudge(run, {
@@ -771,9 +985,6 @@ export class WorkflowEngine {
       await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
       return { ok: false, reason: 'stale judge respawn discarded: the run changed while the judge was materializing' }
     }
-    if (reason !== undefined) {
-      this.logLine(fresh.run, `JUDGE RESPAWN ${frame.workflowId}/${frame.nodeId}: ${reason}`)
-    }
     return { ok: true, run: fresh.run, message: `judge respawned for node ${frame.nodeId}` }
   }
 
@@ -793,6 +1004,9 @@ export class WorkflowEngine {
     }
     run.status = 'blocked'
     run.blockReason = reason
+    // A3 R5: explicit node_block — source reflects who called (Manager vs the
+    // node's own Actor).
+    this.logBlock(run, frame, isManager ? 'manager' : 'actor', reason)
     await this.state.put(workspaceKey, run, version)
     this.dispatchBook.delete(workspaceKey)
     return { ok: true, run, message: `blocked: ${reason}` }
@@ -815,6 +1029,9 @@ export class WorkflowEngine {
       run.status = 'running'
       run.blockReason = null
       frame.nodeToken = newNodeToken()
+      // A3 R6: judgment-phase resume always targets the judge (followup the
+      // live session, or rebuild from pendingClaim below).
+      this.logResume(run, frame, nodeToken, 'judge', resolutionContext)
       if (run.judgeSessionId !== undefined) {
         // followup the SAME judge (A1 R10 / A4 R3); do not re-dispatch the actor.
         const followup = `[manager resolution]\n${resolutionContext}\n\n请用新的 nodeToken "${frame.nodeToken}" 继续判定，并再次调用 judge_claim 提交。`
@@ -891,6 +1108,8 @@ export class WorkflowEngine {
     run.status = 'running'
     run.blockReason = null
     frame.nodeToken = newNodeToken()
+    // A3 R6: actor-path resume (re-dispatch with the resolution context).
+    this.logResume(run, frame, nodeToken, 'actor', resolutionContext)
     await this.dispatchNow(workspaceKey, run, version, resolutionContext)
     return { ok: true, run, message: run.blockReason ?? `resumed: ${resolutionContext.slice(0, 120)}` }
   }
@@ -928,14 +1147,18 @@ export class WorkflowEngine {
       if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== nodeToken) {
         return { ok: false, reason: 'stale program result discarded: the node moved or blocked meanwhile' }
       }
+      // A3 §9: program outcome (parameters never logged). Recorded after the
+      // stale-result revalidation and before the state transition (§10 order).
+      this.logProgram(fresh.run, topFrame(fresh.run), programId, result.kind, result.kind === 'PASS' ? null : result.reason ?? null)
       if (result.kind === 'ERROR') {
         fresh.run.status = 'blocked'
         fresh.run.blockReason = `program ${programId} ERROR: ${result.reason ?? ''}`
+        this.logBlock(fresh.run, topFrame(fresh.run), 'program', fresh.run.blockReason)
         await this.state.put(workspaceKey, fresh.run, fresh.version)
         this.dispatchBook.delete(workspaceKey)
         return { ok: true, run: fresh.run, message: fresh.run.blockReason }
       }
-      this.advance(fresh.run, result.kind, result.reason ?? '')
+      this.advance(fresh.run, result.kind, result.reason ?? '', 'program')
       await this.persistDeferred(workspaceKey, fresh.run, fresh.version)
       return { ok: true, run: fresh.run, message: `program ${result.kind}` }
     } finally {
@@ -961,7 +1184,9 @@ export class WorkflowEngine {
     // an onFail edge (design §5.2 G6 / acceptance G6).
     run.status = 'running'
     run.blockReason = null
-    this.advance(run, result, reason)
+    // A3 R6: the Manager's manual resolution, recorded before routing.
+    this.logResolve(run, frame, result, reason)
+    this.advance(run, result, reason, 'manager')
     await this.persistDeferred(workspaceKey, run, version)
     return { ok: true, run, message: `resolved ${result}` }
   }
@@ -989,6 +1214,8 @@ export class WorkflowEngine {
       }
     }
     run.modelOverrides[roleKey] = { provider, modelId }
+    // A3 R6: model override — ids only, never credentials.
+    this.logModel(run, roleKey, provider, modelId)
     await this.state.put(workspaceKey, run, version)
     return { ok: true, run, message: `model override set for ${roleKey}` }
   }
@@ -1036,6 +1263,9 @@ export class WorkflowEngine {
     if (topFrame(run).nodeToken === book.dispatchedToken && currentExecutor === sessionId) {
       run.status = 'blocked'
       run.blockReason = 'actor-turn-ended-without-result'
+      // A3 R5: the turn ended without node_claim/node_block — this BLOCK is
+      // what fills the former 52-minute trace silence.
+      this.logBlock(run, topFrame(run), 'actor', run.blockReason)
       await this.state.put(workspaceKey, run, row.version)
       this.dispatchBook.delete(workspaceKey)
       // A3 R3: actively notify the Manager.
@@ -1069,6 +1299,9 @@ export class WorkflowEngine {
         }
         fresh.run.status = 'blocked'
         fresh.run.blockReason = 'host-restarted-before-node-result'
+        // A3 R5: restart-reconcile BLOCK. Reaches the ORIGINAL run log via the
+        // durable traceLogPath persisted at Run start.
+        this.logBlock(fresh.run, topFrame(fresh.run), 'restart', fresh.run.blockReason)
         // A reserved Judge id may be durable while its Session is not (the host
         // can crash between the pre-admission write and materialization). Clear
         // it so node_resume takes A4 R4's spawn-rebuild branch; pendingClaim
@@ -1086,7 +1319,8 @@ export class WorkflowEngine {
   /** Reset: remove the workspace row (design A5). */
   async handleReset(workspaceKey: string): Promise<void> {
     const row = await this.state.get(workspaceKey)
-    if (row !== undefined) this.logFiles.delete(row.run.runId)
+    // A3 review S3: release the one-warning marker for the removed run.
+    if (row !== undefined) this.traceWarnedRuns.delete(row.run.runId)
     await this.state.remove(workspaceKey)
     this.dispatchBook.delete(workspaceKey)
   }

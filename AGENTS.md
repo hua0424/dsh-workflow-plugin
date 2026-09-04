@@ -85,5 +85,5 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 
 - Node 不在 node_modules 内剥 `.ts`，编译产物 `lib/` 才是运行时工件：deploy 前必须 `pnpm run build`，且每次 build 后重跑 `scripts/deploy-web.mjs`.
 - Catalog YAML 是受限单文档 YAML 1.2：禁止 duplicate key、anchor/alias/merge、custom tag、模板插值；文件名必须是小写 `[a-z][a-z0-9-]*.yaml`（拒绝 `.yml`）；invalid 文件只阻塞自身.
-- Trace log 是 best-effort 派生产物，写在 catalog 配置旁 `<catalogDir>/<workflowId>/`，失败静默、绝不阻断 Run，也不进 SQLite 状态.
+- Trace log 是 best-effort 派生产物，写在 catalog 配置旁 `<catalogDir>/<workflowId>/`，失败静默、绝不阻断 Run；日志**内容**不进 SQLite，仅文件路径以可选 `traceLogPath` 元数据随行持久化（host 重启后事件仍写同一文件）.
 - 新增 Checker id 或 builtin program = 修改插件源码 + 测试 + 版本说明；配置不能注册任意程序/脚本/Checker 类型.

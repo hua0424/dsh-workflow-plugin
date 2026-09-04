@@ -11,7 +11,7 @@
 | [A2](a2-milestone-delivery-config-hardening.md) | milestone-delivery 配置强化 | ✅ 已完成（v1 兼容版，已部署） | 3、4、5、6、10 | 2026-09-04 | 本目录 `milestone-delivery.yaml`（新配置）、`milestone-delivery.orig.yaml`（旧版备份）、[a2-config-review.md](a2-config-review.md)（语义评审）；线上 catalog definitionHash `7961a32a…` 与评审副本一致 |
 | [A4](a4-cold-resume-compaction-investigation.md) | Cold-resume Compaction 调查 | ✅ 方案 A 已实现并合并 main（PRD 已审查）；部署与运行时验证延后统一进行 | 11 | — | 见 §3 与 [a4-code-findings.md](a4-code-findings.md) |
 | [A1](a1-claim-admission-and-judge-confirmation.md) | Claim Admission 与 Judge 确认协议 | ⬜ 未开始（语义已确认） | 1、2、7 | — | PRD 已定稿，待实现 |
-| [A3](a3-workflow-trace-observability.md) | Workflow Trace 可观测性 | ⬜ 未开始（方案已确认） | 9 | — | PRD 已定稿，待实现 |
+| [A3](a3-workflow-trace-observability.md) | Workflow Trace 可观测性 | ✅ 已实现（分支 a3-trace-observability；AC4 revision 待 A1；审查 7 项已全部修正）；部署与运行时验证延后统一进行 | 9 | 2026-09-04 | 见 §3.1 与 PRD §13/§14 实现与审查记录 |
 | [A5](a5-provider-retry-boundary.md) | Provider Retry 边界 | ⬜ 未开始（跨插件依赖） | 8 + 额度问题 | — | 需在 commandcode provider 侧建立 retry 有界化 Issue，Workflow 侧只保留通用恢复 |
 
 实施顺序依据 README §4：A1（Phase 1）→ A3/A4/A5（Phase 2，可并行）→ A2 定稿 + 隔离验收 run（Phase 3）。
@@ -44,12 +44,22 @@
 - 2026-09-04 **方案 A 已实现**（分支 `a4-cold-compact`）：`src/plugin/host.ts` `compactRoleActor` cold 分支改为 resume→compactNow→dispose；resident 窄竞态 `busy` 降级跳过；resume/compact/teardown 失败 fail-closed BLOCK（复用 A2 R4 框架）。新增 `test/host-compact.test.ts`（11 用例），全套 146/146 + build + e2e smoke 通过。同步回写：`CONTEXT.md` Role Actor 词条、0902 A2 PRD 状态行、`docs/pending-discussions/a2-compact-residency-premise.md` 解决记录。PRD 审查意见已采纳：摘要模型与 Actor 模型可以不一致（a4-code-findings.md §3-A.2 已修正）。
 - **部署策略（用户决策 2026-09-04）：已合并到 main；build+deploy 与运行时验证（A4 PRD §4/AC1/AC3/AC4/AC6）在其他 PRD 完成后统一进行。**
 
+## 3.1 A3 实现登记
+
+- 2026-09-04 **A3 已实现**（分支 `a3-trace-observability`，自 main 新建）：trace log 迁移到 fmt=2 统一 `key=value` + JSON escaping 事件格式，新增 CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/MODEL/PUSH/POP 事件，COMPACT 升级为 fmt=2；R5 全部 BLOCK 入口覆盖（含 restart-reconcile，前提为 `traceLogPath` 可选字段随 RunState 持久化）；每 run 首次日志失败经 `engine.traceWarn` → `ctx.logger.warn` 告警一次。实现决策与覆盖对照见 A3 PRD §13。
+- 2026-09-04 **审查修正（首轮 7 项全部接纳，PRD §14）**：Escaped 类型化包装修复 MODEL 多行注入（S1/AC9）、trace 边界 redact 凭据兜底 + fixture（AC10）、CONTEXT.md State 闭集同步（S2）、traceWarnedRuns 清理（S3）、CLAIM 顺序改为 put 前并声明 at-least-once（S4）、AC4 状态措辞（revision 待 A1）。
+- 2026-09-04 **复审修正（第二轮 8 项全部接纳，PRD §15）**：START（预检查+trace-before-create）与 RESPAWN（trace-before-put）消除反向 crash gap；ROUTE/PUSH/POP/COMPACT 补 token 短前缀去重；redact 覆盖 raw 标识符与 Basic auth；warn marker 失败启动清理；PRD §13.2 过期表格修正。
+- 2026-09-04 **第三轮复审修正（6 项全部接纳，PRD §16）**：rawField 恢复不脱敏（合法 `sk-*` 结构 ID 保留），MODEL provider/model 定点 redact；START create 故障 seam 测试；RESPAWN 表格/事件示例/AGENTS.md 文档收口。
+- 验证：`pnpm test` 169/169、`pnpm run build` 干净、`pnpm run test:e2e` fmt=2 断言全过（隔离临时 home）。
+- 部署策略与 A4 一致：本批 PRD 完成后统一 build+deploy，运行时验证项（52 分钟空白回放、warning 实际输出、COMPACT 真实文案）见 PRD §13.3。
+
 ## 4. 待办清单
 
 - [ ] A4：运行时验证（方案 A 已实现并合并 main；部署与其他 PRD 完成后统一 build+deploy + 隔离 harness 验证 AC1/AC3/AC4/AC6，数据齐备后按 AC9 回写设计文档）
-- [ ] A1：dispatch lease + claim 自动绑定 + REJECT correction feedback（含 schema version 决策）
-- [ ] A3：Actor claim / Judge 结果 / BLOCK/RESUME / POP trace
+- [ ] A1：dispatch lease + claim 自动绑定 + REJECT correction feedback（含 schema version 决策；落地时同步 A3 trace 的 JUDGE 枚举与 revision 字段）
+- [ ] A3：运行时验证（方案已实现；统一部署后回放 52 分钟空白场景、确认 warning 输出与 COMPACT 文案）
 - [ ] A5：在 commandcode provider 仓库建 retry 有界化 Issue；验证 workflow 通用 BLOCK/resume 恢复
-- [ ] A1 落地后：执行 A2 遗留 L1/L2（配置升版 + 移除 handoff-verdict workaround）
+- [ ] A1 落地后：执行 A2 遗留 L1/L2（配置升版 + 移除 handoff-verdict workaround）；顺带定义模型路由 ID（provider/modelId）的协议长度上限（A3 第四轮评审建议，§17）
 - [ ] Phase 3：隔离 GitHub 测试仓库完整 acceptance run（default branch contains delivery、Issues closed、Milestone closed、END）
 - [x] A2：v1 兼容配置强化并部署（2026-09-04）
+- [x] A3：fmt=2 trace 事件全覆盖实现 + 单测/e2e/文档（2026-09-04，分支 a3-trace-observability）

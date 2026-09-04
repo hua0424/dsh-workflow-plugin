@@ -35,18 +35,23 @@ interface MemState {
   version: number
 }
 
-function makeStateHost(mem: MemState): StateHost {
+function makeStateHost(mem: MemState, shouldFailPut?: () => boolean, shouldFailCreate?: () => boolean): StateHost {
   return {
     async get() {
       if (mem.run === undefined) return undefined
       return { run: structuredClone(mem.run), version: mem.version }
     },
     async put(_ws, run, expectedVersion) {
+      // A3 review S4 fault injection: a persistence failure AFTER the trace
+      // write makes the at-least-once crash seam observable in tests.
+      if (shouldFailPut?.()) throw new Error('disk full (injected)')
       assert.equal(mem.version, expectedVersion, 'state version mismatch')
       mem.run = structuredClone(run)
       mem.version += 1
     },
     async create(_ws, run) {
+      // A3 review round 3: START seam — create fails after the START line.
+      if (shouldFailCreate?.()) throw new Error('disk full (injected)')
       if (mem.run !== undefined && mem.run.status !== 'completed') {
         const err = new Error(`workspace already has a ${mem.run.status} run`)
         err.name = 'StateConflictError'
@@ -82,10 +87,18 @@ interface Harness {
   actorCreated: boolean
   compacts: string[]
   compactResult: { ok: boolean; detail?: string }
+  /** A3: scriptable program outcomes by programId (default: ERROR no stub result). */
+  programResults: Map<string, { kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string }>
+  /** A3 review S4: throw from the Manager steer (dispatch failure injection). */
+  steerFailure: Error | undefined
+  /** A3 review S4: next N state.put calls throw (crash-seam injection). */
+  failNextPuts: number
+  /** A3 review round 3: next N state.create calls throw (START seam injection). */
+  failNextCreates: number
 }
 
-function makeHarness(): Harness {
-  const mem: MemState = { version: 0 }
+function makeHarness(memArg?: MemState): Harness {
+  const mem: MemState = memArg ?? { version: 0 }
   const h: Harness = {
     mem,
     engine: undefined as never,
@@ -103,9 +116,16 @@ function makeHarness(): Harness {
     actorCreated: false,
     compacts: [],
     compactResult: { ok: true, detail: 'no compactable range' },
+    programResults: new Map(),
+    steerFailure: undefined,
+    failNextPuts: 0,
+    failNextCreates: 0,
   }
   const targets: DispatchTargets = {
-    async steerManager(_run, text) { h.steers.push(text) },
+    async steerManager(_run, text) {
+      if (h.steerFailure !== undefined) throw h.steerFailure
+      h.steers.push(text)
+    },
     async sendRoleActor(_run, _role, text) {
       h.actorMessages.push(text)
       return { messageId: `msg-role-${h.actorMessages.length}` }
@@ -135,11 +155,16 @@ function makeHarness(): Harness {
   }
   const programs: ProgramHost = {
     async run(_run, programId, _params) {
-      const r = new Map<string, { kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string }>()
-      return r.get(programId) ?? { kind: 'ERROR', reason: 'no stub result' }
+      return h.programResults.get(programId) ?? { kind: 'ERROR', reason: 'no stub result' }
     },
   }
-  h.engine = new WorkflowEngine(targets, subagents, programs, makeStateHost(mem))
+  h.engine = new WorkflowEngine(targets, subagents, programs, makeStateHost(mem, () => {
+    if (h.failNextPuts > 0) { h.failNextPuts -= 1; return true }
+    return false
+  }, () => {
+    if (h.failNextCreates > 0) { h.failNextCreates -= 1; return true }
+    return false
+  }))
   h.engine.cwdResolver = async () => '/workspace'
   return h
 }
@@ -902,7 +927,8 @@ test('child END pops the frame and treats the parent node as PASS', async () => 
   assert.ok(h.steers.some(t => /已完成/.test(t)), 'manager should get a completion steer')
 })
 
-// ---- run trace log (issue #2 / PRD workflow-run-logging R1-R4) ----
+// ---- run trace log (issue #2 / PRD workflow-run-logging R1-R4; A3 PRD
+// docs/prd/20260903-workflow-hardening/a3-workflow-trace-observability.md) ----
 
 /** Create a temp catalog dir containing `<workflowId>.yaml`; removed after fn. */
 async function withTempCatalog(workflowId: string, fn: (configPath: string) => Promise<void>): Promise<void> {
@@ -926,32 +952,67 @@ function readRunLog(configPath: string, workflowId: string): string {
 }
 
 const TS = '\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]'
+const TOK = '[0-9a-f]{8}'
 
-test('startRun creates the trace log and writes the START line (AC1)', async () => {
+test('startRun creates the trace log and writes the START line with fmt=2 (AC1)', async () => {
   await withTempCatalog('eng-test', async (configPath) => {
     const h = makeHarness()
     const run = initialRun()
     const outcome = await h.engine.startRun('ws', run, configPath)
     assert.ok(outcome.ok)
     assert.equal(h.mem.run!.status, 'running')
+    // A3: the log path is durable on the row, so later events (any engine
+    // instance reading this row) reach the same file.
+    const dirFiles = readdirSync(join(dirname(configPath), 'eng-test')).filter(f => f.endsWith('.txt'))
+    assert.equal(h.mem.run!.traceLogPath, join(dirname(configPath), 'eng-test', dirFiles[0]!))
     const log = readRunLog(configPath, 'eng-test')
-    assert.match(log, new RegExp(`^${TS} START workflow=eng-test run=${run.runId}\\n`))
+    assert.match(log, new RegExp(`^${TS} START workflow=eng-test run=${run.runId} fmt=2\\n`))
   })
 })
 
-test('trace log records a PASS routing line (AC2)', async () => {
+test('accepted claim and judge verdict produce CLAIM + JUDGE + ROUTE lines (AC1/AC3)', async () => {
   await withTempCatalog('eng-test', async (configPath) => {
     const h = makeHarness()
     await h.engine.startRun('ws', initialRun(), configPath)
     const token = topFrame(h.mem.run!).nodeToken
-    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned', handoffContext: 'notes for build' }, MANAGER)
     await h.engine.handleJudgeClaim('ws', token, 'PASS', 'planned ok', reservedJudgeId(h))
     const log = readRunLog(configPath, 'eng-test')
-    assert.match(log, new RegExp(`${TS} NODE eng-test/plan PASS -> build\\n`))
+    assert.match(log, new RegExp(`${TS} CLAIM workflow=eng-test node=plan token=${TOK} role=manager outcome=completed summary="planned" handoff="notes for build"\\n`))
+    assert.match(log, new RegExp(`${TS} JUDGE workflow=eng-test node=plan token=${TOK} result=PASS reason="planned ok" judge=${TOK}\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan token=${TOK} result=PASS target=build\\n`))
   })
 })
 
-test('trace log records a FAIL routing line to onFail (AC3), and FAIL -> BLOCK without one', async () => {
+test('CLAIM free text is JSON-escaped onto one line and bounded at protocol max (AC9)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    // Multi-line + quotes + backslash must stay a single escaped line.
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'failed', summary: 'line1\n"quoted" \\ done' }, MANAGER)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} CLAIM workflow=eng-test node=plan token=${TOK} role=manager outcome=failed summary="line1\\\\n\\\\"quoted\\\\" \\\\\\\\ done" handoff=null\\n`))
+    // A stale duplicate claim must not add a second CLAIM (AC2: only accepted claims).
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'stale' }, MANAGER)
+    assert.equal(readRunLog(configPath, 'eng-test').split('\n').filter(l => l.includes('CLAIM')).length, 1)
+  })
+})
+
+test('over-bound claim fields are truncated at the protocol max on one line (AC9)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    // Engine called directly (past the tool validation) with oversized text.
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'z'.repeat(4200) }, MANAGER)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`summary="${'z'.repeat(4000)}…\\[truncated\\]"`))
+    assert.doesNotMatch(log, /z{4001}/)
+  })
+})
+
+test('FAIL routes to onFail, and FAIL -> BLOCK emits ROUTE + BLOCK source=judge (AC5)', async () => {
   const FAIL_CONFIG = validateAndNormalize(parseCatalogConfig(`
 schemaVersion: agent-workflow/v1
 roles: {}
@@ -992,9 +1053,9 @@ workflow:
     assert.ok(outcome.ok)
     assert.equal(topFrame(h.mem.run!).nodeId, 'retry')
     const log = readRunLog(configPath, 'fail-test')
-    assert.match(log, new RegExp(`${TS} NODE fail-test/try FAIL -> retry\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=fail-test node=try token=${TOK} result=FAIL target=retry\\n`))
   })
-  // FAIL without an onFail edge BLOCKs and is logged as FAIL -> BLOCK.
+  // FAIL without an onFail edge BLOCKs: ROUTE target=BLOCK + BLOCK source=judge.
   await withTempCatalog('eng-test', async (configPath) => {
     const h = makeHarness()
     await h.engine.startRun('ws', initialRun(), configPath)
@@ -1003,11 +1064,75 @@ workflow:
     await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not planned', reservedJudgeId(h))
     assert.equal(h.mem.run!.status, 'blocked')
     const log = readRunLog(configPath, 'eng-test')
-    assert.match(log, new RegExp(`${TS} NODE eng-test/plan FAIL -> BLOCK\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan token=${TOK} result=FAIL target=BLOCK\\n`))
+    assert.match(log, new RegExp(`${TS} BLOCK workflow=eng-test node=plan token=${TOK} source=judge reason="checker FAIL: not planned and no onFail edge"\\n`))
   })
 })
 
-test('trace log covers child push/pop routing with owning workflow ids (AC2)', async () => {
+test('JUDGE NEED_CONTEXT emits JUDGE + BLOCK source=judge, then RESUME target=judge (AC4-correction base/AC5/AC6)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+    await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'need repo link', reservedJudgeId(h))
+    assert.equal(h.mem.run!.status, 'blocked')
+    let log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} JUDGE workflow=eng-test node=plan token=${TOK} result=NEED_CONTEXT reason="need repo link" judge=${TOK}\\n`))
+    assert.match(log, new RegExp(`${TS} BLOCK workflow=eng-test node=plan token=${TOK} source=judge reason="need repo link"\\n`))
+    // Manager resumes the judgment phase → followup the SAME judge.
+    const resumed = await h.engine.handleResume('ws', token, 'repo is github.com/x/y', MANAGER)
+    assert.ok(resumed.ok)
+    log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} RESUME workflow=eng-test node=plan oldToken=${TOK} newToken=${TOK} target=judge context="repo is github.com/x/y"\\n`))
+  })
+})
+
+test('node_block by the Manager emits BLOCK source=manager; actor-path resume emits RESUME target=actor (AC5/AC6)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleBlock('ws', token, 'waiting on external review', MANAGER)
+    assert.equal(h.mem.run!.status, 'blocked')
+    let log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} BLOCK workflow=eng-test node=plan token=${TOK} source=manager reason="waiting on external review"\\n`))
+    const resumed = await h.engine.handleResume('ws', token, 'review done, continue', MANAGER)
+    assert.ok(resumed.ok)
+    log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} RESUME workflow=eng-test node=plan oldToken=${TOK} newToken=${TOK} target=actor context="review done, continue"\\n`))
+  })
+})
+
+test('actor turn ending without a result emits BLOCK source=actor (AC5: no 52-minute silence)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    await h.engine.handleTurnEnded('ws', MANAGER)
+    assert.equal(h.mem.run!.status, 'blocked')
+    assert.equal(h.mem.run!.blockReason, 'actor-turn-ended-without-result')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} BLOCK workflow=eng-test node=plan token=${TOK} source=actor reason="actor-turn-ended-without-result"\\n`))
+  })
+})
+
+test('judge_respawn emits RESPAWN with the fresh judge prefix (AC6)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+    await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'unclear', reservedJudgeId(h))
+    const respawned = await h.engine.handleRespawnJudge('ws', token, 'judge model stuck in a loop', MANAGER)
+    assert.ok(respawned.ok)
+    const newJudge = h.mem.run!.judgeSessionId!
+    assert.notEqual(newJudge, undefined)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} RESPAWN workflow=eng-test node=plan token=${TOK} judge=${newJudge.slice(0, 8)} reason="judge model stuck in a loop"\\n`))
+  })
+})
+
+test('trace log covers child PUSH/POP with explicit pairing (AC7)', async () => {
   await withTempCatalog('child-test', async (configPath) => {
     const h = makeChildHarness()
     await h.engine.startRun('ws', h.childRun(), configPath)
@@ -1016,18 +1141,93 @@ test('trace log covers child push/pop routing with owning workflow ids (AC2)', a
     await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', reservedJudgeId(h))
     await h.engine.handleTurnEnded('ws', MANAGER)
     let log = readRunLog(configPath, 'child-test')
-    assert.match(log, new RegExp(`${TS} NODE child-test/begin PASS -> call-child\\n`))
-    assert.match(log, new RegExp(`${TS} NODE child-test/call-child PUSH -> child-a\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-test node=begin token=${TOK} result=PASS target=call-child\\n`))
+    assert.match(log, new RegExp(`${TS} PUSH parent=child-test/call-child token=${TOK} child=child-a\\n`))
     const childToken = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { nodeToken: childToken, outcome: 'completed', summary: 'done' }, 'actor-child-1')
     await h.engine.handleJudgeClaim('ws', childToken, 'PASS', 'child done', reservedJudgeId(h))
     log = readRunLog(configPath, 'child-test')
-    assert.match(log, new RegExp(`${TS} NODE child-a/child-step PASS -> END\\n`))
-    assert.match(log, new RegExp(`${TS} NODE child-test/call-child PASS -> END\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-a node=child-step token=${TOK} result=PASS target=END\\n`))
+    assert.match(log, new RegExp(`${TS} POP child=child-a result=PASS parent=child-test/call-child token=${TOK}\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-test node=call-child token=${TOK} result=PASS target=END\\n`))
   })
 })
 
-test('log creation/append failure never breaks run startup or routing (AC4)', async () => {
+test('builtin program outcomes emit PROGRAM (+BLOCK on ERROR) and RESOLVE on manual fix (AC8/AC6)', async () => {
+  const PROG_TRACE_CONFIG = validateAndNormalize(parseCatalogConfig(`
+schemaVersion: agent-workflow/v1
+roles: {}
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Begin. }
+      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      onPass: prog
+    prog:
+      execution: { type: builtin-program, programId: github.initialize-milestone }
+      onPass: END
+`), { workflowId: 'prog-test' })
+  await withTempCatalog('prog-test', async (configPath) => {
+    const h = makeHarness()
+    const run: RunState = {
+      runId: crypto.randomUUID(),
+      managerSessionId: MANAGER,
+      catalogWorkflowId: 'prog-test',
+      definitionHash: computeDefinitionHash(PROG_TRACE_CONFIG),
+      definitionSnapshot: PROG_TRACE_CONFIG,
+      status: 'running',
+      callStack: [{ workflowId: 'prog-test', nodeId: 'plan', nodeToken: newNodeToken() }],
+      roleActors: {}, modelOverrides: {}, blockReason: null,
+      nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+    }
+    await h.engine.startRun('ws', run, configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'begun' }, MANAGER)
+    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'begun', reservedJudgeId(h))
+    await h.engine.handleTurnEnded('ws', MANAGER)
+    const progToken = topFrame(h.mem.run!).nodeToken
+    // ERROR → PROGRAM + BLOCK source=program.
+    await h.engine.handleRunProgram('ws', progToken, {}, MANAGER)
+    assert.equal(h.mem.run!.status, 'blocked')
+    let log = readRunLog(configPath, 'prog-test')
+    assert.match(log, new RegExp(`${TS} PROGRAM workflow=prog-test node=prog token=${TOK} program=github.initialize-milestone result=ERROR reason="no stub result"\\n`))
+    assert.match(log, new RegExp(`${TS} BLOCK workflow=prog-test node=prog token=${TOK} source=program reason="program github.initialize-milestone ERROR: no stub result"\\n`))
+    // Manual resolve PASS → RESOLVE + ROUTE to END.
+    await h.engine.handleResolveProgram('ws', progToken, 'PASS', 'verified milestone exists', MANAGER)
+    log = readRunLog(configPath, 'prog-test')
+    assert.match(log, new RegExp(`${TS} RESOLVE workflow=prog-test node=prog token=${TOK} result=PASS reason="verified milestone exists"\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=prog-test node=prog token=${TOK} result=PASS target=END\\n`))
+  })
+})
+
+test('model override emits MODEL with ids only (AC6/AC10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const outcome = await h.engine.handleSetRoleModel('ws', 'judge', 'deepseek', 'glm-4.7', MANAGER)
+    assert.ok(outcome.ok)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} MODEL workflow=eng-test role=judge provider=deepseek model=glm-4.7\\n`))
+  })
+})
+
+test('host-restart reconcile emits BLOCK source=restart into the SAME log via the durable traceLogPath (AC5/AC6)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    // A FRESH engine over the same durable state = post-restart process.
+    const h2 = makeHarness(h.mem)
+    await h2.engine.handleRestartReconcile()
+    assert.equal(h.mem.run!.status, 'blocked')
+    assert.equal(h.mem.run!.blockReason, 'host-restarted-before-node-result')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} BLOCK workflow=eng-test node=plan token=${TOK} source=restart reason="host-restarted-before-node-result"\\n`))
+  })
+})
+
+test('log creation/append failure never breaks run startup or routing, and warns once (AC11/§10)', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'engine-tracelog-blocked-'))
   try {
     const configPath = join(dir, 'eng-test.yaml')
@@ -1035,17 +1235,191 @@ test('log creation/append failure never breaks run startup or routing (AC4)', as
     // A regular FILE where the log directory must be created → mkdir fails.
     writeFileSync(join(dir, 'eng-test'), 'i block the log directory')
     const h = makeHarness()
+    const warnings: string[] = []
+    h.engine.traceWarn = (m) => { warnings.push(m) }
     const outcome = await h.engine.startRun('ws', initialRun(), configPath)
     assert.ok(outcome.ok)
     assert.equal(h.mem.run!.status, 'running')
+    assert.equal(h.mem.run!.traceLogPath, undefined, 'no trace path persists on the row')
     assert.equal(h.steers.length, 1)
+    assert.equal(warnings.length, 1, 'creation failure warns exactly once')
+    assert.match(warnings[0]!, /trace log creation failed/)
     // Routing still advances with no log file attached.
     const token = topFrame(h.mem.run!).nodeToken
     const claim = await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'x' }, MANAGER)
     assert.ok(claim.ok)
     await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
     assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+    // No further warnings (no spam loop).
+    assert.equal(warnings.length, 1)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ---- A3 review fixes (S1 injection / AC10 credential fixture / S4 crash seam) ----
+
+test('untrusted raw identifier values cannot inject extra log lines (A3 review S1 / AC9)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    // A provider id starting with a quote and containing a newline tried to
+    // pass the old prefix heuristic as "already escaped".
+    const outcome = await h.engine.handleSetRoleModel('ws', 'judge', '"evil\nINJECTED model=m', 'real-model', MANAGER)
+    assert.ok(outcome.ok)
+    const log = readRunLog(configPath, 'eng-test')
+    // Single MODEL line, JSON-quoted; no forged second event line.
+    assert.match(log, /MODEL workflow=eng-test role=judge provider="\\"evil\\nINJECTED model=m" model=real-model\n/)
+    assert.ok(!/\nINJECTED/.test(log), 'no injected line')
+    assert.equal(log.split('\n').filter(l => l.includes('MODEL')).length, 1)
+  })
+})
+
+test('credential-like text is redacted at the trace boundary (A3 AC10 fixture)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    // Claim summary carrying credential-shaped provider text.
+    await h.engine.handleClaim('ws', {
+      nodeToken: token,
+      outcome: 'failed',
+      summary: 'provider replied 401 for sk-abc123XYZ789def456ghi; Authorization: Bearer tokABCDEF0123456789',
+    }, MANAGER)
+    let log = readRunLog(configPath, 'eng-test')
+    assert.ok(!log.includes('sk-abc123XYZ789def456ghi'), 'api-key-shaped text redacted')
+    assert.ok(!log.includes('tokABCDEF0123456789'), 'bearer token redacted')
+    assert.match(log, /summary="provider replied 401 for \[redacted\]; Authorization: \[redacted\]"/)
+    // Dispatch-failure BLOCK with credential-shaped error text is redacted too.
+    const h2 = makeHarness()
+    h2.steerFailure = new Error('provider api_key=SUPERSECRETKEY12345 rejected')
+    const outcome = await h2.engine.startRun('ws2', initialRun(), configPath)
+    assert.ok(outcome.ok)
+    assert.equal(h2.mem.run!.status, 'blocked')
+    log = readFileSync(h2.mem.run!.traceLogPath!, 'utf8')
+    assert.ok(!log.includes('SUPERSECRETKEY12345'), 'block reason redacted')
+    assert.match(log, /source=dispatch reason="dispatch-failed: Error: provider api_key=\[redacted\] rejected"/)
+  })
+})
+
+test('crash seam: CLAIM is written BEFORE persistence — at-least-once with a distinguishable orphan (A3 review S4 / PRD §10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    // The acceptance put fails (host crash stand-in): the validated claim was
+    // already traced, so the log holds an orphan CLAIM line while State never
+    // accepted the claim. Declared semantics: at-least-once; the token prefix
+    // distinguishes the orphan and State/Git/GitHub stay authoritative.
+    h.failNextPuts = 1
+    await assert.rejects(h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'orphan claim' }, MANAGER), /disk full/)
+    assert.equal(h.mem.run!.pendingClaim, undefined, 'state never accepted the claim')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} CLAIM workflow=eng-test node=plan token=${TOK} role=manager outcome=completed summary="orphan claim" handoff=null\\n`))
+    // No JUDGE/ROUTE follows the orphan.
+    assert.ok(!log.includes('JUDGE'), 'orphan CLAIM has no verdict')
+  })
+})
+
+test('crash seam: RESPAWN is written BEFORE persistence — at-least-once like CLAIM (A3 review round 2 / PRD §10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+    await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'unclear', reservedJudgeId(h))
+    assert.equal(h.mem.run!.status, 'blocked')
+    const oldJudge = h.mem.run!.judgeSessionId!
+    // The respawn persistence put fails (host crash stand-in): the rebuild
+    // was already traced, so the log holds an orphan RESPAWN while State
+    // keeps the old blocked run + old judge (at-least-once; State wins).
+    h.failNextPuts = 1
+    await assert.rejects(h.engine.handleRespawnJudge('ws', token, 'rebuild', MANAGER), /disk full/)
+    assert.equal(h.mem.run!.status, 'blocked', 'state never accepted the respawn')
+    assert.equal(h.mem.run!.judgeSessionId, oldJudge)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} RESPAWN workflow=eng-test node=plan token=${TOK} judge=${TOK} reason="rebuild"\\n`))
+  })
+})
+
+test('conflicted startRun leaves NO orphan trace file (A3 review round 2: common conflict path is clean)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    // Second start on the same workspace: the pre-check rejects BEFORE any
+    // trace artifact — still exactly one log file, no orphan START.
+    const again = await h.engine.startRun('ws', initialRun(), configPath)
+    assert.ok(!again.ok)
+    assert.match(again.ok ? '' : again.reason, /already has a running run/)
+    const files = readdirSync(join(dirname(configPath), 'eng-test')).filter(f => f.endsWith('.txt'))
+    assert.equal(files.length, 1, 'no orphan log file for the rejected start')
+  })
+})
+
+test('credential-shaped raw identifiers (provider/model) are redacted, but legit structural ids survive (A3 review round 3 S1 / AC10/AC1)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const outcome = await h.engine.handleSetRoleModel('ws', 'judge', 'sk-liveSECRET123456', 'normal-model', MANAGER)
+    assert.ok(outcome.ok)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.ok(!log.includes('sk-liveSECRET123456'), 'credential-shaped provider id redacted')
+    assert.match(log, /MODEL workflow=eng-test role=judge provider=\[redacted\] model=normal-model\n/)
+    assert.match(log, /START workflow=eng-test /, 'structural workflow id NOT redacted')
+  })
+})
+
+test('legit secret-pattern-colliding workflow id is NOT redacted (A3 review round 3 S1 regression)', async () => {
+  // 'sk-abcdefgh' matches the credential heuristic but is a legal catalog id
+  // (ID_PATTERN); redacting it would break trace↔catalog correlation.
+  const SK_CONFIG = validateAndNormalize(parseCatalogConfig(`
+schemaVersion: agent-workflow/v1
+roles: {}
+judgeRole: { persona: J }
+workflow:
+  startNode: sk-abcdefgh
+  nodes:
+    sk-abcdefgh:
+      execution: { type: actor-task, role: manager, instruction: Go. }
+      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      onPass: END
+`), { workflowId: 'sk-abcdefgh' })
+  await withTempCatalog('sk-abcdefgh', async (configPath) => {
+    const h = makeHarness()
+    const run: RunState = {
+      runId: crypto.randomUUID(),
+      managerSessionId: MANAGER,
+      catalogWorkflowId: 'sk-abcdefgh',
+      definitionHash: computeDefinitionHash(SK_CONFIG),
+      definitionSnapshot: SK_CONFIG,
+      status: 'running',
+      callStack: [{ workflowId: 'sk-abcdefgh', nodeId: 'sk-abcdefgh', nodeToken: newNodeToken() }],
+      roleActors: {}, modelOverrides: {}, blockReason: null,
+      nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+    }
+    await h.engine.startRun('ws', run, configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'ok' }, MANAGER)
+    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+    const log = readRunLog(configPath, 'sk-abcdefgh')
+    assert.match(log, /START workflow=sk-abcdefgh run=/)
+    assert.match(log, /CLAIM workflow=sk-abcdefgh node=sk-abcdefgh /)
+    assert.match(log, /ROUTE workflow=sk-abcdefgh node=sk-abcdefgh /)
+    assert.ok(!log.includes('[redacted]'), 'no structural id redacted')
+  })
+})
+
+test('crash seam: START is written BEFORE state.create — failure leaves a declared orphan file (A3 review round 3 Spec2 / PRD §10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    const run = initialRun()
+    h.failNextCreates = 1
+    // Non-conflict create failure (host crash stand-in): START already on
+    // disk, State never created. Declared at-least-once orphan.
+    await assert.rejects(h.engine.startRun('ws', run, configPath), /disk full/)
+    assert.equal(h.mem.run, undefined, 'state never created')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`^${TS} START workflow=eng-test run=${run.runId} fmt=2\\n`))
+    assert.equal(log.trim().split('\n').length, 1, 'orphan file holds only the START line')
+  })
 })

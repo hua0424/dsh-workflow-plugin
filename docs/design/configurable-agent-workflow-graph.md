@@ -307,7 +307,8 @@ Definition Snapshot直接保存在该Row的`snapshot_json.definitionSnapshot`；
   blockReason: string | null,
   nodeBoundary: NodeContextBoundary,
   judgeSessionId?: string,
-  pendingClaim?: { outcome, summary, handoffContext? }
+  pendingClaim?: { outcome, summary, handoffContext? },
+  traceLogPath?: string   // A3: Run trace log 文件路径（可选派生元数据，仅日志定位；host 重启后事件仍写同一文件；非 workflow 状态）
 }
 ```
 
@@ -356,12 +357,24 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
 
 ### 5.4 运行轨迹日志（Run Trace Log）
 
-已确认（PRD `docs/prd/workflow-run-logging.md`，R1-R4）：每个Run在文件系统留一份人可读的、按时间顺序的执行轨迹日志，作为派生产物，**不进SQLite State**（保持最小状态原则）。
+已确认（PRD `docs/prd/workflow-run-logging.md` R1-R4；事件格式由 A3 PRD `docs/prd/20260903-workflow-hardening/a3-workflow-trace-observability.md` 升级为 fmt=2）：每个Run在文件系统留一份人可读的、按时间顺序的执行轨迹日志，作为派生产物，**不进SQLite State**（保持最小状态原则；仅路径`traceLogPath`作为可选元数据随行持久化，使host重启后的事件仍写同一文件）。
 
 - **目录**：catalog entry配置文件同级、与workflow同名目录（config path去掉`.yaml`，如`~/.dsh/workflows/smoke-test.yaml`→`~/.dsh/workflows/smoke-test/`）。
 - **文件名**：`yyyyMMdd-HHmmss-<runId前8位>.txt`（本地时间；runId短码避免同秒冲突），追加写入、UTF-8。
-- **行格式**：每行前缀`[YYYY-MM-DD HH:mm:ss]`（本地时间）。Run启动写`START workflow=<id> run=<runId>`；checker/program判定路由时写`NODE <workflowId>/<nodeId> PASS -> <nextNodeId|END>`或`FAIL -> <onFailNodeId|BLOCK>`；child-workflow压栈写`PUSH -> <childWorkflowId>`，出栈由child的END行与parent节点的PASS行共同记录；行内始终含所属workflowId。
-- **失败容忍（R4）**：tracelog模块所有函数绝不抛错——目录/文件创建失败返回`undefined`、追加失败静默忽略，日志问题永不影响Run推进。Engine以runId为键在内存中保存日志路径，Run completed或reset时清理。
+- **行格式（fmt=2，START行声明）**：每行前缀`[YYYY-MM-DD HH:mm:ss]`（本地时间）+ 事件名 + 空格分隔的`key=value`。标识类值原样书写；自由文本值用JSON string转义（换行/引号不破坏"一事件一行"，可逆可grep），并按协议上限截断（超限追加`…[truncated]`）。事件集：
+  - `START workflow= run= fmt=2`；
+  - `CLAIM workflow= node= token=<8位> role= outcome= summary=<json> handoff=<json|null>`（被Engine接受的claim，admission之后、Judge spawn之前；stale/duplicate claim不产生）；
+  - `JUDGE workflow= node= token=<8位> result=PASS|FAIL|NEED_CONTEXT reason=<json> judge=<8位>`（被接受的judge_claim）；
+  - `ROUTE workflow= node= token=<8位> result=PASS|FAIL target=<node|END|BLOCK>`（最终采用的Graph Edge方向：Actor completed+Judge PASS合成PASS/onPass，failed+PASS合成FAIL/onFail；Judge REJECT（A1后）不产生ROUTE只产生JUDGE行）；
+  - `BLOCK workflow= node= token=<8位> source=actor|judge|program|dispatch|compact|restart|manager reason=<json>`（全部BLOCK入口：node_block、actor无结果turn结束、NEED_CONTEXT、Judge技术故障、FAIL无onFail、program ERROR、dispatch失败、compact失败、host重启reconcile）；
+  - `RESUME workflow= node= oldToken=<8位> newToken=<8位> target=judge|actor context=<json>`（判定阶段target=judge，否则actor）；`RESPAWN node= token=<8位> judge=<8位> reason=<json|null>`；`RESOLVE node= token=<8位> result= reason=<json>`；`MODEL workflow= role= provider= model=`（只记id不记凭据，provider/model 经定点 redact）；
+  - `PROGRAM workflow= node= token=<8位> program= result=PASS|FAIL|ERROR reason=<json|null>`（不记parameters）；
+  - `PUSH parent=<wf>/<node> token=<8位> child=<childWf>` / `POP child=<childWf> result=PASS parent=<wf>/<node> token=<8位>`（子流程进出显式配对，不再靠parent PASS行间接推断；PUSH/POP 共享 parent node 的 token）；
+  - `COMPACT workflow= node= token=<8位> role= ok=<bool> detail=<json|null>`。
+  内部nodeToken/Judge session只记8位短前缀作去重标识；`revision`序号留给A1 claim修正协议落地后补充。
+- **隐私边界**：只记录Engine已接受的协议载荷（summary≤4000、handoff≤8000、judge reason≤2000、BLOCK reason≤4000、resolutionContext≤8000）；不记reasoning、普通tool调用、Node-local transcript、program parameters；AUTH/credential错误沿用Host安全化文案，且trace边界（`jsonField`）另有一组固定模式的credential redact兜底（Bearer/sk-*/api_key类），双保险确保凭据形态文本不落盘。
+- **一致性语义（at-least-once）**：事件写入顺序固定为「业务校验→写trace→持久化状态转换」（A3 §10），包括 START（workspace 唯一性预检查通过后先写 START 再 create，仅并发竞态/create 抛错可产生孤立文件）与 RESPAWN（put 前写）；trace与State之间无法做到exactly-once，崩溃缝隙允许产生孤立事件行，**node 级事件（CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）均携带 nodeToken 短前缀用于去重**——循环回到同一 Node 会铸新 token，合法重复与崩溃重复由此可分；run 级事件以 runId（START）或 role（MODEL）标识；State/Git/GitHub始终是权威。反向缺口（State已接受而trace缺失）不存在于正常路径。
+- **失败容忍（R4）**：tracelog模块所有函数绝不抛错——目录/文件创建失败返回`undefined`、追加失败静默返回`false`，日志问题永不影响Run推进。首个失败通过Host logger warning一次（不循环刷warning）；State/Git/GitHub与trace冲突时前者权威。
 - **不做**日志轮转/清理/归档、Web UI展示、turn级对话内容记录、用户自定义格式/路径（本期格式固定）。
 
 ## 6. 中断恢复

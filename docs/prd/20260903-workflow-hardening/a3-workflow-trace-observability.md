@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：方案已确认，待实现
+- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；AC4 revision 待 A1 claim 修正协议落地后补，其余 AC 已实现；部署与运行时验证随本批 PRD 统一进行）
 - 关联需求：记录每个 Node 的 Actor claim、Judge 输出、BLOCK/RESUME
 
 ## 1. 背景
@@ -233,3 +233,89 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 - **AC11 故障容忍**：日志目录不可写时 workflow 行为不变。
 - **AC12 隔离 e2e**：扩展 `scripts/e2e-smoke.mjs` 或新 harness，只使用临时 DSH home 与合成 workspace；不得触碰真实 `~/.dsh`。
 - **AC13 文档**：README 与设计文档更新事件格式、字段、best-effort、隐私边界。
+
+## 13. 实现记录（2026-09-04，分支 a3-trace-observability）
+
+### 13.1 实现时选定的决策
+
+- **§3 格式**：选定**迁移为 ROUTE**（不保留旧 `NODE ... PASS -> ...`），全套事件统一为单行 `key=value` + JSON string escaping，`START` 行声明 `fmt=2` 作版本标记；README/设计文档/单元测试/e2e 断言同步更新，无双格式并存。
+- **§3 JUDGE 取值**：`result` 沿用现行 judge_claim 协议的 `PASS|FAIL|NEED_CONTEXT`（本 PRD 草案中的 `ACCEPT|REJECT` 是 A1 新协议术语）；A1 落地时同步改枚举并保留 `revision` 字段（§5 R2 的 revision 是 A1 claim 修正协议的派生序号，当前单 claim 协议下恒为首次，先以 `token` 8 位短前缀满足 §10 去重诉求）。
+- **traceLogPath 持久化（R5 restart 覆盖的前提）**：原实现日志路径只存 Engine 内存 map，host 重启即丢，restart-reconcile BLOCK 无法落盘。现将可选字段 `traceLogPath` 随 RunState 行持久化（state store 为宽松 JSON 序列化，向后兼容；pre-A3 旧行无此字段，日志 no-op）。日志本身仍是派生产物，不进 SQLite 之外的任何状态语义。代价（复审后修正措辞）：workspace 冲突的常见路径由 `startRun` 预检查拦截、不产生任何文件；仅并发竞态或 `state.create` 异常会残留孤儿文件，且因 START 先于 create 写入，孤儿文件内含一条 START 行（at-least-once 声明允许，见 §13.1 一致性语义与 §16）。
+- **§10 告警**：`appendLine` 改为返回布尔；Engine 新增可注入 `traceWarn`（插件接线到 `ctx.logger.warn`），每 run 首次创建/追加失败各告警一次，之后静默。
+
+### 13.2 事件覆盖对照
+
+| 事件 | 写入点（engine.ts） | 验收 |
+| --- | --- | --- |
+| CLAIM | `handleClaim` admission+lease 校验+最终 re-read 后、pendingClaim 持久化**前**（at-least-once）、startJudge 前 | AC1/AC2/AC9 |
+| JUDGE | `handleJudgeClaim` 校验通过后、任何状态转换前（NEED_CONTEXT/PASS/FAIL 均记） | AC3/AC4 |
+| ROUTE | `advance()`（含 child END→pop→parent 递归路由） | §3 |
+| BLOCK | `handleBlock`(actor/manager)、NEED_CONTEXT(judge)、`blockOnJudgeFault`(judge)、advance FAIL 无 onFail(judge/program/manager)、program ERROR(program)、`dispatchNow` compact 失败(compact)/dispatch 失败(dispatch)、`handleTurnEnded` 无结果(actor)、`handleRestartReconcile`(restart) | AC5 |
+| RESUME | `handleResume` 判定阶段(judge)/普通路径(actor)，token 轮换后、执行前 | AC6 |
+| RESPAWN | `handleRespawnJudge` 校验+drain 旧 Judge 后、持久化 put **前**（at-least-once；spawn 失败由随后的 judge-fault BLOCK 行覆盖） | AC6 |
+| RESOLVE | `handleResolveProgram` advance 前 | AC6/AC8 |
+| PROGRAM | `handleRunProgram` 结果 revalidation 后（不记 parameters） | AC8 |
+| MODEL | `handleSetRoleModel`（只记 provider/model id） | AC6/AC10 |
+| PUSH/POP | `dispatchCurrent` child 分支 / `advance` pop 分支（显式配对） | AC7 |
+| COMPACT | `compactBeforeDispatch` 成败均记（A2 R7 原有语义升级为 fmt=2） | §9 外延 |
+
+- **§10 去重标识落地（复审后补齐）**：§3 示例中的 ROUTE/PUSH/POP/COMPACT 原本无 token；复审后所有 node 级事件（CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）统一携带 nodeToken 8 位短前缀——循环回到同一 Node 会铸新 token，合法重复与崩溃重试重复由此可分。START 以 runId 标识，MODEL 是 run 级事件（role 标识）。
+- **§10 一致性语义（审查后修正为 at-least-once）**：初版 CLAIM 写在 acceptance 持久化之后（at-most-once，崩溃即缺行）；按 §10 规定的「校验→trace→持久化」顺序修正为 put 之前写 CLAIM。语义声明：**at-least-once**——崩溃缝隙可产生孤立事件行（如 CLAIM 已写但 acceptance 未落盘），以 token 短前缀去重，State/Git/GitHub 权威；正常路径不存在反向缺口（State 已接受而 trace 缺失）。其余事件（JUDGE/ROUTE/BLOCK/RESUME/PROGRAM 等）初版即遵循该顺序，crash-seam 语义由 put 故障注入测试固化。
+
+### 13.3 验证情况
+
+- 单元测试：`test/tracelog.test.ts`（fmt=2 助手：转义/截断/null/Escaped 包装防注入/redact 凭据模式/合法 sk-* 结构 ID 不脱敏）+ `test/engine.test.ts` trace 段（START fmt=2、CLAIM/JUDGE/ROUTE、stale/duplicate claim 不产生 CLAIM（AC2）、FAIL→BLOCK source、NEED_CONTEXT→RESUME(judge)、node_block→RESUME(actor)、actor 无结果 BLOCK、RESPAWN、PUSH/POP 配对、PROGRAM ERROR→RESOLVE、MODEL、restart-reconcile 跨 engine 实例写入同一日志、日志目录不可写时 warn 一次且 Run 行为不变、超限截断单行；审查回归：raw 标识符注入、credential fixture、put/create 故障 at-least-once crash seam（CLAIM/RESPAWN/START）、冲突 start 无孤儿文件、合法 secret 碰撞 ID 保留）。169/169 通过。
+- e2e：`scripts/e2e-smoke.mjs` 断言升级为 fmt=2 六行（START/CLAIM/JUDGE/ROUTE×2/CLAIM），隔离临时 home，`E2E SMOKE PASS`。
+- 文档：README "Run trace logs"、设计文档 §5.4（含 at-least-once 一致性语义与 redact 兜底）、CONTEXT.md State 闭集已同步（AC13）。
+- 待运行时验证（随本批统一部署）：真实 milestone-delivery run 的 52 分钟空白场景回放、Host logger warning 实际输出、COMPACT detail 真实文案。
+
+## 14. 审查修正记录（2026-09-04 同批 review，7 项全部接纳）
+
+| 审查项 | 结论与修复 |
+| --- | --- |
+| S1/AC9 高：MODEL 多行日志注入 | 属实（已复现）。`jsonField` 改为返回 `Escaped` 包装类型，`traceEvent` 仅对 `instanceof Escaped` 透传；raw 字符串统一重新过 `[\s"\\]` 检查并 JSON quoting，「以引号开头即已转义」启发式删除。补注入回归测试。 |
+| S2 中：CONTEXT.md State 闭集未列 `traceLogPath` | 属实。已补列为「可选派生元数据」。 |
+| S3 低：`traceWarnedRuns` 只增不减 | 属实。completed/reset 时删除。 |
+| AC9 Spec：单行保证测试缺口 | 属实。补 raw 标识符含引号/换行的注入测试（engine 级 + 助手级）。 |
+| AC10 中高：凭据净化无实现保证与 fixture | 属实。trace 边界 `redact()` 兜底 + credential-like fixture（claim summary、dispatch BLOCK reason 两条路径）；主防线仍为 Host 安全化文案。 |
+| AC4 中：revision 未实现但状态写「已实现」 | 属实。状态改为「AC4 revision 待 A1 claim 修正协议落地，其余 AC 已实现」。 |
+| S4 中：crash seam 语义未定义 | 属实。CLAIM 移到 acceptance put 之前（§10 规定顺序），语义显式声明 at-least-once；put 故障注入测试固化该语义。 |
+
+修正后验证：`pnpm test` 164/164、`pnpm run build` 干净、`pnpm run test:e2e` PASS。
+
+## 15. 复审修正记录（2026-09-04 第二轮 review，8 项全部接纳）
+
+| 审查项 | 结论与修复 |
+| --- | --- |
+| S1 高：START/RESPAWN 反向 crash gap | 属实。START：加 workspace 冲突预检查（常见冲突路径干净返回、不留任何 trace 工件），START 行移到 `state.create` 之前，仅并发竞态可产生孤立文件；RESPAWN：日志移到持久化 put 之前（P1 只约束 put 先于 spawn，不约束先于日志）。两者均归入 at-least-once。 |
+| S2 中：设计文档 Runtime State 闭集遗漏 `traceLogPath` | 属实。已补（含语义注释）。 |
+| S3 中低：redact 不覆盖 raw 字段 + Basic auth 残留 | 属实。`rawField` 同样过 `redact()`（provider/model 等标识符也脱敏）；assignment 模式吞掉可选 `Bearer\|Basic` 前缀并新增独立 Basic 模式。 |
+| S4 低：失败启动泄漏 warn marker | 属实。`startRun` 的 create 失败路径删除 `traceWarnedRuns` 标记。 |
+| Spec1 高：crash-seam 修复不完整 | 随 S1 修复；补 RESPAWN put 故障注入测试与「冲突 start 不留孤儿文件」测试。 |
+| Spec2 中：去重标识未覆盖全部事件 | 属实。ROUTE/PUSH/POP/COMPACT 补 `token` 短前缀（循环回到同一 Node 会铸新 token，合法重复与崩溃重复可分）；MODEL/START 为 run 级事件，文档已如实收窄承诺。 |
+| Spec3 中：AC10 部分保证 | 随 S3 修复；补 raw 标识符凭据（MODEL provider）与 Basic fixture。README「No credentials」表述软化为双保险+best-effort heuristic。 |
+| Spec4 低：PRD §13.2 表格过期 | 属实。CLAIM 行改为「持久化前（at-least-once）」。 |
+
+修正后验证：`pnpm test` 167/167、`pnpm run build` 干净、`pnpm run test:e2e` PASS。
+
+## 16. 第三轮复审修正记录（2026-09-04，6 项全部接纳）
+
+| 审查项 | 结论与修复 |
+| --- | --- |
+| S1/Spec1 中/中高：rawField 全局脱敏把合法 `sk-*` 结构 ID 打成 `[redacted]` | 属实（第二轮过度修正）。`rawField` 恢复不脱敏——raw 值均为 catalog 校验过的结构 ID/枚举；唯一不可信的 raw 输入（MODEL provider/modelId）在 `logModel` 定点 `redact()`。补回归：合法 `sk-abcdefgh` workflow/node id 在 START/CLAIM/ROUTE 中原样保留。 |
+| S2 中低：PRD §13.2 RESPAWN 行仍写「成功后」 | 属实。改为「持久化 put 前（at-least-once）」，与实现和 §13.1 一致。 |
+| S3 低：设计文档 RESPAWN/RESOLVE/PROGRAM 示例缺 token；PRD 数量 164 过期；AGENTS.md 措辞 | 属实。设计文档 §5.4 三个事件示例补 `token=<8位>`；§13.3 更新为 169/169；AGENTS.md 改为「日志内容不进 SQLite，仅 `traceLogPath` 路径元数据进入」。 |
+| Spec2 低中：START 的 at-least-once seam 无故障注入测试 | 属实。harness 加 `failNextCreates`，补 create 故障用例：START 已落盘、State 未创建、文件为声明允许的 orphan。 |
+| Spec3 低：AC13 文档收口 | 随上述 S2/S3 修正完成。 |
+
+修正后验证：`pnpm test` 169/169、`pnpm run build` 干净、`pnpm run test:e2e` PASS。
+
+## 17. 第四轮评审修正记录（2026-09-04，文档收口）
+
+| 评审项 | 结论与修复 |
+| --- | --- |
+| S1 中低：§13.1 孤儿文件描述过期 | 属实。改为准确表述：常见冲突由预检查拦截不留文件；仅竞态/create 异常残留含一条 START 的孤儿文件。 |
+| S2 低：README identifier redact 范围不准 | 属实。改为「全部自由文本字段 + MODEL provider/model 标识符定点」，并明确结构 ID 刻意不脱敏。 |
+| S3 判断性建议：MODEL provider/modelId 无长度上限 | 采纳为延后项：PRD 未规定上限，不属于硬性违规；模型路由 ID 的协议级长度上限留待 A1 协议升版时一并定义（见 TODO §4 登记）。 |
+
+第四轮未发现生产代码缺陷；本轮为纯文档修正，代码路径未改动，测试保持 169/169。
