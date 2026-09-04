@@ -151,10 +151,14 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
     async steerManager(run, text) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      manager.steer(createUserMessage({
+      // A1 R3: the message id is assigned synchronously by createUserMessage,
+      // so the return is available even though steer() itself is fire-and-forget.
+      const message = createUserMessage({
         content: textBlocks(text),
         source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' },
-      }))
+      })
+      manager.steer(message)
+      return { messageId: message.id }
     },
     async sendRoleActor(run, roleKey, text) {
       const manager = adapters.managerAgentOf(run)

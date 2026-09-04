@@ -125,6 +125,7 @@ function makeHarness(memArg?: MemState): Harness {
     async steerManager(_run, text) {
       if (h.steerFailure !== undefined) throw h.steerFailure
       h.steers.push(text)
+      return { messageId: `msg-steer-${h.steers.length}` }
     },
     async sendRoleActor(_run, _role, text) {
       h.actorMessages.push(text)
@@ -609,7 +610,7 @@ test('restart reconciliation contains a row conflict and continues with later wo
     async compactRoleActor() { return { ok: true } },
   }
   const engine = new WorkflowEngine(
-    { async steerManager() {}, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } },
+    { async steerManager() { return { messageId: 'm' } }, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } },
     subagents,
     { async run() { return { kind: 'ERROR', reason: 'unused' } } },
     state,
@@ -751,7 +752,7 @@ test('handoffContext survives a host-restart-equivalent: a fresh engine over dur
   h2.mem = h.mem
   h2.engine = new WorkflowEngine(
     {
-      async steerManager(_run, text) { h2.steers.push(text) },
+      async steerManager(_run, text) { h2.steers.push(text); return { messageId: `msg-steer-${h2.steers.length}` } },
       async sendRoleActor(_run, _role, text) { h2.actorMessages.push(text); return { messageId: `m-${h2.actorMessages.length}` } },
       managerSessionSeq() { return 0 },
     },
@@ -819,7 +820,7 @@ workflow:
     async listRuns() { return h.mem.run === undefined ? [] : [{ workspaceKey: 'ws', run: structuredClone(h.mem.run), version: h.mem.version }] },
   }
   const targets: DispatchTargets = {
-    async steerManager(_run, text) { h.steers.push(text) },
+    async steerManager(_run, text) { h.steers.push(text); return { messageId: `msg-steer-${h.steers.length}` } },
     async sendRoleActor() { return { messageId: 'm' } },
     managerSessionSeq() { return 0 },
   }

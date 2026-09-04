@@ -54,7 +54,7 @@ test('node_resolve_program advances to a non-END target without staying blocked'
     async remove() { mem.run = undefined },
     async listRuns() { return mem.run === undefined ? [] : [{ workspaceKey: 'ws', run: structuredClone(mem.run), version: mem.version }] },
   }
-  const targets: DispatchTargets = { async steerManager() {}, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } }
+  const targets: DispatchTargets = { async steerManager() { return { messageId: 'm' } }, async sendRoleActor() { return { messageId: 'm' } }, managerSessionSeq() { return 0 } }
   const subagents: SubagentHost = {
     async ensureRoleActor() { return { childId: 'a1', messageId: 'm' } },
     async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'm' } },

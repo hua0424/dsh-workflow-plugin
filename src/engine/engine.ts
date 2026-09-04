@@ -40,7 +40,12 @@ function compactFaultNotice(run: RunState, nodeId: string, detail: string): stri
 
 /** Deliverable messages to Manager / Role Actors. */
 export interface DispatchTargets {
-  steerManager(run: RunState, text: string): Promise<void>
+  /**
+   * Steer the Manager session. Returns the user message id assigned by
+   * `createUserMessage` (synchronously allocated before the steer) — the
+   * Manager-dispatch lease identity (A1 R2/R3).
+   */
+  steerManager(run: RunState, text: string): Promise<{ messageId: string }>
   /** Deliver to an EXISTING mapped role actor (followup); returns the message id (A1 R2). */
   sendRoleActor(run: RunState, roleKey: string, text: string): Promise<{ messageId: string }>
   /** The Manager session's current next-seq, captured at dispatch (A1 R2). */
