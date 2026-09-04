@@ -123,6 +123,8 @@ test('traceEvent: a raw string LOOKING like escaped JSON is re-checked (A3 revie
 test('redact: credential-shaped substrings never survive jsonField (A3 AC10)', () => {
   assert.equal(jsonField('key is sk-abc123XYZ789def456 here', 200).text, '"key is [redacted] here"')
   assert.equal(jsonField('Authorization: Bearer tok1234567890', 200).text, '"Authorization: [redacted]"')
+  assert.equal(jsonField('Authorization: Basic dXNlcjpwYXNz', 200).text, '"Authorization: [redacted]"')
+  assert.equal(jsonField('standalone Basic dXNlcjpwYXNzMTIzNA==', 200).text, '"standalone [redacted]"')
   assert.equal(jsonField('ghp_AbCdEfGhIjKlMnOpQrStUv failed', 200).text, '"[redacted] failed"')
   assert.equal(jsonField('api_key=abc123456789secretXYZ', 200).text, '"api_key=[redacted]"')
   assert.equal(jsonField('GitHub token github_pat_11ABCDEFG0123456789abcdefghijklmnopqrstuv', 200).text, '"GitHub token [redacted]"')

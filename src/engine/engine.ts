@@ -228,6 +228,15 @@ export class WorkflowEngine {
 
   /** Start a run: persist the initial row, then dispatch the root start node immediately. */
   async startRun(workspaceKey: string, run: RunState, configPath?: string): Promise<EngineOutcome> {
+    // A3 review round 2: the workspace-uniqueness check is atomic with the
+    // row creation (state.create). Pre-check it so the COMMON conflict (user
+    // error, not a crash) rejects cleanly BEFORE any trace artifact exists —
+    // only a genuine race between this check and create can leave an orphan
+    // START line + file (declared at-least-once semantics).
+    const existing = await this.state.get(workspaceKey)
+    if (existing !== undefined && existing.run.status !== 'completed') {
+      return { ok: false, reason: `workspace already has a ${existing.run.status} run (key: ${workspaceKey})` }
+    }
     // A3: create the trace log BEFORE the state row and persist its path on
     // the row, so every later event (including after a host restart) appends
     // to the same file. Best-effort — tracelog never throws, so logging can
@@ -241,17 +250,22 @@ export class WorkflowEngine {
         this.warnTraceOnce(run.runId, `workflow trace log creation failed for run ${shortId(run.runId)}; the run continues without a trace log`)
       }
     }
+    // R1/R2: the START line announces the event-line format version (A3 §3).
+    // Written BEFORE the row creation per the §10 order (validate → trace →
+    // persist): a crash between leaves an orphan START in an orphan file
+    // (at-least-once); the reverse gap (row without START) does not exist.
+    this.logLine(run, traceEvent('START', { workflow: run.catalogWorkflowId, run: run.runId, fmt: 2 }))
     let version: number
     try {
       version = await this.state.create(workspaceKey, run)
     } catch (error) {
+      // A3 review S4: a failed start leaves no run to clean the marker later.
+      this.traceWarnedRuns.delete(run.runId)
       if (error instanceof Error && error.name === 'StateConflictError') {
         return { ok: false, reason: error.message }
       }
       throw error
     }
-    // R1/R2: the START line announces the event-line format version (A3 §3).
-    this.logLine(run, traceEvent('START', { workflow: run.catalogWorkflowId, run: run.runId, fmt: 2 }))
     // F22: freeze the Manager's current route as the inherited fallback at Run
     // start, so later Manager UI model switches do not change first-time
     // Worker/Judge spawns.
@@ -318,6 +332,7 @@ export class WorkflowEngine {
     this.logLine(run, traceEvent('ROUTE', {
       workflow: frame.workflowId,
       node: frame.nodeId,
+      token: shortId(frame.nodeToken),
       result,
       target,
     }))
@@ -390,10 +405,11 @@ export class WorkflowEngine {
     }))
   }
 
-  /** A3 §8: child-workflow entry (push). */
+  /** A3 §8: child-workflow entry (push). Token pairs with the POP of the same node. */
   private logPush(run: RunState, frame: CallFrame, childWorkflowId: string): void {
     this.logLine(run, traceEvent('PUSH', {
       parent: `${frame.workflowId}/${frame.nodeId}`,
+      token: shortId(frame.nodeToken),
       child: childWorkflowId,
     }))
   }
@@ -404,6 +420,7 @@ export class WorkflowEngine {
       child: childWorkflowId,
       result,
       parent: `${parentFrame.workflowId}/${parentFrame.nodeId}`,
+      token: shortId(parentFrame.nodeToken),
     }))
   }
 
@@ -412,6 +429,7 @@ export class WorkflowEngine {
     this.logLine(run, traceEvent('COMPACT', {
       workflow: frame.workflowId,
       node: frame.nodeId,
+      token: shortId(frame.nodeToken),
       role: roleKey,
       ok,
       detail: jsonField(detail, LIMITS.blockReasonMax),
@@ -919,6 +937,10 @@ export class WorkflowEngine {
     run.judgeSessionId = reservedJudgeSessionId
     run.status = 'running'
     run.blockReason = null
+    // A3 R6 + review round 2: record the rebuild BEFORE persistence (§10
+    // validate → trace → persist; at-least-once). A spawn failure afterwards
+    // is covered by the following judge-fault BLOCK line.
+    this.logRespawn(run, frame, reservedJudgeSessionId, reason ?? null)
     await this.state.put(workspaceKey, run, version)
     try {
       await this.subagents.startJudge(run, {
@@ -960,8 +982,6 @@ export class WorkflowEngine {
       await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
       return { ok: false, reason: 'stale judge respawn discarded: the run changed while the judge was materializing' }
     }
-    // A3 R6: record every successful judge rebuild (reason absent → null).
-    this.logRespawn(fresh.run, frame, reservedJudgeSessionId, reason ?? null)
     return { ok: true, run: fresh.run, message: `judge respawned for node ${frame.nodeId}` }
   }
 

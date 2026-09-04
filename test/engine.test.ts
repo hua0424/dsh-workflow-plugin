@@ -972,7 +972,7 @@ test('accepted claim and judge verdict produce CLAIM + JUDGE + ROUTE lines (AC1/
     const log = readRunLog(configPath, 'eng-test')
     assert.match(log, new RegExp(`${TS} CLAIM workflow=eng-test node=plan token=${TOK} role=manager outcome=completed summary="planned" handoff="notes for build"\\n`))
     assert.match(log, new RegExp(`${TS} JUDGE workflow=eng-test node=plan token=${TOK} result=PASS reason="planned ok" judge=${TOK}\\n`))
-    assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan result=PASS target=build\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan token=${TOK} result=PASS target=build\\n`))
   })
 })
 
@@ -1045,7 +1045,7 @@ workflow:
     assert.ok(outcome.ok)
     assert.equal(topFrame(h.mem.run!).nodeId, 'retry')
     const log = readRunLog(configPath, 'fail-test')
-    assert.match(log, new RegExp(`${TS} ROUTE workflow=fail-test node=try result=FAIL target=retry\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=fail-test node=try token=${TOK} result=FAIL target=retry\\n`))
   })
   // FAIL without an onFail edge BLOCKs: ROUTE target=BLOCK + BLOCK source=judge.
   await withTempCatalog('eng-test', async (configPath) => {
@@ -1056,7 +1056,7 @@ workflow:
     await h.engine.handleJudgeClaim('ws', token, 'FAIL', 'not planned', reservedJudgeId(h))
     assert.equal(h.mem.run!.status, 'blocked')
     const log = readRunLog(configPath, 'eng-test')
-    assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan result=FAIL target=BLOCK\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=eng-test node=plan token=${TOK} result=FAIL target=BLOCK\\n`))
     assert.match(log, new RegExp(`${TS} BLOCK workflow=eng-test node=plan token=${TOK} source=judge reason="checker FAIL: not planned and no onFail edge"\\n`))
   })
 })
@@ -1133,15 +1133,15 @@ test('trace log covers child PUSH/POP with explicit pairing (AC7)', async () => 
     await h.engine.handleJudgeClaim('ws', beginToken, 'PASS', 'begun', reservedJudgeId(h))
     await h.engine.handleTurnEnded('ws', MANAGER)
     let log = readRunLog(configPath, 'child-test')
-    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-test node=begin result=PASS target=call-child\\n`))
-    assert.match(log, new RegExp(`${TS} PUSH parent=child-test/call-child child=child-a\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-test node=begin token=${TOK} result=PASS target=call-child\\n`))
+    assert.match(log, new RegExp(`${TS} PUSH parent=child-test/call-child token=${TOK} child=child-a\\n`))
     const childToken = topFrame(h.mem.run!).nodeToken
     await h.engine.handleClaim('ws', { nodeToken: childToken, outcome: 'completed', summary: 'done' }, 'actor-child-1')
     await h.engine.handleJudgeClaim('ws', childToken, 'PASS', 'child done', reservedJudgeId(h))
     log = readRunLog(configPath, 'child-test')
-    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-a node=child-step result=PASS target=END\\n`))
-    assert.match(log, new RegExp(`${TS} POP child=child-a result=PASS parent=child-test/call-child\\n`))
-    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-test node=call-child result=PASS target=END\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-a node=child-step token=${TOK} result=PASS target=END\\n`))
+    assert.match(log, new RegExp(`${TS} POP child=child-a result=PASS parent=child-test/call-child token=${TOK}\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=child-test node=call-child token=${TOK} result=PASS target=END\\n`))
   })
 })
 
@@ -1190,7 +1190,7 @@ workflow:
     await h.engine.handleResolveProgram('ws', progToken, 'PASS', 'verified milestone exists', MANAGER)
     log = readRunLog(configPath, 'prog-test')
     assert.match(log, new RegExp(`${TS} RESOLVE workflow=prog-test node=prog token=${TOK} result=PASS reason="verified milestone exists"\\n`))
-    assert.match(log, new RegExp(`${TS} ROUTE workflow=prog-test node=prog result=PASS target=END\\n`))
+    assert.match(log, new RegExp(`${TS} ROUTE workflow=prog-test node=prog token=${TOK} result=PASS target=END\\n`))
   })
 })
 
@@ -1310,5 +1310,52 @@ test('crash seam: CLAIM is written BEFORE persistence — at-least-once with a d
     assert.match(log, new RegExp(`${TS} CLAIM workflow=eng-test node=plan token=${TOK} role=manager outcome=completed summary="orphan claim" handoff=null\\n`))
     // No JUDGE/ROUTE follows the orphan.
     assert.ok(!log.includes('JUDGE'), 'orphan CLAIM has no verdict')
+  })
+})
+
+test('crash seam: RESPAWN is written BEFORE persistence — at-least-once like CLAIM (A3 review round 2 / PRD §10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'planned' }, MANAGER)
+    await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'unclear', reservedJudgeId(h))
+    assert.equal(h.mem.run!.status, 'blocked')
+    const oldJudge = h.mem.run!.judgeSessionId!
+    // The respawn persistence put fails (host crash stand-in): the rebuild
+    // was already traced, so the log holds an orphan RESPAWN while State
+    // keeps the old blocked run + old judge (at-least-once; State wins).
+    h.failNextPuts = 1
+    await assert.rejects(h.engine.handleRespawnJudge('ws', token, 'rebuild', MANAGER), /disk full/)
+    assert.equal(h.mem.run!.status, 'blocked', 'state never accepted the respawn')
+    assert.equal(h.mem.run!.judgeSessionId, oldJudge)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} RESPAWN workflow=eng-test node=plan token=${TOK} judge=${TOK} reason="rebuild"\\n`))
+  })
+})
+
+test('conflicted startRun leaves NO orphan trace file (A3 review round 2: common conflict path is clean)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    // Second start on the same workspace: the pre-check rejects BEFORE any
+    // trace artifact — still exactly one log file, no orphan START.
+    const again = await h.engine.startRun('ws', initialRun(), configPath)
+    assert.ok(!again.ok)
+    assert.match(again.ok ? '' : again.reason, /already has a running run/)
+    const files = readdirSync(join(dirname(configPath), 'eng-test')).filter(f => f.endsWith('.txt'))
+    assert.equal(files.length, 1, 'no orphan log file for the rejected start')
+  })
+})
+
+test('credential-shaped raw identifiers (provider/model) are redacted too (A3 review round 2 / AC10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', initialRun(), configPath)
+    const outcome = await h.engine.handleSetRoleModel('ws', 'judge', 'sk-liveSECRET123456', 'normal-model', MANAGER)
+    assert.ok(outcome.ok)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.ok(!log.includes('sk-liveSECRET123456'), 'credential-shaped provider id redacted')
+    assert.match(log, /MODEL workflow=eng-test role=judge provider=\[redacted\] model=normal-model\n/)
   })
 })

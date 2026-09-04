@@ -75,25 +75,29 @@ config file (`src/engine/tracelog.ts`):
   - `[ts] START workflow=<id> run=<runId> fmt=2`
   - `[ts] CLAIM workflow=<id> node=<node> token=<8> role=<role> outcome=<completed|failed> summary=<json> handoff=<json|null>` — every accepted Actor claim (after admission, before Judge spawn).
   - `[ts] JUDGE workflow=<id> node=<node> token=<8> result=<PASS|FAIL|NEED_CONTEXT> reason=<json> judge=<8>` — every accepted Judge verdict.
-  - `[ts] ROUTE workflow=<id> node=<node> result=<PASS|FAIL> target=<node|END|BLOCK>` — the finally-adopted Graph edge direction.
+  - `[ts] ROUTE workflow=<id> node=<node> token=<8> result=<PASS|FAIL> target=<node|END|BLOCK>` — the finally-adopted Graph edge direction.
   - `[ts] BLOCK workflow=<id> node=<node> token=<8> source=<actor|judge|program|dispatch|compact|restart|manager> reason=<json>` — every BLOCK entrance.
   - `[ts] RESUME workflow=<id> node=<node> oldToken=<8> newToken=<8> target=<judge|actor> context=<json>` / `RESPAWN` / `RESOLVE` / `MODEL` — recovery actions (node_resume, judge_respawn, node_resolve_program, workflow_set_role_model).
   - `[ts] PROGRAM workflow=<id> node=<node> token=<8> program=<id> result=<PASS|FAIL|ERROR> reason=<json|null>` — builtin-program outcomes (parameters are never logged).
-  - `[ts] PUSH parent=<wf>/<node> child=<childWf>` / `[ts] POP child=<childWf> result=PASS parent=<wf>/<node>` — explicit child-workflow entry/return pairing.
-  - `[ts] COMPACT workflow=<id> node=<node> role=<role> ok=<bool> detail=<json|null>` — node-boundary compaction results.
+  - `[ts] PUSH parent=<wf>/<node> token=<8> child=<childWf>` / `[ts] POP child=<childWf> result=PASS parent=<wf>/<node> token=<8>` — explicit child-workflow entry/return pairing (PUSH/POP share the parent node's token).
+  - `[ts] COMPACT workflow=<id> node=<node> token=<8> role=<role> ok=<bool> detail=<json|null>` — node-boundary compaction results.
 - **Durable path**: the log file path is persisted on the run's state row
   (`traceLogPath`), so events after a DSH host restart (restart-reconcile
   BLOCK, post-restart resume) still append to the SAME file. The log itself
   remains a derived artifact outside SQLite.
 - **Privacy**: only Engine-accepted protocol payloads are logged (summary /
   handoff / judge reason / block reason / resolution context, bounded). No
-  reasoning, no tool transcripts, no program parameters, no credentials;
-  auth/credential errors keep the Host's sanitized wording, and the trace
-  boundary additionally redacts credential-shaped patterns (Bearer tokens,
-  `sk-…`/`ghp_…`/`github_pat_…`, `api_key=…`-style assignments) as a backstop.
+  reasoning, no tool transcripts, no program parameters. Credential text is
+  doubly guarded: auth/credential errors keep the Host's sanitized wording
+  (primary), and the trace boundary redacts credential-shaped patterns
+  (Bearer/Basic, `sk-…`/`ghp_…`/`github_pat_…`, `api_key=…`-style
+  assignments) in BOTH free-text and identifier fields (backstop,
+  best-effort heuristic — not a secret scanner).
 - **Consistency**: events are written validate → trace → persist, so the log
-  is **at-least-once** — a crash at the seam may leave an orphan line (the
-  token prefixes dedupe it); State/Git/GitHub stay authoritative.
+  is **at-least-once** — a crash at the seam may leave an orphan line.
+  Node-scoped events carry a nodeToken prefix for dedup (looping back to the
+  same node mints a fresh token, so legit repeats differ from crash dupes);
+  State/Git/GitHub stay authoritative.
 - **Best-effort**: log directory/file creation or appends never fail the run.
   The FIRST failure per run surfaces once as a Host logger warning; further
   failures stay silent. State/Git/GitHub remain authoritative when they

@@ -247,7 +247,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 
 | 事件 | 写入点（engine.ts） | 验收 |
 | --- | --- | --- |
-| CLAIM | `handleClaim` admission+lease 校验后、pendingClaim 持久化后、startJudge 前 | AC1/AC2/AC9 |
+| CLAIM | `handleClaim` admission+lease 校验+最终 re-read 后、pendingClaim 持久化**前**（at-least-once）、startJudge 前 | AC1/AC2/AC9 |
 | JUDGE | `handleJudgeClaim` 校验通过后、任何状态转换前（NEED_CONTEXT/PASS/FAIL 均记） | AC3/AC4 |
 | ROUTE | `advance()`（含 child END→pop→parent 递归路由） | §3 |
 | BLOCK | `handleBlock`(actor/manager)、NEED_CONTEXT(judge)、`blockOnJudgeFault`(judge)、advance FAIL 无 onFail(judge/program/manager)、program ERROR(program)、`dispatchNow` compact 失败(compact)/dispatch 失败(dispatch)、`handleTurnEnded` 无结果(actor)、`handleRestartReconcile`(restart) | AC5 |
@@ -259,6 +259,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | PUSH/POP | `dispatchCurrent` child 分支 / `advance` pop 分支（显式配对） | AC7 |
 | COMPACT | `compactBeforeDispatch` 成败均记（A2 R7 原有语义升级为 fmt=2） | §9 外延 |
 
+- **§10 去重标识落地（复审后补齐）**：§3 示例中的 ROUTE/PUSH/POP/COMPACT 原本无 token；复审后所有 node 级事件（CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）统一携带 nodeToken 8 位短前缀——循环回到同一 Node 会铸新 token，合法重复与崩溃重试重复由此可分。START 以 runId 标识，MODEL 是 run 级事件（role 标识）。
 - **§10 一致性语义（审查后修正为 at-least-once）**：初版 CLAIM 写在 acceptance 持久化之后（at-most-once，崩溃即缺行）；按 §10 规定的「校验→trace→持久化」顺序修正为 put 之前写 CLAIM。语义声明：**at-least-once**——崩溃缝隙可产生孤立事件行（如 CLAIM 已写但 acceptance 未落盘），以 token 短前缀去重，State/Git/GitHub 权威；正常路径不存在反向缺口（State 已接受而 trace 缺失）。其余事件（JUDGE/ROUTE/BLOCK/RESUME/PROGRAM 等）初版即遵循该顺序，crash-seam 语义由 put 故障注入测试固化。
 
 ### 13.3 验证情况
@@ -281,3 +282,18 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | S4 中：crash seam 语义未定义 | 属实。CLAIM 移到 acceptance put 之前（§10 规定顺序），语义显式声明 at-least-once；put 故障注入测试固化该语义。 |
 
 修正后验证：`pnpm test` 164/164、`pnpm run build` 干净、`pnpm run test:e2e` PASS。
+
+## 15. 复审修正记录（2026-09-04 第二轮 review，8 项全部接纳）
+
+| 审查项 | 结论与修复 |
+| --- | --- |
+| S1 高：START/RESPAWN 反向 crash gap | 属实。START：加 workspace 冲突预检查（常见冲突路径干净返回、不留任何 trace 工件），START 行移到 `state.create` 之前，仅并发竞态可产生孤立文件；RESPAWN：日志移到持久化 put 之前（P1 只约束 put 先于 spawn，不约束先于日志）。两者均归入 at-least-once。 |
+| S2 中：设计文档 Runtime State 闭集遗漏 `traceLogPath` | 属实。已补（含语义注释）。 |
+| S3 中低：redact 不覆盖 raw 字段 + Basic auth 残留 | 属实。`rawField` 同样过 `redact()`（provider/model 等标识符也脱敏）；assignment 模式吞掉可选 `Bearer\|Basic` 前缀并新增独立 Basic 模式。 |
+| S4 低：失败启动泄漏 warn marker | 属实。`startRun` 的 create 失败路径删除 `traceWarnedRuns` 标记。 |
+| Spec1 高：crash-seam 修复不完整 | 随 S1 修复；补 RESPAWN put 故障注入测试与「冲突 start 不留孤儿文件」测试。 |
+| Spec2 中：去重标识未覆盖全部事件 | 属实。ROUTE/PUSH/POP/COMPACT 补 `token` 短前缀（循环回到同一 Node 会铸新 token，合法重复与崩溃重复可分）；MODEL/START 为 run 级事件，文档已如实收窄承诺。 |
+| Spec3 中：AC10 部分保证 | 随 S3 修复；补 raw 标识符凭据（MODEL provider）与 Basic fixture。README「No credentials」表述软化为双保险+best-effort heuristic。 |
+| Spec4 低：PRD §13.2 表格过期 | 属实。CLAIM 行改为「持久化前（at-least-once）」。 |
+
+修正后验证：`pnpm test` 167/167、`pnpm run build` 干净、`pnpm run test:e2e` PASS。

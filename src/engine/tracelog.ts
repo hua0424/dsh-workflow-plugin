@@ -105,9 +105,10 @@ export function bounded(text: string, max: number): string {
  */
 const REDACT_PATTERNS: ReadonlyArray<readonly [RegExp, string]> = [
   // key=value / key: value assignments; an Authorization value may itself be
-  // `Bearer <token>`, so consume an optional Bearer prefix inside the value.
-  [/\b(api[_-]?key|apikey|access[_-]?token|secret|password|authorization)(\s*[:=]\s*)(?:Bearer\s+)?\S+/gi, '$1$2[redacted]'],
-  [/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [redacted]'],
+  // `Bearer <token>` / `Basic <base64>`, so consume an optional scheme prefix
+  // inside the value.
+  [/\b(api[_-]?key|apikey|access[_-]?token|secret|password|authorization)(\s*[:=]\s*)(?:(?:Bearer|Basic)\s+)?\S+/gi, '$1$2[redacted]'],
+  [/\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi, '[redacted]'],
   [/\b(?:sk|ghp|gho|ghu|ghs|ghr|glpat|github_pat)[-_][A-Za-z0-9_-]{8,}\b/g, '[redacted]'],
 ]
 
@@ -142,9 +143,11 @@ export function jsonField(text: string | null | undefined, max: number): Escaped
   return new Escaped(JSON.stringify(bounded(redact(text), max)))
 }
 
-/** A raw (identifier-like) field value; any whitespace/quote/backslash forces JSON quoting. */
+/** A raw (identifier-like) field value: redacted like free text (A3 review
+ * round 2 — untrusted identifiers such as provider/model ids can carry
+ * credential shapes), then JSON-quoted if it contains whitespace/quotes. */
 function rawField(value: string | number | boolean): string {
-  const text = String(value)
+  const text = redact(String(value))
   // Legit identifiers never contain these; if unexpected input does, keep
   // the one-event-per-line invariant by falling back to JSON quoting.
   if (/[\s"\\]/.test(text)) return JSON.stringify(text)

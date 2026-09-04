@@ -183,9 +183,9 @@ try {
       new RegExp(`${TS} START workflow=smoke-test run=${run.runId} fmt=2\\n`),
       new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt" handoff=null\\n`),
       new RegExp(`${TS} JUDGE workflow=smoke-test node=hello token=${TOK} result=PASS reason="content matches criteria" judge=${TOK}\\n`),
-      new RegExp(`${TS} ROUTE workflow=smoke-test node=hello result=PASS target=worker-echo\\n`),
+      new RegExp(`${TS} ROUTE workflow=smoke-test node=hello token=${TOK} result=PASS target=worker-echo\\n`),
       new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok" handoff=null\\n`),
-      new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo result=PASS target=END\\n`),
+      new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo token=${TOK} result=PASS target=END\\n`),
     ]
     for (const [i, re] of expectations.entries()) {
       const ok = re.test(log)
