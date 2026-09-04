@@ -91,8 +91,10 @@ config file (`src/engine/tracelog.ts`):
   doubly guarded: auth/credential errors keep the Host's sanitized wording
   (primary), and the trace boundary redacts credential-shaped patterns
   (Bearer/Basic, `sk-…`/`ghp_…`/`github_pat_…`, `api_key=…`-style
-  assignments) in BOTH free-text and identifier fields (backstop,
-  best-effort heuristic — not a secret scanner).
+  assignments) in all free-text fields plus the untrusted MODEL
+  provider/model identifier fields (backstop, best-effort heuristic — not a
+  secret scanner). Catalog-validated structural ids (workflow/node/role/
+  target) are deliberately NOT redacted so the trace stays correlatable.
 - **Consistency**: events are written validate → trace → persist, so the log
   is **at-least-once** — a crash at the seam may leave an orphan line.
   Node-scoped events carry a nodeToken prefix for dedup (looping back to the

@@ -59,7 +59,7 @@
 - [ ] A1：dispatch lease + claim 自动绑定 + REJECT correction feedback（含 schema version 决策；落地时同步 A3 trace 的 JUDGE 枚举与 revision 字段）
 - [ ] A3：运行时验证（方案已实现；统一部署后回放 52 分钟空白场景、确认 warning 输出与 COMPACT 文案）
 - [ ] A5：在 commandcode provider 仓库建 retry 有界化 Issue；验证 workflow 通用 BLOCK/resume 恢复
-- [ ] A1 落地后：执行 A2 遗留 L1/L2（配置升版 + 移除 handoff-verdict workaround）
+- [ ] A1 落地后：执行 A2 遗留 L1/L2（配置升版 + 移除 handoff-verdict workaround）；顺带定义模型路由 ID（provider/modelId）的协议长度上限（A3 第四轮评审建议，§17）
 - [ ] Phase 3：隔离 GitHub 测试仓库完整 acceptance run（default branch contains delivery、Issues closed、Milestone closed、END）
 - [x] A2：v1 兼容配置强化并部署（2026-09-04）
 - [x] A3：fmt=2 trace 事件全覆盖实现 + 单测/e2e/文档（2026-09-04，分支 a3-trace-observability）

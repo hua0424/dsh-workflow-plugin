@@ -240,7 +240,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 
 - **§3 格式**：选定**迁移为 ROUTE**（不保留旧 `NODE ... PASS -> ...`），全套事件统一为单行 `key=value` + JSON string escaping，`START` 行声明 `fmt=2` 作版本标记；README/设计文档/单元测试/e2e 断言同步更新，无双格式并存。
 - **§3 JUDGE 取值**：`result` 沿用现行 judge_claim 协议的 `PASS|FAIL|NEED_CONTEXT`（本 PRD 草案中的 `ACCEPT|REJECT` 是 A1 新协议术语）；A1 落地时同步改枚举并保留 `revision` 字段（§5 R2 的 revision 是 A1 claim 修正协议的派生序号，当前单 claim 协议下恒为首次，先以 `token` 8 位短前缀满足 §10 去重诉求）。
-- **traceLogPath 持久化（R5 restart 覆盖的前提）**：原实现日志路径只存 Engine 内存 map，host 重启即丢，restart-reconcile BLOCK 无法落盘。现将可选字段 `traceLogPath` 随 RunState 行持久化（state store 为宽松 JSON 序列化，向后兼容；pre-A3 旧行无此字段，日志 no-op）。日志本身仍是派生产物，不进 SQLite 之外的任何状态语义。代价：`state.create` 冲突时可能残留一个空孤儿日志文件（best-effort 接受）。
+- **traceLogPath 持久化（R5 restart 覆盖的前提）**：原实现日志路径只存 Engine 内存 map，host 重启即丢，restart-reconcile BLOCK 无法落盘。现将可选字段 `traceLogPath` 随 RunState 行持久化（state store 为宽松 JSON 序列化，向后兼容；pre-A3 旧行无此字段，日志 no-op）。日志本身仍是派生产物，不进 SQLite 之外的任何状态语义。代价（复审后修正措辞）：workspace 冲突的常见路径由 `startRun` 预检查拦截、不产生任何文件；仅并发竞态或 `state.create` 异常会残留孤儿文件，且因 START 先于 create 写入，孤儿文件内含一条 START 行（at-least-once 声明允许，见 §13.1 一致性语义与 §16）。
 - **§10 告警**：`appendLine` 改为返回布尔；Engine 新增可注入 `traceWarn`（插件接线到 `ctx.logger.warn`），每 run 首次创建/追加失败各告警一次，之后静默。
 
 ### 13.2 事件覆盖对照
@@ -309,3 +309,13 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | Spec3 低：AC13 文档收口 | 随上述 S2/S3 修正完成。 |
 
 修正后验证：`pnpm test` 169/169、`pnpm run build` 干净、`pnpm run test:e2e` PASS。
+
+## 17. 第四轮评审修正记录（2026-09-04，文档收口）
+
+| 评审项 | 结论与修复 |
+| --- | --- |
+| S1 中低：§13.1 孤儿文件描述过期 | 属实。改为准确表述：常见冲突由预检查拦截不留文件；仅竞态/create 异常残留含一条 START 的孤儿文件。 |
+| S2 低：README identifier redact 范围不准 | 属实。改为「全部自由文本字段 + MODEL provider/model 标识符定点」，并明确结构 ID 刻意不脱敏。 |
+| S3 判断性建议：MODEL provider/modelId 无长度上限 | 采纳为延后项：PRD 未规定上限，不属于硬性违规；模型路由 ID 的协议级长度上限留待 A1 协议升版时一并定义（见 TODO §4 登记）。 |
+
+第四轮未发现生产代码缺陷；本轮为纯文档修正，代码路径未改动，测试保持 169/169。
