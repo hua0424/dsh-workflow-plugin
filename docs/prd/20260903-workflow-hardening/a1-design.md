@@ -2,7 +2,7 @@
 
 - 日期：2026-09-05
 - 上游 PRD：`a1-claim-admission-and-judge-confirmation.md`（核心语义以 PRD 为准，本文只定机制）
-- 状态：待评审
+- 状态：已定稿（两轮设计评审修正后，2026-09-05）
 - 范围：Dispatch Lease 与 claim admission、caller turn 绑定、Judge ACCEPT/REJECT 协议、REJECT correction 流、v2 原地升级落地
 
 ## 0. 决策记录
@@ -53,7 +53,7 @@ export function callerTurnUserMessageIds(
 解析顺序：
 
 1. **原生路径**：存在 `tool/call` 且 `data.callId === callId` → 以该事件的 `turn` 为准（原生 `tool/call` 恒在工具体执行前落 log，此分支必然命中）。
-2. **Code Mode 路径**（原生分支未命中时）：须存在 `tool/code-dispatch-start` 且 `data.subCallId === callId`（证明本次调用确实是代码内子派发，防伪造 callId 蹭根调用），再以 `data.callId === rootCallId` 的 `tool/call`（根 `run_code`）定位 turn。两者任一缺失 → undefined。
+2. **Code Mode 路径**（原生分支未命中时）：须存在 `tool/code-dispatch-start` 且 **同时满足** `data.subCallId === callId` 与 `data.rootCallId === rootCallId`（证明本次调用确实是该根调用的代码内子派发，防伪造 callId 蹭根调用；root 关联使异常日志的 fail-closed 定义完整——评审第二轮中4），再以 `data.callId === rootCallId` 的 `tool/call`（根 `run_code`）定位 turn。两者任一缺失 → undefined。
 3. 无论哪个分支定位到 turn `T`：单次倒序扫描自命中事件回溯，收集沿途 `user/message` 的 `data.id`，直到 `turn/start` 且 `turn === T` 为止；若先越过 turn 边界仍未命中起点 → undefined（log 异常，fail-closed）。
 
 时序保证：`tool/code-dispatch-start` 由 code-mode 的 start() 在 scheduler.prepare（即工具体执行）**之前** append，因此工具体运行期间两个定位事件都已在 log 中。
@@ -112,14 +112,16 @@ async dispatchCurrent(run, transient): Promise<DispatchIdentity | undefined>
 - builtin-program 节点返回 `undefined`（不产生 lease：program 节点不接受 claim）；
 - child-workflow 分支**透传内层递归的返回值**（lease 属于最内层真实 actor-task 派发）。
 
-发布点收敛在 `dispatchNow()`（现有四个调用方 startRun / handleJudgeClaim / handleResume / handleTurnEnded 全部经过它）：dispatchCurrent 成功返回后写入 book 的 `dispatchMessageId` + `leaseConsumed = false`，与现有 `dispatchBook.set` 同一处完成。send 抛错 → dispatchCurrent 抛出 → dispatchNow BLOCK → book 删除——"dispatch 失败不得产生可 claim lease"。
+发布点收敛在 `dispatchNow()`（现有四个调用方 startRun / handleJudgeClaim / handleResume / handleTurnEnded 全部经过它）：dispatchCurrent 成功返回 `DispatchIdentity` 后写入 book 的 `dispatchMessageId` + `leaseConsumed = false`，与现有 `dispatchBook.set` 同一处完成。send 抛错 → dispatchCurrent 抛出 → dispatchNow BLOCK → book 删除——"dispatch 失败不得产生可 claim lease"。
+
+**无 lease 节点的显式初始化（评审第二轮阻塞1）**：`DispatchIdentity === undefined`（builtin-program 节点）时，book 必须显式初始化为无 lease 态：`dispatchMessageId: undefined, leaseConsumed: true`——"无 lease"是一等状态而非字段缺省，防止后续逻辑把"字段缺失"误读为"尚未发布"。
 
 同时 manager 节点补写 `nodeBoundary.executorDispatchMessageId`（字段已存在，此前仅 role 路径填写）——manager 节点 boundary 的其余语义（`dispatchedAt`/`managerFromSeq`）不变。
 
-### 3.2 消费（一次性）
+### 3.2 消费（一次性；acceptance 边界在持久化之后——评审第二轮中2）
 
-- `handleClaim` 准入通过并完成最终 re-read 后置 `book.leaseConsumed = true`；同一 lease 的第二个 claim 拒绝（AC4）。
-- `node_block`：当 caller 是当前 node 的精确 executor 时，走与 claim 相同的 lease 绑定检查并消费（见 §5.2）。
+- `handleClaim`：**`leaseConsumed = true` 的时点在 `state.put`（pendingClaim + judgeSessionId 持久化）成功之后、`startJudge` 之前**。完整顺序：最终 re-read → log CLAIM → `state.put` 成功 → `book.leaseConsumed = true` → startJudge。put 失败（故障注入 `failNextPuts` 可模拟）时 State 未接受 claim，lease 保持未消费，同一 Actor 可原样重试——workspace mutation 本身经 enqueue 串行，无需提前消费防并发。同一 lease 的第二个 claim 在持久化成功后被拒（AC4）。
+- `node_block`：现状即"持久化成功后 `dispatchBook.delete`"——BLOCK 使 lease 随 book 消失，不留 consumed 残留；put 失败时 book 原样保留（可重试）。
 
 ### 3.3 失效
 
@@ -169,17 +171,18 @@ interface ClaimCaller {
 5. **lease 准入**（§3 判据，读 DispatchBook）：book 缺失 / `pendingDispatch` / `leaseConsumed` / 无 `dispatchMessageId` / token 不匹配 / executor 不匹配 / `dispatchMessageId ∉ caller.turnUserMessageIds` → 拒绝，文案：`当前调用无法绑定到一个已 dispatch 的 Node`（显式覆盖 PRD 问题 1：State 已 advance、Node 未 dispatch 时 book 处于 pendingDispatch 或 dispatchMessageId 缺失，必然落此分支，不改 State、不 spawn Judge——AC1）；
 6. `run.pendingClaim !== undefined` / inFlight 检查（现状保留）；
 7. 最终 re-read（entered 状态复核）中 token 校验改用 book 的 `dispatchedToken`（此时与 topFrame 必相等，防御性保留）；
-8. 通过后置 `book.leaseConsumed = true`，再走现有 judge spawn 流程。
+8. 通过后走现有 judge spawn 流程；`book.leaseConsumed = true` 在 `state.put` 成功之后、`startJudge` 之前置位（§3.2 acceptance 边界——put 失败时 lease 未消费，Actor 可重试）。
 
 executor 精确性由 lease 隐含（book.executorSessionId 即 dispatch 目标），原 `executorSessionOf` 显式检查保留为断言级冗余，不承担正确性。
 
 `workflow_status` 返回的 `currentFrame.nodeToken` 保留（node_resume / judge_respawn / node_resolve_program 仍需，R5）；仅 `node_claim` 不再消费它。
 
-### 5.2 `node_block`
+### 5.2 `node_block`（评审第二轮阻塞1修正分类）
 
 - 参数保留 `nodeToken`（R5），现有 status/token/executor 检查不变。
-- **Actor/Manager 作为当前 node 精确 executor 调用**：须通过与 claim 相同的 lease 绑定检查（同 turn、未消费）并消费 lease——同一 dispatch 的第二个 claim/block 被拒（AC4），旧 turn 的迟到 block 也被拒（AC3 同源）。
-- **Manager 对非自身 executor 的 role 节点调用**：控制面动作（与 node_resume 同类），不走 lease，现状语义保留；BLOCK 本身使 lease 失效（§3.3）。
+- **lease 绑定只适用于 `actor-task` 节点**：当前节点为 actor-task 且 caller 是其精确 executor（Manager-executor 或 role Actor）时，须通过与 claim 相同的 lease 绑定检查（同 turn、未消费）并消费——同一 dispatch 的第二个 claim/block 被拒（AC4），旧 turn 的迟到 block 也被拒（AC3 同源）。
+- **builtin-program / child-workflow 节点上的 Manager `node_block`：控制面动作**，不走 lease。理由：`executorSessionOf()` 对这两类节点返回 Manager Session（Manager 驱动 program 参数/child 准入），但它们**不发布 lease**（§3.1 DispatchIdentity 为 undefined）——若按"精确 executor"归类会因无 lease 而永久拒绝，破坏现有语义。这两类节点只校验 status/token/caller（现状）。
+- **Manager 对 role-executor 的 actor-task 节点调用 `node_block`**：同样控制面（与 node_resume 同类），不走 lease，现状语义保留；BLOCK 使 lease 随 book 消失（§3.2）。
 
 ### 5.3 判定阶段的一致性
 
@@ -258,12 +261,19 @@ pendingCorrection?: {
 | correction 派发失败 → BLOCK → resume | **重建**：`handleResume` actor 分支检测 `pendingCorrection !== undefined && pendingClaim === undefined` → transient = `{ kind: 'correction', text: 由 pendingCorrection 重建的 [judge rejection]+[previous claim] 段 + [manager resolution] 段 }`——Actor 在 resume 后仍收到完整 R7 证据（评审中5），不依赖 Manager 从 trace 手工复制 |
 | reset / 行删除 | 随行消失 |
 
-### 6.5 判定期保护原 Actor（评审阻塞3）
+### 6.5 判定期保护原 Actor（评审阻塞3 + 第二轮中3修正）
 
-`handleSetRoleModel` 现状：actor idle 即 `delete run.roleActors[roleKey]`——而 claim 后等 Judge 期间 actor 恰为 idle，Manager 此刻切模型会删映射，REJECT 重派将新建 replacement Actor、boundary 被重置、原 Actor 修正历史丢失。双重防护：
+`handleSetRoleModel` 现状：actor idle 即 `delete run.roleActors[roleKey]`——而 claim 后等 Judge 期间 actor 恰为 idle，Manager 此刻切模型会删映射，REJECT 重派将新建 replacement Actor、boundary 被重置、原 Actor 修正历史丢失。三重机制：
 
-1. **守卫（主）**：`handleSetRoleModel` 在 `run.roleActors[roleKey] === run.nodeBoundary.executorSessionId && run.nodeBoundary.dispatchedAt !== 0 && (run.pendingClaim !== undefined || run.pendingCorrection !== undefined)` 时拒绝：`role "x" 的 actor 正在等待判定/修正；override 被拒绝`。
+1. **守卫（主，不依赖 mapping）**：`handleSetRoleModel` 在以下条件全部成立时拒绝（`role "x" 的 actor 正在等待判定/修正；override 被拒绝`）：
+   - 当前节点为 actor-task 且 `node.execution.role === roleKey`（**按 Node role + boundary 判断，不比较 `roleActors` 映射**——映射缺失/漂移时守卫必须同样命中，否则 override 静默成功而 correction 又把旧 Actor 回写映射，本次 override 完全不生效）；
+   - `run.nodeBoundary.dispatchedAt !== 0 && run.nodeBoundary.executorSessionId !== undefined`；
+   - `run.pendingClaim !== undefined || run.pendingCorrection !== undefined`；
+   - `run.status === 'running'`（blocked 例外见第 3 条）。
 2. **解析（辅）**：correction 重派（§6.2 步骤 9）与 resume 重建派发一律以 `nodeBoundary.executorSessionId` 为该 Node 的 executor 真值：映射缺失/漂移时先回写 `roleActors[roleKey] = nodeBoundary.executorSessionId` 再 followup，保证 R6.4"重派给原 Actor"是机制不变量而非守卫的副产品。manager 节点 executor 恒为 managerSessionId，天然成立。
+3. **恢复通道（blocked 例外）**：`run.status === 'blocked'` 时守卫不适用——节点已暂停，Manager 有处置权：
+   - **blocked + pendingCorrection**（correction 派发失败态）：若原 Actor 因 provider/model 故障不可继续，Manager 显式 `workflow_set_role_model` 被接受，且 handler 额外**重置 boundary**（`nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }`）并照常删除映射——resume 的 correction 重派因 boundary 无 executor 而走 `ensureRoleActor` 用新路由创建 replacement，correction 消息（含 `[previous rejection]`/`[previous claim]`）与 `pendingCorrection` 证据照常送达新 Actor。trace 侧 MODEL 行 + boundary 重置共同构成显式替换的持久记录。
+   - **blocked + pendingClaim**（NEED_CONTEXT / judge fault 态）：override 走现状 idle-replacement 语义（影响该 role 的后续节点）；当前节点的判定由 judge followup/respawn 收尾，不涉及 correction 重派。若 judge 随后 REJECT，correction 重派按第 2 条回到原 Actor（boundary 未动）——此角落下 override 对当前修正不生效、对后续节点生效，符合"idle 可替换"的既有语义，记录在案。
 
 ### 6.6 不加 revision 字段（D2）
 
@@ -321,7 +331,7 @@ REJECT 后：token 轮换 + judgeSessionId 清空 + Judge 授权撤销（`retire
 - e2e smoke 与全部测试夹具中的 YAML；
 - `CONTEXT.md`：`agent-workflow/v1`、`judge.goal-satisfied`、Judge `PASS/FAIL` 结果语义等全部相关词条（不止一条），并新增 `pendingCorrection`、`ActorDispatchLease`（DispatchBook lease 字段）、`ACCEPT/REJECT/NEED_CONTEXT` 词条；State 闭集同步；
 - `docs/design/configurable-agent-workflow-graph.md`：§2.2 Judge 职责与流程图、§5.2 工具协议（node_claim 参数、judge_claim enum）、§5.4 trace 事件（JUDGE 取值 + CORRECT）、State 闭集（pendingCorrection/traceLogPath）、示例 YAML（checker id 与 schemaVersion）；
-- `README.MD`：协议示例、trace JUDGE 取值、Judge 语义描述；
+- `README.md`：协议示例、trace JUDGE 取值、Judge 语义描述；
 - 部署侧：`~/.dsh/workflows/milestone-delivery.yaml` 随批末统一 build+deploy 重新生成（definitionHash 变化只影响新 run）。
 
 ### 8.3 旧 v1 行为（记录为 breaking 后果）
@@ -360,11 +370,16 @@ D2 关闭 A3 遗留的 revision 事项，以下位置的"revision 待 A1"表述�
 | AC10 | 旧 judge id / 旧 token judge_claim 拒绝（含 REJECT 后旧 Judge 再提交） | 现有 stale-judge 用例扩展 |
 | AC11 | manager 节点：steer 返回 id → lease 绑定 → manager claim 接受；未含 id 的 manager turn 拒绝 | stub steerManager 返回固定 id |
 | AC12 | 全量 unit + e2e | node:test |
-| — 评审补充4 | **turnbind.test.ts 纯函数**：native 定位、Code Mode 定位（含 subCallId 校验）、伪造 callId（形如 `x:code:1` 但无对应 start 事件）、缺失根 `tool/call`、mid-turn steer、log 截断/异常 → fail-closed | node:test |
+| — 评审补充4 | **turnbind.test.ts 纯函数**：native 定位、Code Mode 定位（含 subCallId + **start 事件 rootCallId 双绑定** 校验）、伪造 callId（形如 `x:code:1` 但无对应 start 事件 / start 事件 rootCallId 不匹配）、缺失根 `tool/call`、mid-turn steer、log 截断/异常 → fail-closed | node:test |
 | — 评审补充4 | **Manager correction 证据**：manager 节点 REJECT → 重派 → 再 claim → packet 文本含 `[previous rejection]`/`[previous claim]` 段（不依赖 projection） | 断言 renderJudgePrompt 输入 |
-| — 评审补充4 | **判定期 model override**：pendingClaim/pendingCorrection 期间对 boundary executor role 的 override 被拒；非当前 executor role 仍允许 | handleSetRoleModel 断言 |
+| — 评审补充4 | **判定期 model override**：pendingClaim/pendingCorrection 期间对当前 Node role 的 override 被拒——**含 mapping 已缺失/漂移的构造**（守卫按 Node role + boundary 判定，§6.5）；非当前节点 role 仍允许 | handleSetRoleModel 断言 |
 | — 评审补充4 | **correction 派发失败→resume**：重派 steer/followup 抛错 → BLOCK 且 pendingCorrection 存续 → resume 后派发消息含完整 [judge rejection]+[previous claim]+[manager resolution]+[instruction] | failNextPuts/fault injection |
 | — 评审补充4 | **e2e**：Role 与 Manager 两条 REJECT → 修正 → 再次 ACCEPT 全链路（smoke 扩展或新脚本） | scripts/e2e-smoke.mjs |
+| — 评审第二轮 | **builtin-program node_block 回归**：program 节点上 Manager node_block 走控制面被接受（不要求 lease）；program 节点 claim 本就因 kind 被拒 | makeHarness + program 节点 |
+| — 评审第二轮 | **acceptance 边界**：claim 的 `state.put` 故障注入 → lease 未消费 → 同一 Actor 重试成功；block 的 put 故障 → book 原样可重试 | failNextPuts |
+| — 评审第二轮 | **correction × host restart**：REJECT 后 deferred correction 期间重启 → restart-reconcile BLOCK（pendingCorrection 随行存续）→ resume 重建完整 correction 消息 | 共享 MemState 的 makeHarness 重启模拟 |
+| — 评审第二轮 | **persistDeferred book 初始化**：旧 book 缺失时 `executorSessionId` 回退行为显式断言，turn/end 仍能触发延迟 correction 派发 | 构造 book 缺失场景 |
+| — 评审第二轮 | **blocked 恢复通道**：correction BLOCK 态 override 被接受且 boundary 重置 → resume 重派为 replacement Actor（新路由）且 correction 证据照常送达；NEED_CONTEXT BLOCK 态 override 走 idle-replacement 语义 | handleSetRoleModel + resume 断言 |
 
 既有 169 用例改造面：`NodeClaim` 去字段、`handleClaim` 签名、judge enum 改名、checker id 改名、SUBMISSION_CONSTRAINT 断言、e2e smoke 的 judge 脚本与断言。
 

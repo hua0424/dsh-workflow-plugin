@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|
 | [A2](a2-milestone-delivery-config-hardening.md) | milestone-delivery 配置强化 | ✅ 已完成（v1 兼容版，已部署） | 3、4、5、6、10 | 2026-09-04 | 本目录 `milestone-delivery.yaml`（新配置）、`milestone-delivery.orig.yaml`（旧版备份）、[a2-config-review.md](a2-config-review.md)（语义评审）；线上 catalog definitionHash `7961a32a…` 与评审副本一致 |
 | [A4](a4-cold-resume-compaction-investigation.md) | Cold-resume Compaction 调查 | ✅ 方案 A 已实现并合并 main（PRD 已审查）；部署与运行时验证延后统一进行 | 11 | — | 见 §3 与 [a4-code-findings.md](a4-code-findings.md) |
-| [A1](a1-claim-admission-and-judge-confirmation.md) | Claim Admission 与 Judge 确认协议 | 🔶 设计定稿（`a1-design.md`，v2 原地升级已决策；设计评审 3 阻塞+4 中等已全部修正） | 1、2、7 | — | 待实现 |
+| [A1](a1-claim-admission-and-judge-confirmation.md) | Claim Admission 与 Judge 确认协议 | 🔶 设计已定稿（`a1-design.md`；v2 原地升级已决策；两轮设计评审共 1+3 与 3+4 项发现全部修正） | 1、2、7 | — | 待实现 |
 | [A3](a3-workflow-trace-observability.md) | Workflow Trace 可观测性 | ✅ 已实现（分支 a3-trace-observability；AC4 revision 经 A1 决议由 token 前缀 + CORRECT 事件等价覆盖；审查 7 项已全部修正）；部署与运行时验证延后统一进行 | 9 | 2026-09-04 | 见 §3.1 与 PRD §13/§14 实现与审查记录 |
 | [A5](a5-provider-retry-boundary.md) | Provider Retry 边界 | ⬜ 未开始（跨插件依赖） | 8 + 额度问题 | — | 需在 commandcode provider 侧建立 retry 有界化 Issue，Workflow 侧只保留通用恢复 |
 
@@ -57,6 +57,7 @@
 
 - 2026-09-05 **机制设计定稿**（`a1-design.md`，分支 `a1-claim-admission`，commit 01c8d0a）：R3 Host seam 验证通过（`exec.callId` + `tool/call` 先于工具体落 log + `session.events` 同步读；`steerManager` 经 `createUserMessage` 捕获 messageId）；版本决策 D1 = v2 原地升级（用户确认）；D2 不加 revision 字段（A3 遗留 AC4 关闭）；D3 MODEL 上限 64/128。
 - 2026-09-05 **设计评审修正（3 阻塞 + 4 中等 + 4 补充全部接纳）**：① turnbind 覆盖 Code Mode 嵌套调用（`tool/code-dispatch-start` 无 turn，按 `rootCallId` 定位根 `tool/call` + subCallId 校验）；② Manager 路径 correction 证据改经持久化 `pendingCorrection` 进入下一 Judgment Packet `[previous rejection]` 段（不放宽 projection source 过滤）；③ 判定期/修正期禁止对 boundary executor role 的 model override + correction 重派以 `nodeBoundary.executorSessionId` 解析原 Actor；④ `TransientDispatch` 联合类型贯穿 DispatchBook/persistDeferred/dispatchNow/dispatchCurrent；⑤ lease 并入 DispatchBook（`dispatchCurrent` 返回派发身份，发布收敛于 dispatchNow 单点，零新增清理点）；⑥ MODEL 上限字段名纠正为 `roles[*].model`/`judgeRole.model` 并统一 trim-规范化 helper；⑦ A3/主设计文档 revision 表述收口、v2 迁移清单扩充、快照先于清除、测试计划补 5 组用例。
+- 2026-09-05 **第二轮设计评审修正（1 阻塞 + 3 中等 + 5 补充全部接纳）**：① `node_block` lease 绑定限定 actor-task——builtin-program/child-workflow 节点 Manager block 保持控制面（二者不发 lease，按 executor 归类会永久拒绝）；无 lease 节点 book 显式初始化 `dispatchMessageId: undefined, leaseConsumed: true`；② `leaseConsumed` 移到 `state.put` 成功之后（put 失败 lease 未消费、可重试），node_block 同理不留 consumed 残留；③ model override 守卫改按 Node role + boundary 判定（不依赖 roleActors 映射），并新增 blocked 恢复通道（correction BLOCK 态 override + boundary 重置 → resume 用新路由建 replacement 且证据照常送达）；④ Code Mode start 事件补 `rootCallId` 双绑定校验；⑤ 测试补 5 组（program block 回归、acceptance 边界、correction×restart、persistDeferred 初始化、blocked 恢复通道），设计状态行定稿，TODO/README 文件名与措辞同步。
 
 ## 4. 待办清单
 
@@ -64,7 +65,7 @@
 - [ ] A1：dispatch lease + claim 自动绑定 + REJECT correction feedback（schema version 已决策为 v2 原地升级；落地时同步 A3 trace 的 JUDGE 枚举；revision 字段已决议不加，token 前缀 + CORRECT 事件覆盖——见 `a1-design.md`）
 - [ ] A3：运行时验证（方案已实现；统一部署后回放 52 分钟空白场景、确认 warning 输出与 COMPACT 文案）
 - [ ] A5：在 commandcode provider 仓库建 retry 有界化 Issue；验证 workflow 通用 BLOCK/resume 恢复
-- [ ] A1 落地后：执行 A2 遗留 L1/L2（配置升版 + 移除 handoff-verdict workaround）；顺带定义模型路由 ID（provider/modelId）的协议长度上限（A3 第四轮评审建议，§17）
+- [ ] A1 落地后：执行 A2 遗留 L1/L2（配置升版 + 移除 handoff-verdict workaround）；顺带实现模型路由 ID（provider/modelId）长度上限（上限已定义 64/128，见 `a1-design.md` §9 D3；源自 A3 第四轮评审建议 §17）
 - [ ] Phase 3：隔离 GitHub 测试仓库完整 acceptance run（default branch contains delivery、Issues closed、Milestone closed、END）
 - [x] A2：v1 兼容配置强化并部署（2026-09-04）
 - [x] A3：fmt=2 trace 事件全覆盖实现 + 单测/e2e/文档（2026-09-04，分支 a3-trace-observability）
