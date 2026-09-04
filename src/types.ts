@@ -165,6 +165,14 @@ export interface RunState {
    * the verdict lands.
    */
   pendingClaim?: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
+  /**
+   * Absolute path of this run's trace log file (A3). Persisted so events
+   * after a host restart (restart-reconcile BLOCK, post-restart resume)
+   * still append to the SAME file; absent for pre-A3 rows (logging no-ops).
+   * The trace log itself remains a derived artifact — this path is metadata,
+   * never workflow state.
+   */
+  traceLogPath?: string
 }
 
 export interface StateRow {

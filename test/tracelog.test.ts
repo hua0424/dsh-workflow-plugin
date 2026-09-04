@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createRunLog, appendLine, lineTimestamp, runLogDir } from '../src/engine/tracelog.ts'
+import { createRunLog, appendLine, lineTimestamp, runLogDir, shortId, bounded, jsonField, traceEvent } from '../src/engine/tracelog.ts'
 
 function withTempDir(fn: (dir: string) => void): void {
   const dir = mkdtempSync(join(tmpdir(), 'tracelog-test-'))
@@ -45,15 +45,13 @@ test('appendLine: appends timestamped lines, accumulating content', () => {
     writeFileSync(configPath, '')
     const logPath = createRunLog(configPath, 'smoke-test', '9e473ab5-0000')
     assert.ok(logPath !== undefined)
-    appendLine(logPath, 'workflow "smoke-test" run 9e473ab5-0000 started', new Date(2026, 0, 3, 14, 15, 22))
-    appendLine(logPath, 'node hello PASS -> worker-echo', new Date(2026, 0, 3, 14, 16, 1))
-    appendLine(logPath, 'node worker-echo PASS -> END', new Date(2026, 0, 3, 14, 16, 30))
+    assert.equal(appendLine(logPath, 'START workflow=smoke-test run=9e473ab5-0000 fmt=2', new Date(2026, 0, 3, 14, 15, 22)), true)
+    assert.equal(appendLine(logPath, 'ROUTE workflow=smoke-test node=hello result=PASS target=END', new Date(2026, 0, 3, 14, 16, 30)), true)
     const content = readFileSync(logPath, 'utf8')
     assert.equal(
       content,
-      '[2026-01-03 14:15:22] workflow "smoke-test" run 9e473ab5-0000 started\n' +
-        '[2026-01-03 14:16:01] node hello PASS -> worker-echo\n' +
-        '[2026-01-03 14:16:30] node worker-echo PASS -> END\n',
+      '[2026-01-03 14:15:22] START workflow=smoke-test run=9e473ab5-0000 fmt=2\n' +
+        '[2026-01-03 14:16:30] ROUTE workflow=smoke-test node=hello result=PASS target=END\n',
     )
   })
 })
@@ -69,11 +67,45 @@ test('createRunLog: unwritable location returns undefined without throwing', () 
   })
 })
 
-test('appendLine: unwritable target is silently ignored', () => {
+test('appendLine: unwritable target is silently ignored and reports false (A3 §10)', () => {
   withTempDir((tmp) => {
     // Directory does not exist → append fails; must not throw.
-    appendLine(join(tmp, 'no-such-dir', 'x.txt'), 'line')
+    assert.equal(appendLine(join(tmp, 'no-such-dir', 'x.txt'), 'line'), false)
     // Path points at a directory → append fails; must not throw.
-    appendLine(tmp, 'line')
+    assert.equal(appendLine(tmp, 'line'), false)
   })
+})
+
+// ---- A3 fmt=2 event-line helpers ----
+
+test('shortId: first 8 chars', () => {
+  assert.equal(shortId('9e473ab5-1234-5678'), '9e473ab5')
+  assert.equal(shortId('abc'), 'abc')
+})
+
+test('bounded: clamps to the protocol bound and marks truncation (A3 §4)', () => {
+  assert.equal(bounded('short', 10), 'short')
+  assert.equal(bounded('x'.repeat(11), 10), `${'x'.repeat(10)}…[truncated]`)
+  assert.equal(bounded('x'.repeat(10), 10), 'x'.repeat(10))
+})
+
+test('jsonField: escapes free text onto one line; null for absent (A3 §3)', () => {
+  assert.equal(jsonField('planned', 100), '"planned"')
+  assert.equal(jsonField('multi\nline "quoted" \\ path', 100), '"multi\\nline \\"quoted\\" \\\\ path"')
+  assert.equal(jsonField(null, 100), 'null')
+  assert.equal(jsonField(undefined, 100), 'null')
+  // Over-bound text is truncated inside the quotes.
+  assert.equal(jsonField('y'.repeat(12), 10), `"${'y'.repeat(10)}…[truncated]"`)
+})
+
+test('traceEvent: key=value tokens in insertion order; undefined omitted, null kept', () => {
+  assert.equal(
+    traceEvent('CLAIM', { workflow: 'eng-test', node: 'plan', token: 'ab12cd34', role: 'manager', outcome: 'completed', summary: '"planned"', handoff: 'null' }),
+    'CLAIM workflow=eng-test node=plan token=ab12cd34 role=manager outcome=completed summary="planned" handoff=null',
+  )
+  assert.equal(traceEvent('MODEL', { workflow: 'w', role: 'judge', provider: undefined, model: 'm1' }), 'MODEL workflow=w role=judge model=m1')
+  assert.equal(traceEvent('COMPACT', { ok: true, detail: 'null' }), 'COMPACT ok=true detail=null')
+  // Unexpected whitespace in a raw identifier falls back to JSON quoting so
+  // the one-event-per-line invariant holds.
+  assert.equal(traceEvent('MODEL', { provider: 'a b' }), 'MODEL provider="a b"')
 })

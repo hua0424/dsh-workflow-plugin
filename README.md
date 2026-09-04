@@ -67,17 +67,32 @@ config file (`src/engine/tracelog.ts`):
   `~/.dsh/workflows/smoke-test/`).
 - **Naming**: `yyyyMMdd-HHmmss-<runId前8位>.txt` (local time; the run-id
   prefix avoids same-second collisions), appended in UTF-8.
-- **Format**: one line per event, each prefixed with
-  `[YYYY-MM-DD HH:mm:ss]` (local time):
-  - `[ts] START workflow=<workflowId> run=<runId>` — written at run start.
-  - `[ts] NODE <workflowId>/<nodeId> PASS -> <nextNodeId|END>` / `FAIL ->
-    <onFailNodeId|BLOCK>` — written when a checker/program verdict routes to
-    the next node. Child-workflow push/pop routing is logged too
-    (`PUSH -> <childWorkflowId>` on entry; the child's END line plus the
-    parent node's PASS line on return).
-- **Best-effort**: log directory/file creation or appends never fail the run
-  — failures are silently ignored and the workflow keeps advancing. Logs are
-  derived artifacts; they are not part of the SQLite state.
+- **Format** (`fmt=2`, announced on the START line): one line per event,
+  prefixed with `[YYYY-MM-DD HH:mm:ss]` (local time), made of
+  space-separated `key=value` tokens. Identifier values are raw; free-text
+  values are JSON-string escaped (newlines never break the one-line rule)
+  and bounded at their protocol max (over-bound text gets `…[truncated]`):
+  - `[ts] START workflow=<id> run=<runId> fmt=2`
+  - `[ts] CLAIM workflow=<id> node=<node> token=<8> role=<role> outcome=<completed|failed> summary=<json> handoff=<json|null>` — every accepted Actor claim (after admission, before Judge spawn).
+  - `[ts] JUDGE workflow=<id> node=<node> token=<8> result=<PASS|FAIL|NEED_CONTEXT> reason=<json> judge=<8>` — every accepted Judge verdict.
+  - `[ts] ROUTE workflow=<id> node=<node> result=<PASS|FAIL> target=<node|END|BLOCK>` — the finally-adopted Graph edge direction.
+  - `[ts] BLOCK workflow=<id> node=<node> token=<8> source=<actor|judge|program|dispatch|compact|restart|manager> reason=<json>` — every BLOCK entrance.
+  - `[ts] RESUME workflow=<id> node=<node> oldToken=<8> newToken=<8> target=<judge|actor> context=<json>` / `RESPAWN` / `RESOLVE` / `MODEL` — recovery actions (node_resume, judge_respawn, node_resolve_program, workflow_set_role_model).
+  - `[ts] PROGRAM workflow=<id> node=<node> token=<8> program=<id> result=<PASS|FAIL|ERROR> reason=<json|null>` — builtin-program outcomes (parameters are never logged).
+  - `[ts] PUSH parent=<wf>/<node> child=<childWf>` / `[ts] POP child=<childWf> result=PASS parent=<wf>/<node>` — explicit child-workflow entry/return pairing.
+  - `[ts] COMPACT workflow=<id> node=<node> role=<role> ok=<bool> detail=<json|null>` — node-boundary compaction results.
+- **Durable path**: the log file path is persisted on the run's state row
+  (`traceLogPath`), so events after a DSH host restart (restart-reconcile
+  BLOCK, post-restart resume) still append to the SAME file. The log itself
+  remains a derived artifact outside SQLite.
+- **Privacy**: only Engine-accepted protocol payloads are logged (summary /
+  handoff / judge reason / block reason / resolution context, bounded). No
+  reasoning, no tool transcripts, no program parameters, no credentials;
+  auth/credential errors keep the Host's sanitized wording.
+- **Best-effort**: log directory/file creation or appends never fail the run.
+  The FIRST failure per run surfaces once as a Host logger warning; further
+  failures stay silent. State/Git/GitHub remain authoritative when they
+  disagree with a trace.
 
 The e2e smoke (`pnpm run test:e2e`) asserts the START line and both PASS
 routing lines of the smoke-test workflow in an isolated temporary DSH home

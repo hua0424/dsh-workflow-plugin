@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：方案已确认，待实现
+- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；部署与运行时验证随本批 PRD 统一进行）
 - 关联需求：记录每个 Node 的 Actor claim、Judge 输出、BLOCK/RESUME
 
 ## 1. 背景
@@ -233,3 +233,35 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 - **AC11 故障容忍**：日志目录不可写时 workflow 行为不变。
 - **AC12 隔离 e2e**：扩展 `scripts/e2e-smoke.mjs` 或新 harness，只使用临时 DSH home 与合成 workspace；不得触碰真实 `~/.dsh`。
 - **AC13 文档**：README 与设计文档更新事件格式、字段、best-effort、隐私边界。
+
+## 13. 实现记录（2026-09-04，分支 a3-trace-observability）
+
+### 13.1 实现时选定的决策
+
+- **§3 格式**：选定**迁移为 ROUTE**（不保留旧 `NODE ... PASS -> ...`），全套事件统一为单行 `key=value` + JSON string escaping，`START` 行声明 `fmt=2` 作版本标记；README/设计文档/单元测试/e2e 断言同步更新，无双格式并存。
+- **§3 JUDGE 取值**：`result` 沿用现行 judge_claim 协议的 `PASS|FAIL|NEED_CONTEXT`（本 PRD 草案中的 `ACCEPT|REJECT` 是 A1 新协议术语）；A1 落地时同步改枚举并保留 `revision` 字段（§5 R2 的 revision 是 A1 claim 修正协议的派生序号，当前单 claim 协议下恒为首次，先以 `token` 8 位短前缀满足 §10 去重诉求）。
+- **traceLogPath 持久化（R5 restart 覆盖的前提）**：原实现日志路径只存 Engine 内存 map，host 重启即丢，restart-reconcile BLOCK 无法落盘。现将可选字段 `traceLogPath` 随 RunState 行持久化（state store 为宽松 JSON 序列化，向后兼容；pre-A3 旧行无此字段，日志 no-op）。日志本身仍是派生产物，不进 SQLite 之外的任何状态语义。代价：`state.create` 冲突时可能残留一个空孤儿日志文件（best-effort 接受）。
+- **§10 告警**：`appendLine` 改为返回布尔；Engine 新增可注入 `traceWarn`（插件接线到 `ctx.logger.warn`），每 run 首次创建/追加失败各告警一次，之后静默。
+
+### 13.2 事件覆盖对照
+
+| 事件 | 写入点（engine.ts） | 验收 |
+| --- | --- | --- |
+| CLAIM | `handleClaim` admission+lease 校验后、pendingClaim 持久化后、startJudge 前 | AC1/AC2/AC9 |
+| JUDGE | `handleJudgeClaim` 校验通过后、任何状态转换前（NEED_CONTEXT/PASS/FAIL 均记） | AC3/AC4 |
+| ROUTE | `advance()`（含 child END→pop→parent 递归路由） | §3 |
+| BLOCK | `handleBlock`(actor/manager)、NEED_CONTEXT(judge)、`blockOnJudgeFault`(judge)、advance FAIL 无 onFail(judge/program/manager)、program ERROR(program)、`dispatchNow` compact 失败(compact)/dispatch 失败(dispatch)、`handleTurnEnded` 无结果(actor)、`handleRestartReconcile`(restart) | AC5 |
+| RESUME | `handleResume` 判定阶段(judge)/普通路径(actor)，token 轮换后、执行前 | AC6 |
+| RESPAWN | `handleRespawnJudge` 成功后（reason 缺省记 null） | AC6 |
+| RESOLVE | `handleResolveProgram` advance 前 | AC6/AC8 |
+| PROGRAM | `handleRunProgram` 结果 revalidation 后（不记 parameters） | AC8 |
+| MODEL | `handleSetRoleModel`（只记 provider/model id） | AC6/AC10 |
+| PUSH/POP | `dispatchCurrent` child 分支 / `advance` pop 分支（显式配对） | AC7 |
+| COMPACT | `compactBeforeDispatch` 成败均记（A2 R7 原有语义升级为 fmt=2） | §9 外延 |
+
+### 13.3 验证情况
+
+- 单元测试：`test/tracelog.test.ts`（fmt=2 助手：转义/截断/null/原始值白名单）+ `test/engine.test.ts` trace 段（START fmt=2、CLAIM/JUDGE/ROUTE、REJECT 不产生 CLAIM、FAIL→BLOCK source、NEED_CONTEXT→RESUME(judge)、node_block→RESUME(actor)、actor 无结果 BLOCK、RESPAWN、PUSH/POP 配对、PROGRAM ERROR→RESOLVE、MODEL、restart-reconcile 跨 engine 实例写入同一日志、日志目录不可写时 warn 一次且 Run 行为不变、超限截断单行）。159/159 通过。
+- e2e：`scripts/e2e-smoke.mjs` 断言升级为 fmt=2 六行（START/CLAIM/JUDGE/ROUTE×2/CLAIM），隔离临时 home，`E2E SMOKE PASS`。
+- 文档：README "Run trace logs"、设计文档 §5.4 已同步（AC13）。
+- 待运行时验证（随本批统一部署）：真实 milestone-delivery run 的 52 分钟空白场景回放、Host logger warning 实际输出、COMPACT detail 真实文案。

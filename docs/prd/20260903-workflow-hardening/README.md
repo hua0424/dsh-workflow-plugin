@@ -4,7 +4,7 @@
 - Trace：`~/.dsh/workflows/milestone-delivery/20260903-191156-b2697138.txt`
 - 试跑目标：Judge subagent label 携带当前 nodeId
 - 最终结果：功能实现与测试通过，Issue #4 closed；复盘发现协议、配置、日志、compaction 与 provider retry 问题
-- 本目录状态：A2（配置强化）已按 v1 兼容语义落地并部署；A4 方案 A 已实现（分支 `a4-cold-compact`，待部署与运行时验证，见 [a4-code-findings.md](a4-code-findings.md)）；A1/A3/A5 仍为需求与方案文档，尚未实现
+- 本目录状态：A2（配置强化）已按 v1 兼容语义落地并部署；A4 方案 A 已实现并合并 main（待部署与运行时验证，见 [a4-code-findings.md](a4-code-findings.md)）；A3 已实现（分支 `a3-trace-observability`，fmt=2 trace 事件全覆盖，见 PRD §13 实现记录）；A1/A5 仍为需求与方案文档，尚未实现
 - 批次进度看板：[TODO.md](TODO.md)（状态变化以该文件为准）
 
 ## 1. 文档索引

@@ -159,6 +159,11 @@ export function apply(ctx: Context) {
     if (agent === undefined) return 'unknown'
     return agent.status === 'running' ? 'active' : 'idle'
   }
+  // A3 §10: surface the FIRST per-run trace-log failure through the Host
+  // logger (once per run, never in a loop).
+  engine.traceWarn = (message) => {
+    ctx.logger.warn(message)
+  }
 
   /** Resolve one session's workspace: recorded mapping first, then cwd realpath. */
   async function workspaceOfSession(sessionId: string): Promise<string | undefined> {

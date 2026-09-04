@@ -169,8 +169,9 @@ try {
 
   let pass = final.run.status === 'completed' && final.run.callStack.length === 0
 
-  // 5. run trace log assertions (PRD workflow-run-logging AC1/AC2)
+  // 5. run trace log assertions (workflow-run-logging AC1/AC2 + A3 fmt=2 events)
   const TS = '\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]'
+  const TOK = '[0-9a-f]{8}'
   const logDir = join(dirname(entry.path), 'smoke-test')
   const logFiles = existsSync(logDir) ? readdirSync(logDir).filter(f => f.endsWith('.txt')) : []
   if (logFiles.length !== 1 || !/^\d{8}-\d{6}-[0-9a-f-]{8}\.txt$/.test(logFiles[0])) {
@@ -179,9 +180,12 @@ try {
   } else {
     const log = readFileSync(join(logDir, logFiles[0]), 'utf8')
     const expectations = [
-      new RegExp(`${TS} START workflow=smoke-test run=${run.runId}\\n`),
-      new RegExp(`${TS} NODE smoke-test/hello PASS -> worker-echo\\n`),
-      new RegExp(`${TS} NODE smoke-test/worker-echo PASS -> END\\n`),
+      new RegExp(`${TS} START workflow=smoke-test run=${run.runId} fmt=2\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt" handoff=null\\n`),
+      new RegExp(`${TS} JUDGE workflow=smoke-test node=hello token=${TOK} result=PASS reason="content matches criteria" judge=${TOK}\\n`),
+      new RegExp(`${TS} ROUTE workflow=smoke-test node=hello result=PASS target=worker-echo\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok" handoff=null\\n`),
+      new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo result=PASS target=END\\n`),
     ]
     for (const [i, re] of expectations.entries()) {
       const ok = re.test(log)
