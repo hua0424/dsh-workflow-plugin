@@ -21,8 +21,8 @@ export const BUILTIN_PROGRAM_IDS = new Set([
   'github.all-milestone-issues-complete',
 ])
 
-/** Builtin checker ids known to this plugin version (design §3). */
-export const BUILTIN_CHECKER_IDS = new Set(['judge.goal-satisfied'])
+/** Builtin checker ids known to this plugin version (design §3; A1 v2 rename). */
+export const BUILTIN_CHECKER_IDS = new Set(['judge.claim-correct'])
 
 function isEnd(target: string): boolean {
   return target === 'END'
@@ -178,7 +178,7 @@ function validateChecker(label: string, checker: CheckerRef, problems: string[])
     problems.push(`${label} references unknown checker "${checker.checkerId}"`)
     return
   }
-  if (checker.checkerId === 'judge.goal-satisfied') {
+  if (checker.checkerId === 'judge.claim-correct') {
     const criteria = checker.config['criteria']
     if (typeof criteria !== 'string') {
       problems.push(`${label} checker config.criteria must be a non-empty string`)

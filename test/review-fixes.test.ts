@@ -30,7 +30,7 @@ test('buildGhArgs never emits jq pipelines and encodes the query', async () => {
 
 // ---- F6: manual resolve clears BLOCK before advancing ----
 const PROG_CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -38,7 +38,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Begin. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: prog
     prog:
       execution: { type: builtin-program, programId: github.all-milestone-issues-complete }

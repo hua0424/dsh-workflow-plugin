@@ -4,7 +4,7 @@
  * wires real DSH services into these.
  */
 import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome, ClaimCaller, TransientDispatch, PendingCorrection } from '../types.ts'
-import { WorkflowError, LIMITS } from '../types.ts'
+import { WorkflowError, LIMITS, normalizeModelRoute } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { createRunLog, appendLine, jsonField, redact, shortId, traceEvent } from './tracelog.ts'
 import { SUBMISSION_CONSTRAINT } from './texts.ts'
@@ -810,7 +810,7 @@ export class WorkflowEngine {
     const node = this.nodeAt(run, frame)!
     const checker = node.checker
     if (checker === undefined) return { ok: false, reason: 'actor-task node has no checker' }
-    if (checker.checkerId !== 'judge.goal-satisfied') {
+    if (checker.checkerId !== 'judge.claim-correct') {
       return { ok: false, reason: `unknown checker ${checker.checkerId}` }
     }
     // A1 R2/§5.1: dispatch-lease admission. This also subsumes the old
@@ -1433,9 +1433,17 @@ export class WorkflowEngine {
         run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
       }
     }
-    run.modelOverrides[roleKey] = { provider, modelId }
-    // A3 R6: model override — ids only, never credentials.
-    this.logModel(run, roleKey, provider, modelId)
+    // A1 D3: one trim-then-normalize rule for both entry points (catalog zod
+    // caps + here). A blank/over-limit route is rejected with the limit.
+    let route: { provider: string; modelId: string }
+    try {
+      route = normalizeModelRoute(provider, modelId)
+    } catch (error) {
+      return { ok: false, reason: error instanceof WorkflowError ? error.message : String(error) }
+    }
+    run.modelOverrides[roleKey] = route
+    // A3 R6: model override — ids only, never credentials (already normalized).
+    this.logModel(run, roleKey, route.provider, route.modelId)
     await this.state.put(workspaceKey, run, version)
     return { ok: true, run, message: `model override set for ${roleKey}` }
   }

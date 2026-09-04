@@ -1,16 +1,18 @@
 /**
- * Strict zod schema for agent-workflow/v1 configs (design §2.3/§2.4/§7).
- * Unknown fields are rejected at every level (zod object default = strip;
- * we use .strict()).
+ * Strict zod schema for agent-workflow/v2 configs (design §2.3/§2.4/§7; A1
+ * in-place upgrade — no v1 dual-track). Unknown fields are rejected at every
+ * level (zod object default = strip; we use .strict()).
  */
 import { z } from 'zod'
+import { LIMITS } from '../types.ts'
 
 const nonEmptyTrimmed = z.string().trim().min(1)
 
 const roleModel = z
   .object({
-    provider: nonEmptyTrimmed,
-    modelId: nonEmptyTrimmed,
+    // A1 D3 caps, enforced after the trim transform (stored values are trimmed).
+    provider: nonEmptyTrimmed.max(LIMITS.providerMax),
+    modelId: nonEmptyTrimmed.max(LIMITS.modelIdMax),
   })
   .strict()
 
@@ -102,7 +104,7 @@ const workflowDef = z
 
 export const workflowConfigSchema = z
   .object({
-    schemaVersion: z.literal('agent-workflow/v1'),
+    schemaVersion: z.literal('agent-workflow/v2'),
     roles: z.record(z.string(), roleDefinition),
     judgeRole: judgeRoleDefinition,
     workflow: workflowDef,

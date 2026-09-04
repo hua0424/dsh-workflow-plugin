@@ -1,9 +1,10 @@
 /**
- * Core domain types for agent-workflow/v1.
- * Pure data types only — no Cordis imports, testable without the host.
+ * Core domain types for agent-workflow/v2 (A1: claim admission + judge
+ * confirmation). Pure data types only — no Cordis imports, testable without
+ * the host.
  */
 
-export const SCHEMA_VERSION = 'agent-workflow/v1' as const
+export const SCHEMA_VERSION = 'agent-workflow/v2' as const
 export const STATE_FORMAT_VERSION = 'agent-workflow-state/v1' as const
 export const STATE_TABLE_NAME = 'workflow_state' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
@@ -27,11 +28,30 @@ export const LIMITS = {
   resolutionMin: 1,
   resolutionMax: 8000,
   blockReasonMax: 4000,
+  /** A1 D3: model-route component caps (characters, after trim). */
+  providerMax: 64,
+  modelIdMax: 128,
 } as const
 
 export interface RoleModel {
   provider: string
   modelId: string
+}
+
+/**
+ * A1 D3: the single trim-then-normalize rule for model routes, shared by the
+ * catalog schema caps and `handleSetRoleModel`. Empty-after-trim or
+ * over-limit components are rejected with the limit in the message; the
+ * returned values are the trim results actually stored.
+ */
+export function normalizeModelRoute(provider: string, modelId: string): RoleModel {
+  const p = provider.trim()
+  const m = modelId.trim()
+  if (p === '') throw new WorkflowError(`provider must be 1..${LIMITS.providerMax} characters after trim`)
+  if (p.length > LIMITS.providerMax) throw new WorkflowError(`provider must be at most ${LIMITS.providerMax} characters after trim (got ${p.length})`)
+  if (m === '') throw new WorkflowError(`modelId must be 1..${LIMITS.modelIdMax} characters after trim`)
+  if (m.length > LIMITS.modelIdMax) throw new WorkflowError(`modelId must be at most ${LIMITS.modelIdMax} characters after trim (got ${m.length})`)
+  return { provider: p, modelId: m }
 }
 
 export interface RoleDefinition {

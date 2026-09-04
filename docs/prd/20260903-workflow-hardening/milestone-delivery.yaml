@@ -1,7 +1,7 @@
 # Hardened milestone-delivery config (PRD 20260903-workflow-hardening A2).
 # v1-protocol compatible: Judge verdicts stay PASS|FAIL|NEED_CONTEXT; FAIL
 # routes the onFail edge. REJECT/correction-feedback wording lands with A1.
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 
 roles:
   developer:
@@ -55,7 +55,7 @@ workflow:
           URL), milestoneTitle, branchName, and a short restatement of the
           user goal.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             The user goal is clear enough to deliver. The handoff identifies
@@ -88,7 +88,7 @@ workflow:
           carry PRD path, PRD commit, repository, branch, milestoneTitle and
           milestoneNumber.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             A PRD exists under docs/prd/ and covers the user goal, scope,
@@ -111,7 +111,7 @@ workflow:
           number. On completed claim, carry milestoneTitle and milestoneNumber
           forward in handoffContext.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             Inspect the PRD, Milestone and Issues. PASS only when the required
@@ -139,7 +139,7 @@ workflow:
           (yes/no), blocking findings (empty when satisfied), PRD path,
           Milestone number/title, and the default-branch revision reviewed.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             PASS only when the review was actually performed on the remote
@@ -165,7 +165,7 @@ workflow:
           URL, number, title, final state, and the default-branch integrated
           revision.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             The GitHub Milestone state is closed, open_issues is 0, every
@@ -186,7 +186,7 @@ workflow:
           Issues in the current Milestone. On completed claim, carry the
           remediation Issue URLs forward in handoffContext.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: |
             PASS only when every blocking finding from the handoff is covered
@@ -207,7 +207,7 @@ childWorkflows:
             repository, the milestone branch and the milestone number the
             delivery will target.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               PASS only when the selected Issue exists, is unfinished, belongs
@@ -248,7 +248,7 @@ childWorkflows:
             repository, branch and implementation commit forward in
             handoffContext for Reviewer.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the Issue discussion, repository and commits. PASS only
@@ -272,7 +272,7 @@ childWorkflows:
             approved), Issue URL, repository, branch and reviewed commit, for
             Tester.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the Issue, the reviewed commit's diff and the
@@ -298,7 +298,7 @@ childWorkflows:
             completed claim, carry the implementation commit, report path and
             report commit forward in handoffContext for Manager delivery.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the test report and repository state. PASS only when the
@@ -329,7 +329,7 @@ childWorkflows:
             branch, integrated revision or merged PR URL, and closure state
             in handoffContext.
         checker:
-          checkerId: judge.goal-satisfied
+          checkerId: judge.claim-correct
           config:
             criteria: |
               Inspect the Issue, repository and delivered revision. PASS only

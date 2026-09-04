@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 
 const VALID_CONFIG = `
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles:
   developer:
     persona: Implement.
@@ -24,7 +24,7 @@ workflow:
         role: manager
         instruction: Plan it.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: PASS when a plan exists.
       onPass: build
@@ -34,7 +34,7 @@ workflow:
         role: developer
         instruction: Build it.
       checker:
-        checkerId: judge.goal-satisfied
+        checkerId: judge.claim-correct
         config:
           criteria: PASS when built.
       onPass: END
@@ -42,10 +42,27 @@ workflow:
 
 test('valid config parses and normalizes', () => {
   const config = parseCatalogConfig(VALID_CONFIG)
-  assert.equal(config.schemaVersion, 'agent-workflow/v1')
+  assert.equal(config.schemaVersion, 'agent-workflow/v2')
   assert.deepEqual(Object.keys(config.roles), ['developer'])
   const normalized = validateAndNormalize(config, { workflowId: 'test-wf' })
   assert.equal(normalized.workflow.startNode, 'plan')
+})
+
+test('v1 schemaVersion is rejected (A1 D1: in-place upgrade, no dual-track)', () => {
+  const legacy = VALID_CONFIG.replace('agent-workflow/v2', 'agent-workflow/v1')
+  assert.throws(() => parseCatalogConfig(legacy), /schemaVersion/)
+})
+
+test('model route caps: provider ≤64 / modelId ≤128 after trim (A1 D3)', () => {
+  const withModel = (provider: string, modelId: string) => parseCatalogConfig(VALID_CONFIG.replace(
+    '  developer:\n    persona: Implement.',
+    `  developer:\n    persona: Implement.\n    model: { provider: "${provider}", modelId: "${modelId}" }`,
+  ))
+  assert.throws(() => withModel('p'.repeat(65), 'm'), /provider.*64/)
+  assert.throws(() => withModel('p', 'm'.repeat(129)), /modelId.*128/)
+  // Boundary values parse fine (≤ caps) and arrive trimmed (stored trimmed).
+  const capped = validateAndNormalize(withModel(' p2 ', ' m2 '), { workflowId: 'caps-wf' })
+  assert.deepEqual(capped.roles['developer']!.model, { provider: 'p2', modelId: 'm2' })
 })
 
 test('duplicate keys are rejected', () => {
@@ -69,12 +86,12 @@ test('multi-document input is rejected', () => {
 })
 
 test('unknown fields are rejected', () => {
-  assert.throws(() => parseCatalogConfig('schemaVersion: agent-workflow/v1\nunknownTop: 1\nroles: {}\njudgeRole: {persona: J}\nworkflow: {startNode: x, nodes: {}}'), /unknownTop/)
+  assert.throws(() => parseCatalogConfig('schemaVersion: agent-workflow/v2\nunknownTop: 1\nroles: {}\njudgeRole: {persona: J}\nworkflow: {startNode: x, nodes: {}}'), /unknownTop/)
 })
 
 test('root startNode must be a manager actor-task', () => {
   const config = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
 judgeRole: { persona: J }
 workflow:
@@ -82,7 +99,7 @@ workflow:
   nodes:
     build:
       execution: { type: actor-task, role: developer, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `)
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /startNode/)
@@ -90,7 +107,7 @@ workflow:
 
 test('onFail END is rejected', () => {
   const config = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
 judgeRole: { persona: J }
 workflow:
@@ -98,12 +115,12 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: build
       onFail: END
     build:
       execution: { type: actor-task, role: developer, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `)
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /onFail/)
@@ -111,7 +128,7 @@ workflow:
 
 test('unknown role is rejected', () => {
   const config = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
 judgeRole: { persona: J }
 workflow:
@@ -119,11 +136,11 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: build
     build:
       execution: { type: actor-task, role: ghost, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `)
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /unknown role/)
@@ -131,7 +148,7 @@ workflow:
 
 test('unreachable node is rejected', () => {
   const config = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
 judgeRole: { persona: J }
 workflow:
@@ -139,11 +156,11 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
     orphan:
       execution: { type: actor-task, role: developer, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `)
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /not reachable/)
@@ -151,7 +168,7 @@ workflow:
 
 test('child workflow cycle is rejected', () => {
   const config = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
 judgeRole: { persona: J }
 workflow:
@@ -159,7 +176,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 childWorkflows:
   a:
@@ -190,7 +207,7 @@ test('definition hash is stable and content-sensitive', () => {
 
 test('criteria bounds are enforced', () => {
   const tooLong = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
 judgeRole: { persona: J }
 workflow:
@@ -198,7 +215,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: "${'x'.repeat(9000)}" } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: "${'x'.repeat(9000)}" } }
       onPass: END
 `)
   assert.throws(() => validateAndNormalize(tooLong, { workflowId: 'w' }), CatalogValidationError, /criteria/)
@@ -219,7 +236,7 @@ test('scanCatalog ignores invalid files and lists valid ones', async () => {
   await mkdir(dir, { recursive: true })
   try {
     await writeFile(join(dir, 'good.yaml'), VALID_CONFIG)
-    await writeFile(join(dir, 'bad.yaml'), 'schemaVersion: agent-workflow/v1\nnope: 1\n')
+    await writeFile(join(dir, 'bad.yaml'), 'schemaVersion: agent-workflow/v2\nnope: 1\n')
     await writeFile(join(dir, 'ignored.yml'), VALID_CONFIG)
     const scan = await scanCatalog(home)
     assert.deepEqual(scan.entries.map(e => e.workflowId), ['good'])
@@ -239,7 +256,7 @@ test('scanCatalog on a missing directory returns empty', async () => {
 
 test('builtin program ids are validated', () => {
   const config = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -247,7 +264,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: prog
     prog:
       execution: { type: builtin-program, programId: unknown.program }
@@ -258,7 +275,7 @@ workflow:
 
 test('prototype-pollution role names are rejected (hasOwn checks)', () => {
   const config = parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -266,11 +283,11 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: build
     build:
       execution: { type: actor-task, role: constructor, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `)
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /unknown role/)

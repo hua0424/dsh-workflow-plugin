@@ -28,7 +28,7 @@ test('lineTimestamp: [YYYY-MM-DD HH:mm:ss] local-time format', () => {
 test('createRunLog: creates sibling directory and yyyyMMdd-HHmmss-<runId8>.txt file', () => {
   withTempDir((tmp) => {
     const configPath = join(tmp, 'smoke-test.yaml')
-    writeFileSync(configPath, 'schemaVersion: agent-workflow/v1\n')
+    writeFileSync(configPath, 'schemaVersion: agent-workflow/v2\n')
     const logPath = createRunLog(configPath, 'smoke-test', '9e473ab5-1234-5678-9abc-def012345678', new Date(2026, 0, 3, 14, 15, 22))
     assert.ok(logPath !== undefined)
     assert.equal(logPath, join(tmp, 'smoke-test', '20260103-141522-9e473ab5.txt'))

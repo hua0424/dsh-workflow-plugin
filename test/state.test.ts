@@ -10,7 +10,7 @@ import { validateAndNormalize, computeDefinitionHash } from '../src/catalog/vali
 import type { RunState } from '../src/types.ts'
 
 const CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
 judgeRole: { persona: J }
 workflow:
@@ -18,7 +18,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `), { workflowId: 'state-test' })
 

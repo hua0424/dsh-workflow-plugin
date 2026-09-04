@@ -24,7 +24,7 @@ function actorCaller(h: Harness, id = 'actor-child-1'): ClaimCaller {
 
 /** Two-node config: manager plan → developer build → END. */
 const CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles:
   developer: { persona: D }
 judgeRole: { persona: J }
@@ -33,11 +33,11 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Plan. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS when planned. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS when planned. } }
       onPass: build
     build:
       execution: { type: actor-task, role: developer, instruction: Build. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS when built. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS when built. } }
       onPass: END
 `), { workflowId: 'eng-test' })
 
@@ -643,7 +643,7 @@ test('A1 §3.2: a failed BLOCK put keeps the book intact for a verbatim retry', 
 
 test('A1 §5.2: Manager node_block on a builtin-program node is control-plane (no lease required)', async () => {
   const PROG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -651,7 +651,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Begin. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: run
     run:
       execution: { type: builtin-program, programId: github.initialize-milestone }
@@ -877,6 +877,29 @@ test('role model override is rejected while the role actor turn is active; idle 
   assert.ok(judgeOverride.ok)
 })
 
+test('model override routes are trim-normalized and capped (A1 D3)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  // Whitespace is trimmed BEFORE storage (never store raw blanks).
+  const trimmed = await h.engine.handleSetRoleModel('ws', 'judge', '  p1  ', '  m1  ')
+  assert.ok(trimmed.ok)
+  assert.deepEqual(h.mem.run!.modelOverrides['judge'], { provider: 'p1', modelId: 'm1' })
+  // Empty-after-trim and over-limit values are rejected with the bound.
+  const blank = await h.engine.handleSetRoleModel('ws', 'judge', '   ', 'm1')
+  assert.ok(!blank.ok)
+  assert.match(blank.reason ?? '', /provider.*1\.\.64/)
+  const longProvider = await h.engine.handleSetRoleModel('ws', 'judge', 'p'.repeat(65), 'm1')
+  assert.ok(!longProvider.ok)
+  assert.match(longProvider.reason ?? '', /provider.*64/)
+  const longModel = await h.engine.handleSetRoleModel('ws', 'judge', 'p1', 'm'.repeat(129))
+  assert.ok(!longModel.ok)
+  assert.match(longModel.reason ?? '', /modelId.*128/)
+  // Boundary values still pass and the previous override is untouched by failures.
+  const capped = await h.engine.handleSetRoleModel('ws', 'judge', 'p'.repeat(64), 'm'.repeat(128))
+  assert.ok(capped.ok)
+  assert.deepEqual(h.mem.run!.modelOverrides['judge'], { provider: 'p'.repeat(64), modelId: 'm'.repeat(128) })
+})
+
 test('node-boundary compact runs before dispatching a fresh role node (A2 AC1)', async () => {
   const h = makeHarness()
   await h.engine.startRun('ws', initialRun())
@@ -1022,7 +1045,7 @@ test('first role creation skips compact (A2 AC3)', async () => {
 
 test('builtin-program dispatch does not inject the submission constraint (A3 AC2)', async () => {
   const PROG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -1030,7 +1053,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Begin. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: run
     run:
       execution: { type: builtin-program, programId: github.initialize-milestone }
@@ -1083,7 +1106,7 @@ workflow:
 // ---- child-workflow coverage (acceptance D3) ----
 
 const CHILD_CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: { worker: { persona: W } }
 judgeRole: { persona: J }
 workflow:
@@ -1091,7 +1114,7 @@ workflow:
   nodes:
     begin:
       execution: { type: actor-task, role: manager, instruction: Begin. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: call-child
     call-child:
       execution: { type: child-workflow, workflowId: child-a }
@@ -1102,7 +1125,7 @@ childWorkflows:
     nodes:
       child-step:
         execution: { type: actor-task, role: worker, instruction: Do child work. }
-        checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
         onPass: END
 `), { workflowId: 'child-test' })
 
@@ -1162,7 +1185,7 @@ async function withTempCatalog(workflowId: string, fn: (configPath: string) => P
   const dir = mkdtempSync(join(tmpdir(), 'engine-tracelog-'))
   try {
     const configPath = join(dir, `${workflowId}.yaml`)
-    writeFileSync(configPath, 'schemaVersion: agent-workflow/v1\n')
+    writeFileSync(configPath, 'schemaVersion: agent-workflow/v2\n')
     await fn(configPath)
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -1241,7 +1264,7 @@ test('over-bound claim fields are truncated at the protocol max on one line (AC9
 
 test('FAIL routes to onFail, and FAIL -> BLOCK emits ROUTE + BLOCK source=judge (AC5)', async () => {
   const FAIL_CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -1249,12 +1272,12 @@ workflow:
   nodes:
     try:
       execution: { type: actor-task, role: manager, instruction: Try. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
       onFail: retry
     retry:
       execution: { type: actor-task, role: manager, instruction: Retry. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `), { workflowId: 'fail-test' })
   const failRun = (): RunState => ({
@@ -1382,7 +1405,7 @@ test('trace log covers child PUSH/POP with explicit pairing (AC7)', async () => 
 
 test('builtin program outcomes emit PROGRAM (+BLOCK on ERROR) and RESOLVE on manual fix (AC8/AC6)', async () => {
   const PROG_TRACE_CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -1390,7 +1413,7 @@ workflow:
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Begin. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: prog
     prog:
       execution: { type: builtin-program, programId: github.initialize-milestone }
@@ -1600,7 +1623,7 @@ test('legit secret-pattern-colliding workflow id is NOT redacted (A3 review roun
   // 'sk-abcdefgh' matches the credential heuristic but is a legal catalog id
   // (ID_PATTERN); redacting it would break trace↔catalog correlation.
   const SK_CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v1
+schemaVersion: agent-workflow/v2
 roles: {}
 judgeRole: { persona: J }
 workflow:
@@ -1608,7 +1631,7 @@ workflow:
   nodes:
     sk-abcdefgh:
       execution: { type: actor-task, role: manager, instruction: Go. }
-      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `), { workflowId: 'sk-abcdefgh' })
   await withTempCatalog('sk-abcdefgh', async (configPath) => {
