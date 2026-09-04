@@ -2,7 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
-import { resolveRoleModel, roleDenyList, judgeSpawnPlan, JUDGE_ALLOW } from '../src/roles/roles.ts'
+import { resolveRoleModel, roleDenyList, judgeSpawnPlan, judgeLabel, JUDGE_ALLOW } from '../src/roles/roles.ts'
 import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
@@ -70,6 +70,10 @@ test('judge spawn plan: fixed allow-list + persona + route', () => {
   assert.equal(plan.persona, 'Judge persona.')
   assert.deepEqual(plan.toolFilter.allow, JUDGE_ALLOW)
   assert.deepEqual(plan.agentOptions, { provider: 'jp', model: 'jm' })
+})
+
+test('judge label carries the current node id', () => {
+  assert.equal(judgeLabel('implement'), 'workflow-judge:implement')
 })
 
 test('judge allow-list contains the fixed read-only tools plus judge_claim', () => {

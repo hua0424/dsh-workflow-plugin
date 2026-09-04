@@ -12,7 +12,8 @@ import type { RunState } from '../types.ts'
 import { WorkflowError } from '../types.ts'
 import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
-import { judgeSpawnPlan, JUDGE_ALLOW, JUDGE_MACHINERY_EXEMPT, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
+import { judgeLabel, judgeSpawnPlan, JUDGE_ALLOW, JUDGE_MACHINERY_EXEMPT, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
+import { topFrame } from '../state/invariants.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
 
@@ -240,7 +241,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
 
       const started = await adapters.ctx.subagents.startContinuable({
         provider: 'spawn',
-        label: 'workflow-judge',
+        label: judgeLabel(topFrame(run).nodeId),
         // P1: use the engine-reserved id, which was persisted BEFORE child
         // admission; the child may begin judging as soon as the prompt is
         // accepted, so an Engine-returned id would arrive too late.
