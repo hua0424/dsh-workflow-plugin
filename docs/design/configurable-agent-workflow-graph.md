@@ -367,8 +367,8 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
   - `JUDGE workflow= node= token=<8位> result=PASS|FAIL|NEED_CONTEXT reason=<json> judge=<8位>`（被接受的judge_claim）；
   - `ROUTE workflow= node= token=<8位> result=PASS|FAIL target=<node|END|BLOCK>`（最终采用的Graph Edge方向：Actor completed+Judge PASS合成PASS/onPass，failed+PASS合成FAIL/onFail；Judge REJECT（A1后）不产生ROUTE只产生JUDGE行）；
   - `BLOCK workflow= node= token=<8位> source=actor|judge|program|dispatch|compact|restart|manager reason=<json>`（全部BLOCK入口：node_block、actor无结果turn结束、NEED_CONTEXT、Judge技术故障、FAIL无onFail、program ERROR、dispatch失败、compact失败、host重启reconcile）；
-  - `RESUME workflow= node= oldToken=<8位> newToken=<8位> target=judge|actor context=<json>`（判定阶段target=judge，否则actor）；`RESPAWN node= judge=<8位> reason=<json|null>`；`RESOLVE node= result= reason=<json>`；`MODEL workflow= role= provider= model=`（只记id不记凭据）；
-  - `PROGRAM workflow= node= program= result=PASS|FAIL|ERROR reason=<json|null>`（不记parameters）；
+  - `RESUME workflow= node= oldToken=<8位> newToken=<8位> target=judge|actor context=<json>`（判定阶段target=judge，否则actor）；`RESPAWN node= token=<8位> judge=<8位> reason=<json|null>`；`RESOLVE node= token=<8位> result= reason=<json>`；`MODEL workflow= role= provider= model=`（只记id不记凭据，provider/model 经定点 redact）；
+  - `PROGRAM workflow= node= token=<8位> program= result=PASS|FAIL|ERROR reason=<json|null>`（不记parameters）；
   - `PUSH parent=<wf>/<node> token=<8位> child=<childWf>` / `POP child=<childWf> result=PASS parent=<wf>/<node> token=<8位>`（子流程进出显式配对，不再靠parent PASS行间接推断；PUSH/POP 共享 parent node 的 token）；
   - `COMPACT workflow= node= token=<8位> role= ok=<bool> detail=<json|null>`。
   内部nodeToken/Judge session只记8位短前缀作去重标识；`revision`序号留给A1 claim修正协议落地后补充。

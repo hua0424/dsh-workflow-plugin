@@ -35,7 +35,7 @@ interface MemState {
   version: number
 }
 
-function makeStateHost(mem: MemState, shouldFailPut?: () => boolean): StateHost {
+function makeStateHost(mem: MemState, shouldFailPut?: () => boolean, shouldFailCreate?: () => boolean): StateHost {
   return {
     async get() {
       if (mem.run === undefined) return undefined
@@ -50,6 +50,8 @@ function makeStateHost(mem: MemState, shouldFailPut?: () => boolean): StateHost 
       mem.version += 1
     },
     async create(_ws, run) {
+      // A3 review round 3: START seam — create fails after the START line.
+      if (shouldFailCreate?.()) throw new Error('disk full (injected)')
       if (mem.run !== undefined && mem.run.status !== 'completed') {
         const err = new Error(`workspace already has a ${mem.run.status} run`)
         err.name = 'StateConflictError'
@@ -91,6 +93,8 @@ interface Harness {
   steerFailure: Error | undefined
   /** A3 review S4: next N state.put calls throw (crash-seam injection). */
   failNextPuts: number
+  /** A3 review round 3: next N state.create calls throw (START seam injection). */
+  failNextCreates: number
 }
 
 function makeHarness(memArg?: MemState): Harness {
@@ -115,6 +119,7 @@ function makeHarness(memArg?: MemState): Harness {
     programResults: new Map(),
     steerFailure: undefined,
     failNextPuts: 0,
+    failNextCreates: 0,
   }
   const targets: DispatchTargets = {
     async steerManager(_run, text) {
@@ -155,6 +160,9 @@ function makeHarness(memArg?: MemState): Harness {
   }
   h.engine = new WorkflowEngine(targets, subagents, programs, makeStateHost(mem, () => {
     if (h.failNextPuts > 0) { h.failNextPuts -= 1; return true }
+    return false
+  }, () => {
+    if (h.failNextCreates > 0) { h.failNextCreates -= 1; return true }
     return false
   }))
   h.engine.cwdResolver = async () => '/workspace'
@@ -1348,7 +1356,7 @@ test('conflicted startRun leaves NO orphan trace file (A3 review round 2: common
   })
 })
 
-test('credential-shaped raw identifiers (provider/model) are redacted too (A3 review round 2 / AC10)', async () => {
+test('credential-shaped raw identifiers (provider/model) are redacted, but legit structural ids survive (A3 review round 3 S1 / AC10/AC1)', async () => {
   await withTempCatalog('eng-test', async (configPath) => {
     const h = makeHarness()
     await h.engine.startRun('ws', initialRun(), configPath)
@@ -1357,5 +1365,61 @@ test('credential-shaped raw identifiers (provider/model) are redacted too (A3 re
     const log = readRunLog(configPath, 'eng-test')
     assert.ok(!log.includes('sk-liveSECRET123456'), 'credential-shaped provider id redacted')
     assert.match(log, /MODEL workflow=eng-test role=judge provider=\[redacted\] model=normal-model\n/)
+    assert.match(log, /START workflow=eng-test /, 'structural workflow id NOT redacted')
+  })
+})
+
+test('legit secret-pattern-colliding workflow id is NOT redacted (A3 review round 3 S1 regression)', async () => {
+  // 'sk-abcdefgh' matches the credential heuristic but is a legal catalog id
+  // (ID_PATTERN); redacting it would break trace↔catalog correlation.
+  const SK_CONFIG = validateAndNormalize(parseCatalogConfig(`
+schemaVersion: agent-workflow/v1
+roles: {}
+judgeRole: { persona: J }
+workflow:
+  startNode: sk-abcdefgh
+  nodes:
+    sk-abcdefgh:
+      execution: { type: actor-task, role: manager, instruction: Go. }
+      checker: { checkerId: judge.goal-satisfied, config: { criteria: PASS. } }
+      onPass: END
+`), { workflowId: 'sk-abcdefgh' })
+  await withTempCatalog('sk-abcdefgh', async (configPath) => {
+    const h = makeHarness()
+    const run: RunState = {
+      runId: crypto.randomUUID(),
+      managerSessionId: MANAGER,
+      catalogWorkflowId: 'sk-abcdefgh',
+      definitionHash: computeDefinitionHash(SK_CONFIG),
+      definitionSnapshot: SK_CONFIG,
+      status: 'running',
+      callStack: [{ workflowId: 'sk-abcdefgh', nodeId: 'sk-abcdefgh', nodeToken: newNodeToken() }],
+      roleActors: {}, modelOverrides: {}, blockReason: null,
+      nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+    }
+    await h.engine.startRun('ws', run, configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { nodeToken: token, outcome: 'completed', summary: 'ok' }, MANAGER)
+    await h.engine.handleJudgeClaim('ws', token, 'PASS', 'ok', reservedJudgeId(h))
+    const log = readRunLog(configPath, 'sk-abcdefgh')
+    assert.match(log, /START workflow=sk-abcdefgh run=/)
+    assert.match(log, /CLAIM workflow=sk-abcdefgh node=sk-abcdefgh /)
+    assert.match(log, /ROUTE workflow=sk-abcdefgh node=sk-abcdefgh /)
+    assert.ok(!log.includes('[redacted]'), 'no structural id redacted')
+  })
+})
+
+test('crash seam: START is written BEFORE state.create — failure leaves a declared orphan file (A3 review round 3 Spec2 / PRD §10)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    const run = initialRun()
+    h.failNextCreates = 1
+    // Non-conflict create failure (host crash stand-in): START already on
+    // disk, State never created. Declared at-least-once orphan.
+    await assert.rejects(h.engine.startRun('ws', run, configPath), /disk full/)
+    assert.equal(h.mem.run, undefined, 'state never created')
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`^${TS} START workflow=eng-test run=${run.runId} fmt=2\\n`))
+    assert.equal(log.trim().split('\n').length, 1, 'orphan file holds only the START line')
   })
 })

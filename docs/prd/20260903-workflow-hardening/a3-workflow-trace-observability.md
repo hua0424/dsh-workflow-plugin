@@ -252,7 +252,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | ROUTE | `advance()`（含 child END→pop→parent 递归路由） | §3 |
 | BLOCK | `handleBlock`(actor/manager)、NEED_CONTEXT(judge)、`blockOnJudgeFault`(judge)、advance FAIL 无 onFail(judge/program/manager)、program ERROR(program)、`dispatchNow` compact 失败(compact)/dispatch 失败(dispatch)、`handleTurnEnded` 无结果(actor)、`handleRestartReconcile`(restart) | AC5 |
 | RESUME | `handleResume` 判定阶段(judge)/普通路径(actor)，token 轮换后、执行前 | AC6 |
-| RESPAWN | `handleRespawnJudge` 成功后（reason 缺省记 null） | AC6 |
+| RESPAWN | `handleRespawnJudge` 校验+drain 旧 Judge 后、持久化 put **前**（at-least-once；spawn 失败由随后的 judge-fault BLOCK 行覆盖） | AC6 |
 | RESOLVE | `handleResolveProgram` advance 前 | AC6/AC8 |
 | PROGRAM | `handleRunProgram` 结果 revalidation 后（不记 parameters） | AC8 |
 | MODEL | `handleSetRoleModel`（只记 provider/model id） | AC6/AC10 |
@@ -264,7 +264,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 
 ### 13.3 验证情况
 
-- 单元测试：`test/tracelog.test.ts`（fmt=2 助手：转义/截断/null/Escaped 包装防注入/redact 凭据模式）+ `test/engine.test.ts` trace 段（START fmt=2、CLAIM/JUDGE/ROUTE、stale/duplicate claim 不产生 CLAIM（AC2）、FAIL→BLOCK source、NEED_CONTEXT→RESUME(judge)、node_block→RESUME(actor)、actor 无结果 BLOCK、RESPAWN、PUSH/POP 配对、PROGRAM ERROR→RESOLVE、MODEL、restart-reconcile 跨 engine 实例写入同一日志、日志目录不可写时 warn 一次且 Run 行为不变、超限截断单行；审查回归：raw 标识符注入、credential fixture、put 故障 at-least-once crash seam）。164/164 通过。
+- 单元测试：`test/tracelog.test.ts`（fmt=2 助手：转义/截断/null/Escaped 包装防注入/redact 凭据模式/合法 sk-* 结构 ID 不脱敏）+ `test/engine.test.ts` trace 段（START fmt=2、CLAIM/JUDGE/ROUTE、stale/duplicate claim 不产生 CLAIM（AC2）、FAIL→BLOCK source、NEED_CONTEXT→RESUME(judge)、node_block→RESUME(actor)、actor 无结果 BLOCK、RESPAWN、PUSH/POP 配对、PROGRAM ERROR→RESOLVE、MODEL、restart-reconcile 跨 engine 实例写入同一日志、日志目录不可写时 warn 一次且 Run 行为不变、超限截断单行；审查回归：raw 标识符注入、credential fixture、put/create 故障 at-least-once crash seam（CLAIM/RESPAWN/START）、冲突 start 无孤儿文件、合法 secret 碰撞 ID 保留）。169/169 通过。
 - e2e：`scripts/e2e-smoke.mjs` 断言升级为 fmt=2 六行（START/CLAIM/JUDGE/ROUTE×2/CLAIM），隔离临时 home，`E2E SMOKE PASS`。
 - 文档：README "Run trace logs"、设计文档 §5.4（含 at-least-once 一致性语义与 redact 兜底）、CONTEXT.md State 闭集已同步（AC13）。
 - 待运行时验证（随本批统一部署）：真实 milestone-delivery run 的 52 分钟空白场景回放、Host logger warning 实际输出、COMPACT detail 真实文案。
@@ -297,3 +297,15 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 | Spec4 低：PRD §13.2 表格过期 | 属实。CLAIM 行改为「持久化前（at-least-once）」。 |
 
 修正后验证：`pnpm test` 167/167、`pnpm run build` 干净、`pnpm run test:e2e` PASS。
+
+## 16. 第三轮复审修正记录（2026-09-04，6 项全部接纳）
+
+| 审查项 | 结论与修复 |
+| --- | --- |
+| S1/Spec1 中/中高：rawField 全局脱敏把合法 `sk-*` 结构 ID 打成 `[redacted]` | 属实（第二轮过度修正）。`rawField` 恢复不脱敏——raw 值均为 catalog 校验过的结构 ID/枚举；唯一不可信的 raw 输入（MODEL provider/modelId）在 `logModel` 定点 `redact()`。补回归：合法 `sk-abcdefgh` workflow/node id 在 START/CLAIM/ROUTE 中原样保留。 |
+| S2 中低：PRD §13.2 RESPAWN 行仍写「成功后」 | 属实。改为「持久化 put 前（at-least-once）」，与实现和 §13.1 一致。 |
+| S3 低：设计文档 RESPAWN/RESOLVE/PROGRAM 示例缺 token；PRD 数量 164 过期；AGENTS.md 措辞 | 属实。设计文档 §5.4 三个事件示例补 `token=<8位>`；§13.3 更新为 169/169；AGENTS.md 改为「日志内容不进 SQLite，仅 `traceLogPath` 路径元数据进入」。 |
+| Spec2 低中：START 的 at-least-once seam 无故障注入测试 | 属实。harness 加 `failNextCreates`，补 create 故障用例：START 已落盘、State 未创建、文件为声明允许的 orphan。 |
+| Spec3 低：AC13 文档收口 | 随上述 S2/S3 修正完成。 |
+
+修正后验证：`pnpm test` 169/169、`pnpm run build` 干净、`pnpm run test:e2e` PASS。

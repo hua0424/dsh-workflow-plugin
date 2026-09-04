@@ -118,6 +118,10 @@ test('traceEvent: a raw string LOOKING like escaped JSON is re-checked (A3 revie
   assert.ok(!line.includes('\n'), 'single line preserved')
   // Only the Escaped wrapper passes through untouched.
   assert.ok(jsonField('x', 10) instanceof Escaped)
+  // Raw identifiers are NOT redacted: a legit secret-pattern-colliding id
+  // ('sk-…' is valid per ID_PATTERN) must survive for trace↔catalog
+  // correlation (A3 review round 3 S1).
+  assert.equal(traceEvent('ROUTE', { workflow: 'sk-abcdefgh', node: 'sk-abcdefgh' }), 'ROUTE workflow=sk-abcdefgh node=sk-abcdefgh')
 })
 
 test('redact: credential-shaped substrings never survive jsonField (A3 AC10)', () => {

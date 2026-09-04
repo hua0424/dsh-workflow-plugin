@@ -49,7 +49,8 @@
 - 2026-09-04 **A3 已实现**（分支 `a3-trace-observability`，自 main 新建）：trace log 迁移到 fmt=2 统一 `key=value` + JSON escaping 事件格式，新增 CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/MODEL/PUSH/POP 事件，COMPACT 升级为 fmt=2；R5 全部 BLOCK 入口覆盖（含 restart-reconcile，前提为 `traceLogPath` 可选字段随 RunState 持久化）；每 run 首次日志失败经 `engine.traceWarn` → `ctx.logger.warn` 告警一次。实现决策与覆盖对照见 A3 PRD §13。
 - 2026-09-04 **审查修正（首轮 7 项全部接纳，PRD §14）**：Escaped 类型化包装修复 MODEL 多行注入（S1/AC9）、trace 边界 redact 凭据兜底 + fixture（AC10）、CONTEXT.md State 闭集同步（S2）、traceWarnedRuns 清理（S3）、CLAIM 顺序改为 put 前并声明 at-least-once（S4）、AC4 状态措辞（revision 待 A1）。
 - 2026-09-04 **复审修正（第二轮 8 项全部接纳，PRD §15）**：START（预检查+trace-before-create）与 RESPAWN（trace-before-put）消除反向 crash gap；ROUTE/PUSH/POP/COMPACT 补 token 短前缀去重；redact 覆盖 raw 标识符与 Basic auth；warn marker 失败启动清理；PRD §13.2 过期表格修正。
-- 验证：`pnpm test` 167/167、`pnpm run build` 干净、`pnpm run test:e2e` fmt=2 断言全过（隔离临时 home）。
+- 2026-09-04 **第三轮复审修正（6 项全部接纳，PRD §16）**：rawField 恢复不脱敏（合法 `sk-*` 结构 ID 保留），MODEL provider/model 定点 redact；START create 故障 seam 测试；RESPAWN 表格/事件示例/AGENTS.md 文档收口。
+- 验证：`pnpm test` 169/169、`pnpm run build` 干净、`pnpm run test:e2e` fmt=2 断言全过（隔离临时 home）。
 - 部署策略与 A4 一致：本批 PRD 完成后统一 build+deploy，运行时验证项（52 分钟空白回放、warning 实际输出、COMPACT 真实文案）见 PRD §13.3。
 
 ## 4. 待办清单

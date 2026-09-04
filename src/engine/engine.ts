@@ -6,7 +6,7 @@
 import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome } from '../types.ts'
 import { WorkflowError, LIMITS } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
-import { createRunLog, appendLine, jsonField, shortId, traceEvent } from './tracelog.ts'
+import { createRunLog, appendLine, jsonField, redact, shortId, traceEvent } from './tracelog.ts'
 import { SUBMISSION_CONSTRAINT } from './texts.ts'
 
 /** A2 R4: marker prefix compactBeforeDispatch throws with (for clean BLOCK routing). */
@@ -395,13 +395,16 @@ export class WorkflowEngine {
     }))
   }
 
-  /** A3 R6: model override — ids only, never credentials. */
+  /** A3 R6: model override — ids only, never credentials. provider/modelId
+   * are untrusted Manager tool input: redact credential shapes pointwise
+   * (other raw identifiers are catalog-validated and intentionally exempt,
+   * A3 review round 3 S1). */
   private logModel(run: RunState, roleKey: string, provider: string, modelId: string): void {
     this.logLine(run, traceEvent('MODEL', {
       workflow: run.catalogWorkflowId,
       role: roleKey,
-      provider,
-      model: modelId,
+      provider: redact(provider),
+      model: redact(modelId),
     }))
   }
 

@@ -143,13 +143,13 @@ export function jsonField(text: string | null | undefined, max: number): Escaped
   return new Escaped(JSON.stringify(bounded(redact(text), max)))
 }
 
-/** A raw (identifier-like) field value: redacted like free text (A3 review
- * round 2 — untrusted identifiers such as provider/model ids can carry
- * credential shapes), then JSON-quoted if it contains whitespace/quotes. */
+/** A raw (identifier-like) field value: NOT redacted — raw values are
+ * catalog-validated structural ids or enums (review round 3 S1: a legit
+ * `sk-*` workflow/node id must survive for trace↔catalog correlation). The
+ * only untrusted raw inputs (MODEL provider/model) are redacted at the
+ * `logModel` call site. Whitespace/quotes still force JSON quoting. */
 function rawField(value: string | number | boolean): string {
-  const text = redact(String(value))
-  // Legit identifiers never contain these; if unexpected input does, keep
-  // the one-event-per-line invariant by falling back to JSON quoting.
+  const text = String(value)
   if (/[\s"\\]/.test(text)) return JSON.stringify(text)
   return text
 }
