@@ -431,31 +431,39 @@ all-issues-complete?
 文件：`${DSH_HOME}/workflows/milestone-delivery.yaml`
 
 ```yaml
+# Hardened milestone-delivery config (PRD 20260903-workflow-hardening A2).
+# v1-protocol compatible: Judge verdicts stay PASS|FAIL|NEED_CONTEXT; FAIL
+# routes the onFail edge. REJECT/correction-feedback wording lands with A1.
 schemaVersion: agent-workflow/v1
 
 roles:
   developer:
     persona: |
-      Implement the current issue. Use the issue and repository context
-      supplied by the Manager. Report only through node_claim/node_block.
+      Implement the current issue and publish it: implement, run the required
+      implementation-level checks, commit, and push to the identified
+      milestone branch BEFORE claiming completed. Use the issue and repository
+      context supplied by the Manager. Report only through node_claim/node_block.
       node_claim/node_block is the FINAL action of your turn; call it at most
       once per turn, and never after a successful claim.
 
   reviewer:
     persona: |
-      Review the current issue implementation independently.
-      Do not modify implementation files.
-      Report only through node_claim/node_block — a text report alone does not
-      submit your result. node_claim/node_block is the FINAL action of your
-      turn; call it at most once per turn.
+      Review the current implementation independently and READ-ONLY. Review
+      the exact commits identified by the handoff on the remote branch; do
+      not modify implementation files, do not commit, push, or change
+      issues/milestones. Report only through node_claim/node_block — a text
+      report alone does not submit your result. node_claim/node_block is the
+      FINAL action of your turn; call it at most once per turn.
     tools:
       deny: [edit, write]
 
   tester:
     persona: |
-      Execute the tests required by the current issue and leave a clear report.
-      Report only through node_claim/node_block. node_claim/node_block is the
-      FINAL action of your turn; call it at most once per turn.
+      Execute the tests required by the current issue and publish the report:
+      create the test report file, commit, and push it to the identified
+      milestone branch BEFORE claiming completed. Report only through
+      node_claim/node_block. node_claim/node_block is the FINAL action of
+      your turn; call it at most once per turn.
 
 judgeRole:
   persona: |
@@ -465,20 +473,28 @@ judgeRole:
     Prefer PASS/FAIL; use NEED_CONTEXT only when information is genuinely missing.
 
 workflow:
-  startNode: draft-prd
+  startNode: plan-milestone
   nodes:
-    draft-prd:
+    plan-milestone:
       execution:
         type: actor-task
         role: manager
         instruction: |
-          Use the current Manager conversation to create or update the PRD.
+          Plan the milestone delivery from the current user goal: choose the
+          Milestone title and the milestone branch name. Planning only — do
+          not create or modify workspace files, branches, or GitHub objects
+          in this node; the next node initializes them. On completed claim,
+          the handoffContext must carry the repository (owner/repo and origin
+          URL), milestoneTitle, branchName, and a short restatement of the
+          user goal.
       checker:
         checkerId: judge.goal-satisfied
         config:
           criteria: |
-            Inspect docs/prd. PASS only when a PRD exists and covers the
-            current user goal, scope, non-goals and acceptance criteria.
+            The user goal is clear enough to deliver. The handoff identifies
+            the repository (origin), a non-empty actionable milestoneTitle and
+            branchName consistent with the goal, and the goal restatement. Do
+            NOT require the PRD, the Milestone, or the branch to exist yet.
       onPass: initialize-milestone
 
     initialize-milestone:
@@ -486,7 +502,34 @@ workflow:
         type: builtin-program
         programId: github.initialize-milestone
         instruction: |
-          Choose the Milestone title and branch name from the current PRD.
+          Run github.initialize-milestone via node_run_program with title and
+          branchName taken verbatim from the plan-milestone handoff; the
+          repository is the current workspace origin. Do not write any files
+          before this runs — the working tree must still be clean.
+      onPass: draft-prd
+
+    draft-prd:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          The workspace is now on the milestone branch. Create or update the
+          PRD under docs/prd/ (follow the repository PRD convention) covering
+          the user goal, scope, non-goals and acceptance criteria. Commit the
+          PRD and push the commit to the remote milestone branch BEFORE
+          claiming completed. On completed claim, the handoffContext must
+          carry PRD path, PRD commit, repository, branch, milestoneTitle and
+          milestoneNumber.
+      checker:
+        checkerId: judge.goal-satisfied
+        config:
+          criteria: |
+            A PRD exists under docs/prd/ and covers the user goal, scope,
+            non-goals and acceptance criteria. The PRD commit exists on the
+            current milestone branch, and the remote milestone branch contains
+            it. The handoff identifies PRD path, PRD commit, repository,
+            branch, milestoneTitle and milestoneNumber. Do NOT require the
+            default branch to contain the PRD at this point.
       onPass: plan-issues
 
     plan-issues:
@@ -496,14 +539,17 @@ workflow:
         instruction: |
           Create and organize the GitHub Issues required to deliver the PRD.
           When using `gh issue create`, pass the milestone by TITLE
-          (--milestone "<title>"), NOT its number — the gh CLI --milestone flag
-          expects a title, while `gh api ...?milestone=` expects a number.
+          (--milestone "<title>"), NOT its number — the gh CLI --milestone
+          flag expects a title, while `gh api ...?milestone=` expects a
+          number. On completed claim, carry milestoneTitle and milestoneNumber
+          forward in handoffContext.
       checker:
         checkerId: judge.goal-satisfied
         config:
           criteria: |
-            Inspect the PRD, Milestone and Issues. PASS only when required
-            Issues cover the PRD and each Issue is actionable.
+            Inspect the PRD, Milestone and Issues. PASS only when the required
+            Issues cover the PRD, each Issue is actionable, and the handoff
+            carries milestoneTitle and milestoneNumber.
       onPass: run-issue-cycle
 
     run-issue-cycle:
@@ -517,13 +563,49 @@ workflow:
         type: actor-task
         role: reviewer
         instruction: |
-          Review the completed Milestone against the PRD.
+          Review the finished Milestone against the PRD with the remote
+          DEFAULT branch as the authoritative baseline — not the milestone
+          branch. Check the PRD acceptance criteria, every Milestone Issue,
+          each Issue's integrated revision, and the test reports on the
+          default branch. Claim completed once the review itself is done,
+          either way, and record the outcome in handoffContext: satisfied
+          (yes/no), blocking findings (empty when satisfied), PRD path,
+          Milestone number/title, and the default-branch revision reviewed.
       checker:
         checkerId: judge.goal-satisfied
         config:
           criteria: |
-            Inspect the PRD, Milestone Issues and delivered code. PASS only
-            when the Milestone satisfies the acceptance criteria.
+            PASS only when the review was actually performed on the remote
+            default branch, every PRD acceptance criterion is satisfied, all
+            Milestone Issues are closed with integrated revisions, and the
+            handoff records satisfied=yes with no blocking findings. FAIL when
+            any blocking finding exists — the handoff findings then route to
+            remediation.
+      onPass: close-milestone
+      onFail: plan-remediation
+
+    close-milestone:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          Close the delivered Milestone. First confirm the final review was
+          accepted and the Milestone has zero open Issues. Then close it with
+          `gh api --method PATCH repos/{owner}/{repo}/milestones/{number} -f
+          state=closed` — the REST API uses the numeric Milestone number; do
+          not confuse it with `gh issue create --milestone` title semantics.
+          On completed claim, the handoffContext must carry the Milestone
+          URL, number, title, final state, and the default-branch integrated
+          revision.
+      checker:
+        checkerId: judge.goal-satisfied
+        config:
+          criteria: |
+            The GitHub Milestone state is closed, open_issues is 0, every
+            Milestone Issue is closed, and the handoff carries the Milestone
+            URL, number, title, state and the default-branch integrated
+            revision. PASS only when all hold — a still-open Milestone must
+            FAIL.
       onPass: END
       onFail: plan-remediation
 
@@ -532,14 +614,16 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          Turn the final-review findings into one or more unfinished,
-          actionable remediation Issues in the current Milestone.
+          Turn the final-review (or close-milestone) blocking findings from
+          the handoff into one or more unfinished, actionable remediation
+          Issues in the current Milestone. On completed claim, carry the
+          remediation Issue URLs forward in handoffContext.
       checker:
         checkerId: judge.goal-satisfied
         config:
           criteria: |
-            PASS only when every blocking final-review finding is covered by
-            an unfinished actionable Issue in the current Milestone.
+            PASS only when every blocking finding from the handoff is covered
+            by an unfinished, actionable Issue in the current Milestone.
       onPass: run-issue-cycle
 
 childWorkflows:
@@ -552,13 +636,17 @@ childWorkflows:
           role: manager
           instruction: |
             Inspect the current Milestone and select one required unfinished
-            Issue. In node_claim handoffContext, state its URL and repository.
+            Issue. In node_claim handoffContext, carry the Issue URL plus the
+            repository, the milestone branch and the milestone number the
+            delivery will target.
         checker:
           checkerId: judge.goal-satisfied
           config:
             criteria: |
-              PASS only when the selected Issue exists, is unfinished,
-              belongs to the current Milestone and is actionable.
+              PASS only when the selected Issue exists, is unfinished, belongs
+              to the current Milestone, is actionable, and the handoff carries
+              the Issue URL, repository, milestone branch and milestone
+              number.
         onPass: deliver-one-issue
 
       deliver-one-issue:
@@ -572,7 +660,8 @@ childWorkflows:
           type: builtin-program
           programId: github.all-milestone-issues-complete
           instruction: |
-            Use the current Milestone number from the Manager conversation.
+            Use the current Milestone number from the Manager conversation or
+            handoff.
         onPass: END
         onFail: select-next-issue
 
@@ -585,15 +674,22 @@ childWorkflows:
           role: developer
           instruction: |
             Implement the Issue identified in the current handoff message.
-            On completed claim, carry its URL, repository and branch forward
-            in handoffContext for Reviewer.
+            Run the required implementation-level checks, commit the Issue
+            changes, and push the commit to the identified milestone branch
+            BEFORE claiming completed — an uncommitted or unpushed working
+            tree is not a delivery. On completed claim, carry the Issue URL,
+            repository, branch and implementation commit forward in
+            handoffContext for Reviewer.
         checker:
           checkerId: judge.goal-satisfied
           config:
             criteria: |
               Inspect the Issue discussion, repository and commits. PASS only
-              when the requested implementation is complete and published,
-              and the claim handoff identifies the Issue/repository/branch.
+              when the requested implementation is complete, the required
+              implementation-level checks pass, an implementation commit
+              exists, the remote milestone branch contains it, and the claim
+              handoff identifies the Issue, repository, branch and
+              implementation commit.
         onPass: review
         onFail: implement
 
@@ -602,15 +698,22 @@ childWorkflows:
           type: actor-task
           role: reviewer
           instruction: |
-            Review the current Issue implementation. On completed claim,
-            carry the Issue URL, repository and branch forward for Tester.
+            Review the exact implementation commit identified in the handoff
+            on the remote milestone branch — read-only. Claim completed once
+            the review is done, either way, and record the outcome in
+            handoffContext: approved (yes/no), blocking findings (empty when
+            approved), Issue URL, repository, branch and reviewed commit, for
+            Tester.
         checker:
           checkerId: judge.goal-satisfied
           config:
             criteria: |
-              Inspect the Issue, diff and repository. PASS only when the code
-              satisfies the Issue, has no blocking quality problem, and the
-              claim handoff preserves Issue/repository/branch identity.
+              Inspect the Issue, the reviewed commit's diff and the
+              repository. PASS only when the reviewed code satisfies the
+              Issue, has no blocking quality problem, and the handoff
+              preserves the Issue/repository/branch/commit identity with
+              approved=yes. Blocking findings must FAIL and return the Issue
+              to implement.
         onPass: test
         onFail: implement
 
@@ -619,16 +722,25 @@ childWorkflows:
           type: actor-task
           role: tester
           instruction: |
-            Test the current Issue implementation and publish a clear result.
-            On completed claim, carry the Issue URL, repository, branch and
-            test report location forward for Manager delivery.
+            Test the implementation commit identified in the handoff. Create
+            the test report at docs/test-reports/<issue-number>-<slug>-test-report.md
+            recording the Issue URL, repository, branch, tested commit,
+            environment, commands, results and isolation notes. Commit the
+            report and push it to the remote milestone branch BEFORE claiming
+            completed — an untracked or unpushed report is not published. On
+            completed claim, carry the implementation commit, report path and
+            report commit forward in handoffContext for Manager delivery.
         checker:
           checkerId: judge.goal-satisfied
           config:
             criteria: |
-              Inspect the Tester report and relevant repository state. PASS
-              only when required tests were executed and passed, and the claim
-              handoff preserves Issue/repository/branch/report identity.
+              Inspect the test report and repository state. PASS only when the
+              required tests were executed and passed at the identified
+              commit, the report file exists with the required content, the
+              report commit is on the remote milestone branch, and the
+              handoff identifies the implementation commit, report path and
+              report commit. A clean tracked tree with an untracked or
+              unpushed report is NOT published.
         onPass: complete-issue
         onFail: implement
 
@@ -637,14 +749,29 @@ childWorkflows:
           type: actor-task
           role: manager
           instruction: |
-            Deliver the tested implementation according to repository policy
-            and close the current Issue only after delivery is verifiable.
+            Integrate the tested delivery into the remote DEFAULT branch
+            according to repository policy (PR merge or direct merge). Verify
+            by Git ancestry that the default branch now reaches BOTH the
+            implementation commit and the test-report commit; a pushed
+            milestone branch alone is not integration, and an open PR is not
+            a merge. Squash-merge-only repositories need a separate
+            machine-verifiable contract that this workflow does not define —
+            surface that instead of bypassing it. Satisfy the required
+            CI/branch protection, close the Issue only after integration is
+            verifiable, and on completed claim carry the Issue URL, default
+            branch, integrated revision or merged PR URL, and closure state
+            in handoffContext.
         checker:
           checkerId: judge.goal-satisfied
           config:
             criteria: |
               Inspect the Issue, repository and delivered revision. PASS only
-              when the implementation is delivered and the Issue is closed.
+              when the remote default branch contains the delivery by commit
+              ancestry (implementation and test report), any PR used is
+              merged rather than open, required checks pass, the Issue is
+              closed, and the handoff identifies the Issue, default branch,
+              integrated revision or PR, and closure state. A milestone-branch
+              push alone must FAIL.
         onPass: END
         onFail: implement
 ```

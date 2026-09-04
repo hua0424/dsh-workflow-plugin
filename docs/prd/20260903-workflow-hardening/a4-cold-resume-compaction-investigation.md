@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：调查立项；未预设最终修复方案
+- 状态：调查进行中——代码层调研已完成（结论：H1 证实、H2 部分证伪、方案 A 可行，见 [a4-code-findings.md](a4-code-findings.md)）；隔离 harness 运行时验证未开始
 - 类型：诊断/原型/决策 PRD
 
 ## 1. 背景

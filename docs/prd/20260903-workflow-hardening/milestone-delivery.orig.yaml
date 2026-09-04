@@ -1,0 +1,216 @@
+schemaVersion: agent-workflow/v1
+
+roles:
+  developer:
+    persona: |
+      Implement the current issue. Use the issue and repository context
+      supplied by the Manager. Report only through node_claim/node_block.
+      node_claim/node_block is the FINAL action of your turn; call it at most
+      once per turn, and never after a successful claim.
+
+  reviewer:
+    persona: |
+      Review the current issue implementation independently.
+      Do not modify implementation files.
+      Report only through node_claim/node_block — a text report alone does not
+      submit your result. node_claim/node_block is the FINAL action of your
+      turn; call it at most once per turn.
+    tools:
+      deny: [edit, write]
+
+  tester:
+    persona: |
+      Execute the tests required by the current issue and leave a clear report.
+      Report only through node_claim/node_block. node_claim/node_block is the
+      FINAL action of your turn; call it at most once per turn.
+
+judgeRole:
+  persona: |
+    Independently inspect the current claim and real workspace/remote facts.
+    Never modify evaluated artifacts. Submit your verdict ONLY through
+    judge_claim({nodeToken, result: PASS|FAIL|NEED_CONTEXT, reason}).
+    Prefer PASS/FAIL; use NEED_CONTEXT only when information is genuinely missing.
+
+workflow:
+  startNode: draft-prd
+  nodes:
+    draft-prd:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          Use the current Manager conversation to create or update the PRD.
+      checker:
+        checkerId: judge.goal-satisfied
+        config:
+          criteria: |
+            Inspect docs/prd. PASS only when a PRD exists and covers the
+            current user goal, scope, non-goals and acceptance criteria.
+      onPass: initialize-milestone
+
+    initialize-milestone:
+      execution:
+        type: builtin-program
+        programId: github.initialize-milestone
+        instruction: |
+          Choose the Milestone title and branch name from the current PRD.
+      onPass: plan-issues
+
+    plan-issues:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          Create and organize the GitHub Issues required to deliver the PRD.
+          When using `gh issue create`, pass the milestone by TITLE
+          (--milestone "<title>"), NOT its number — the gh CLI --milestone flag
+          expects a title, while `gh api ...?milestone=` expects a number.
+      checker:
+        checkerId: judge.goal-satisfied
+        config:
+          criteria: |
+            Inspect the PRD, Milestone and Issues. PASS only when required
+            Issues cover the PRD and each Issue is actionable.
+      onPass: run-issue-cycle
+
+    run-issue-cycle:
+      execution:
+        type: child-workflow
+        workflowId: issue-cycle
+      onPass: final-review
+
+    final-review:
+      execution:
+        type: actor-task
+        role: reviewer
+        instruction: |
+          Review the completed Milestone against the PRD.
+      checker:
+        checkerId: judge.goal-satisfied
+        config:
+          criteria: |
+            Inspect the PRD, Milestone Issues and delivered code. PASS only
+            when the Milestone satisfies the acceptance criteria.
+      onPass: END
+      onFail: plan-remediation
+
+    plan-remediation:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          Turn the final-review findings into one or more unfinished,
+          actionable remediation Issues in the current Milestone.
+      checker:
+        checkerId: judge.goal-satisfied
+        config:
+          criteria: |
+            PASS only when every blocking final-review finding is covered by
+            an unfinished actionable Issue in the current Milestone.
+      onPass: run-issue-cycle
+
+childWorkflows:
+  issue-cycle:
+    startNode: select-next-issue
+    nodes:
+      select-next-issue:
+        execution:
+          type: actor-task
+          role: manager
+          instruction: |
+            Inspect the current Milestone and select one required unfinished
+            Issue. In node_claim handoffContext, state its URL and repository.
+        checker:
+          checkerId: judge.goal-satisfied
+          config:
+            criteria: |
+              PASS only when the selected Issue exists, is unfinished,
+              belongs to the current Milestone and is actionable.
+        onPass: deliver-one-issue
+
+      deliver-one-issue:
+        execution:
+          type: child-workflow
+          workflowId: issue-delivery
+        onPass: all-issues-complete
+
+      all-issues-complete:
+        execution:
+          type: builtin-program
+          programId: github.all-milestone-issues-complete
+          instruction: |
+            Use the current Milestone number from the Manager conversation.
+        onPass: END
+        onFail: select-next-issue
+
+  issue-delivery:
+    startNode: implement
+    nodes:
+      implement:
+        execution:
+          type: actor-task
+          role: developer
+          instruction: |
+            Implement the Issue identified in the current handoff message.
+            On completed claim, carry its URL, repository and branch forward
+            in handoffContext for Reviewer.
+        checker:
+          checkerId: judge.goal-satisfied
+          config:
+            criteria: |
+              Inspect the Issue discussion, repository and commits. PASS only
+              when the requested implementation is complete and published,
+              and the claim handoff identifies the Issue/repository/branch.
+        onPass: review
+        onFail: implement
+
+      review:
+        execution:
+          type: actor-task
+          role: reviewer
+          instruction: |
+            Review the current Issue implementation. On completed claim,
+            carry the Issue URL, repository and branch forward for Tester.
+        checker:
+          checkerId: judge.goal-satisfied
+          config:
+            criteria: |
+              Inspect the Issue, diff and repository. PASS only when the code
+              satisfies the Issue, has no blocking quality problem, and the
+              claim handoff preserves Issue/repository/branch identity.
+        onPass: test
+        onFail: implement
+
+      test:
+        execution:
+          type: actor-task
+          role: tester
+          instruction: |
+            Test the current Issue implementation and publish a clear result.
+            On completed claim, carry the Issue URL, repository, branch and
+            test report location forward for Manager delivery.
+        checker:
+          checkerId: judge.goal-satisfied
+          config:
+            criteria: |
+              Inspect the Tester report and relevant repository state. PASS
+              only when required tests were executed and passed, and the claim
+              handoff preserves Issue/repository/branch/report identity.
+        onPass: complete-issue
+        onFail: implement
+
+      complete-issue:
+        execution:
+          type: actor-task
+          role: manager
+          instruction: |
+            Deliver the tested implementation according to repository policy
+            and close the current Issue only after delivery is verifiable.
+        checker:
+          checkerId: judge.goal-satisfied
+          config:
+            criteria: |
+              Inspect the Issue, repository and delivered revision. PASS only
+              when the implementation is delivered and the Issue is closed.
+        onPass: END
+        onFail: implement

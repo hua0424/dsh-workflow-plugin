@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：方案已确认，待修改 `${DSH_HOME}/workflows/milestone-delivery.yaml`
+- 状态：**v1 兼容版已落地**。`milestone-delivery.yaml` 已按本 PRD 决策重写并部署（评审副本：本目录 `milestone-delivery.yaml`，旧版备份：`milestone-delivery.orig.yaml`，语义评审记录：`a2-config-review.md`）。Judge 文案沿用 v1 `PASS|FAIL|NEED_CONTEXT`、FAIL 走 `onFail` 边；A1 的 `REJECT`/correction-feedback 文案落地后需同步升版配置
 - 类型：配置与提示词改造，不新增业务状态机代码（关闭 Milestone 所需 GitHub 操作由 Manager actor 执行）
 
 ## 1. 背景
