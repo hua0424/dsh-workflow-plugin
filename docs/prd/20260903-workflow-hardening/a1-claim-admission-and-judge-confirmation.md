@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：核心语义已确认，待实现
+- 状态：已决策（见 §7），机制设计见 `a1-design.md`，待实现
 - 关联问题：未实际 dispatch 的节点可以提前 claim；Judge REJECT 原因未传回 Actor；Actor 不应手工填写 nodeToken
 
 ## 1. 背景
@@ -191,6 +191,8 @@ REJECT 属于同一业务 Node 的 claim revision，而不是 Graph 自环：
 - 若项目确认 v1 尚未形成兼容承诺，也可原地升级，但必须同步 `CONTEXT.md`、设计文档、工具 schema、所有示例和 tests，并在 release note 标为 breaking semantic change。
 
 禁止在不记录兼容决策的情况下静默改变 v1。
+
+> **决策（2026-09-05，用户确认）：原地升级。** `SCHEMA_VERSION` 直接改为 `agent-workflow/v2`、checker 更名 `judge.claim-correct`，全量迁移配置/示例/测试/文档，标 breaking semantic change，不维护 v1/v2 双轨。核心理由：工具 schema 全局单份，双轨会把 `judge_claim` enum 污染成五值并集、`node_claim` 的 nodeToken 变成按 run 版本分叉的运行时分支；双语义引擎路径是永久测试矩阵成本；唯一真实 catalog 部署配置只影响新 run；存量 v1 运行行在 host 重启后本就被 restart-reconcile BLOCK（fail-closed，退出路径 `/dsh-flow reset`）。机制细节与旧 v1 行为清单见 `a1-design.md` §0/§8。
 
 ## 8. 非目标
 
