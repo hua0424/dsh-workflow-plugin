@@ -2,7 +2,7 @@
 
 - 日期：2026-09-03
 - 来源：真实 `milestone-delivery` run `b2697138-3db5-4ab8-ac11-75e4777f91ac` 复盘
-- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；AC4 revision 待 A1 claim 修正协议落地后补，其余 AC 已实现；部署与运行时验证随本批 PRD 统一进行）
+- 状态：已实现（2026-09-04，分支 `a3-trace-observability`；AC4 的 revision 序号经 A1 决议改为以 token 前缀 + CORRECT 事件覆盖（见 §5 R2 决议注），其余 AC 已实现；部署与运行时验证随本批 PRD 统一进行）
 - 关联需求：记录每个 Node 的 Actor claim、Judge 输出、BLOCK/RESUME
 
 ## 1. 背景
@@ -115,6 +115,8 @@ ROUTE ... result=PASS ...
 
 revision 是当前 Node 内的派生追踪序号，不要求进入长期业务 State；若为恢复一致性需要持久化，应只保存当前 revision。
 
+> **A1 决议（2026-09-05，见 `a1-design.md` §0 D2/§6.6）**：不引入 revision 字段。每次 REJECT 轮换 nodeToken 并退役 Judge，CLAIM/JUDGE/CORRECT 行各自携带当次 token 8 位短前缀即可区分轮次；旧 Judge 重复提交由 token/judgeSession 双重拒绝。本节示例中的 `revision=n` 以 token 前缀差异替代实现。
+
 ## 6. Judge 日志
 
 ### R3：记录 accepted Judge confirmation
@@ -223,7 +225,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 - **AC1 Claim**：每个 accepted Actor claim 有一条 CLAIM，字段完整且 escaped。
 - **AC2 Rejected claim**：stale/unauthorized/duplicate claim 不产生正式 CLAIM。
 - **AC3 Judge**：每个 accepted Judge result 有一条 JUDGE，包含完整有界 reason。
-- **AC4 Correction**：连续 REJECT/修正可按 revision 还原。
+- **AC4 Correction**：连续 REJECT/修正可按 revision 还原。（A1 决议后以 token 前缀轮换 + CORRECT 事件还原轮次，等价满足——见 §5 R2 决议注）
 - **AC5 BLOCK**：所有列出的 BLOCK 入口都有日志；真实 actor-no-result 不再形成 52 分钟空白。
 - **AC6 RESUME**：node_resume/respawn/resolve 均可在 trace 中看到。
 - **AC7 PUSH/POP**：嵌套 child workflow 的进入与返回可显式配对。
@@ -239,7 +241,7 @@ PROGRAM workflow=<id> node=<id> program=<programId> result=<PASS|FAIL|ERROR> rea
 ### 13.1 实现时选定的决策
 
 - **§3 格式**：选定**迁移为 ROUTE**（不保留旧 `NODE ... PASS -> ...`），全套事件统一为单行 `key=value` + JSON string escaping，`START` 行声明 `fmt=2` 作版本标记；README/设计文档/单元测试/e2e 断言同步更新，无双格式并存。
-- **§3 JUDGE 取值**：`result` 沿用现行 judge_claim 协议的 `PASS|FAIL|NEED_CONTEXT`（本 PRD 草案中的 `ACCEPT|REJECT` 是 A1 新协议术语）；A1 落地时同步改枚举并保留 `revision` 字段（§5 R2 的 revision 是 A1 claim 修正协议的派生序号，当前单 claim 协议下恒为首次，先以 `token` 8 位短前缀满足 §10 去重诉求）。
+- **§3 JUDGE 取值**：`result` 沿用现行 judge_claim 协议的 `PASS|FAIL|NEED_CONTEXT`（本 PRD 草案中的 `ACCEPT|REJECT` 是 A1 新协议术语）；A1 落地时同步改枚举（2026-09-05 决议：不加 `revision` 字段，token 8 位短前缀 + A1 新增 CORRECT 事件满足 §10 去重诉求，见 `a1-design.md` §0 D2）。
 - **traceLogPath 持久化（R5 restart 覆盖的前提）**：原实现日志路径只存 Engine 内存 map，host 重启即丢，restart-reconcile BLOCK 无法落盘。现将可选字段 `traceLogPath` 随 RunState 行持久化（state store 为宽松 JSON 序列化，向后兼容；pre-A3 旧行无此字段，日志 no-op）。日志本身仍是派生产物，不进 SQLite 之外的任何状态语义。代价（复审后修正措辞）：workspace 冲突的常见路径由 `startRun` 预检查拦截、不产生任何文件；仅并发竞态或 `state.create` 异常会残留孤儿文件，且因 START 先于 create 写入，孤儿文件内含一条 START 行（at-least-once 声明允许，见 §13.1 一致性语义与 §16）。
 - **§10 告警**：`appendLine` 改为返回布尔；Engine 新增可注入 `traceWarn`（插件接线到 `ctx.logger.warn`），每 run 首次创建/追加失败各告警一次，之后静默。
 

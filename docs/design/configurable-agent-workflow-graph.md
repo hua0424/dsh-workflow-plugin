@@ -371,7 +371,7 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
   - `PROGRAM workflow= node= token=<8位> program= result=PASS|FAIL|ERROR reason=<json|null>`（不记parameters）；
   - `PUSH parent=<wf>/<node> token=<8位> child=<childWf>` / `POP child=<childWf> result=PASS parent=<wf>/<node> token=<8位>`（子流程进出显式配对，不再靠parent PASS行间接推断；PUSH/POP 共享 parent node 的 token）；
   - `COMPACT workflow= node= token=<8位> role= ok=<bool> detail=<json|null>`。
-  内部nodeToken/Judge session只记8位短前缀作去重标识；`revision`序号留给A1 claim修正协议落地后补充。
+  内部nodeToken/Judge session只记8位短前缀作去重标识；A1 决议不引入`revision`序号——claim 修正轮次由每次 REJECT 的 token 轮换区分，并新增 `CORRECT` 事件标记重派边界（见 `docs/prd/20260903-workflow-hardening/a1-design.md` §0 D2/§7.2）。
 - **隐私边界**：只记录Engine已接受的协议载荷（summary≤4000、handoff≤8000、judge reason≤2000、BLOCK reason≤4000、resolutionContext≤8000）；不记reasoning、普通tool调用、Node-local transcript、program parameters；AUTH/credential错误沿用Host安全化文案，且trace边界（`jsonField`）另有一组固定模式的credential redact兜底（Bearer/sk-*/api_key类），双保险确保凭据形态文本不落盘。
 - **一致性语义（at-least-once）**：事件写入顺序固定为「业务校验→写trace→持久化状态转换」（A3 §10），包括 START（workspace 唯一性预检查通过后先写 START 再 create，仅并发竞态/create 抛错可产生孤立文件）与 RESPAWN（put 前写）；trace与State之间无法做到exactly-once，崩溃缝隙允许产生孤立事件行，**node 级事件（CLAIM/JUDGE/ROUTE/BLOCK/RESUME/RESPAWN/RESOLVE/PROGRAM/PUSH/POP/COMPACT）均携带 nodeToken 短前缀用于去重**——循环回到同一 Node 会铸新 token，合法重复与崩溃重复由此可分；run 级事件以 runId（START）或 role（MODEL）标识；State/Git/GitHub始终是权威。反向缺口（State已接受而trace缺失）不存在于正常路径。
 - **失败容忍（R4）**：tracelog模块所有函数绝不抛错——目录/文件创建失败返回`undefined`、追加失败静默返回`false`，日志问题永不影响Run推进。首个失败通过Host logger warning一次（不循环刷warning）；State/Git/GitHub与trace冲突时前者权威。
