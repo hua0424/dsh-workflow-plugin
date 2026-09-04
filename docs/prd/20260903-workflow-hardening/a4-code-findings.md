@@ -53,7 +53,7 @@ Node N dispatch → actor turn（node_claim 是 turn 内 tool call，SUBMISSION_
 约束与注意：
 
 1. **必须先 dispose 再 followup**：同 id 的 Agent 已在注册表时 `AgentRegistry.enter` 拒绝，续管 manager 的 coldResume 会失败。顺序 await 即无并发（H3 的并发担忧只在乱序时成立）。
-2. 成本：每个 Node 边界一次额外物化 + 一次摘要 LLM 调用（followup 的 coldResume 本来也要物化，故为"双重物化"）。摘要路由建议传角色 route（`resolveRoleModel`）保持与 Actor 模型一致。
+2. 成本：每个 Node 边界一次额外物化 + 一次摘要 LLM 调用（followup 的 coldResume 本来也要物化，故为"双重物化"）。**摘要模型与 Actor 模型可以不一致**：DSH summarizer 的路由优先级是 compaction 配置 `summarizationProvider/summarizationModel`（可为摘要配置独立模型）> 会话最近一次实际路由（默认即 Actor 自己用的模型，summarizer.ts:138 `configured ?? latest ?? agentTarget`）> resume 时传入的 agentOptions（仅末位兜底）。实现里传角色 route 只是镜像 coldResume 的兜底行为，不构成"摘要必须与 Actor 同模型"的约束。
 3. 失败语义：`resume` 失败（persistence 故障）或 `compactNow` 抛 `ManualCompactionError`（busy/cancelled/changed/summary/commit/persistence）应 fail-closed BLOCK，复用 A2 R4 既有的 `COMPACT_FAIL_PREFIX` 通知与 resume 框架；窄竞态下的 `busy`（Actor 仍 resident）可降级为跳过。
 4. 对插件其他机制无副作用：`src/index.ts:364-365` 的 turn 结算订阅只认 `turn/end`，compaction 事件不会误触发；摘要走 `ctx.llm` 直调，不产生 Agent turn，不需要 role-actor 授权。
 

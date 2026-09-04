@@ -356,8 +356,11 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       try {
         handle = await adapters.ctx.agents.resume({
           resumeSessionId: childId as SessionId,
-          // Keep the summarizer on the role's own route (the same options the
-          // continuation manager re-applies when IT cold-resumes this child).
+          // Mirrors the agentOptions the continuation manager re-applies when
+          // IT cold-resumes this child. This is only the summarizer's LAST
+          // fallback (compaction summarization* config > the session's own
+          // latest routed request), so the summary model may differ from the
+          // actor's model.
           agentOptions: route.provider !== undefined || route.model !== undefined ? route : undefined,
         })
       } catch (error) {
