@@ -12,7 +12,7 @@
 | [A4](a4-cold-resume-compaction-investigation.md) | Cold-resume Compaction 调查 | ✅ 方案 A 已实现并合并 main（PRD 已审查）；部署与运行时验证延后统一进行 | 11 | — | 见 §3 与 [a4-code-findings.md](a4-code-findings.md) |
 | [A1](a1-claim-admission-and-judge-confirmation.md) | Claim Admission 与 Judge 确认协议 | ✅ 已实现并已合并 main（分支 a1-claim-admission 按 `a1-design.md` §11 七步落地；两轮设计评审 + 三轮实现评审全部修正；209/209 单测 + e2e v2 全链路）；部署与运行时验证延后统一进行 | 1、2、7 | 2026-09-05 | 见 §3.2 与 PRD §13 结项记录 |
 | [A3](a3-workflow-trace-observability.md) | Workflow Trace 可观测性 | ✅ 已实现（分支 a3-trace-observability；AC4 revision 经 A1 决议由 token 前缀 + CORRECT 事件等价覆盖；审查 7 项已全部修正）；部署与运行时验证延后统一进行 | 9 | 2026-09-04 | 见 §3.1 与 PRD §13/§14 实现与审查记录 |
-| [A5](a5-provider-retry-boundary.md) | Provider Retry 边界 | ⬜ 未开始（跨插件依赖） | 8 + 额度问题 | — | 需在 commandcode provider 侧建立 retry 有界化 Issue，Workflow 侧只保留通用恢复 |
+| [A5](a5-provider-retry-boundary.md) | Provider Retry 边界 | ❎ 放弃（用户决策 2026-09-05：需修改外部 commandcode provider 插件，不修复；改用其他模型规避额度/重试问题） | 8 + 额度问题 | — | — |
 
 实施顺序依据 README §4：A1（Phase 1）→ A3/A4/A5（Phase 2，可并行）→ A2 定稿 + 隔离验收 run（Phase 3）。
 本轮按用户决策提前执行了 A2 的 v1 兼容版；A1 落地后需按 §2 遗留项回补配置文案。
@@ -63,11 +63,11 @@
 
 ## 4. 待办清单
 
-- [ ] A4：运行时验证（方案 A 已实现并合并 main；部署与其他 PRD 完成后统一 build+deploy + 隔离 harness 验证 AC1/AC3/AC4/AC6，数据齐备后按 AC9 回写设计文档）
-- [ ] A1：批末统一部署（build+deploy + 真实 `~/.dsh/workflows/milestone-delivery.yaml` 重新生成；旧 v1 运行行 fail-closed，退出 `/dsh-flow reset`）与运行时验证（实现已完成，见 §3.2）
-- [ ] A3：运行时验证（方案已实现；统一部署后回放 52 分钟空白场景、确认 warning 输出与 COMPACT 文案）
-- [ ] A5：在 commandcode provider 仓库建 retry 有界化 Issue；验证 workflow 通用 BLOCK/resume 恢复
-- [ ] A2 遗留 L1/L2（配置已在 A1 实现中随 v2 迁移升版；L2 handoff-verdict workaround 待在真实 run 中确认 failed-claim 语义直传后移除）；MODEL 上限（provider/modelId 64/128）已随 A1 实现落地
+- [ ] A4：运行时验证（方案 A 已实现并合并 main；2026-09-05 已随批末统一 build+deploy 部署，重启后隔离 harness 验证 AC1/AC3/AC4/AC6，数据齐备后按 AC9 回写设计文档）
+- [ ] A1：2026-09-05 统一 build+deploy 完成（真实 `~/.dsh/workflows/milestone-delivery.yaml` 已覆盖为 v2、`smoke-test.yaml` 同步升 v2、catalog 扫描 `diagnostics: []`；本仓库工作区存一行 v1 completed 旧运行行，真实测试前 `/dsh-flow reset`）；运行时验证待重启后进行
+- [ ] A3：运行时验证（已实现并已随批末部署；重启后回放 52 分钟空白场景、确认 warning 输出与 COMPACT 文案）
+- [x] ~~A5~~：放弃（2026-09-05 用户决策，不改外部 commandcode provider 插件）
+- [ ] A2 遗留 L2（配置已在 A1 实现中随 v2 迁移升版；L2 handoff-verdict workaround 待在真实 run 中确认 failed-claim 语义直传后移除）
 - [ ] Phase 3：隔离 GitHub 测试仓库完整 acceptance run（default branch contains delivery、Issues closed、Milestone closed、END）
 - [x] A2：v1 兼容配置强化并部署（2026-09-04）
 - [x] A3：fmt=2 trace 事件全覆盖实现 + 单测/e2e/文档（2026-09-04，分支 a3-trace-observability）
