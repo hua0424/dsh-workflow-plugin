@@ -1405,6 +1405,9 @@ export class WorkflowEngine {
     if (this.currentNodeKind(run) !== 'builtin-program') {
       return { ok: false, reason: `current node is ${this.currentNodeKind(run)}; only builtin-program accepts node_resolve_program` }
     }
+    // A1 review fix: same defensive trim as the judge/block/resume reasons —
+    // the resolve reason flows into the trace line and any FAIL BLOCK reason.
+    reason = reason.trim()
     // Clear the BLOCK before advancing; advance() re-BLOCKs on a FAIL without
     // an onFail edge (design §5.2 G6 / acceptance G6).
     run.status = 'running'

@@ -1992,11 +1992,15 @@ test('persistDeferred with no prior book falls back to an empty executor and the
   await ontoBuildNode(h)
   const buildToken = topFrame(h.mem.run!).nodeToken
   await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
-  // A fresh engine over the SAME durable state has an EMPTY dispatch book —
-  // this REJECT's persistDeferred must inherit nothing and still defer.
+  // A fresh engine over the SAME durable state has an EMPTY dispatch book.
   const h2 = makeHarness(h.mem)
+  // Force the DEFERRED path (review round 3 note): the actor turn is still
+  // open, so the REJECT's correction defers into a persistDeferred book
+  // instead of dispatchNow.
+  h2.engine.actorActivity = async () => 'active'
   await h2.engine.handleJudgeClaim('ws', buildToken, 'REJECT', 'tests missing', h.mem.run!.judgeSessionId!)
-  assert.equal(h2.mem.run!.status, 'running', 'correction deferred while the actor turn is open')
+  assert.equal(h2.mem.run!.status, 'running')
+  assert.equal(h2.actorMessages.length, 0, 'correction deferred — nothing dispatched yet')
   // The book's executorSessionId fell back to '' — turn settlement from ANY
   // session drives the deferred correction dispatch.
   await h2.engine.handleTurnEnded('ws', MANAGER)
