@@ -10,7 +10,7 @@
 |---|---|---|---|---|---|
 | [A2](a2-milestone-delivery-config-hardening.md) | milestone-delivery 配置强化 | ✅ 已完成（v1 兼容版，已部署） | 3、4、5、6、10 | 2026-09-04 | 本目录 `milestone-delivery.yaml`（新配置）、`milestone-delivery.orig.yaml`（旧版备份）、[a2-config-review.md](a2-config-review.md)（语义评审）；线上 catalog definitionHash `7961a32a…` 与评审副本一致 |
 | [A4](a4-cold-resume-compaction-investigation.md) | Cold-resume Compaction 调查 | ✅ 方案 A 已实现并合并 main（PRD 已审查）；部署与运行时验证延后统一进行 | 11 | — | 见 §3 与 [a4-code-findings.md](a4-code-findings.md) |
-| [A1](a1-claim-admission-and-judge-confirmation.md) | Claim Admission 与 Judge 确认协议 | ✅ 已实现（分支 a1-claim-admission，按 `a1-design.md` §11 七步落地；两轮设计评审全部修正；202/202 单测 + e2e v2 全链路）；部署与运行时验证延后统一进行 | 1、2、7 | 2026-09-05 | 见 §3.2 与 PRD §13 结项记录 |
+| [A1](a1-claim-admission-and-judge-confirmation.md) | Claim Admission 与 Judge 确认协议 | ✅ 已实现并已合并 main（分支 a1-claim-admission 按 `a1-design.md` §11 七步落地；两轮设计评审 + 三轮实现评审全部修正；209/209 单测 + e2e v2 全链路）；部署与运行时验证延后统一进行 | 1、2、7 | 2026-09-05 | 见 §3.2 与 PRD §13 结项记录 |
 | [A3](a3-workflow-trace-observability.md) | Workflow Trace 可观测性 | ✅ 已实现（分支 a3-trace-observability；AC4 revision 经 A1 决议由 token 前缀 + CORRECT 事件等价覆盖；审查 7 项已全部修正）；部署与运行时验证延后统一进行 | 9 | 2026-09-04 | 见 §3.1 与 PRD §13/§14 实现与审查记录 |
 | [A5](a5-provider-retry-boundary.md) | Provider Retry 边界 | ⬜ 未开始（跨插件依赖） | 8 + 额度问题 | — | 需在 commandcode provider 侧建立 retry 有界化 Issue，Workflow 侧只保留通用恢复 |
 
