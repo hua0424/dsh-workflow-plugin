@@ -1917,3 +1917,90 @@ test('NEED_CONTEXT BLOCK + override keeps the boundary (idle-replacement semanti
   assert.equal(h.mem.run!.nodeBoundary.dispatchedAt, boundaryAt, 'boundary untouched')
   assert.equal(h.mem.run!.roleActors['developer'], undefined, 'idle mapping removed for later nodes')
 })
+
+test('model override on a completed run does not throw (review: empty callStack)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built' }, actorCaller(h))
+  await h.engine.handleJudgeClaim('ws', buildToken, 'ACCEPT', 'ok', reservedJudgeId(h))
+  await h.engine.handleTurnEnded('ws', 'actor-child-1')
+  assert.equal(h.mem.run!.status, 'completed')
+  assert.equal(h.mem.run!.callStack.length, 0)
+  // A completed run has no top frame — the guard must not read one.
+  const outcome = await h.engine.handleSetRoleModel('ws', 'developer', 'p2', 'm2')
+  assert.ok(outcome.ok)
+  assert.deepEqual(h.mem.run!.modelOverrides['developer'], { provider: 'p2', modelId: 'm2' })
+})
+
+// ---- A1 review-fix regressions ----
+
+test('a sibling role actor cannot block a node whose executor mapping drifted (lease fail-closed)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  await ontoBuildNode(h)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  // Drift: the durable mapping for the CURRENT role is gone, while a sibling
+  // actor session may still be authorized through its own mapping. The
+  // DispatchBook — not the mapping — names the precise executor.
+  delete h.mem.run!.roleActors['developer']
+  const sibling = await h.engine.handleBlock('ws', buildToken, 'sibling tries to block', { sessionId: 'actor-child-2', turnUserMessageIds: new Set(h.messageIds) })
+  assert.ok(!sibling.ok)
+  assert.match(sibling.reason ?? '', /无法绑定到一个已 dispatch 的 Node/)
+  assert.equal(h.mem.run!.status, 'running')
+  // The TRUE executor (the dispatch's book truth, mapping-independent) still binds.
+  const own = await h.engine.handleBlock('ws', buildToken, 'own pause', actorCaller(h))
+  assert.ok(own.ok)
+  assert.equal(h.mem.run!.status, 'blocked')
+})
+
+test('the Manager-executor node requires the lease for the Manager itself (empty turn ids rejected)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  const wrongTurn = await h.engine.handleBlock('ws', token, 'no binding', { sessionId: MANAGER, turnUserMessageIds: new Set() })
+  assert.ok(!wrongTurn.ok)
+  assert.match(wrongTurn.reason ?? '', /无法绑定到一个已 dispatch 的 Node/)
+  assert.equal(h.mem.run!.status, 'running')
+  const own = await h.engine.handleBlock('ws', token, 'pause', mgr(h))
+  assert.ok(own.ok)
+  assert.equal(h.mem.run!.status, 'blocked')
+})
+
+test('padded protocol payloads are stored/traced trimmed (engine defensive normalize)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  const paddedSummary = ' '.repeat(6000) + 'planned' + ' '.repeat(6000)
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: paddedSummary, handoffContext: '  hand  ' }, mgr(h))
+  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'completed', summary: 'planned', handoffContext: 'hand' })
+  await h.engine.handleJudgeClaim('ws', token, 'REJECT', ' '.repeat(5000) + 'redo' + ' '.repeat(5000), reservedJudgeId(h))
+  assert.deepEqual(h.mem.run!.pendingCorrection, { judgeReason: 'redo', previousClaim: { outcome: 'completed', summary: 'planned', handoffContext: 'hand' } })
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  const correction = h.steers.at(-1)!
+  assert.ok(correction.includes('[judge rejection]\nredo\n'), 'correction carries the trimmed reason')
+  assert.ok(!correction.includes(' '.repeat(100)), 'no whitespace padding in the correction message')
+})
+
+test('persistDeferred with no prior book falls back to an empty executor and the deferred correction still dispatches on turn/end (review gap)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  await ontoBuildNode(h)
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'built v1' }, actorCaller(h))
+  // A fresh engine over the SAME durable state has an EMPTY dispatch book —
+  // this REJECT's persistDeferred must inherit nothing and still defer.
+  const h2 = makeHarness(h.mem)
+  await h2.engine.handleJudgeClaim('ws', buildToken, 'REJECT', 'tests missing', h.mem.run!.judgeSessionId!)
+  assert.equal(h2.mem.run!.status, 'running', 'correction deferred while the actor turn is open')
+  // The book's executorSessionId fell back to '' — turn settlement from ANY
+  // session drives the deferred correction dispatch.
+  await h2.engine.handleTurnEnded('ws', MANAGER)
+  const correction = h2.actorMessages.at(-1)
+  assert.ok(correction !== undefined && correction.includes('[correction]'), 'deferred correction dispatched after the settlement')
+  assert.match(correction, /\[judge rejection\]\ntests missing/)
+})

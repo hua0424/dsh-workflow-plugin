@@ -128,7 +128,13 @@ export const workflowTools: ToolDefinition[] = [
         const handoffError = lengthError('handoffContext', args.handoffContext, 1, LIMITS.handoffMax, false)
         if (handoffError !== undefined) return `拒绝：${handoffError}`
       }
-      const outcome = await host.claim(auth.workspaceKey, { outcome: args.outcome, summary: args.summary, handoffContext: args.handoffContext }, claimCallerOf(exec))
+      const outcome = await host.claim(auth.workspaceKey, {
+        outcome: args.outcome,
+        // Review fix: length checks are trim-based, so the STORED payloads are
+        // the trim results — a whitespace bomb must never reach State.
+        summary: args.summary.trim(),
+        handoffContext: args.handoffContext !== undefined ? args.handoffContext.trim() : undefined,
+      }, claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },
@@ -147,7 +153,7 @@ export const workflowTools: ToolDefinition[] = [
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       const reasonError = lengthError('reason', args.reason, 1, LIMITS.blockReasonMax, true)
       if (reasonError !== undefined) return `拒绝：${reasonError}`
-      const outcome = await thisHost().block(auth.workspaceKey, args.nodeToken, args.reason, claimCallerOf(exec))
+      const outcome = await thisHost().block(auth.workspaceKey, args.nodeToken, args.reason.trim(), claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },
@@ -166,7 +172,7 @@ export const workflowTools: ToolDefinition[] = [
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       const ctxError = lengthError('resolutionContext', args.resolutionContext, LIMITS.resolutionMin, LIMITS.resolutionMax, true)
       if (ctxError !== undefined) return `拒绝：${ctxError}`
-      return fmtResult(await thisHost().resume(auth.workspaceKey, args.nodeToken, args.resolutionContext, auth.caller))
+      return fmtResult(await thisHost().resume(auth.workspaceKey, args.nodeToken, args.resolutionContext.trim(), auth.caller))
     },
   }),
 
@@ -199,7 +205,7 @@ export const workflowTools: ToolDefinition[] = [
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       const reasonError = lengthError('reason', args.reason, 1, LIMITS.blockReasonMax, true)
       if (reasonError !== undefined) return `拒绝：${reasonError}`
-      return fmtResult(await thisHost().resolveProgram(auth.workspaceKey, args.nodeToken, args.result, args.reason, auth.caller))
+      return fmtResult(await thisHost().resolveProgram(auth.workspaceKey, args.nodeToken, args.result, args.reason.trim(), auth.caller))
     },
   }),
 
@@ -248,7 +254,7 @@ export const workflowTools: ToolDefinition[] = [
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       const reasonError = lengthError('reason', args.reason, LIMITS.reasonMin, LIMITS.reasonMax, true)
       if (reasonError !== undefined) return `拒绝：${reasonError}`
-      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason, auth.caller)
+      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason.trim(), auth.caller)
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },

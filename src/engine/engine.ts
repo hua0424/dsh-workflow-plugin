@@ -835,6 +835,12 @@ export class WorkflowEngine {
     }
     this.inFlight.set(flightKey, 'judge')
     try {
+      // A1 review fix: the tool layer validates trim-based lengths, so the
+      // payloads persisted/traced here are trimmed defensively too — a
+      // whitespace-padded summary can never bloat State or the correction
+      // message regardless of how the caller reached the engine.
+      const summary = claim.summary.trim()
+      const handoff = claim.handoffContext?.trim()
       // Prepare every fallible packet input BEFORE publishing the reserved id.
       const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
       const cwd = await this.cwdResolver(run)
@@ -848,9 +854,9 @@ export class WorkflowEngine {
         return { ok: false, reason: 'stale claim discarded: the node moved or blocked meanwhile' }
       }
       const reservedJudgeSessionId = newNodeToken()
-      entered.run.pendingClaim = { outcome: claim.outcome, summary: claim.summary }
-      if (claim.outcome === 'completed' && claim.handoffContext !== undefined && claim.handoffContext.trim() !== '') {
-        entered.run.pendingClaim.handoffContext = claim.handoffContext.trim()
+      entered.run.pendingClaim = { outcome: claim.outcome, summary }
+      if (claim.outcome === 'completed' && handoff !== undefined && handoff !== '') {
+        entered.run.pendingClaim.handoffContext = handoff
       }
       entered.run.judgeSessionId = reservedJudgeSessionId
       // A3 R1 + §10 crash-seam order: validate → trace → persist. The CLAIM
@@ -863,7 +869,7 @@ export class WorkflowEngine {
         topFrame(entered.run),
         node.execution.role ?? 'manager',
         claim.outcome,
-        claim.summary,
+        summary,
         entered.run.pendingClaim.handoffContext ?? null,
       )
       await this.state.put(workspaceKey, entered.run, entered.version)
@@ -881,7 +887,7 @@ export class WorkflowEngine {
           nodeToken: frame.nodeToken,
           instruction: node.execution.instruction ?? '',
           criteria,
-          claim: { outcome: claim.outcome, summary: claim.summary },
+          claim: { outcome: claim.outcome, summary },
           // A1 §7.1: a re-claim after a REJECT carries the prior evidence.
           previousRejection: entered.run.pendingCorrection,
           cwd,
@@ -960,6 +966,10 @@ export class WorkflowEngine {
     if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}; judge claims are rejected` }
     const frame = topFrame(run)
     if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
+    // A1 review fix: the stored/traced reason is the trim result — a
+    // whitespace-padded reason must not bloat State or the correction message
+    // (design §6.3/§6.4 bound the LIMITS at their trim semantics).
+    reason = reason.trim()
     // A1 R9 / AC9: only the current node's mapped judge session may claim.
     if (run.judgeSessionId === undefined || run.judgeSessionId !== judgeSessionId) {
       return { ok: false, reason: 'judge session is not the current node judge' }
@@ -1168,30 +1178,46 @@ export class WorkflowEngine {
     if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}` }
     const frame = topFrame(run)
     if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
-    // Manager may block any current node; a role actor may block only its own.
-    const expectedExecutor = executorSessionOf(run)
     const isManager = run.managerSessionId === caller.sessionId
-    if (!isManager && expectedExecutor !== '' && expectedExecutor !== caller.sessionId) {
-      return { ok: false, reason: 'only the current node executor or the Manager may block' }
-    }
-    // A1 §5.2: lease binding applies ONLY when the current node is an
-    // actor-task AND the caller is its precise executor (Manager-executor or
-    // the role Actor) — the claim/block pair shares one dispatch lease, so a
-    // second claim/block on the same dispatch and a stale-turn block are both
-    // rejected. Manager blocks on role-executor nodes stay control-plane
-    // (node_resume's sibling), and builtin-program / child-workflow nodes
-    // publish no lease at all (Manager-driven control-plane by design).
-    if (this.currentNodeKind(run) === 'actor-task' && expectedExecutor === caller.sessionId) {
-      const lease = this.admitLease(workspaceKey, run, caller)
-      if (!lease.ok) {
-        return { ok: false, reason: '当前调用无法绑定到一个已 dispatch 的 Node' }
+    // A1 §5.2, review fix: classify by NODE ROLE — never by the drift-prone
+    // roleActors mapping. executorSessionOf() returning '' for a missing
+    // mapping must not fail OPEN: a sibling role actor that keeps its own
+    // authorization (live session-role mapping) could otherwise block a node
+    // whose executor mapping drifted, with no dispatch lease at all.
+    const kind = this.currentNodeKind(run)
+    if (kind !== 'actor-task') {
+      // builtin-program / child-workflow nodes are Manager-driven control
+      // plane and publish no lease; the Manager keeps its control-plane block.
+      if (!isManager) {
+        return { ok: false, reason: 'only the current node executor or the Manager may block' }
+      }
+    } else {
+      const roleOfNode = this.nodeAt(run, frame)!.execution.role!
+      // Manager on a role-executor node: control plane (node_resume's
+      // sibling) — the status/token/caller checks above suffice, no lease.
+      const managerControlPlane = isManager && roleOfNode !== 'manager'
+      if (!managerControlPlane) {
+        // Non-Manager on a Manager-executor node is not the executor at all.
+        if (!isManager && roleOfNode === 'manager') {
+          return { ok: false, reason: 'only the current node executor or the Manager may block' }
+        }
+        // Everyone else here IS the precise executor of this dispatch (the
+        // Manager-executor, or the role Actor bound by the book's executor
+        // truth) — the claim/block pair shares one dispatch lease, so a
+        // second claim/block and a stale-turn block are both rejected.
+        const lease = this.admitLease(workspaceKey, run, caller)
+        if (!lease.ok) {
+          return { ok: false, reason: '当前调用无法绑定到一个已 dispatch 的 Node' }
+        }
       }
     }
     run.status = 'blocked'
-    run.blockReason = reason
+    // A1 review fix: the tool layer's bound is trim-based — persist the trim
+    // result so a whitespace bomb never inflates the durable row.
+    run.blockReason = reason.trim()
     // A3 R5: explicit node_block — source reflects who called (Manager vs the
     // node's own Actor).
-    this.logBlock(run, frame, isManager ? 'manager' : 'actor', reason)
+    this.logBlock(run, frame, isManager ? 'manager' : 'actor', run.blockReason)
     await this.state.put(workspaceKey, run, version)
     // A1 §3.2: BLOCK consumes the lease WITH the book (no consumed residue);
     // a put failure above leaves the book intact for a verbatim retry.
@@ -1210,6 +1236,9 @@ export class WorkflowEngine {
     }
     const frame = topFrame(run)
     if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
+    // A1 review fix: trim the resolution context once — it feeds followups,
+    // the resume log and the correction rebuild, all under trim-based bounds.
+    resolutionContext = resolutionContext.trim()
 
     // A4 R4: in the judgment phase, the sole control signal is judgeSessionId.
     if (run.pendingClaim !== undefined) {
@@ -1402,7 +1431,10 @@ export class WorkflowEngine {
       // REJECT flow would then resurrect the OLD actor mapping. Judged by
       // Node role + boundary (NOT the roleActors mapping): a drifted/missing
       // mapping must still trip the guard.
-      const node = this.nodeAt(run, topFrame(run))
+      // Review fix: a completed run has NO top frame (callStack=[]) — read
+      // the node only when one exists; completed runs take the plain
+      // override path exactly as before A1 (no throw).
+      const node = run.callStack.length > 0 ? this.nodeAt(run, topFrame(run)) : undefined
       if (run.status === 'running'
         && node !== undefined && node.execution.type === 'actor-task' && node.execution.role === roleKey
         && run.nodeBoundary.dispatchedAt !== 0 && run.nodeBoundary.executorSessionId !== undefined

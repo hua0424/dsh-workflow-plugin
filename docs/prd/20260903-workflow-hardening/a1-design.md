@@ -173,7 +173,7 @@ interface ClaimCaller {
 7. 最终 re-read（entered 状态复核）中 token 校验改用 book 的 `dispatchedToken`（此时与 topFrame 必相等，防御性保留）；
 8. 通过后走现有 judge spawn 流程；`book.leaseConsumed = true` 在 `state.put` 成功之后、`startJudge` 之前置位（§3.2 acceptance 边界——put 失败时 lease 未消费，Actor 可重试）。
 
-executor 精确性由 lease 隐含（book.executorSessionId 即 dispatch 目标），原 `executorSessionOf` 显式检查保留为断言级冗余，不承担正确性。
+executor 精确性由 lease 隐含（book.executorSessionId 即 dispatch 目标）。**实现注（评审修正）**：`handleClaim` 中原 `executorSessionOf` 显式检查已并入 lease 判据而非保留为独立断言——lease 用 dispatch 时的真实 executor（与漂移中的 `roleActors` 映射无关），重复一道基于映射的检查只会在映射缺失时弱化语义；`executorSessionOf` 仅保留给 turn 结算等不涉及准入的路径。
 
 `workflow_status` 返回的 `currentFrame.nodeToken` 保留（node_resume / judge_respawn / node_resolve_program 仍需，R5）；仅 `node_claim` 不再消费它。
 
@@ -183,6 +183,8 @@ executor 精确性由 lease 隐含（book.executorSessionId 即 dispatch 目标�
 - **lease 绑定只适用于 `actor-task` 节点**：当前节点为 actor-task 且 caller 是其精确 executor（Manager-executor 或 role Actor）时，须通过与 claim 相同的 lease 绑定检查（同 turn、未消费）并消费——同一 dispatch 的第二个 claim/block 被拒（AC4），旧 turn 的迟到 block 也被拒（AC3 同源）。
 - **builtin-program / child-workflow 节点上的 Manager `node_block`：控制面动作**，不走 lease。理由：`executorSessionOf()` 对这两类节点返回 Manager Session（Manager 驱动 program 参数/child 准入），但它们**不发布 lease**（§3.1 DispatchIdentity 为 undefined）——若按"精确 executor"归类会因无 lease 而永久拒绝，破坏现有语义。这两类节点只校验 status/token/caller（现状）。
 - **Manager 对 role-executor 的 actor-task 节点调用 `node_block`**：同样控制面（与 node_resume 同类），不走 lease，现状语义保留；BLOCK 使 lease 随 book 消失（§3.2）。
+
+> **实现评审修正（fail-closed）**：初版实现以 `executorSessionOf()` 判定"精确 executor"，但该函数读的是会漂移的 `roleActors` 映射——当前 role 映射缺失时返回 `''`，executor 检查与 lease 门槛双双短路（fail-open）。最终实现改为**按 Node role 分类**：program/child 节点拒绝一切非 Manager caller；manager-executor 节点拒绝一切非 Manager caller 且 Manager 须过 lease；role-executor 节点上 Manager 走控制面、任意非 Manager caller 必须过 lease（book.executorSessionId 即 dispatch 真值，与映射无关）。映射缺失时 `''` 不再是任何逃生门。
 
 ### 5.3 判定阶段的一致性
 
@@ -249,6 +251,8 @@ pendingCorrection?: {
   previousClaim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
 }
 ```
+
+> **实现评审修正（trim-后-存储）**：LIMITS 的边界语义是"trim 后长度"——tool 层校验 trim 后长度但不得把原始串下传；`node_claim`/`judge_claim`/`node_block`/`node_resume`/`node_resolve_program` 一律传 trim 结果，engine 侧对 `summary`/`handoffContext`/`reason`/`resolutionContext` 再做防御性 trim 才落 State/trace/correction 消息。否则首尾海量空白可绕过长度上限把近 MB 级文本写入 State 与 correction prompt。
 
 生命周期：
 

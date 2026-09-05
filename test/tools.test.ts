@@ -142,6 +142,20 @@ test('judge_claim routes to host.judgeClaim and concludes the turn on success', 
   assert.equal(concluded, true)
 })
 
+test('trim-bounded payloads reach the host trimmed — a whitespace bomb never lands (A1 review fix)', async () => {
+  const host = makeToolHost()
+  const nodeClaim = findTool('node_claim')
+  const judgeClaim = findTool('judge_claim')
+  const nodeBlock = findTool('node_block')
+  const padded = ' '.repeat(10_000) + 'x'
+  await nodeClaim.execute({ outcome: 'completed', summary: padded, handoffContext: '  h  ' }, EXEC as never)
+  await judgeClaim.execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: padded }, EXEC as never)
+  await nodeBlock.execute({ nodeToken: randomUUID(), reason: padded }, EXEC as never)
+  assert.deepEqual((host.calls[0]!.args as { claim: { summary: string; handoffContext: string } }).claim, { outcome: 'completed', summary: 'x', handoffContext: 'h' })
+  assert.equal((host.calls[1]!.args as { reason: string }).reason, 'x')
+  assert.equal((host.calls[2]!.args as { reason: string }).reason, 'x')
+})
+
 test('judge_respawn routes to host.respawnJudge', async () => {
   const host = makeToolHost()
   const tool = findTool('judge_respawn')
