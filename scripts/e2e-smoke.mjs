@@ -33,7 +33,11 @@ const workspaceKey = await workspaceKeyOf(ws)
 if (workspaceKey === undefined) throw new Error('no workspace key')
 
 // Embedded v2 catalog: hermetic against the real home's catalog version.
+// compactThresholdTokens exercises the optional top-level threshold field
+// (Issue #5) through the real restricted-YAML + schema + hash load chain;
+// the fake SubagentHost simply receives it on the fresh role dispatch.
 const SMOKE_YAML = `schemaVersion: agent-workflow/v2
+compactThresholdTokens: 32000
 roles:
   worker: { persona: Echo worker. }
 judgeRole: { persona: Judge. }

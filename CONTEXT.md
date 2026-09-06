@@ -14,7 +14,7 @@
 
 ## Role Actor
 
-某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用（Session级复用：DSH continuable child在quiescent时Activation被自动释放，后续followup自动cold-resume）；每次派发新Node前Engine对其执行Node边界compact（A4方案A：cold Actor先经`ctx.agents.resume`无prompt物化，`ctx.compaction.compactNow`压缩后`dispose`释放，随后followup重放已压缩surface；resident窄竞态下的`busy`降级跳过），compact异常进入BLOCK；不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping，也不被compact。
+某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用（Session级复用：DSH continuable child在quiescent时Activation被自动释放，后续followup自动cold-resume）；每次派发新Node前Engine对其执行Node边界compact（A4方案A：cold Actor先经`ctx.agents.resume`无prompt物化，`ctx.compaction.compactNow`压缩后`dispose`释放，随后followup重放已压缩surface；resident窄竞态下的`busy`降级跳过），compact异常进入BLOCK。配置了Workflow Configuration顶层可选`compactThresholdTokens`时，Host先以DSH replay-aware token meter测量已物化Session的`totalTokens`，仅当严格大于阈值才执行compact（等于/低于跳过；meter缺失、测量抛错或非法测量fail-closed BLOCK，绝不静默当作低于阈值），未配置则保持无条件尝试；首次创建与同Node resume不测量。不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping，也不被compact。
 
 ## Judge Role
 
@@ -28,7 +28,7 @@
 
 ## Workflow Configuration
 
-`${DSH_HOME:-$HOME/.dsh}/workflows/<workflow-id>.yaml`中的一个自包含Catalog文件。文件名stem就是Root Workflow ID；顶层`workflow`保存Root Graph，可选`childWorkflows`保存复用子流程。文件还内联全部Role Definitions和一个Judge Role。Schema精确为`agent-workflow/v2`（A1原地升级：v1文件被loader拒绝，不设双轨），使用单文档受限YAML 1.2，无duplicate key、anchor/alias/merge、custom tag或模板插值。首期不存在import、include、extends、overlay、跨文件引用或远程Registry。Catalog每次list/start fresh非递归扫描根目录，只接受lowercase`[a-z][a-z0-9-]*.yaml`普通文件，拒绝symlink/junction和`.yml`；invalid文件只阻塞自身。主入口是原生Command：`/dsh-flow list|start <workflow-id> [extra text]|status|reset`；无参数返回usage error，不做隐式status/list。
+`${DSH_HOME:-$HOME/.dsh}/workflows/<workflow-id>.yaml`中的一个自包含Catalog文件。文件名stem就是Root Workflow ID；顶层`workflow`保存Root Graph，可选`childWorkflows`保存复用子流程。文件还内联全部Role Definitions和一个Judge Role，以及可选的顶层`compactThresholdTokens`（估算token的JavaScript安全正整数：Role Actor进入新Node前仅当token meter测得`totalTokens`严格大于该阈值才执行Node边界compact，等于/低于跳过；缺省保持无条件尝试compact；值随Run启动冻结进Definition Snapshot）。Schema精确为`agent-workflow/v2`（A1原地升级：v1文件被loader拒绝，不设双轨），使用单文档受限YAML 1.2，无duplicate key、anchor/alias/merge、custom tag或模板插值。首期不存在import、include、extends、overlay、跨文件引用或远程Registry。Catalog每次list/start fresh非递归扫描根目录，只接受lowercase`[a-z][a-z0-9-]*.yaml`普通文件，拒绝symlink/junction和`.yml`；invalid文件只阻塞自身。主入口是原生Command：`/dsh-flow list|start <workflow-id> [extra text]|status|reset`；无参数返回usage error，不做隐式status/list。
 
 ## Workflow Plugin Bundle
 

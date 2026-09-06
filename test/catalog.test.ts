@@ -292,3 +292,67 @@ workflow:
 `)
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /unknown role/)
 })
+
+// ---- compactThresholdTokens (Issue #5 / milestone subagent-compact-threshold) ----
+
+const withThreshold = (literal: string): string =>
+  VALID_CONFIG.replace('schemaVersion: agent-workflow/v2', `schemaVersion: agent-workflow/v2\ncompactThresholdTokens: ${literal}`)
+
+test('compactThresholdTokens: safe positive integer enters the snapshot and the definition hash (AC1)', () => {
+  const config = parseCatalogConfig(withThreshold('32000'))
+  assert.equal(config.compactThresholdTokens, 32000)
+  const normalized = validateAndNormalize(config, { workflowId: 'threshold-wf' })
+  assert.equal(normalized.compactThresholdTokens, 32000)
+  // The value is part of the hash input — two snapshots differing only in the
+  // threshold are different definitions (freeze identity).
+  assert.notEqual(
+    computeDefinitionHash(normalized),
+    computeDefinitionHash({ ...normalized, compactThresholdTokens: 64000 }),
+  )
+  // Boundary: 1 and Number.MAX_SAFE_INTEGER are accepted.
+  assert.equal(parseCatalogConfig(withThreshold('1')).compactThresholdTokens, 1)
+  assert.equal(parseCatalogConfig(withThreshold('9007199254740991')).compactThresholdTokens, 9007199254740991)
+})
+
+test('compactThresholdTokens: absent field stays compatible (AC2)', () => {
+  const config = parseCatalogConfig(VALID_CONFIG)
+  assert.equal(config.compactThresholdTokens, undefined)
+  assert.equal('compactThresholdTokens' in config, false)
+})
+
+test('compactThresholdTokens: zero / negative / non-integer / non-number / unsafe values get field-level diagnostics (AC1)', () => {
+  const invalid: Array<[string, string]> = [
+    ['0', 'zero'],
+    ['-1', 'negative'],
+    ['1.5', 'non-integer'],
+    ['"32000"', 'string is not a number'],
+    ['true', 'boolean is not a number'],
+    ['9007199254740992', 'beyond MAX_SAFE_INTEGER'],
+    ['{ a: 1 }', 'object is not a number'],
+  ]
+  for (const [literal, label] of invalid) {
+    assert.throws(() => parseCatalogConfig(withThreshold(literal)), /compactThresholdTokens/, label)
+  }
+})
+
+test('compactThresholdTokens: the loaded snapshot is frozen against later file edits (AC10)', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'threshold-freeze-'))
+  const dir = join(home, 'workflows')
+  await mkdir(dir, { recursive: true })
+  try {
+    const path = join(dir, 'freeze-wf.yaml')
+    await writeFile(path, withThreshold('1000'), 'utf8')
+    const first = await scanCatalog(home)
+    assert.equal(first.entries[0]!.config.compactThresholdTokens, 1000)
+    // Edit the file AFTER the first snapshot was taken: the already-loaded
+    // entry (what a started Run freezes) keeps its value; only a fresh scan
+    // (the next Run) sees the new one, and the hash moves with it.
+    await writeFile(path, withThreshold('2000'), 'utf8')
+    assert.equal(first.entries[0]!.config.compactThresholdTokens, 1000)
+    const second = await scanCatalog(home)
+    assert.equal(second.entries[0]!.config.compactThresholdTokens, 2000)
+    assert.notEqual(first.entries[0]!.definitionHash, second.entries[0]!.definitionHash)
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})

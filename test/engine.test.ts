@@ -99,6 +99,8 @@ interface Harness {
   judgeSessionExists: (id: string) => Promise<boolean>
   actorCreated: boolean
   compacts: string[]
+  /** Issue #5: the compactThresholdTokens forwarded with each compact request. */
+  compactThresholds: Array<number | undefined>
   compactResult: { ok: boolean; detail?: string }
   /** A3: scriptable program outcomes by programId (default: ERROR no stub result). */
   programResults: Map<string, { kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string }>
@@ -131,6 +133,7 @@ function makeHarness(memArg?: MemState): Harness {
     judgeSessionExists: async () => true,
     actorCreated: false,
     compacts: [],
+    compactThresholds: [],
     compactResult: { ok: true, detail: 'no compactable range' },
     programResults: new Map(),
     steerFailure: undefined,
@@ -175,7 +178,11 @@ function makeHarness(memArg?: MemState): Harness {
     async judgeSessionExists(id) { return h.judgeSessionExists(id) },
     async retireJudge(_run, judgeSessionId) { h.retiredJudges.push(judgeSessionId) },
     async drainJudge(_run, judgeSessionId) { h.drainedJudges.push(judgeSessionId) },
-    async compactRoleActor(_run, roleKey) { h.compacts.push(roleKey); return h.compactResult },
+    async compactRoleActor(_run, roleKey, thresholdTokens) {
+      h.compacts.push(roleKey)
+      h.compactThresholds.push(thresholdTokens)
+      return h.compactResult
+    },
   }
   const programs: ProgramHost = {
     async run(_run, programId, _params) {
@@ -1041,6 +1048,110 @@ test('first role creation skips compact (A2 AC3)', async () => {
   await h.engine.handleTurnEnded('ws', MANAGER)
   assert.deepEqual(h.compacts, [])
   assert.ok(h.actorCreated)
+})
+
+// ---- compactThresholdTokens (Issue #5 / milestone subagent-compact-threshold) ----
+
+/** Same two-node shape as CONFIG, with the frozen threshold configured. */
+const THRESHOLD_CONFIG = validateAndNormalize(parseCatalogConfig(`
+schemaVersion: agent-workflow/v2
+compactThresholdTokens: 1234
+roles:
+  developer: { persona: D }
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Plan. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS when planned. } }
+      onPass: build
+    build:
+      execution: { type: actor-task, role: developer, instruction: Build. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS when built. } }
+      onPass: END
+`), { workflowId: 'eng-test' })
+
+function initialRunWithThreshold(): RunState {
+  return { ...initialRun(), definitionSnapshot: THRESHOLD_CONFIG, definitionHash: computeDefinitionHash(THRESHOLD_CONFIG) }
+}
+
+test('fresh role dispatch forwards the frozen compactThresholdTokens from the snapshot (Issue #5)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRunWithThreshold())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  // Pre-seed the role mapping so the developer node dispatches to an EXISTING actor.
+  h.mem.run!.roleActors['developer'] = 'actor-child-1'
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  // Fresh developer node → exactly one threshold-aware compact request.
+  assert.deepEqual(h.compacts, ['developer'])
+  assert.deepEqual(h.compactThresholds, [1234])
+})
+
+test('unconfigured snapshot forwards undefined — legacy unconditional compact attempt (AC2)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  h.mem.run!.roleActors['developer'] = 'actor-child-1'
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  assert.deepEqual(h.compacts, ['developer'])
+  assert.deepEqual(h.compactThresholds, [undefined])
+})
+
+test('first creation and same-node resume never reach the threshold-aware compact seam (AC7)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRunWithThreshold())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  // First creation has no mapping → ensureRoleActor, no compact, no measurement.
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  assert.deepEqual(h.compacts, [])
+  assert.deepEqual(h.compactThresholds, [])
+  assert.ok(h.actorCreated)
+  // Same-node resume (actor ended its turn without claiming; Manager resumes)
+  // → followup retains the boundary and never re-enters the compact seam.
+  await h.engine.handleTurnEnded('ws', 'actor-child-1')
+  assert.equal(h.mem.run!.status, 'blocked')
+  const buildToken = topFrame(h.mem.run!).nodeToken
+  const resumed = await h.engine.handleResume('ws', buildToken, 'finish and claim', MANAGER)
+  assert.ok(resumed.ok)
+  assert.deepEqual(h.compacts, [])
+  assert.deepEqual(h.compactThresholds, [])
+})
+
+test('threshold measurement failure BLOCKs the node and notifies the Manager (AC8)', async () => {
+  const h = makeHarness()
+  h.compactResult = { ok: false, detail: 'threshold check failed: token meter service is unavailable' }
+  await h.engine.startRun('ws', initialRunWithThreshold())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  h.mem.run!.roleActors['developer'] = 'actor-child-1'
+  const settled = await h.engine.handleTurnEnded('ws', MANAGER)
+  assert.ok(settled !== undefined && settled.ok)
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.match(h.mem.run!.blockReason ?? '', /^node-boundary compact failed: threshold check failed: token meter service is unavailable$/)
+  assert.ok(h.steers.some(t => /Node 边界 compact 失败/.test(t) && /token meter service is unavailable/.test(t)))
+})
+
+test('threshold gate detail reaches the COMPACT trace line with role, measurement and decision (AC9)', async () => {
+  await withTempCatalog('eng-test', async (configPath) => {
+    const h = makeHarness()
+    h.compactResult = { ok: true, detail: 'compact skip (below threshold): totalTokens=100 vs compactThresholdTokens=1234' }
+    await h.engine.startRun('ws', initialRunWithThreshold(), configPath)
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'planned' }, mgr(h))
+    await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+    h.mem.run!.roleActors['developer'] = 'actor-child-1'
+    await h.engine.handleTurnEnded('ws', MANAGER)
+    const log = readRunLog(configPath, 'eng-test')
+    assert.match(log, new RegExp(`${TS} COMPACT workflow=eng-test node=build token=${TOK} role=developer ok=true detail="compact skip \\(below threshold\\): totalTokens=100 vs compactThresholdTokens=1234"\\n`))
+  })
 })
 
 test('builtin-program dispatch does not inject the submission constraint (A3 AC2)', async () => {

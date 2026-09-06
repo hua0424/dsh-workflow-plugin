@@ -105,6 +105,10 @@ const workflowDef = z
 export const workflowConfigSchema = z
   .object({
     schemaVersion: z.literal('agent-workflow/v2'),
+    // Issue #5: optional workflow-wide Node 边界 compact token 阈值。`.safe()`
+    // 同时要求整数与 JavaScript 安全整数范围，`.positive()` 拒绝零与负数；
+    // 每种非法值都带 `compactThresholdTokens` 字段级诊断（AC1）。
+    compactThresholdTokens: z.number().safe().positive().optional(),
     roles: z.record(z.string(), roleDefinition),
     judgeRole: judgeRoleDefinition,
     workflow: workflowDef,

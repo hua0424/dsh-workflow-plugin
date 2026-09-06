@@ -124,6 +124,15 @@ export interface WorkflowConfig {
   judgeRole: JudgeRoleDefinition
   workflow: WorkflowDef
   childWorkflows?: Record<string, WorkflowDef>
+  /**
+   * Issue #5（milestone `subagent-compact-threshold`）：可选的全工作流 Node
+   * 边界 compact token 阈值（估算 token，JavaScript 安全正整数）。配置后，
+   * Host 在 Node 边界先经 DSH replay-aware token meter 测量已物化 Role Actor
+   * Session 的 `totalTokens`，仅当 `totalTokens` 严格大于该阈值才执行
+   * `compactNow`（等于或低于都跳过）；缺省保留无条件尝试 compact 的既有行为。
+   * 随 Definition Snapshot 在 Run 启动时冻结，对 Root/Child 一致生效。
+   */
+  compactThresholdTokens?: number
 }
 
 export type RunStatus = 'running' | 'blocked' | 'completed'

@@ -74,10 +74,39 @@ judgeRole:                   # Judge
 | 字段 | 必填 | 内容 |
 | --- | --- | --- |
 | `schemaVersion` | ✓ | 固定 `agent-workflow/v2` |
+| `compactThresholdTokens` | ✗ | Node 边界 compact 的 token 阈值（见下节） |
 | `roles` | ✓ | worker Role 定义表；key 即 roleKey |
 | `judgeRole` | ✓ | Judge 定义（persona 必填，model 可选） |
 | `workflow` | ✓ | 根工作流图 |
 | `childWorkflows` | ✗ | 子工作流图（按 workflowId 引用） |
+
+## compactThresholdTokens（Node 边界 compact 阈值）
+
+顶层可选字段，控制 Role Actor **复用已有 Session 进入新 Node 时**是否值得
+执行 Node 边界 compact：
+
+- **字段位置**：Catalog 顶层，与 `roles` / `judgeRole` / `workflow` 同级；
+  对 Root 与所有 Child Workflow 中全部非 Manager Role Actor 一致生效
+  （没有 per-role / per-node 开关）。
+- **单位与数据源**：估算 token（不是字符数或消息数）。Host 在调用
+  `compactNow` 前用 DSH replay-aware `tokenMeter.measure(agent.session)`
+  的 `totalTokens` 做决策，与 DSH 自动 pressure compaction 同一口径。
+- **比较规则**：**严格大于**才 compact——`totalTokens > 阈值` 执行现有
+  compact；`totalTokens <= 阈值`（含**等于**）跳过摘要直接派发。
+- **缺省兼容**：省略该字段 = 既有行为不变（无条件尝试 compact），且不引入
+  token-meter 预检查依赖。
+- **豁免不变**：Manager、首次创建 Role Actor、同 Node resume（BLOCK/resume
+  重派）都不测量也不 compact。
+- **失败安全**：配置了阈值但 token-meter 服务缺失、测量抛错或返回非法值时，
+  当前 Node fail-closed 进入 BLOCK 并通知 Manager，绝不静默当作低于阈值；
+  resident 窄竞态下 `compactNow` 的 `busy` 仍降级为跳过。
+- **Snapshot 冻结**：值必须是 JavaScript 安全正整数（0、负数、非整数、
+  非数值、超范围值在 Catalog 加载时给出字段级诊断）；Run 启动后随
+  Definition Snapshot 冻结，修改磁盘 Catalog 只影响下一次 Run。
+- **可观测性**：阈值决策写入 trace log 的 `COMPACT` 行——detail 同时携带
+  测量值、阈值与决策（`compact skip (below/at threshold)` /
+  `compact run (above threshold)`），可区分「低于阈值跳过」「执行 compact」
+  与「compact 无可压范围（null）」。
 
 Role 定义：
 

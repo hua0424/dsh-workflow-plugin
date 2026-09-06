@@ -25,6 +25,19 @@
 schemaVersion: agent-workflow/v2
 
 # -----------------------------------------------------------------------------
+# compactThresholdTokens（可选，顶层，与 roles/judgeRole/workflow 同级）：
+# Node 边界 compact 的 token 阈值。Role Actor 每次进入新 Node 前，Host 用
+# DSH replay-aware token meter 测量其已物化 Session 的 totalTokens：
+#   - totalTokens 严格大于阈值 → 执行现有 compact；
+#   - 等于或低于阈值 → 跳过 compact，直接派发；
+#   - 缺省（不写本字段）→ 保持无条件尝试 compact 的既有行为。
+# 单位是估算 token（非字符/消息数）；值必须是 JavaScript 安全正整数。
+# 阈值随 Run 启动冻结进 Definition Snapshot，Run 中途改文件不影响当前 Run。
+# 取消下一行注释即启用（示例：32000 tokens）。
+# -----------------------------------------------------------------------------
+# compactThresholdTokens: 32000
+
+# -----------------------------------------------------------------------------
 # Worker Role：按需创建并复用的 continuable subagent。
 # `manager` 与 `judge` 是保留 roleKey，禁止出现在 roles 中。
 # 每个 role 可配：persona（必填）/ model（可选）/ tools.deny（可选，非空）。

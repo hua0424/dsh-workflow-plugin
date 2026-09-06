@@ -6,7 +6,7 @@ import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-subagent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionId, type Session } from '@deepseek-ai/dsh-session'
 import { StateStore } from '../state/store.ts'
 import type { RunState } from '../types.ts'
 import { WorkflowError } from '../types.ts'
@@ -20,6 +20,52 @@ import { renderJudgePrompt } from '../judge/checker.ts'
 /** Narrow shape of the `ctx.compaction` service (`@deepseek-ai/dsh-compaction`). */
 interface CompactionService {
   compactNow(agent: Agent, signal: AbortSignal): Promise<{ shadowedSeqs: number[]; shadowedTokenCount: number } | null>
+}
+
+/**
+ * Narrow shape of the optional DSH `tokenMeter` service (Issue #5) — the same
+ * replay-aware estimator DSH's automatic pressure compaction uses. Duck-typed
+ * because the package is not a dependency of this plugin.
+ */
+interface TokenMeterLike {
+  measure(session: Session): unknown
+}
+
+/**
+ * Issue #5 threshold gate for the Node-boundary compact. Measures the given
+ * (materialized) agent Session via the DSH replay-aware token meter and
+ * compares `totalTokens` against the frozen `compactThresholdTokens` with a
+ * STRICTLY-greater rule: equality skips. Any meter problem — service missing,
+ * measure throwing, malformed/illegal measurement — fails CLOSED so the node
+ * BLOCKs instead of silently treating the context as below threshold.
+ */
+function thresholdGate(
+  ctx: Context,
+  session: Session,
+  compactThresholdTokens: number,
+): { ok: true; skip: boolean; note: string } | { ok: false; detail: string } {
+  const meter = ctx.get('tokenMeter') as TokenMeterLike | undefined
+  if (meter === undefined || typeof meter.measure !== 'function') {
+    return { ok: false, detail: 'threshold check failed: token meter service is unavailable' }
+  }
+  let measured: unknown
+  try {
+    measured = meter.measure(session)
+  } catch (error) {
+    return { ok: false, detail: `threshold check failed: token meter measure failed: ${errorDetail(error)}` }
+  }
+  const totalTokens = measured !== null && typeof measured === 'object'
+    ? (measured as { totalTokens?: unknown }).totalTokens
+    : undefined
+  if (typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens < 0) {
+    return { ok: false, detail: `threshold check failed: token meter returned an invalid totalTokens: ${JSON.stringify(totalTokens)}` }
+  }
+  const ratio = `totalTokens=${totalTokens} vs compactThresholdTokens=${compactThresholdTokens}`
+  if (totalTokens <= compactThresholdTokens) {
+    const verdict = totalTokens === compactThresholdTokens ? 'at threshold' : 'below threshold'
+    return { ok: true, skip: true, note: `compact skip (${verdict}): ${ratio}` }
+  }
+  return { ok: true, skip: false, note: `compact run (above threshold): ${ratio}` }
 }
 
 /** Duck-typed ManualCompactionError (`@deepseek-ai/dsh-compaction`). */
@@ -324,7 +370,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       await adapters.ctx.subagents.drainContinuableChildren(manager, [SessionId(judgeSessionId)]).catch(() => {})
     },
 
-    async compactRoleActor(run, roleKey) {
+    async compactRoleActor(run, roleKey, compactThresholdTokens) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
       const compaction = adapters.ctx.get('compaction') as CompactionService | undefined
@@ -342,17 +388,27 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // cold-resumes the compacted surface.
       const resident = adapters.ctx.agents.get(childId as SessionId)
       if (resident !== undefined) {
+        // Issue #5: with a configured threshold, measure the resident surface
+        // FIRST; a skip decision (or any meter failure) short-circuits before
+        // compactNow. Undefined threshold = unconditional attempt (legacy).
+        let prefix = ''
+        if (compactThresholdTokens !== undefined) {
+          const gate = thresholdGate(adapters.ctx, resident.session, compactThresholdTokens)
+          if (!gate.ok) return { ok: false, detail: gate.detail }
+          if (gate.skip) return { ok: true, detail: gate.note }
+          prefix = `${gate.note}; `
+        }
         // Rare race (findings §1): the Judge finished while the actor's own
         // turn is still draining. Compact in place; a busy actor degrades to a
         // skip — the dispatch message queues FIFO behind the running turn
         // exactly as it did before plan A.
         try {
           const result = await compaction.compactNow(resident, signal)
-          if (result === null) return { ok: true, detail: 'no compactable range' }
-          return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+          if (result === null) return { ok: true, detail: `${prefix}no compactable range` }
+          return { ok: true, detail: `${prefix}compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
         } catch (error) {
           if (isManualCompactionError(error) && error.code === 'busy') {
-            return { ok: true, detail: 'resident actor busy; skipped' }
+            return { ok: true, detail: `${prefix}resident actor busy; skipped` }
           }
           return { ok: false, detail: compactErrorDetail(error) }
         }
@@ -372,14 +428,31 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       } catch (error) {
         return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
       }
-      let outcome: { ok: boolean; detail: string }
-      try {
-        const result = await compaction.compactNow(handle.agent, signal)
-        outcome = result === null
-          ? { ok: true, detail: 'cold: no compactable range' }
-          : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
-      } catch (error) {
-        outcome = { ok: false, detail: compactErrorDetail(error) }
+      let outcome: { ok: boolean; detail: string } | null = null
+      let prefix = ''
+      if (compactThresholdTokens !== undefined) {
+        // Issue #5: the cold gate measures AFTER the no-prompt resume (the
+        // replay-aware estimate needs the materialized surface) and BEFORE any
+        // compactNow. A skip still runs the teardown below — a leaked resident
+        // agent would collide with the same Session id in the followup.
+        const gate = thresholdGate(adapters.ctx, handle.agent.session, compactThresholdTokens)
+        if (!gate.ok) {
+          outcome = { ok: false, detail: gate.detail }
+        } else if (gate.skip) {
+          outcome = { ok: true, detail: `cold ${gate.note}` }
+        } else {
+          prefix = `${gate.note}; `
+        }
+      }
+      if (outcome === null) {
+        try {
+          const result = await compaction.compactNow(handle.agent, signal)
+          outcome = result === null
+            ? { ok: true, detail: `${prefix}cold: no compactable range` }
+            : { ok: true, detail: `${prefix}cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+        } catch (error) {
+          outcome = { ok: false, detail: compactErrorDetail(error) }
+        }
       }
       // ALWAYS tear the materialization down: a leaked resident agent would
       // collide on the registry id inside the dispatch followup's cold resume.

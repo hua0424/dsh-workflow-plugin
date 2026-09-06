@@ -114,8 +114,13 @@ export interface SubagentHost {
    * materialized without a prompt, compacted while idle, and released before
    * the dispatch followup cold-resumes the compacted surface. Failure returns
    * ok:false so the caller BLOCKs with a clean reason (A2 R4).
+   * `compactThresholdTokens` (Issue #5) is the workflow-wide gate frozen in
+   * the Definition Snapshot: defined → the host measures the materialized
+   * surface via the DSH token meter first and only compacts when totalTokens
+   * is strictly greater (equality skips; meter failures fail closed);
+   * undefined → the legacy unconditional compact attempt with no metering.
    */
-  compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
+  compactRoleActor(run: RunState, roleKey: string, compactThresholdTokens?: number): Promise<{ ok: boolean; detail?: string }>
 }
 
 /** Program executor used by builtin-program nodes. */
@@ -557,7 +562,10 @@ export class WorkflowEngine {
         && run.nodeBoundary.executorSessionId === existing
       if (existing !== undefined) {
         if (!isSameNodeResume) {
-          await this.compactBeforeDispatch(run, roleKey)
+          // Issue #5: the threshold travels from the frozen Definition
+          // Snapshot on every fresh dispatch (AC10 — disk edits after Run
+          // start never reach the running snapshot).
+          await this.compactBeforeDispatch(run, roleKey, run.definitionSnapshot.compactThresholdTokens)
         }
         // A1 R2: capture the boundary cursors BEFORE the followup await — a
         // manager message landing during the send belongs to this node's
@@ -616,11 +624,13 @@ export class WorkflowEngine {
   }
 
   /** A2: node-boundary compact of a resident role actor (best-effort trace log). */
-  private async compactBeforeDispatch(run: RunState, roleKey: string): Promise<void> {
+  private async compactBeforeDispatch(run: RunState, roleKey: string, compactThresholdTokens?: number): Promise<void> {
     // Fresh-node-entry decision is the caller's (dispatchCurrent): same-node
-    // resume and first creation never reach here (A2 R3/R6).
+    // resume and first creation never reach here (A2 R3/R6). The threshold is
+    // the optional frozen `compactThresholdTokens` (Issue #5) — undefined
+    // keeps the unconditional compact attempt.
     const frame = topFrame(run)
-    const result = await this.subagents.compactRoleActor(run, roleKey)
+    const result = await this.subagents.compactRoleActor(run, roleKey, compactThresholdTokens)
     if (!result.ok) {
       const detail = result.detail ?? 'unknown compaction failure'
       this.logCompact(run, frame, roleKey, false, detail)
