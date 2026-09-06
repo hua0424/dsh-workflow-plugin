@@ -1,48 +1,39 @@
-# Hardened milestone-delivery config (PRD 20260903-workflow-hardening A2, migrated to v2 by A1).
-# A1 (agent-workflow/v2): Judge CONFIRMS claims via ACCEPT|REJECT|NEED_CONTEXT —
-# ACCEPT concludes the node exactly as claimed; REJECT re-dispatches the SAME
-# node with the reason as the correction instruction. node_claim carries no
-# nodeToken (the dispatch lease binds the calling turn).
+# 加固版 milestone-delivery 配置（PRD 20260903-workflow-hardening A2，由 A1 迁移至 v2）。
+# A1（agent-workflow/v2）：Judge 通过 ACCEPT|REJECT|NEED_CONTEXT 确认 claim ——
+# ACCEPT 使节点完全按声称内容结束；REJECT 以 reason 作为纠正指令重新派发同一
+# 节点。node_claim 不携带 nodeToken（派发 lease 绑定调用它的那个 turn）。
 schemaVersion: agent-workflow/v2
 
 roles:
   developer:
     persona: |
-      Implement the current issue and publish it: implement, run the required
-      implementation-level checks, commit, and push to the identified
-      milestone branch BEFORE claiming completed. Use the issue and repository
-      context supplied by the Manager. Report only through node_claim/node_block.
-      node_claim/node_block is the FINAL action of your turn; call it at most
-      once per turn, and never after a successful claim.
+      实现当前 issue 并发布交付：实现、运行所需的实现级检查、提交，并在声明
+      completed 之前推送到指定的 milestone 分支。使用 Manager 提供的 issue 与
+      仓库上下文。仅通过 node_claim/node_block 汇报。node_claim/node_block 是
+      你本轮的最终动作；每轮最多调用一次，且在 claim 成功后绝不再调用。
 
   reviewer:
     persona: |
-      Review the current implementation independently and READ-ONLY. Review
-      the exact commits identified by the handoff on the remote branch; do
-      not modify implementation files, do not commit, push, or change
-      issues/milestones. Report only through node_claim/node_block — a text
-      report alone does not submit your result. node_claim/node_block is the
-      FINAL action of your turn; call it at most once per turn.
+      以独立且只读的方式评审当前实现。评审 handoff 指明的远端分支上的确切
+      提交；不修改实现文件，不提交、推送或更改 issues/milestones。仅通过
+      node_claim/node_block 汇报——仅凭文本报告不会提交你的结果。
+      node_claim/node_block 是你本轮的最终动作；每轮最多调用一次。
     tools:
       deny: [edit, write]
 
   tester:
     persona: |
-      Execute the tests required by the current issue and publish the report:
-      create the test report file, commit, and push it to the identified
-      milestone branch BEFORE claiming completed. Report only through
-      node_claim/node_block. node_claim/node_block is the FINAL action of
-      your turn; call it at most once per turn.
+      执行当前 issue 要求的测试并发布报告：创建测试报告文件、提交，并在声明
+      completed 之前推送到指定的 milestone 分支。仅通过 node_claim/node_block
+      汇报。node_claim/node_block 是你本轮的最终动作；每轮最多调用一次。
 
 judgeRole:
   persona: |
-    Independently inspect the current claim and real workspace/remote facts.
-    Never modify evaluated artifacts. Submit your verdict ONLY through
-    judge_claim({nodeToken, result: ACCEPT|REJECT|NEED_CONTEXT, reason}).
-    ACCEPT confirms the claim as trustworthy (the node then concludes exactly
-    as the worker claimed); REJECT requires a reason stating concretely how
-    to correct the work — it reaches the worker verbatim as the correction
-    instruction; use NEED_CONTEXT only when information is genuinely missing.
+    独立检查当前 claim 与真实的工作区/远端事实。绝不修改被评估的产物。仅通过
+    judge_claim({nodeToken, result: ACCEPT|REJECT|NEED_CONTEXT, reason}) 提交
+    你的判定。ACCEPT 表示确认 claim 可信（节点随后完全按执行者声称的方式结
+    束）；REJECT 必须附带具体说明如何纠正工作的 reason——它会逐字作为纠正指
+    令送达执行者；仅在确实缺少信息时才使用 NEED_CONTEXT。
 
 workflow:
   startNode: plan-milestone
@@ -52,21 +43,18 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          Plan the milestone delivery from the current user goal: choose the
-          Milestone title and the milestone branch name. Planning only — do
-          not create or modify workspace files, branches, or GitHub objects
-          in this node; the next node initializes them. On completed claim,
-          the handoffContext must carry the repository (owner/repo and origin
-          URL), milestoneTitle, branchName, and a short restatement of the
-          user goal.
+          根据当前用户目标规划里程碑交付：选定 Milestone 标题和 milestone 分
+          支名。仅做规划——本节点内不要创建或修改工作区文件、分支或 GitHub
+          对象；下一节点会初始化它们。声明 completed 时，handoffContext 必须
+          携带仓库（owner/repo 与 origin URL）、milestoneTitle、branchName，
+          以及用户目标的简短复述。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            The user goal is clear enough to deliver. The handoff identifies
-            the repository (origin), a non-empty actionable milestoneTitle and
-            branchName consistent with the goal, and the goal restatement. Do
-            NOT require the PRD, the Milestone, or the branch to exist yet.
+            用户目标足够清晰、可以交付。handoff 指明了仓库（origin）、非空且
+            可执行的 milestoneTitle 和与目标一致的 branchName，以及目标复述。
+            不要求 PRD、Milestone 或分支此时已经存在。
       onPass: initialize-milestone
 
     initialize-milestone:
@@ -74,10 +62,9 @@ workflow:
         type: builtin-program
         programId: github.initialize-milestone
         instruction: |
-          Run github.initialize-milestone via node_run_program with title and
-          branchName taken verbatim from the plan-milestone handoff; the
-          repository is the current workspace origin. Do not write any files
-          before this runs — the working tree must still be clean.
+          通过 node_run_program 运行 github.initialize-milestone，title 和
+          branchName 逐字取自 plan-milestone 的 handoff；仓库为当前工作区的
+          origin。在运行之前不要写入任何文件——工作树必须仍保持干净。
       onPass: draft-prd
 
     draft-prd:
@@ -85,23 +72,19 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          The workspace is now on the milestone branch. Create or update the
-          PRD under docs/prd/ (follow the repository PRD convention) covering
-          the user goal, scope, non-goals and acceptance criteria. Commit the
-          PRD and push the commit to the remote milestone branch BEFORE
-          claiming completed. On completed claim, the handoffContext must
-          carry PRD path, PRD commit, repository, branch, milestoneTitle and
-          milestoneNumber.
+          工作区现已位于 milestone 分支。在 docs/prd/ 下创建或更新 PRD（遵循
+          仓库的 PRD 约定），覆盖用户目标、范围、非目标与验收标准。提交 PRD，
+          并在声明 completed 之前把该提交推送到远端 milestone 分支。声明
+          completed 时，handoffContext 必须携带 PRD 路径、PRD 提交、仓库、分
+          支、milestoneTitle 和 milestoneNumber。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            A PRD exists under docs/prd/ and covers the user goal, scope,
-            non-goals and acceptance criteria. The PRD commit exists on the
-            current milestone branch, and the remote milestone branch contains
-            it. The handoff identifies PRD path, PRD commit, repository,
-            branch, milestoneTitle and milestoneNumber. Do NOT require the
-            default branch to contain the PRD at this point.
+            docs/prd/ 下存在 PRD，且覆盖用户目标、范围、非目标与验收标准。
+            PRD 提交存在于当前 milestone 分支上，且远端 milestone 分支包含该
+            提交。handoff 指明了 PRD 路径、PRD 提交、仓库、分支、
+            milestoneTitle 和 milestoneNumber。不要求默认分支此时已包含 PRD。
       onPass: plan-issues
 
     plan-issues:
@@ -109,19 +92,18 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          Create and organize the GitHub Issues required to deliver the PRD.
-          When using `gh issue create`, pass the milestone by TITLE
-          (--milestone "<title>"), NOT its number — the gh CLI --milestone
-          flag expects a title, while `gh api ...?milestone=` expects a
-          number. On completed claim, carry milestoneTitle and milestoneNumber
-          forward in handoffContext.
+          创建并组织交付 PRD 所需的 GitHub Issues。使用 `gh issue create` 时，
+          按标题传 milestone（--milestone "<title>"），而非编号——gh CLI 的
+          --milestone 参数接受标题，而 `gh api ...?milestone=` 接受编号。声明
+          completed 时，在 handoffContext 中继续携带 milestoneTitle 和
+          milestoneNumber。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            Inspect the PRD, Milestone and Issues. PASS only when the required
-            Issues cover the PRD, each Issue is actionable, and the handoff
-            carries milestoneTitle and milestoneNumber.
+            检查 PRD、Milestone 与 Issues。仅当所需 Issues 覆盖 PRD、每个
+            Issue 都可执行、且 handoff 携带 milestoneTitle 和 milestoneNumber
+            时才 PASS。
       onPass: run-issue-cycle
 
     run-issue-cycle:
@@ -135,24 +117,20 @@ workflow:
         type: actor-task
         role: reviewer
         instruction: |
-          Review the finished Milestone against the PRD with the remote
-          DEFAULT branch as the authoritative baseline — not the milestone
-          branch. Check the PRD acceptance criteria, every Milestone Issue,
-          each Issue's integrated revision, and the test reports on the
-          default branch. Claim completed once the review itself is done,
-          either way, and record the outcome in handoffContext: satisfied
-          (yes/no), blocking findings (empty when satisfied), PRD path,
-          Milestone number/title, and the default-branch revision reviewed.
+          以远端默认分支作为权威基线（而非 milestone 分支），对照 PRD 评审已
+          完成的 Milestone。检查 PRD 验收标准、每个 Milestone Issue、每个
+          Issue 已集成的修订，以及默认分支上的测试报告。评审本身完成后即声明
+          completed（无论结论如何），并在 handoffContext 中记录结果：
+          satisfied（yes/no）、阻断性发现（satisfied 时为空）、PRD 路径、
+          Milestone 编号/标题，以及所评审的默认分支修订。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            PASS only when the review was actually performed on the remote
-            default branch, every PRD acceptance criterion is satisfied, all
-            Milestone Issues are closed with integrated revisions, and the
-            handoff records satisfied=yes with no blocking findings. FAIL when
-            any blocking finding exists — the handoff findings then route to
-            remediation.
+            仅当评审确实在远端默认分支上执行、每条 PRD 验收标准均满足、所有
+            Milestone Issues 均已关闭且修订已集成、且 handoff 记录
+            satisfied=yes 且无阻断性发现时才 PASS。存在任何阻断性发现时
+            FAIL——handoff 中的发现随后路由到修复流程。
       onPass: close-milestone
       onFail: plan-remediation
 
@@ -161,23 +139,20 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          Close the delivered Milestone. First confirm the final review was
-          accepted and the Milestone has zero open Issues. Then close it with
-          `gh api --method PATCH repos/{owner}/{repo}/milestones/{number} -f
-          state=closed` — the REST API uses the numeric Milestone number; do
-          not confuse it with `gh issue create --milestone` title semantics.
-          On completed claim, the handoffContext must carry the Milestone
-          URL, number, title, final state, and the default-branch integrated
-          revision.
+          关闭已交付的 Milestone。先确认终审已被接受且该 Milestone 无未关闭
+          Issue。然后用 `gh api --method PATCH repos/{owner}/{repo}/milestones/{number} -f
+          state=closed` 关闭——REST API 使用数字 Milestone 编号；不要与
+          `gh issue create --milestone` 的标题语义混淆。声明 completed 时，
+          handoffContext 必须携带 Milestone URL、编号、标题、最终状态，以及
+          默认分支集成修订。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            The GitHub Milestone state is closed, open_issues is 0, every
-            Milestone Issue is closed, and the handoff carries the Milestone
-            URL, number, title, state and the default-branch integrated
-            revision. PASS only when all hold — a still-open Milestone must
-            FAIL.
+            GitHub Milestone 状态为 closed，open_issues 为 0，每个 Milestone
+            Issue 均已关闭，且 handoff 携带 Milestone URL、编号、标题、状态及
+            默认分支集成修订。全部满足才 PASS——仍处于打开状态的 Milestone
+            必须 FAIL。
       onPass: END
       onFail: plan-remediation
 
@@ -186,16 +161,15 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          Turn the final-review (or close-milestone) blocking findings from
-          the handoff into one or more unfinished, actionable remediation
-          Issues in the current Milestone. On completed claim, carry the
-          remediation Issue URLs forward in handoffContext.
+          将 handoff 中来自 final-review（或 close-milestone）的阻断性发现，
+          转化为当前 Milestone 中一个或多个未完成、可执行的修复 Issue。声明
+          completed 时，在 handoffContext 中继续携带修复 Issue 的 URL。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            PASS only when every blocking finding from the handoff is covered
-            by an unfinished, actionable Issue in the current Milestone.
+            仅当 handoff 中每条阻断性发现都被当前 Milestone 中一个未完成、可
+            执行的 Issue 覆盖时才 PASS。
       onPass: run-issue-cycle
 
 childWorkflows:
@@ -207,18 +181,16 @@ childWorkflows:
           type: actor-task
           role: manager
           instruction: |
-            Inspect the current Milestone and select one required unfinished
-            Issue. In node_claim handoffContext, carry the Issue URL plus the
-            repository, the milestone branch and the milestone number the
-            delivery will target.
+            检查当前 Milestone，选择一个所需的未完成 Issue。在 node_claim 的
+            handoffContext 中携带 Issue URL，以及本次交付所针对的仓库、
+            milestone 分支和 milestone 编号。
         checker:
           checkerId: judge.claim-correct
           config:
             criteria: |
-              PASS only when the selected Issue exists, is unfinished, belongs
-              to the current Milestone, is actionable, and the handoff carries
-              the Issue URL, repository, milestone branch and milestone
-              number.
+              仅当所选 Issue 存在、未完成、属于当前 Milestone、可执行，且
+              handoff 携带 Issue URL、仓库、milestone 分支和 milestone 编号时
+              才 PASS。
         onPass: deliver-one-issue
 
       deliver-one-issue:
@@ -232,8 +204,7 @@ childWorkflows:
           type: builtin-program
           programId: github.all-milestone-issues-complete
           instruction: |
-            Use the current Milestone number from the Manager conversation or
-            handoff.
+            使用 Manager 对话或 handoff 中的当前 Milestone 编号。
         onPass: END
         onFail: select-next-issue
 
@@ -245,23 +216,18 @@ childWorkflows:
           type: actor-task
           role: developer
           instruction: |
-            Implement the Issue identified in the current handoff message.
-            Run the required implementation-level checks, commit the Issue
-            changes, and push the commit to the identified milestone branch
-            BEFORE claiming completed — an uncommitted or unpushed working
-            tree is not a delivery. On completed claim, carry the Issue URL,
-            repository, branch and implementation commit forward in
-            handoffContext for Reviewer.
+            实现当前 handoff 消息中指明的 Issue。运行所需的实现级检查，提交
+            Issue 变更，并在声明 completed 之前把该提交推送到指定的
+            milestone 分支——未提交或未推送的工作树不算交付。声明 completed
+            时，在 handoffContext 中为 Reviewer 继续携带 Issue URL、仓库、分
+            支和实现提交。
         checker:
           checkerId: judge.claim-correct
           config:
             criteria: |
-              Inspect the Issue discussion, repository and commits. PASS only
-              when the requested implementation is complete, the required
-              implementation-level checks pass, an implementation commit
-              exists, the remote milestone branch contains it, and the claim
-              handoff identifies the Issue, repository, branch and
-              implementation commit.
+              检查 Issue 讨论、仓库与提交。仅当所请求的实现已完成、所需的实
+              现级检查通过、存在实现提交、远端 milestone 分支包含该提交、且
+              claim 的 handoff 指明了 Issue、仓库、分支和实现提交时才 PASS。
         onPass: review
         onFail: implement
 
@@ -270,22 +236,19 @@ childWorkflows:
           type: actor-task
           role: reviewer
           instruction: |
-            Review the exact implementation commit identified in the handoff
-            on the remote milestone branch — read-only. Claim completed once
-            the review is done, either way, and record the outcome in
-            handoffContext: approved (yes/no), blocking findings (empty when
-            approved), Issue URL, repository, branch and reviewed commit, for
-            Tester.
+            评审 handoff 中指明的远端 milestone 分支上的确切实现提交——只
+            读。评审完成后即声明 completed（无论结论如何），并在
+            handoffContext 中记录结果：approved（yes/no）、阻断性发现
+            （approved 时为空）、Issue URL、仓库、分支和已评审提交，供
+            Tester 使用。
         checker:
           checkerId: judge.claim-correct
           config:
             criteria: |
-              Inspect the Issue, the reviewed commit's diff and the
-              repository. PASS only when the reviewed code satisfies the
-              Issue, has no blocking quality problem, and the handoff
-              preserves the Issue/repository/branch/commit identity with
-              approved=yes. Blocking findings must FAIL and return the Issue
-              to implement.
+              检查 Issue、已评审提交的 diff 与仓库。仅当已评审代码满足
+              Issue、无阻断性质量问题、且 handoff 保留 Issue/仓库/分支/提交
+              标识且 approved=yes 时才 PASS。阻断性发现必须 FAIL，并将 Issue
+              退回 implement。
         onPass: test
         onFail: implement
 
@@ -294,25 +257,20 @@ childWorkflows:
           type: actor-task
           role: tester
           instruction: |
-            Test the implementation commit identified in the handoff. Create
-            the test report at docs/test-reports/<issue-number>-<slug>-test-report.md
-            recording the Issue URL, repository, branch, tested commit,
-            environment, commands, results and isolation notes. Commit the
-            report and push it to the remote milestone branch BEFORE claiming
-            completed — an untracked or unpushed report is not published. On
-            completed claim, carry the implementation commit, report path and
-            report commit forward in handoffContext for Manager delivery.
+            测试 handoff 中指明的实现提交。在 docs/test-reports/<issue-number>-<slug>-test-report.md
+            创建测试报告，记录 Issue URL、仓库、分支、被测提交、环境、命令、
+            结果与隔离说明。提交报告，并在声明 completed 之前推送到远端
+            milestone 分支——未跟踪或未推送的报告不算已发布。声明 completed
+            时，在 handoffContext 中为 Manager 交付继续携带实现提交、报告路
+            径和报告提交。
         checker:
           checkerId: judge.claim-correct
           config:
             criteria: |
-              Inspect the test report and repository state. PASS only when the
-              required tests were executed and passed at the identified
-              commit, the report file exists with the required content, the
-              report commit is on the remote milestone branch, and the
-              handoff identifies the implementation commit, report path and
-              report commit. A clean tracked tree with an untracked or
-              unpushed report is NOT published.
+              检查测试报告与仓库状态。仅当所需测试已在指定提交上执行并通
+              过、报告文件存在且内容齐备、报告提交位于远端 milestone 分支
+              上、且 handoff 指明实现提交、报告路径和报告提交时才 PASS。工作
+              树干净且被跟踪、但报告未跟踪或未推送，不算已发布。
         onPass: complete-issue
         onFail: implement
 
@@ -321,28 +279,21 @@ childWorkflows:
           type: actor-task
           role: manager
           instruction: |
-            Integrate the tested delivery into the remote DEFAULT branch
-            according to repository policy (PR merge or direct merge). Verify
-            by Git ancestry that the default branch now reaches BOTH the
-            implementation commit and the test-report commit; a pushed
-            milestone branch alone is not integration, and an open PR is not
-            a merge. Squash-merge-only repositories need a separate
-            machine-verifiable contract that this workflow does not define —
-            surface that instead of bypassing it. Satisfy the required
-            CI/branch protection, close the Issue only after integration is
-            verifiable, and on completed claim carry the Issue URL, default
-            branch, integrated revision or merged PR URL, and closure state
-            in handoffContext.
+            按仓库策略（PR 合并或直接合并）将已测试的交付集成到远端默认分
+            支。通过 Git 祖先关系验证默认分支现在同时可达实现提交和测试报告
+            提交；仅推送 milestone 分支不算集成，处于打开状态的 PR 不算合
+            并。仅支持 squash-merge 的仓库需要一份本工作流未定义的、可机器
+            验证的契约——请将其暴露出来，而不是绕过它。满足所需的 CI/分支
+            保护要求，仅在集成可验证之后关闭 Issue，声明 completed 时在
+            handoffContext 中携带 Issue URL、默认分支、集成修订或已合并 PR
+            URL，以及关闭状态。
         checker:
           checkerId: judge.claim-correct
           config:
             criteria: |
-              Inspect the Issue, repository and delivered revision. PASS only
-              when the remote default branch contains the delivery by commit
-              ancestry (implementation and test report), any PR used is
-              merged rather than open, required checks pass, the Issue is
-              closed, and the handoff identifies the Issue, default branch,
-              integrated revision or PR, and closure state. A milestone-branch
-              push alone must FAIL.
+              检查 Issue、仓库与交付修订。仅当远端默认分支按提交祖先关系包
+              含交付（实现与测试报告）、所用 PR 已合并而非打开、所需检查通
+              过、Issue 已关闭、且 handoff 指明 Issue、默认分支、集成修订或
+              PR、以及关闭状态时才 PASS。仅推送 milestone 分支必须 FAIL。
         onPass: END
         onFail: implement

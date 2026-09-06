@@ -20,6 +20,7 @@ v1 catalogs are rejected by the loader; old v1 run rows fail closed (exit via
 - [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — confirmed v1 requirements and design (authoritative).
 - [`docs/testing/acceptance-test-plan.md`](docs/testing/acceptance-test-plan.md) — acceptance criteria, test matrix, e2e scenarios (frozen before implementation).
 - [`docs/testing/acceptance-report.md`](docs/testing/acceptance-report.md) — current acceptance status and the remaining live-GUI checklist.
+- [`docs/example/`](docs/example/) — copyable workflow config template (`workflow-template.yaml`) + config/model reference for new workflows.
 
 Superseded `feature-delivery/v1` designs remain available in Git history.
 
@@ -64,7 +65,7 @@ directory under the web profile (the same layout the shipped bundles use, so
 Re-deploy after every `pnpm run build` (step 2). The profile's `pnpm install`
 owns runtime deps (`yaml`, `zod`).
 
-Workflow configs live in `%DSH_HOME%\workflows\*.yaml` (e.g. `milestone-delivery.yaml`, `smoke-test.yaml`).
+Workflow configs live in `%DSH_HOME%\workflows\*.yaml` (e.g. `milestone-delivery.yaml`, `smoke-test.yaml`). New workflows: copy [`docs/example/workflow-template.yaml`](docs/example/workflow-template.yaml) and adapt it (see [`docs/example/README.md`](docs/example/README.md) for the model-route and config-surface reference).
 
 ## Run trace logs
 
