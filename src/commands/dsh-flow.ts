@@ -12,7 +12,7 @@ export interface CommandHost {
   list(): Promise<{ entries: Array<{ workflowId: string }>; diagnostics: Array<{ workflowId: string | null; path: string; reason: string }> }>
   /** Start a workflow run on behalf of the given agent session. */
   start(agent: Agent, workspaceKey: string, workflowId: string, extraText: string): Promise<{ ok: boolean; reason?: string; message?: string }>
-  status(workspaceKey: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
+  status(workspaceKey: string, caller: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
   reset(workspaceKey: string): Promise<{ ok: boolean; reason?: string; message?: string }>
 }
 
@@ -62,7 +62,7 @@ export function makeDshFlowCommand(host: CommandHost): CommandDefinition {
         case 'status': {
           const ws = await host.currentWorkspaceKey(invocation.agent)
           if (ws === undefined) return { kind: 'error', text: '当前会话没有 workspace cwd' }
-          const outcome = await host.status(ws)
+          const outcome = await host.status(ws, invocation.agent.session.id)
           if (!outcome.ok) return { kind: 'error', text: `status 失败：${outcome.reason ?? '未知错误'}` }
           return { kind: 'success', text: typeof outcome.status === 'string' ? outcome.status : JSON.stringify(outcome.status ?? null, null, 2) }
         }

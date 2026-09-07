@@ -197,6 +197,27 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     observed.clear()
     unsafe.clear()
   })
+  async function judgePrompt(run: RunState, input: import('../engine/engine.ts').JudgeSpawnInput): Promise<string> {
+    const manager = adapters.managerAgentOf(run)
+    if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+    const executorSessionId = input.boundary.executorSessionId
+    let actorSession: ProjectionSource | undefined
+    if (executorSessionId !== undefined) {
+      const actorAgent = adapters.ctx.agents.get(SessionId(executorSessionId))
+      actorSession = actorAgent?.session ?? await inspectPersistedSession(adapters.ctx, executorSessionId)
+    }
+    return renderJudgePrompt({
+      nodeToken: input.nodeToken,
+      nodeInstruction: `[当前工作单 input]\n${input.input}\n\n[instruction]\n${input.instruction}`,
+      criteria: input.criteria,
+      workerOutcome: input.claim.outcome,
+      workerHandoff: input.claim.handoff,
+      workspaceCwd: input.cwd,
+      transcript: projectNodeLocal(manager.session, input.boundary, actorSession),
+      previousFeedback: input.previousFeedback,
+      managerContext: input.managerContext,
+    })
+  }
   return {
     observeTurnEnd(sessionId) {
       const agent = adapters.ctx.agents.get(SessionId(sessionId))
@@ -273,35 +294,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const plan = judgeSpawnPlan(run, frozenRoute())
 
-      // A1 R5–R7: Node-local projection (no full manager transcript).
-      // F9: read the actor's events resident-first, then through session
-      // persistence — a Judge packet rebuilt for respawn/spawn-recovery runs
-      // long after the actor's Activation auto-settled (DSH releases continuable
-      // children when quiescent), and the durable Session log still holds the
-      // node's actor history either way.
-      const executorSessionId = input.boundary.executorSessionId
-      let actorSession: ProjectionSource | undefined
-      if (executorSessionId !== undefined) {
-        const actorAgent = adapters.ctx.agents.get(SessionId(executorSessionId))
-        if (actorAgent !== undefined) {
-          actorSession = actorAgent.session
-        } else {
-          actorSession = await inspectPersistedSession(adapters.ctx, executorSessionId)
-        }
-      }
-      const transcript = projectNodeLocal(manager.session, input.boundary, actorSession)
-
-      const prompt = renderJudgePrompt({
-        nodeToken: input.nodeToken,
-        nodeInstruction: `[当前工作单 input]\n${input.input}\n\n[instruction]\n${input.instruction}`,
-        criteria: input.criteria,
-        workerOutcome: input.claim.outcome,
-        workerHandoff: input.claim.handoff,
-        workspaceCwd: input.cwd,
-        transcript,
-        // A1 §7.1: prior REJECT evidence for this same node, when present.
-        previousRejection: input.previousRejection,
-      })
+      // 首次、followup 与 respawn 都从同一当前工作单材料重建完整 packet。
+      const prompt = await judgePrompt(run, input)
 
       const started = await adapters.ctx.subagents.startContinuable({
         provider: 'spawn',
@@ -346,11 +340,13 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       return judgeSessionExistsInPersistence(adapters.ctx, judgeSessionId)
     },
 
-    async followupJudge(run, judgeSessionId, text) {
+    async followupJudge(run, judgeSessionId, input) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(judgeSessionId), textBlocks(text),
+      const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(judgeSessionId), textBlocks(await judgePrompt(run, input)),
         { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
+      adapters.registerJudgeSession(judgeSessionId, input.cwd)
+      return { messageId }
     },
 
     async retireJudge(run, judgeSessionId) {
@@ -365,8 +361,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async drainJudge(run, judgeSessionId) {
       const manager = adapters.managerAgentOf(run)
       adapters.revokeJudgeSession(judgeSessionId)
-      if (manager === undefined) return
-      await adapters.ctx.subagents.drainContinuableChildren(manager, [SessionId(judgeSessionId)]).catch(() => {})
+      if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+      await adapters.ctx.subagents.drainContinuableChildren(manager, [SessionId(judgeSessionId)])
     },
 
     async compactRoleActor(run, roleKey) {

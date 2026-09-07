@@ -23,7 +23,7 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
     },
     claim: async (ws, claim, caller) => { calls.push({ name: 'claim', args: { ws, claim, caller } }); return { ok: true, message: 'claimed' } },
     block: async (ws, nodeToken, reason) => { calls.push({ name: 'block', args: { ws, nodeToken, reason } }); return { ok: true, message: 'blocked' } },
-    resume: async (ws, nodeToken, resolutionContext) => { calls.push({ name: 'resume', args: { ws, nodeToken, resolutionContext } }); return { ok: true, message: 'resumed' } },
+    resume: async (ws, nodeToken, resolutionContext, _caller, target) => { calls.push({ name: 'resume', args: { ws, nodeToken, resolutionContext, target } }); return { ok: true, message: 'resumed' } },
     runProgram: async (ws, nodeToken, parameters) => { calls.push({ name: 'runProgram', args: { ws, nodeToken, parameters } }); return { ok: true, message: 'ran' } },
     resolveProgram: async (ws, nodeToken, result, reason) => { calls.push({ name: 'resolveProgram', args: { ws, nodeToken, result, reason } }); return { ok: true, message: 'resolved' } },
     setRoleModel: async (ws, roleKey, provider, modelId) => { calls.push({ name: 'setRoleModel', args: { ws, roleKey, provider, modelId } }); return { ok: true, message: 'set' } },
@@ -97,8 +97,9 @@ test('node_resume routes to host.resume', async () => {
   const host = makeToolHost()
   const tool = findTool('node_resume')
   const token = randomUUID()
-  await tool.execute({ nodeToken: token, resolutionContext: 'fixed it' }, EXEC as never)
-  assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'fixed it' } })
+  await tool.execute({ nodeToken: token, resolutionContext: 'fixed it', target: 'judge' }, EXEC as never)
+  assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'fixed it', target: 'judge' } })
+  await assert.rejects(() => tool.execute({ nodeToken: token, resolutionContext: 'fixed', surprise: true }, EXEC as never), /unsupported node_resume property/)
 })
 
 test('node_run_program routes to host.runProgram', async () => {
@@ -132,9 +133,24 @@ test('workflow_status renders host status', async () => {
   assert.ok(host.calls.length === 0)
 })
 
+test('workflow_status forwards explicit history paging and rejects open-root extras or invalid combinations', async () => {
+  const calls: unknown[] = []
+  makeToolHost({ status: async (...args: unknown[]) => { calls.push(args); return { ok: true, status: { history: [] } } } })
+  const tool = findTool('workflow_status')
+  const agent = { session: { id: 'manager' } }
+  await tool.execute({ executionId: 'execution-1', after: 4, limit: 10 }, { ...EXEC, agent } as never)
+  assert.deepEqual(calls, [['ws-1', 'manager', { executionId: 'execution-1', after: 4, limit: 10 }]])
+  await assert.rejects(() => tool.execute({ after: 1 }, { ...EXEC, agent } as never), /executionId/)
+  await assert.rejects(() => tool.execute({ executionId: 'execution-1', limit: 51 }, { ...EXEC, agent } as never), /limit/)
+  await assert.rejects(() => tool.execute({ executionId: 'execution-1', surprise: true }, { ...EXEC, agent } as never), /unsupported workflow_status property/)
+})
+
 test('judge_claim routes to host.judgeClaim and concludes the turn on success', async () => {
   const host = makeToolHost()
   const tool = findTool('judge_claim')
+  assert.match(tool.description, /REJECT 仅用于 claim 与既有 criteria 或可验证事实冲突/)
+  const resultDescription = (tool.parameters as { properties: { result: { description: string } } }).properties.result.description
+  assert.match(resultDescription, /NEED_CONTEXT=信息不足或要求不清/)
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
   const token = randomUUID()
@@ -186,6 +202,7 @@ test('judge_respawn routes to host.respawnJudge', async () => {
   const token = randomUUID()
   await tool.execute({ nodeToken: token, reason: 'model swap' }, EXEC as never)
   assert.deepEqual(host.calls[0], { name: 'respawnJudge', args: { ws: 'ws-1', nodeToken: token, reason: 'model swap', caller: '' } })
+  await assert.rejects(() => tool.execute({ nodeToken: token, extra: true }, EXEC as never), /unsupported judge_respawn property/)
 })
 
 test('inspection wrappers reject when authorize fails', async () => {
@@ -308,7 +325,7 @@ test('dsh-flow start rejects invalid workflow ids', async () => {
 
 test('dsh-flow status renders host status', async () => {
   const cmd = makeDshFlowCommand(makeCommandHost())
-  const result = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'status', attachments: [], signal: new AbortController().signal })
+  const result = await cmd.handler({ commandId: 'x' as never, agent: { session: { id: 'manager' } } as never, rawInput: 'status', attachments: [], signal: new AbortController().signal })
   assert.equal(result.kind, 'success')
   assert.match(result.text ?? '', /running/)
 })

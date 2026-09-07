@@ -4,28 +4,32 @@ DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
 workflows (`agent-workflow/v2`).
 
 **当前 `refact` 是集成中间态，不能部署，也不能宣称全量验收通过。**
-T1/T2 已完成；T3 引入真实 SQLite 的 Actor → Judge ACCEPT → 后继/END 三表闭环。
-构建、本票 69 项相关测试和 `scripts/t3-smoke.mjs` 通过，但全量仍有 107 项
-旧接口/后续行为测试失败，原 `pnpm run test:e2e` 尚未迁移。证据与未接通范围见
-[`T3 报告`](docs/test-reports/issue-10-work-order-loop.md)；最终全量验收由 T9 收口。
+T1–T4 已完成；三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT、
+Manager 定向 resume/Judge respawn、争议协议和 Manager-only 有界历史。`scripts/e2e-smoke.mjs`
+已迁移到真实 Runtime/SQLite 的 T4 受控闭环；这仍不是目标宿主真实 Run。T3 基线见
+[`T3 报告`](docs/test-reports/issue-10-work-order-loop.md)，最终全量验收仍由后续票/T9 收口。
+T4 验证：build、114 项相关测试、T3 smoke、迁移后的 e2e 通过；全量仍保留
+103 项已知失败（旧 `engine` MemState、旧单表 `state` 与 T7 Program），未删除或 skip。
 
 当前 claim 合同为 `node_claim({outcome, handoff})`：handoff 必填、trim 后
 1..8000 字符，completed/failed 对称，END 也交付；明确拒绝旧 summary/handoffContext。
 claim 不携带 nodeToken，运行时核对真实派发身份。Judge、Manager、后继与最终结果
 共用原文，无独立摘要或 fallback。Catalog v2 保持，v1 Catalog 被拒绝。
 
-State format 为 `agent-workflow-state/v3`：`runs`、`node_executions`、
-`node_execution_events` 保存位置、当前工作与关键快照。最终交付从终局工作单读取，
-不再保留 Run pending 材料镜像或 T2 的临时 finalHandoff 字段。
+State format 为 `agent-workflow-state/v4`：`runs`、`node_executions`、
+`node_execution_events` 保存位置、当前工作与关键快照；旧 v3/legacy 有数据时保留并
+fail-closed，不静默迁移。REJECT 后当前单保留完整 previous claim 与统一 judgment 关联，
+补充/恢复材料只保留当前完整版本，旧值由 events 解释；正常恢复不回放 events。
 
-当前只接通 Actor Task 的上述闭环和必要安全门控。REJECT/NEED_CONTEXT、公开历史、
-完整恢复/replacement、Program/Child、授权 Reset/旧格式退出按 T4–T8 接通；
-未支持入口明确拒绝，不退回旧引擎。旧格式有数据时保留并拒绝启动新存储，
-不自动迁移或清库。真实宿主组合验收留 T9，受控派发 smoke 不代表真实外部模型执行。
+当前接通 Actor Task 的 ACCEPT/REJECT/NEED_CONTEXT、正常 BLOCK 的 auto/actor/judge
+resume、有效 claim 下 Judge respawn，以及 `workflow_status` 的 Manager-only 当前 Run
+execution 历史分页（stable after、limit ≤ 50）。完整冷重启/replacement、Program/Child、
+授权 Reset/旧格式退出仍按 T5–T8 接通；未支持入口明确拒绝，不退回旧引擎。
+真实宿主组合验收留 T9，受控派发 smoke 不代表真实外部模型执行。
 
 ## Current documentation
 
-- [`CONTEXT.md`](CONTEXT.md) — 当前领域术语与 T3 实现边界。
+- [`CONTEXT.md`](CONTEXT.md) — 当前领域术语与 T4 实现边界。
 - [`docs/design/node-execution-runtime.md`](docs/design/node-execution-runtime.md) / [`spec`](docs/specs/node-execution-runtime.md) — refact 目标设计与验收基线。
 - [`docs/work-plans/runtime-refact.md`](docs/work-plans/runtime-refact.md) — 工单依赖、当前进度与分票证据。
 - [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — 旧版设计参考，不覆盖 refact 新规格。
@@ -45,7 +49,7 @@ src/
   engine/             serial node advancement, token settlement, deferred dispatch
   roles/              role/judge spawn plans, model routes, deny/allow lists
   judge/              transcript projection + judge.claim-correct Judgment Packet + judge_claim protocol
-  tools/              7 workflow tools + 2 inspection wrappers
+  tools/              workflow control tools + read-only inspection wrappers
   commands/           /dsh-flow list|start|status|reset
   programs/           git/gh runner + 2 builtin programs
   plugin/host.ts      adapters wiring real DSH services into the engine
@@ -81,8 +85,8 @@ Workflow configs live in `%DSH_HOME%\workflows\*.yaml` (e.g. `milestone-delivery
 
 ## Run trace logs
 
-以下完整字段清单是原 trace 约定。T3 已保留基本 START/CLAIM/JUDGE/ROUTE/BLOCK
-与脱敏/转义能力，后票专属日志及旧细字段/时序仍待 T9 同步；关键业务历史以三表为准，
+以下完整字段清单是原 trace 约定。T4 保留基本 START/CLAIM/JUDGE/ROUTE/BLOCK
+与脱敏/转义能力，返工/补充/respawn 的专属细日志仍待 T9 同步；关键业务历史以三表为准，
 不要用旧 trace 格式或先写日志的时序替代当前事务事实。
 
 Every workflow run writes a human-readable trace log beside its catalog
@@ -102,9 +106,9 @@ config file (`src/engine/tracelog.ts`):
   - `[ts] CLAIM workflow=<id> node=<node> token=<8> role=<role> outcome=<completed|failed> handoff=<json>` — every accepted Actor claim (after lease admission, before Judge spawn).
   - `[ts] JUDGE workflow=<id> node=<node> token=<8> result=<ACCEPT|REJECT|NEED_CONTEXT> reason=<json> judge=<8>` — every accepted Judge confirmation (v2).
   - `[ts] ROUTE workflow=<id> node=<node> token=<8> result=<PASS|FAIL> target=<node|END|BLOCK>` — the finally-adopted Graph edge direction (ACCEPT maps the claimed outcome; REJECT routes nothing).
-  - `[ts] CORRECT workflow=<id> node=<node> token=<8 new> role=<role> judge=<8 old> detail=<json>` — the REJECT re-dispatch boundary (same node, rotated token, retired judge).
+  - `CORRECT` 专属细行当前未恢复；REJECT 的同 execution 关联与顺序以 `node_execution_events` 为准，nodeToken 不因普通返工轮换。
   - `[ts] BLOCK workflow=<id> node=<node> token=<8> source=<actor|judge|program|dispatch|compact|restart|manager> reason=<json>` — every BLOCK entrance.
-  - `[ts] RESUME workflow=<id> node=<node> oldToken=<8> newToken=<8> target=<judge|actor> context=<json>` / `RESPAWN` / `RESOLVE` / `MODEL` — recovery actions (node_resume, judge_respawn, node_resolve_program, workflow_set_role_model).
+  - `RESUME` / `RESPAWN` 专属细行当前未恢复；Manager context/resume/respawn decision 已与当前状态同事务写入关键 events。
   - `[ts] PROGRAM workflow=<id> node=<node> token=<8> program=<id> result=<PASS|FAIL|ERROR> reason=<json|null>` — builtin-program outcomes (parameters are never logged).
   - `[ts] PUSH parent=<wf>/<node> token=<8> child=<childWf>` / `[ts] POP child=<childWf> result=PASS parent=<wf>/<node> token=<8>` — explicit child-workflow entry/return pairing (PUSH/POP share the parent node's token).
   - `[ts] COMPACT workflow=<id> node=<node> token=<8> role=<role> ok=<bool> detail=<json|null>` — node-boundary compaction results.
@@ -112,8 +116,9 @@ config file (`src/engine/tracelog.ts`):
   (`traceLogPath`), so events after a DSH host restart (restart-reconcile
   BLOCK, post-restart resume) still append to the SAME file. The log itself
   remains a derived artifact outside SQLite.
-- **Privacy**: only Engine-accepted protocol payloads are logged (handoff /
-  judge reason / block reason / resolution context, bounded). No
+- **Privacy**: current trace logs only Engine-accepted handoff / Judge reason /
+  block reason (bounded). Manager resolution context/respawn decisions are currently
+  persisted in SQLite events, not trace; their dedicated trace lines remain T9 work. No
   reasoning, no tool transcripts, no program parameters. Credential text is
   doubly guarded: auth/credential errors keep the Host's sanitized wording
   (primary), and the trace boundary redacts credential-shaped patterns
@@ -122,11 +127,10 @@ config file (`src/engine/tracelog.ts`):
   provider/model identifier fields (backstop, best-effort heuristic — not a
   secret scanner). Catalog-validated structural ids (workflow/node/role/
   target) are deliberately NOT redacted so the trace stays correlatable.
-- **Consistency**: events are written validate → trace → persist, so the log
-  is **at-least-once** — a crash at the seam may leave an orphan line.
-  Node-scoped events carry a nodeToken prefix for dedup (looping back to the
-  same node AND correction re-dispatches both mint fresh tokens, so legit
-  repeats differ from crash dupes); State/Git/GitHub stay authoritative.
+- **Consistency**: SQLite current state + `node_execution_events` are authoritative
+  and commit together; trace is post-commit best-effort and is never replayed for recovery.
+  New Graph visits mint new nodeToken/execution IDs; ordinary same-execution correction
+  keeps the visit/token and uses dispatch/claim/Judge/input identities to reject stale work.
 - **Best-effort**: log directory/file creation or appends never fail the run.
   The FIRST failure per run surfaces once as a Host logger warning; further
   failures stay silent. State/Git/GitHub remain authoritative when they

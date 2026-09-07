@@ -88,8 +88,11 @@ export function apply(ctx: Context) {
     // restart. Fall back to the durable row in either case; a positive match
     // repairs the live mappings.
     const row = await store.get(workspaceKey)
+    const judgment = row?.execution.judgment
+    const currentJudged = judgment !== undefined && judgment.claimId === row?.execution.claim?.id
+      && judgment.inputVersion === row?.execution.inputVersion
     if (row !== undefined && row.run.status === 'running' && row.execution.phase === 'checking'
-      && row.execution.judgment === undefined && row.execution.judge?.sessionId === sessionId) {
+      && !currentJudged && row.execution.judge?.sessionId === sessionId) {
       judgeSessions.add(sessionId)
       judgeWorkspaces.set(sessionId, workspaceKey)
       sessionWorkspaces.set(sessionId, workspaceKey)
@@ -195,13 +198,13 @@ export function apply(ctx: Context) {
     authorize,
     claim: (ws, claim, caller) => engine.handleClaim(ws, claim, caller).then(outcomeOf),
     block: (ws, nodeToken, reason, caller) => engine.handleBlock(ws, nodeToken, reason, caller).then(outcomeOf),
-    resume: (ws, nodeToken, resolutionContext, caller) => engine.handleResume(ws, nodeToken, resolutionContext, caller).then(outcomeOf),
+    resume: (ws, nodeToken, resolutionContext, caller, target) => engine.handleResume(ws, nodeToken, resolutionContext, caller, target).then(outcomeOf),
     runProgram: (ws, nodeToken, parameters, caller) => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf),
     resolveProgram: (ws, nodeToken, result, reason, caller) => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf),
     setRoleModel: (ws, roleKey, provider, modelId) => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf),
     judgeClaim: (ws, nodeToken, result, reason, caller) => engine.handleJudgeClaim(ws, nodeToken, result, reason, caller).then(outcomeOf),
     respawnJudge: (ws, nodeToken, reason, caller) => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf),
-    status: (ws) => engine.status(ws),
+    status: (ws, caller, history) => engine.status(ws, caller, history),
     inspectGit: async (_ws, operation) => {
       const cwd = ambientAgent()?.session.header.cwd
       if (cwd === undefined) return { ok: false, reason: 'no cwd' }
@@ -308,7 +311,7 @@ export function apply(ctx: Context) {
         return { ok: false, reason: String(error) }
       }
     },
-    status: (workspaceKey) => toolHost.status(workspaceKey),
+    status: (workspaceKey, caller) => toolHost.status(workspaceKey, caller),
     async reset(workspaceKey) {
       try {
         await engine.handleReset(workspaceKey)

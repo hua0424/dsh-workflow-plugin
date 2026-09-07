@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -194,6 +195,12 @@ test('Store rejects mutable input/snapshot and BLOCK retains the workspace slot'
   try {
     const row = (await f.store.get('ws'))!
     await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: { ...row.execution, input: 'silently replaced' }, expectedRevision: row.execution.revision, events: [] }]), /input is immutable/)
+    const emptyResolution = structuredClone(row.execution)
+    emptyResolution.resolution = { target: 'actor', inputVersion: emptyResolution.inputVersion }
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: emptyResolution, expectedRevision: row.execution.revision, events: [] }]), /resolution requires context or decision/)
+    const staleResolution = structuredClone(row.execution)
+    staleResolution.resolution = { target: 'actor', context: 'stale', inputVersion: staleResolution.inputVersion + 1 }
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: staleResolution, expectedRevision: row.execution.revision, events: [] }]), /resolution input version mismatch/)
     const altered = structuredClone(row.run)
     altered.definitionSnapshot.judgeRole.persona = 'Changed during run'
     await assert.rejects(f.store.updateRow('ws', altered, row.stateVersion, []), /definitionSnapshot is immutable/)
@@ -221,6 +228,102 @@ test('legacy state fails closed without creating empty replacement tables or cha
     assert.deepEqual(sql.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(row => row.name), ['workflow_state'])
     assert.equal(sql.prepare('SELECT snapshot_json FROM workflow_state').get()!.snapshot_json, 'old active materials')
   } finally { sql.close(); rmSync(home, { recursive: true, force: true }) }
+})
+
+test('Store rejects a current judgment bound to the wrong Judge Session', async () => {
+  const f = await fixture()
+  try {
+    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, f.actor)
+    await f.engine.handleTurnEnded('ws', f.actor)
+    let row = (await f.store.get('ws'))!
+    const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
+    await f.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'need context', judge)
+    row = (await f.store.get('ws'))!
+    const corrupted = structuredClone(row.execution)
+    corrupted.judgment!.judgeSessionId = 'forged-judge-session'
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{
+      execution: corrupted, expectedRevision: row.execution.revision, events: [],
+    }]), /judgment dispatch\/session mismatch/)
+    assert.deepEqual(await f.store.get('ws'), row)
+  } finally { f.cleanup() }
+})
+
+test('failed respawn arrangement keeps the old Judge identity and reports failure', async () => {
+  const f = await fixture()
+  try {
+    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, f.actor)
+    await f.engine.handleTurnEnded('ws', f.actor)
+    let row = (await f.store.get('ws'))!
+    const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
+    await f.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'need replacement', judge)
+    row = (await f.store.get('ws'))!
+    const events = await f.store.events('ws', row.execution.executionId)
+    f.sql.exec("CREATE TRIGGER fail_respawn BEFORE INSERT ON node_execution_events WHEN NEW.type = 'judge-respawned' BEGIN SELECT RAISE(ABORT, 'injected respawn arrangement failure'); END")
+    const failed = await f.engine.handleRespawnJudge('ws', row.execution.nodeToken, 'replace Judge', 'manager')
+    assert.equal(failed.ok, false)
+    assert.match(failed.reason!, /injected respawn arrangement failure/)
+    assert.deepEqual(await f.store.get('ws'), row)
+    assert.deepEqual(await f.store.events('ws', row.execution.executionId), events)
+    f.sql.exec('DROP TRIGGER fail_respawn')
+    assert.equal((await f.engine.handleRespawnJudge('ws', row.execution.nodeToken, 'retry replacement', 'manager')).ok, true)
+  } finally { f.cleanup() }
+})
+
+test('v3 three-table state is rejected without physical or logical mutation', () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-v3-safety-'))
+  mkdirSync(join(home, 'workflows'))
+  const path = stateDbPath(home)
+  const raw = new DatabaseSync(path)
+  try {
+    raw.exec(`
+      PRAGMA foreign_keys = OFF;
+      CREATE TABLE runs (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL UNIQUE, workspace_key TEXT NOT NULL,
+        format_version TEXT NOT NULL, state_version INTEGER NOT NULL CHECK(state_version > 0),
+        status TEXT NOT NULL CHECK(status IN ('running', 'blocked', 'completed')), current_execution_id TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)), updated_at TEXT NOT NULL,
+        FOREIGN KEY(run_id, current_execution_id) REFERENCES node_executions(run_id, execution_id) DEFERRABLE INITIALLY DEFERRED
+      ) STRICT;
+      CREATE UNIQUE INDEX one_active_run_per_workspace ON runs(workspace_key) WHERE status IN ('running', 'blocked');
+      CREATE INDEX workspace_runs ON runs(workspace_key, sequence DESC);
+      CREATE TABLE node_executions (
+        execution_id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(run_id), visit INTEGER NOT NULL CHECK(visit > 0),
+        revision INTEGER NOT NULL CHECK(revision > 0), snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
+        UNIQUE(run_id, execution_id), UNIQUE(run_id, visit)
+      ) STRICT;
+      CREATE TABLE node_execution_events (
+        execution_id TEXT NOT NULL REFERENCES node_executions(execution_id), sequence INTEGER NOT NULL CHECK(sequence > 0),
+        type TEXT NOT NULL CHECK(type IN ('entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited', 'blocked')),
+        at TEXT NOT NULL, snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)), PRIMARY KEY(execution_id, sequence)
+      ) STRICT;
+      PRAGMA user_version = 3;
+      INSERT INTO runs (run_id, workspace_key, format_version, state_version, status, current_execution_id, snapshot_json, updated_at)
+        VALUES ('v3-run', 'v3-workspace', 'agent-workflow-state/v3', 7, 'blocked', 'v3-execution', '{"sentinel":"run"}', 'old-time');
+      INSERT INTO node_executions (execution_id, run_id, visit, revision, snapshot_json)
+        VALUES ('v3-execution', 'v3-run', 1, 4, '{"sentinel":"execution"}');
+      INSERT INTO node_execution_events (execution_id, sequence, type, at, snapshot_json)
+        VALUES ('v3-execution', 1, 'blocked', 'old-time', '{"sentinel":"event"}');
+    `)
+  } finally { raw.close() }
+  const snapshot = () => {
+    const db = new DatabaseSync(path)
+    try {
+      return {
+        version: db.prepare('PRAGMA user_version').get(),
+        schema: db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE type IN ('table', 'index') ORDER BY type, name").all(),
+        runs: db.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+        executions: db.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+        events: db.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+      }
+    } finally { db.close() }
+  }
+  try {
+    const before = snapshot()
+    const hashBefore = createHash('sha256').update(readFileSync(path)).digest('hex')
+    assert.throws(() => new StateStore(home), /incompatible state format/)
+    assert.deepEqual(snapshot(), before)
+    assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), hashBefore)
+  } finally { rmSync(home, { recursive: true, force: true }) }
 })
 
 test('claim event failure rolls back current work; original dispatch retries and survives SQLite reopen', async () => {

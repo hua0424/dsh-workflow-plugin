@@ -5,7 +5,7 @@
  */
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v3' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v4' as const
 export const STATE_TABLE_NAME = 'runs' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
@@ -192,6 +192,31 @@ export interface ExecutionDispatch {
   settled: boolean
 }
 
+export interface ExecutionClaim extends NodeClaim {
+  id: string
+  dispatchId: string
+}
+
+/** 最新 Judge 判定/反馈；保留 claim/Judge/input 关联，只有 ACCEPT 可交接。 */
+export interface ExecutionJudgment extends JudgeResult {
+  claimId: string
+  judgeDispatchId: string
+  judgeSessionId: string
+  inputVersion: number
+}
+
+export type ResumeTarget = 'auto' | 'actor' | 'judge'
+
+/** 当前完整补充/恢复材料；后续补充替换它，旧值由 events 保留。 */
+export interface ExecutionResolution {
+  target: Exclude<ResumeTarget, 'auto'>
+  /** 每次 node_resume 提供的完整当前补充；respawn 不伪造补充。 */
+  context?: string
+  /** 最近一次 Manager 恢复/重建决定，供事件解释，不作为新 criteria。 */
+  decision?: string
+  inputVersion: number
+}
+
 /** 一次 Graph visit 的唯一当前材料。revision 与派发/claim 身份互不替代。 */
 export interface NodeExecution {
   executionId: string
@@ -207,9 +232,12 @@ export interface NodeExecution {
   successorId?: string
   boundary?: NodeContextBoundary
   dispatch?: ExecutionDispatch
-  claim?: NodeClaim & { id: string; dispatchId: string }
+  claim?: ExecutionClaim
+  /** REJECT/显式退回后保留的已失效旧 claim；不授予当前提交资格。 */
+  previousClaim?: ExecutionClaim
   judge?: ExecutionDispatch & { claimId: string; inputVersion: number }
-  judgment?: JudgeResult & { claimId: string; judgeDispatchId: string }
+  judgment?: ExecutionJudgment
+  resolution?: ExecutionResolution
   inputVersion: number
   blockReason: string | null
   enteredAt: string
@@ -219,7 +247,7 @@ export interface NodeExecution {
 export interface NodeExecutionEvent {
   executionId: string
   sequence: number
-  type: 'entered' | 'actor-arranged' | 'claim' | 'judge-arranged' | 'judgment' | 'exited' | 'blocked'
+  type: 'entered' | 'actor-arranged' | 'claim' | 'judge-arranged' | 'judgment' | 'exited' | 'blocked' | 'manager-context' | 'resumed' | 'judge-respawned'
   at: string
   snapshot: NodeExecution
 }
@@ -271,14 +299,6 @@ export function normalizeNodeClaim(claim: NodeClaim): NodeClaim {
   const handoff = claim.handoff.trim()
   if (handoff.length > LIMITS.handoffMax) throw new WorkflowError(`handoff must be at most ${LIMITS.handoffMax} characters after trim`)
   return { outcome: claim.outcome, handoff }
-}
-
-/** A1 §6.4: persisted REJECT evidence for the current node's correction cycle. */
-export interface PendingCorrection {
-  /** The Judge's REJECT reason (≤ reasonMax) — reused verbatim as the correction instruction. */
-  judgeReason: string
-  /** Snapshot of the claim the Judge rejected. */
-  previousClaim: NodeClaim
 }
 
 /** Judge decision submitted through the `judge_claim` protocol (A1 R9). */

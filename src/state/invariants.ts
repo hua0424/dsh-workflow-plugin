@@ -23,9 +23,16 @@ const executionSchema = z.object({
   phase: z.enum(['ready', 'working', 'checking', 'settling', 'exited']),
   predecessorId: text.optional(), successorId: text.optional(),
   boundary: z.object({ dispatchedAt: revision, managerFromSeq: revision, executorSessionId: text.optional(), executorDispatchMessageId: text.optional() }).strict().optional(),
-  dispatch: dispatch.optional(), claim: claim.optional(),
+  dispatch: dispatch.optional(), claim: claim.optional(), previousClaim: claim.optional(),
   judge: dispatch.extend({ claimId: text, inputVersion: revision }).optional(),
-  judgment: z.object({ result: z.enum(['ACCEPT', 'REJECT', 'NEED_CONTEXT']), reason: z.string().trim().min(1).max(LIMITS.reasonMax), claimId: text, judgeDispatchId: text }).strict().optional(),
+  judgment: z.object({
+    result: z.enum(['ACCEPT', 'REJECT', 'NEED_CONTEXT']), reason: z.string().trim().min(1).max(LIMITS.reasonMax),
+    claimId: text, judgeDispatchId: text, judgeSessionId: text, inputVersion: revision,
+  }).strict().optional(),
+  resolution: z.object({
+    target: z.enum(['actor', 'judge']), context: z.string().trim().min(LIMITS.resolutionMin).max(LIMITS.resolutionMax).optional(),
+    decision: z.string().trim().min(1).max(LIMITS.reasonMax).optional(), inputVersion: revision,
+  }).strict().optional(),
   inputVersion: revision, blockReason: text.nullable(), enteredAt: z.iso.datetime(), exitedAt: z.iso.datetime().optional(),
 }).strict()
 
@@ -42,7 +49,19 @@ export function checkExecutionInvariants(run: RunState, execution: NodeExecution
   if ((execution.phase === 'exited') !== (execution.exitedAt !== undefined)) problems.push('exited phase/time mismatch')
   if (execution.claim && execution.claim.dispatchId !== execution.dispatch?.id) problems.push('claim dispatch mismatch')
   if (execution.judge && (execution.judge.claimId !== execution.claim?.id || execution.judge.inputVersion !== execution.inputVersion)) problems.push('judge claim/input mismatch')
-  if (execution.judgment && (execution.judgment.claimId !== execution.claim?.id || execution.judgment.judgeDispatchId !== execution.judge?.id)) problems.push('judgment claim/dispatch mismatch')
+  if (execution.judgment) {
+    const current = execution.judgment.inputVersion === execution.inputVersion
+      && execution.judgment.claimId === execution.claim?.id
+    const judgedClaim = execution.judgment.claimId === execution.claim?.id ? execution.claim : execution.previousClaim
+    if (execution.judgment.claimId !== judgedClaim?.id) problems.push('judgment claim mismatch')
+    if (execution.judgment.result === 'ACCEPT' && !current) problems.push('ACCEPT must be the current conclusion')
+    if (current && (execution.judgment.judgeDispatchId !== execution.judge?.id
+      || execution.judgment.judgeSessionId !== execution.judge?.sessionId)) problems.push('judgment dispatch/session mismatch')
+    if (!current && execution.judgment.inputVersion >= execution.inputVersion) problems.push('historical judgment must have an older input version')
+  }
+  if (execution.resolution && !execution.resolution.context && !execution.resolution.decision) problems.push('resolution requires context or decision')
+  if (execution.resolution?.inputVersion !== undefined && execution.resolution.inputVersion !== execution.inputVersion) problems.push('resolution input version mismatch')
+  if (execution.resolution?.target === 'judge' && !execution.claim) problems.push('judge resolution requires claim')
   if (execution.phase === 'checking' && !execution.claim) problems.push('checking requires claim')
   return problems
 }

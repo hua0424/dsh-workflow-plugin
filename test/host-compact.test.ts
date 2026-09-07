@@ -46,7 +46,7 @@ function makeRun(actorForDeveloper: string | undefined): RunState {
 }
 
 test('Role and Judge continuation use host distinct-turn queue with exact Manager authority', async () => {
-  const manager = { session: { id: 'manager' } } as unknown as Agent
+  const manager = { session: { id: 'manager', seq: 0, snapshotEvents: () => [] } } as unknown as Agent
   const deliveries: Array<{ parent: Agent; childId: string; text: string; source: unknown }> = []
   const queue: HostPromptQueue = {
     async [queueSubagentPrompt](parent, childId, content, source, signal) {
@@ -66,15 +66,37 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
   const host = makeSubagentHost(adapters, () => ({}))
   assert.deepEqual(await dispatch.sendRoleActor(run, 'developer', 'next node'), { messageId: 'dispatch-1' })
   assert.deepEqual(await host.ensureRoleActor(run, 'developer', 'resume node'), { childId: 'sess-dev', messageId: 'dispatch-2' })
-  await host.followupJudge(run, 'sess-judge', 'more evidence')
-  assert.deepEqual(deliveries, [
+  assert.deepEqual(await host.followupJudge(run, 'sess-judge', {
+    nodeToken: run.callStack[0]!.nodeToken, instruction: 'Do.', criteria: 'PASS.', input: 'root input',
+    boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need facts', claim: { outcome: 'completed', handoff: 'candidate' } },
+    managerContext: 'more evidence', cwd: '.', judgeSessionId: 'sess-judge',
+  }), { messageId: 'dispatch-3' })
+  assert.deepEqual(deliveries.slice(0, 2), [
     { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
     { parent: manager, childId: 'sess-dev', text: 'resume node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
-    { parent: manager, childId: 'sess-judge', text: 'more evidence', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
   ])
+  assert.equal(deliveries[2]!.childId, 'sess-judge')
+  assert.match(deliveries[2]!.text, /Worker handoff:\ncandidate/)
+  assert.match(deliveries[2]!.text, /need facts/)
+  assert.match(deliveries[2]!.text, /more evidence/)
   adapters.managerAgentOf = () => undefined
   await assert.rejects(dispatch.sendRoleActor(run, 'developer', 'unauthorized'), /manager agent is not live/)
   assert.equal(deliveries.length, 3)
+})
+
+test('Judge drain propagates missing Manager and host drain failures', async () => {
+  const manager = { session: { id: 'manager' } } as unknown as Agent
+  const adapters: HostAdapters = {
+    ctx: { subagents: { drainContinuableChildren: async () => { throw new Error('drain failed') } } } as unknown as Context,
+    managerAgentOf: () => manager,
+    cwdOfManager: async () => undefined,
+    registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+  }
+  const host = makeSubagentHost(adapters, () => ({}))
+  await assert.rejects(host.drainJudge(makeRun(undefined), 'judge-old'), /drain failed/)
+  adapters.managerAgentOf = () => undefined
+  await assert.rejects(host.drainJudge(makeRun(undefined), 'judge-old'), /manager agent is not live/)
 })
 
 function manualError(code: string, message: string): Error & { code: string } {

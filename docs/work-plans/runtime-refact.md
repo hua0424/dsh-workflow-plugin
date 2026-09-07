@@ -9,7 +9,7 @@
 | T1 | [#8](https://github.com/hua0424/dsh-workflow-plugin/issues/8) | DSH 0.1.2-rc.1 兼容基线 | 无 | 完成 |
 | T2 | [#9](https://github.com/hua0424/dsh-workflow-plugin/issues/9) | outcome+handoff 单文本闭环 | #8 | 完成 |
 | T3 | [#10](https://github.com/hua0424/dsh-workflow-plugin/issues/10) | 三表工作单 Actor/Judge 事务闭环 | #9 | 完成 |
-| T4 | [#11](https://github.com/hua0424/dsh-workflow-plugin/issues/11) | 同节点返工、历史与争议协调 | #10 | 待开始 |
+| T4 | [#11](https://github.com/hua0424/dsh-workflow-plugin/issues/11) | 同节点返工、历史与争议协调 | #10 | 完成 |
 | T5 | [#13](https://github.com/hua0424/dsh-workflow-plugin/issues/13) | Role 复用、compact 与安全收口 | #11 | 待开始 |
 | T6 | [#14](https://github.com/hua0424/dsh-workflow-plugin/issues/14) | 统一中断恢复与现场检查 | #13 | 待开始 |
 | T7 | [#15](https://github.com/hua0424/dsh-workflow-plugin/issues/15) | Program/Child/FAIL 交接恢复 | #14 | 待开始 |
@@ -33,7 +33,8 @@ T8 与 T4–T7 的阻塞关系不同，但同一共享工作区默认顺序实�
 
 - T1：commit `e245289991b9606e0fe186c406d90c34d49bfa83`，#8 已关闭；`docs/test-reports/issue-8-host-baseline.md`；目标依赖适配后 build、222/222 unit、隔离 smoke 通过，父任务独立复验通过；Standards 0 项、Spec 0 项。
 - T2：commit `6927fe79280ed9bd625e1cad679c85eebafbef9d`，#9 已关闭；`docs/test-reports/issue-9-single-handoff.md`；单文本交接、终局保存及旧格式保护完成，build、228/228 unit、隔离 smoke 经父独立复验通过；Standards 0 项、Spec 0 项。
-- T3：`docs/test-reports/issue-10-work-order-loop.md`；三表 Actor→Judge→后继/END 闭环、事务/身份/收口门控完成。build、69/69本票相关测试、T3隔离smoke经父独立复验通过；全量249项中142通过/107失败且0skip，原e2e仍失败并按后票保留。首轮Standards P2已修复复审关闭，最终 Standards 0、Spec 0。起始固定点 `6927fe79280ed9bd625e1cad679c85eebafbef9d`。
+- T3：commit `0be6fd19d3879efdb51e109f73396916a4baeed6`，#10 已关闭；`docs/test-reports/issue-10-work-order-loop.md`。三表 Actor→Judge→后继/END 闭环、事务/身份/收口门控完成。build、69/69本票相关测试、T3隔离smoke经父独立复验通过；全量249项中142通过/107失败且0skip，原e2e仍失败并按后票保留。首轮Standards P2已修复复审关闭，最终 Standards 0、Spec 0。
+- T4：`docs/test-reports/issue-11-rework-disputes.md`；同execution REJECT/NEED_CONTEXT、定向resume、Judge respawn、争议协议、Manager-only事件分页完成，State v4。build、114项相关测试、T3smoke/e2e通过；父最终93项相关及两套smoke通过，全量267=164PASS/103后票FAIL/0skip。审查修复drain顺序/silent stall/status泄漏/身份不变量/多代退回/v3证据等，最终Standards 0、Spec 0。起始代码固定点 `0be6fd19d3879efdb51e109f73396916a4baeed6`。
 - T9 只读预检：`docs/testing/runtime-refact-host-preflight.md` 已核实可复用宿主入口；未编写/执行组合 fixture，A30 尚未通过，不解除工单依赖。
 
 逐票在完成后补充测试报告/commit/审查结论。尚未完成的票不能仅凭设计或代码存在被标记通过。

@@ -1,6 +1,6 @@
 # Domain Glossary
 
-> `refact` 当前为 T3 集成态，未部署。目标架构见 `docs/design/node-execution-runtime.md`，当前工单范围见 `docs/work-plans/runtime-refact.md`。以下区分已接通行为与后续票，不能据此操作真实 Run。
+> `refact` 当前为 T4 集成态，未部署。目标架构见 `docs/design/node-execution-runtime.md`，当前工单范围见 `docs/work-plans/runtime-refact.md`。以下区分已接通行为与后续票，不能据此操作真实 Run。
 
 ## Agent Team Workflow / Manager
 
@@ -30,7 +30,7 @@ nodeToken 是控制面过期检查，不是授权凭证。**旧 Turn 即使查�
 
 ## Node Execution（工作单）
 
-`node_executions` 是一次 Graph visit 的当前事实。每次沿 Edge 进入（包括自环、回边）创建独立 execution；T4–T6 的同 visit 返工/恢复将更新同一单。
+`node_executions` 是一次 Graph visit 的当前事实。每次沿 Edge 进入（包括自环、回边）创建独立 execution；REJECT、补充、普通 resume 与 Judge respawn 更新同一单，完整重启/replacement 仍由 T5/T6 收口。
 
 工作单保存 input 快照、phase、Actor 安排与真实 Host message ID、Node-local 投影边界、当前 claim/Judge/判定、版本与暂停原因，以及前驱/后继关联。input 进入时固定，不被前驱修改或后续补充覆盖。
 
@@ -42,7 +42,7 @@ phase 为 `ready|working|checking|settling|exited`：表示已登记业务事实
 
 状态与对应事件同事务。ACCEPT 的 judgment、前驱离开、后继 input/进入事件、Run 指针同事务；失败全部回滚，同一真实提交可重试，成功后重复提交不能二次推进。
 
-正常继续读当前工作单，历史解释读事件。不回放事件恢复；不建 attempt、outbox、effect 或 recovery-job 表。Store 提供同 Run 的有界事件读取，Manager 公开历史工具在 T4 接通。
+正常继续读当前工作单，历史解释读事件。不回放事件恢复；不建 attempt、outbox、effect 或 recovery-job 表。`workflow_status({executionId,after?,limit?})` 向当前 Run Manager 提供稳定 sequence 的前向分页（每页最多 50）；Role/Judge 与跨 Run execution 拒绝，默认无参仍只给当前摘要。
 
 ## Node Claim / Handoff
 
@@ -68,13 +68,13 @@ compact 的 cold-resume/维护/释放在 Host Adapter 内。成功与合法 no-o
 
 ## Judge Role / Judge Agent
 
-Judge 是独立只读检查者，不补做 Actor 工作，不改写 claim outcome。T3 每次判断创建新 continuable Judge，安排在外部 spawn 前落库，真实派发 message ID 返回后才允许该 Turn 提交。
+Judge 是独立只读检查者，不补做 Actor 工作，不改写 claim outcome。首次判断和 respawn 创建 continuable Judge；NEED_CONTEXT 补充可复用同一 Session，但每次都先登记新的 Judge dispatch，再以 Host queue 开新真实 Turn，并在真实 message ID 返回后才允许该 Turn 提交。
 
 Host 用真实 tool allow-list 限制 read/glob/grep/read_image 和 workspace/repository 限定的 workflow_inspect_git/workflow_inspect_github，并授予专用 judge_claim；spawn 后检查最终工具面，异常 fail-closed。Actor/Manager 不能冒充 Judge。
 
 Judgment Packet 来自本次工作单 input、instruction/criteria、claim.handoff 与本次 dispatch 的 Node-local projection，不从旧 Run.nodeBoundary/pendingClaim 镜像读取。投影排除旧 Node、system/tool/notice 与提交约束，不注入完整 Manager 历史。
 
-`judge_claim({nodeToken,result,reason})` 的真实 caller Turn 也绑定当前 Judge dispatch，且必须匹配 claim/input version。ACCEPT 后 completed→PASS、failed→FAIL；有合法出口才原子交接。REJECT/NEED_CONTEXT 的返工/补充在 T4 显式未接通，当前拒绝，不假 ACCEPT 或绕回旧引擎。
+`judge_claim({nodeToken,result,reason})` 的真实 caller Turn 绑定当前 Judge dispatch，且必须匹配 claim/input version。ACCEPT 后 completed→PASS、failed→FAIL；有合法出口才原子交接。REJECT 在同 execution 保存完整旧 claim 与 Judge/input 关联、使当前资格失效并重派原 Actor，不走 onFail/新 visit/compact；NEED_CONTEXT 保留当前 claim 并 BLOCK。Manager 的完整当前补充先入库/事件、递增 inputVersion，再开 Judge followup；失败仍保留材料，旧 Turn 无效。
 
 ## 安全收口 / Host Adapter
 
@@ -88,12 +88,11 @@ SQLite 事务与状态队列不包 spawn/compact/网络/Program 长调用。inde
 
 ## BLOCK / 暂未接通范围
 
-T3 支持显式 node_block、Actor 未提交结果、Judge 未提交结论、派发/compact/安全收口故障的可见 BLOCK；材料保留。重启默认 BLOCK 未结束 Run，不猜测外部效果。
+T4 支持显式 node_block、Actor 未提交结果、Judge 未提交结论、NEED_CONTEXT、派发/compact/安全收口故障的可见 BLOCK；材料保留。`node_resume` 仍是 Manager-only/current BLOCK，可选 auto/actor/judge 并拒绝已 exited、不适用阶段或可交接结论；`judge_respawn` 仅在有效 claim 下重建并撤销/收口旧 Judge。Actor/Judge 争议协议由插件统一注入，Manager 补充不改冻结 Snapshot/criteria。重启默认 BLOCK 未结束 Run，不猜测外部效果。
 
 以下入口在 refact 集成期明确拒绝，无旧引擎 fallback：
 
-- T4：REJECT/NEED_CONTEXT 返工、补充、公开有界历史与争议协调。
-- T5/T6：完整 Role replacement、node_resume、judge_respawn 与中断继续。
+- T5/T6：完整 Role replacement、冷重启与未知外部进度恢复；T4 只接通正常 BLOCK 补充/返工/判定闭环。
 - T7：Builtin Program、Child Workflow、FAIL 无出口重开与 model replacement 控制。含 Program/Child 的 Root 图在启动前拒绝；已有 onFail 的 Actor FAIL 对称交接已支持。
 - T8：授权 Reset/terminated 与旧格式备份退出；当前 Reset 不删除材料。
 
@@ -101,14 +100,14 @@ Program 的目标合同为参数先存再执行、确定结果交接、不确定
 
 ## Workflow State Store / 可观察性
 
-使用内置 node:sqlite、WAL、单连接短事务；SQL active-workspace unique/FK 与 Run/Execution CAS 共同保护位置。旧 workflow_state 有行、未知格式/坏快照必须明确拒绝，保留原数据，不静默迁移或创建空库遮盖。State format 为 `agent-workflow-state/v3`。
+使用内置 node:sqlite、WAL、单连接短事务；SQL active-workspace unique/FK 与 Run/Execution CAS 共同保护位置。旧 workflow_state 有行、未知格式/坏快照必须明确拒绝，保留原数据，不静默迁移或创建空库遮盖。T4 扩展严格工作单/事件合同后 State format 为 `agent-workflow-state/v4`；旧 v3 同样 fail-closed，不静默迁移。
 
-命令仍是 `/dsh-flow list|start <id> [extra text]|status|reset`，Root extraText 在首次派发前作为 input 保存。status 展示当前 execution/phase/角色/原因及同 handoff 预览；最终通知 best-effort，失败不撤销终局事务。
+命令仍是 `/dsh-flow list|start <id> [extra text]|status|reset`，Root extraText 在首次派发前作为 input 保存。默认 status 只展示当前 execution/phase/角色/原因、input/handoff 有界预览与恢复方向，不暴露完整 claim、previousClaim、Manager context 或内部 dispatch；最终通知 best-effort，失败不撤销终局事务。
 
-trace 是派生产物，不是业务 events。T3 沿用 trace helper 的转义/脱敏/失败容忍，记录已提交的 START/CLAIM/JUDGE/ROUTE/BLOCK；不通过 trace 恢复。旧先trace后State的 orphan 时序与后续票专属细日志需 T9 收敛验证。
+trace 是派生产物，不是业务 events。T4 沿用 trace helper 的转义/脱敏/失败容忍，记录已提交的 START/CLAIM/JUDGE/ROUTE/BLOCK；不通过 trace 恢复。旧先trace后State的 orphan 时序与后续票专属细日志需 T9 收敛验证。
 
 ## 测试与交付
 
-最高测试 seam 是真实 Workflow Runtime + 临时 SQLite + 受控 Host Adapter；关键来源测试使用精确派发 ID 集合。`scripts/t3-smoke.mjs` 是独立临时 home 的 T3 冒烟，不操作真实 Run，不冒充 A30 真实宿主验证。
+最高测试 seam 是真实 Workflow Runtime + 临时 SQLite + 受控 Host Adapter；关键来源测试使用精确派发 ID 集合。`scripts/t3-smoke.mjs` 保留 ACCEPT 基线，`scripts/e2e-smoke.mjs` 已迁移为 T4 的 REJECT/failed-onFail/修正闭环；二者都使用独立临时 home，不操作真实 Run，也不冒充 A30 真实宿主验证。
 
-旧全量 engine/state/恢复 smoke 尚待按 T4–T9 迁移，失败必须列明，不通过跳过有效测试伪装全绿。真实宿主 A30、完整恢复/Graph/授权退出及整体验收仍由对应后票完成。
+旧全量 engine/state 测试仍待按 T5–T9 迁移，失败必须列明，不通过删除/skip 有效测试伪装全绿。真实宿主 A30、完整恢复/Graph/授权退出及整体验收仍由对应后票完成。

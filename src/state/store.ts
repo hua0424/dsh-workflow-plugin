@@ -25,7 +25,7 @@ interface ExecutionRow {
   revision: number
   snapshot_json: string
 }
-const EVENT_TYPES = ['entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited', 'blocked'] as const
+const EVENT_TYPES = ['entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited', 'blocked', 'manager-context', 'resumed', 'judge-respawned'] as const
 const CREATE_SQL = `
 CREATE TABLE runs (
   sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,12 +53,12 @@ CREATE TABLE node_executions (
 CREATE TABLE node_execution_events (
   execution_id TEXT NOT NULL REFERENCES node_executions(execution_id),
   sequence INTEGER NOT NULL CHECK(sequence > 0),
-  type TEXT NOT NULL CHECK(type IN ('entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited', 'blocked')),
+  type TEXT NOT NULL CHECK(type IN ('entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited', 'blocked', 'manager-context', 'resumed', 'judge-respawned')),
   at TEXT NOT NULL,
   snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
   PRIMARY KEY(execution_id, sequence)
 ) STRICT;
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;
 `
 
 function json(value: unknown): string {
@@ -99,7 +99,7 @@ export class StateStore {
       if (names.length === 0 && version.user_version === 0) {
         this.db.exec('BEGIN IMMEDIATE')
         try { this.db.exec(CREATE_SQL); this.db.exec('COMMIT') } catch (error) { this.db.exec('ROLLBACK'); throw error }
-      } else if (version.user_version !== 3 || names.length !== 3 || !['runs', 'node_executions', 'node_execution_events'].every(name => names.includes(name))) {
+      } else if (version.user_version !== 4 || names.length !== 3 || !['runs', 'node_executions', 'node_execution_events'].every(name => names.includes(name))) {
         throw new Error('incompatible state format; original data retained; authorized backup/reset required')
       }
       this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000')

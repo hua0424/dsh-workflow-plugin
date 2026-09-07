@@ -27,6 +27,19 @@ function makeSource(id: string, events: Array<{ time: number; seq: number; type:
   }
 }
 
+test('plugin-owned dispute protocol tells Actor to BLOCK disagreements and Judge not to invent criteria', () => {
+  assert.match(SUBMISSION_CONSTRAINT, /认可.*修正/)
+  assert.match(SUBMISSION_CONSTRAINT, /分歧.*证据.*Manager/)
+  assert.match(SUBMISSION_CONSTRAINT, /不伪报 failed/)
+  const prompt = renderJudgePrompt({
+    nodeToken: 'tok', nodeInstruction: 'work', criteria: 'existing criteria', workerOutcome: 'completed', workerHandoff: 'claim', workspaceCwd: '.', transcript: '',
+  })
+  assert.match(prompt, /existing criteria/)
+  assert.match(prompt, /verifiable fact/i)
+  assert.match(prompt, /NEED_CONTEXT/)
+  assert.match(prompt, /preference.*criterion/i)
+})
+
 test('parseJudgeClaim accepts ACCEPT/REJECT/NEED_CONTEXT (A1 v2)', () => {
   assert.deepEqual(parseJudgeClaim({ result: 'ACCEPT', reason: 'good' }), { result: 'ACCEPT', reason: 'good' })
   assert.deepEqual(parseJudgeClaim({ result: 'REJECT', reason: 'bad' }), { result: 'REJECT', reason: 'bad' })
@@ -85,15 +98,29 @@ test('renderJudgePrompt renders the [previous rejection] evidence before the cla
     workerOutcome: 'completed',
     workspaceCwd: 'C:\\ws',
     transcript: '',
-    previousRejection: {
-      judgeReason: 'tests missing',
-      previousClaim: { outcome: 'completed', handoff: 'notes' },
+    previousFeedback: {
+      result: 'REJECT', reason: 'tests missing',
+      claim: { outcome: 'completed', handoff: 'notes' },
     },
   })
-  assert.match(text, /# Previous judgment on this node \(REJECTED\)\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nhandoff: notes\n/)
-  const evidenceAt = text.indexOf('[judge rejection]')
+  assert.match(text, /# Previous Judge feedback on this node \(REJECT\)\n\[judge reason\]\ntests missing\n\n\[judged claim\]\noutcome: completed\nhandoff: notes\n/)
+  const evidenceAt = text.indexOf('[judge reason]')
   const claimAt = text.indexOf('Worker claimed outcome')
   assert.ok(evidenceAt !== -1 && claimAt !== -1 && evidenceAt < claimAt, 'evidence precedes the worker claim')
+})
+
+test('fresh Judge packet preserves NEED_CONTEXT feedback and the current Manager resolution', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-1', nodeInstruction: 'Build it', criteria: 'PASS when built',
+    workerHandoff: 'candidate', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need the approved scope decision', claim: { outcome: 'completed', handoff: 'candidate' } },
+    managerContext: 'The approved scope explicitly includes this behavior.',
+  })
+  assert.match(text, /NEED_CONTEXT/)
+  assert.match(text, /need the approved scope decision/)
+  assert.match(text, /candidate/)
+  assert.match(text, /The approved scope explicitly includes this behavior/)
+  assert.match(text, /does not change frozen criteria/)
 })
 
 test('renderJudgePrompt renders an empty transcript placeholder', () => {
