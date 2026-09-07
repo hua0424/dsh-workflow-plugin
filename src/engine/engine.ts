@@ -1,5 +1,5 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
-import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ResumeTarget } from '../types.ts'
+import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget } from '../types.ts'
 import { WorkflowError, LIMITS, normalizeNodeClaim } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
@@ -255,7 +255,9 @@ export class WorkflowEngine {
       const cwd = await this.cwdResolver(run)
       if (!await this.stillCurrent(ws, e, version)) return
       const continuationSessionId = e.judgment?.result === 'NEED_CONTEXT' && e.judgment.claimId === e.claim.id
-        && e.judgment.inputVersion < e.inputVersion ? e.judgment.judgeSessionId : undefined
+        && e.judgment.inputVersion + 1 === e.inputVersion && e.previousJudge !== undefined
+        && e.judgment.judgeDispatchId === e.previousJudge.id && e.judgment.judgeSessionId === e.previousJudge.sessionId
+        ? e.judgment.judgeSessionId : undefined
       if (continuationSessionId && !await this.subagents.safeToInspect(continuationSessionId)) throw new WorkflowError('previous Judge turn is not safely closed')
       if (!await this.stillCurrent(ws, e, version)) return
       e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
@@ -276,6 +278,13 @@ export class WorkflowEngine {
     const row = await this.state.get(ws)
     return row?.run.status === 'running' && row.version === version && row.execution.executionId === e.executionId
       && row.execution.dispatch?.id === e.dispatch?.id && row.execution.claim?.id === e.claim?.id ? row : undefined
+  }
+  /** Manager-side destructive Judge handoff: drain first, then prove the same work is still current. */
+  private async drainJudgeAndRevalidate(ws: string, row: RuntimeRow, judgeToDrain: ExecutionJudge | undefined): Promise<boolean> {
+    if (judgeToDrain) await this.subagents.drainJudge(row.run, judgeToDrain.sessionId)
+    const current = await this.state.get(ws)
+    return current?.version === row.version && current.run.runId === row.run.runId
+      && current.execution.executionId === row.execution.executionId
   }
   private async dispatchFault(ws: string, e: NodeExecution, error: unknown, committedVersion: number): Promise<void> {
     const row = await this.state.get(ws)
@@ -316,6 +325,7 @@ export class WorkflowEngine {
       const rejectedClaim = e.claim
       const rejectedJudge = e.judge
       e.previousClaim = rejectedClaim
+      e.previousJudge = rejectedJudge
       e.judgment = {
         result, reason, claimId: rejectedClaim.id, judgeDispatchId: rejectedJudge.id,
         judgeSessionId: rejectedJudge.sessionId!, inputVersion: rejectedJudge.inputVersion,
@@ -334,6 +344,8 @@ export class WorkflowEngine {
     }
     if (result === 'NEED_CONTEXT') {
       const judge = e.judge
+      delete e.previousJudge
+      delete e.previousClaim
       e.judgment = {
         result, reason, claimId: e.claim.id, judgeDispatchId: judge.id,
         judgeSessionId: judge.sessionId!, inputVersion: judge.inputVersion,
@@ -349,6 +361,8 @@ export class WorkflowEngine {
     const node = this.nodeAt(run, topFrame(run))!
     const target = e.claim.outcome === 'completed' ? node.onPass : node.onFail
     if (!target) return unsupported('T7 FAIL without onFail')
+    delete e.previousJudge
+    delete e.previousClaim
     e.judgment = {
       result, reason, claimId: e.claim.id, judgeDispatchId: e.judge.id,
       judgeSessionId: e.judge.sessionId!, inputVersion: e.judge.inputVersion,
@@ -438,18 +452,42 @@ export class WorkflowEngine {
     const resolvedTarget: Exclude<ResumeTarget, 'auto'> = target === 'auto'
       ? e.phase === 'checking' && e.claim && e.judgment?.result !== 'ACCEPT' ? 'judge' : 'actor'
       : target
-    const oldJudgeSessionId = e.judge?.sessionId
+    const oldJudge = e.judge
+    const oldJudgeSessionId = oldJudge?.sessionId
     if (resolvedTarget === 'judge') {
       if (e.phase !== 'checking' || !e.claim || !e.dispatch?.settled || e.judgment?.result === 'ACCEPT') return rejected('judge resume requires an effective settled claim without a business conclusion')
+      const sameJudgeNeedContext = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
+        && e.judgment.claimId === e.claim.id && e.judgment.inputVersion === e.inputVersion
+        && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
+      const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
+      if (!sameJudgeNeedContext && judgeToDrain) {
+        try {
+          if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale judge resume request after Judge drain')
+        } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+      }
+      if (sameJudgeNeedContext && oldJudge) e.previousJudge = oldJudge
       delete e.judge
     } else {
       const canReturnActor = e.phase === 'ready' || (e.phase === 'working' && !e.claim)
         || (e.phase === 'checking' && !!e.claim && e.judgment?.result !== 'ACCEPT')
       if (!canReturnActor) return rejected('actor resume would overwrite a transferable conclusion')
+      const relatedClaimId = e.claim?.id ?? e.previousClaim?.id
+      const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === relatedClaimId ? e.previousJudge : undefined)
+      if (judgeToDrain) {
+        try {
+          if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale actor resume request after Judge drain')
+        } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+      }
       if (e.claim) {
         const returnedClaim = e.claim
+        const currentFeedback = e.judgment?.result === 'NEED_CONTEXT' && e.judgment.claimId === returnedClaim.id && e.judgment.inputVersion === e.inputVersion
+          && oldJudge !== undefined && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
+        const historicalFeedback = e.judgment?.claimId === returnedClaim.id && e.judgment.inputVersion < e.inputVersion
+          && e.previousJudge !== undefined && e.judgment.judgeDispatchId === e.previousJudge.id
+          && e.judgment.judgeSessionId === e.previousJudge.sessionId
         e.previousClaim = returnedClaim
-        if (e.judgment?.claimId !== returnedClaim.id) delete e.judgment
+        if (currentFeedback && oldJudge) e.previousJudge = oldJudge
+        else if (!historicalFeedback) { delete e.judgment; delete e.previousJudge }
       }
       delete e.claim
       delete e.judge
@@ -476,15 +514,17 @@ export class WorkflowEngine {
     if (caller !== run.managerSessionId) return rejected('judge_respawn is Manager-only')
     if (this.nodeAt(run, topFrame(run))?.execution.type !== 'actor-task' || e.phase !== 'checking' || !e.claim
       || !e.dispatch?.settled || e.judgment?.result === 'ACCEPT') return rejected('judge_respawn requires an effective settled claim without a business conclusion')
-    const oldJudgeSessionId = e.judge?.sessionId
+    const oldJudge = e.judge
     let committedVersion = version
     try {
       const cwd = await this.cwdResolver(run)
-      if (oldJudgeSessionId) await this.subagents.drainJudge(run, oldJudgeSessionId)
-      const current = await this.state.get(ws)
-      if (!current || current.version !== version || current.execution.executionId !== e.executionId
-        || current.execution.claim?.id !== e.claim.id || current.execution.judge?.id !== e.judge?.id) return rejected('stale respawn request after Judge drain')
+      const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
+      if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale respawn request after Judge drain')
+      const currentFeedback = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
+        && e.judgment.claimId === e.claim.id && e.judgment.inputVersion === e.inputVersion
+        && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
       e.inputVersion++
+      if (currentFeedback && oldJudge) e.previousJudge = oldJudge
       e.resolution = {
         target: 'judge', inputVersion: e.inputVersion,
         ...(e.resolution?.context ? { context: e.resolution.context } : {}),

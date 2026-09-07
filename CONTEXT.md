@@ -100,7 +100,7 @@ Program 的目标合同为参数先存再执行、确定结果交接、不确定
 
 ## Workflow State Store / 可观察性
 
-使用内置 node:sqlite、WAL、单连接短事务；SQL active-workspace unique/FK 与 Run/Execution CAS 共同保护位置。旧 workflow_state 有行、未知格式/坏快照必须明确拒绝，保留原数据，不静默迁移或创建空库遮盖。T4 扩展严格工作单/事件合同后 State format 为 `agent-workflow-state/v4`；旧 v3 同样 fail-closed，不静默迁移。
+使用内置 node:sqlite、WAL、单连接短事务；SQL active-workspace unique/FK 与 Run/Execution CAS 共同保护位置。旧 workflow_state 有行、未知格式/坏快照必须明确拒绝，保留原数据，不静默迁移或创建空库遮盖。T4 为一代 previous claim/Judge 的严格身份关联将 State format 升为 `agent-workflow-state/v5`；旧 v3/v4 同样 fail-closed，不静默迁移。
 
 命令仍是 `/dsh-flow list|start <id> [extra text]|status|reset`，Root extraText 在首次派发前作为 input 保存。默认 status 只展示当前 execution/phase/角色/原因、input/handoff 有界预览与恢复方向，不暴露完整 claim、previousClaim、Manager context 或内部 dispatch；最终通知 best-effort，失败不撤销终局事务。
 

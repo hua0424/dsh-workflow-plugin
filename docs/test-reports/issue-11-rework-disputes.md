@@ -2,7 +2,7 @@
 
 - 工单：<https://github.com/hua0424/dsh-workflow-plugin/issues/11>。
 - 分支：refact；起始代码固定点 `0be6fd19d3879efdb51e109f73396916a4baeed6`，正式 precommit 审查排除其后的独立文档提交。
-- 状态：T4 实现、验证及最终双轴审查完成，随本报告提交；批准的103项后票旧测试仍明确保留。
+- 状态：初次提交 `b060dab7bb57ae793991f5746bc4b7016bebfba6` 后因延迟终审重开；follow-up安全补丁、验证和重新双轴终审现已完成，随本报告更新提交。
 - 用户示例配置不修改；不 push、部署或操作真实 Run。
 
 ## 目标
@@ -38,11 +38,11 @@ State format 由 v3 正规升级 v4。NodeExecution 使用 ExecutionClaim、统�
 | 检查 | 实施者 | 父任务独立复验 |
 |---|---|---|
 | pnpm run build | PASS | PASS |
-| T4/T3相关组合 | 首跑107项106 PASS/1旧followup测试失败；首次迁移后112/112 PASS；最终新增审查回归后114/114 PASS | 审查修复前86/86、第一轮最终91/91、第二轮最终93/93 PASS |
+| T4/T3相关组合 | 初次提交前114/114；follow-up最终121/121 PASS | 初次提交前93/93；follow-up最终100/100 PASS |
 | test/single-handoff.test.ts | 迁移后4/4 PASS | 包含在父相关组，PASS |
 | node scripts/t3-smoke.mjs | PASS | PASS |
 | pnpm run test:e2e | 迁移后PASS | PASS |
-| pnpm test | 审查修复前260项157 PASS；第一轮265项162 PASS；最终仅增2条回归 | 最终267项：164 PASS/103 FAIL/0 skip/cancelled，exit 1 |
+| pnpm test | 初次提交前267项164 PASS；follow-up最终274项171 PASS/103 FAIL/0 skip/cancelled | 父复核最终同为274项171 PASS/103 FAIL/0 skip/cancelled，exit 1 |
 | T4-owned git diff --check | PASS，仅换行提示 | PASS |
 
 剩余103项精确归类：`test/engine.test.ts`旧MemState/Run pending及T5–T9行为91项，`test/state.test.ts`旧单表11项，`test/review-fixes.test.ts` T7 Program 1项。原single-handoff四项已迁回全绿。没有删除或skip；本票按批准的refact集成中间态交付，T9必须恢复最终全量绿。
@@ -78,4 +78,21 @@ State format 由 v3 正规升级 v4。NodeExecution 使用 ExecutionClaim、统�
 
 三项均已修复：退回Actor只保留最新previousClaim，错配旧judgment从当前投影清除但events历史保留；current judgment同时绑定Judge dispatch/session；v3使用固定历史DDL与三表sentinel，拒绝前后SHA256、完整schema、user_version和全部rows一致。最终Spec复审为0项；此前drain顺序、silent stall、status投影、失败返回和Judge协议修复均无回归。
 
-最终：Standards 0项，Spec 0项。两个轴均为只读独立审查，测试证据由实施者及父任务分别执行。
+先前一度记录 Standards 0 / Spec 0 并提交，但 Spec 审查随后撤回批准并确认2项：
+
+1. **高**：Judge无结论/不安全收口形成BLOCK后，`node_resume target=judge` 会删除并仅retire旧Judge，再由driver启动新Judge，绕过safeToInspect/drain，可能与旧Judge/工具并行。
+2. **中**：historical REJECT只保留judgment中的dispatch/session字符串，工作单已删除旧judge；当前不变量无法验证这两个身份，坏快照仍会作为可信events/history输出，不满足A08关联正确与坏状态fail-closed。
+
+两项follow-up先完成 target=judge drain/CAS 与单代previousJudge后，最新终审又找到同根因的2个sibling缺口：
+
+- target=actor 放弃current Judge时也必须从Manager Turn先drain相关Judge并CAS，不能仅retire后派Actor。
+- 没有judgment时previousJudge仍必须关联current/previousClaim且版本更旧；覆盖previousClaim时清除不匹配的旧previousJudge。resume/respawn只可选择与current/returned claim相关的previousJudge作为drain目标，不能被坏快照引向任意Session。
+
+最终follow-up采用更强约束：
+
+- target=actor/target=judge/respawn 在放弃相关Judge时共用mutation前drain+CAS；仅精确current NEED_CONTEXT保留同Session followup。CAS gate测试在drain等待期间提交并发winner，确保stale请求不写resolution或派发。
+- previousJudge只与精确historical judgment成对；unjudged Judge drain后不进入当前控制材料。REJECT、NEED_CONTEXT、ACCEPT的current/historical位置均有不变量和篡改回归；fallback只选择由historical judgment佐证且claim相关的previousJudge。
+- State format v5拒绝v4；真实v3/v4保护测试保留原数据。多代claim、Judge准备故障、actor/judge resume及事件篡改组合均覆盖。
+- Standards唯一剩余possible smell（手写deferred Promise）改用项目已有`Promise.withResolvers`。
+
+最终验证：实施者build、121项相关、T3smoke/e2e通过，全量274=171PASS/103后票FAIL/0skip；父build、最终100项相关、两套smoke通过，并复核全量相同。最新只读终审：Standards 0项硬违规/0 smell，Spec 0项缺失/scope/语义错误。#11可用follow-up提交重新关闭，T5随后解锁。

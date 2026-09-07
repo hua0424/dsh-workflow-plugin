@@ -230,7 +230,64 @@ test('legacy state fails closed without creating empty replacement tables or cha
   } finally { sql.close(); rmSync(home, { recursive: true, force: true }) }
 })
 
-test('Store rejects a current judgment bound to the wrong Judge Session', async () => {
+test('Store rejects previousJudge without a historical judgment', async () => {
+  const f = await fixture()
+  try {
+    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'returned claim' }, f.actor)
+    await f.engine.handleTurnEnded('ws', f.actor)
+    let row = (await f.store.get('ws'))!
+    const oldJudge = structuredClone(row.execution.judge)!
+    const judge: ClaimCaller = { sessionId: oldJudge.sessionId, turnUserMessageIds: new Set(['judge-message-1']) }
+    await f.engine.handleTurnEnded('ws', judge)
+    row = (await f.store.get('ws'))!
+    assert.equal((await f.engine.handleResume('ws', row.execution.nodeToken, 'Return unjudged claim to Actor.', 'manager', 'actor')).ok, true)
+    row = (await f.store.get('ws'))!
+    assert.equal(row.execution.judgment, undefined)
+    assert.equal(row.execution.previousJudge, undefined)
+
+    const wrongClaim = structuredClone(row.execution)
+    wrongClaim.previousJudge = { ...oldJudge, claimId: 'forged-claim' }
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: wrongClaim, expectedRevision: row.execution.revision, events: [] }]), /previous Judge requires a historical judgment/)
+    const wrongSession = structuredClone(row.execution)
+    wrongSession.previousJudge = { ...oldJudge, claimId: row.execution.previousClaim!.id, sessionId: '' }
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: wrongSession, expectedRevision: row.execution.revision, events: [] }]))
+    assert.deepEqual(await f.store.get('ws'), row)
+  } finally { f.cleanup() }
+})
+
+test('Store and event reads reject forged historical Judge dispatch or Session identity', async () => {
+  const f = await fixture()
+  try {
+    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim one' }, f.actor)
+    await f.engine.handleTurnEnded('ws', f.actor)
+    let row = (await f.store.get('ws'))!
+    const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-message-1']) }
+    await f.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', 'missing existing criterion', judge)
+    row = (await f.store.get('ws'))!
+    assert.equal(row.execution.previousClaim?.handoff, 'claim one')
+    assert.equal(row.execution.judgment?.judgeDispatchId, row.execution.previousJudge?.id)
+    assert.equal(row.execution.judgment?.judgeSessionId, row.execution.previousJudge?.sessionId)
+
+    for (const field of ['id', 'sessionId'] as const) {
+      const forged = structuredClone(row.execution)
+      forged.previousJudge![field] = `forged-${field}`
+      await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{
+        execution: forged, expectedRevision: row.execution.revision, events: [],
+      }]), /historical judgment\/Judge mismatch/)
+    }
+    assert.deepEqual(await f.store.get('ws'), row)
+    const events = await f.store.events('ws', row.execution.executionId)
+    const judgmentEvent = events.find(event => event.type === 'judgment' && event.snapshot.judgment?.result === 'REJECT')!
+    assert.equal(judgmentEvent.snapshot.previousJudge?.id, judgmentEvent.snapshot.judgment?.judgeDispatchId)
+    const forgedSnapshot = structuredClone(judgmentEvent.snapshot)
+    forgedSnapshot.previousJudge!.sessionId = 'forged-event-session'
+    f.sql.prepare('UPDATE node_execution_events SET snapshot_json = ? WHERE execution_id = ? AND sequence = ?')
+      .run(JSON.stringify(forgedSnapshot), judgmentEvent.executionId, judgmentEvent.sequence)
+    await assert.rejects(f.store.events('ws', row.execution.executionId), /historical judgment\/Judge mismatch/)
+  } finally { f.cleanup() }
+})
+
+test('Store rejects invalid current and same-claim historical REJECT verdict positions', async () => {
   const f = await fixture()
   try {
     await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, f.actor)
@@ -239,12 +296,28 @@ test('Store rejects a current judgment bound to the wrong Judge Session', async 
     const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
     await f.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'need context', judge)
     row = (await f.store.get('ws'))!
-    const corrupted = structuredClone(row.execution)
-    corrupted.judgment!.judgeSessionId = 'forged-judge-session'
+    const wrongSession = structuredClone(row.execution)
+    wrongSession.judgment!.judgeSessionId = 'forged-judge-session'
     await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{
-      execution: corrupted, expectedRevision: row.execution.revision, events: [],
+      execution: wrongSession, expectedRevision: row.execution.revision, events: [],
     }]), /judgment dispatch\/session mismatch/)
+    const currentReject = structuredClone(row.execution)
+    currentReject.judgment!.result = 'REJECT'
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{
+      execution: currentReject, expectedRevision: row.execution.revision, events: [],
+    }]), /REJECT cannot be a current judgment/)
     assert.deepEqual(await f.store.get('ws'), row)
+
+    assert.equal((await f.engine.handleResume('ws', row.execution.nodeToken, 'Supply context for another judgment turn.', 'manager', 'judge')).ok, true)
+    const historical = (await f.store.get('ws'))!
+    assert.equal(historical.execution.judgment?.result, 'NEED_CONTEXT')
+    assert.equal(historical.execution.judgment?.claimId, historical.execution.claim?.id)
+    const historicalReject = structuredClone(historical.execution)
+    historicalReject.judgment!.result = 'REJECT'
+    await assert.rejects(f.store.updateRow('ws', historical.run, historical.stateVersion, [{
+      execution: historicalReject, expectedRevision: historical.execution.revision, events: [],
+    }]), /historical REJECT must target previous claim/)
+    assert.deepEqual(await f.store.get('ws'), historical)
   } finally { f.cleanup() }
 })
 
@@ -324,6 +397,27 @@ test('v3 three-table state is rejected without physical or logical mutation', ()
     assert.deepEqual(snapshot(), before)
     assert.equal(createHash('sha256').update(readFileSync(path)).digest('hex'), hashBefore)
   } finally { rmSync(home, { recursive: true, force: true }) }
+})
+
+test('v4 three-table state is rejected without changing its rows or version', async () => {
+  const f = await fixture()
+  try {
+    f.store.close()
+    f.sql.exec("UPDATE runs SET format_version = 'agent-workflow-state/v4'; PRAGMA user_version = 4")
+    const before = {
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }
+    assert.throws(() => new StateStore(f.home), /incompatible state format/)
+    assert.deepEqual({
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }, before)
+  } finally { f.cleanup() }
 })
 
 test('claim event failure rolls back current work; original dispatch retries and survives SQLite reopen', async () => {

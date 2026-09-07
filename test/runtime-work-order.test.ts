@@ -26,6 +26,8 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   let safe = true
   let followupFailure: Error | undefined
   let drainFailure: Error | undefined
+  let drainGate: Promise<void> | undefined
+  let drainEntered: (() => void) | undefined
   let safetyGate: Promise<void> | undefined
   let gatedSession = ''
   const send = (sessionId: string, text: string) => {
@@ -40,7 +42,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
     async ensureRoleActor(_run, _role, text) { return { ...send('worker-session', text), childId: 'worker-session' } },
     async startJudge(_run, input) { judges.push(input); return { ...send(input.judgeSessionId, 'Judge'), judgeSessionId: input.judgeSessionId } },
     async safeToInspect(sessionId) { if (safetyGate && gatedSession === sessionId) await safetyGate; return safe },
-    async retireJudge() {}, async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); if (drainFailure) throw drainFailure },
+    async retireJudge() {}, async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); drainEntered?.(); if (drainGate) await drainGate; if (drainFailure) throw drainFailure },
     async compactRoleActor(_run, role) { compacts.push(role); return { ok: true } },
     async followupJudge(_run, judgeSessionId, input) { followups.push(input); if (followupFailure) throw followupFailure; return send(judgeSessionId, 'Judge followup') },
     async judgeSessionExists() { return true },
@@ -52,6 +54,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
     setSafe(value: boolean) { safe = value },
     setFollowupFailure(error: Error | undefined) { followupFailure = error },
     setDrainFailure(error: Error | undefined) { drainFailure = error },
+    setDrainGate(gate: Promise<void> | undefined, onEntered?: () => void) { drainGate = gate; drainEntered = onEntered },
     setSafetyGate(sessionId: string, gate: Promise<void> | undefined) { gatedSession = sessionId; safetyGate = gate },
     async start() { return engine.startRun('ws', engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, 'root request') },
     async row() { return (await store.get('ws'))! },
@@ -353,6 +356,7 @@ test('Manager return after a later Judge no-result keeps only that claim as curr
     const returned = await h.row()
     assert.equal(returned.execution.executionId, executionId)
     assert.equal(returned.execution.previousClaim?.handoff, 'claim two awaiting Judge')
+    assert.equal(returned.execution.previousJudge, undefined)
     assert.equal(returned.execution.judgment, undefined)
     assert.match(h.messages.at(-1)!.text, /claim two awaiting Judge/)
     assert.match(h.messages.at(-1)!.text, /Manager returns claim two for another check/)
@@ -364,6 +368,46 @@ test('Manager return after a later Judge no-result keeps only that claim as curr
     await h.engine.handleTurnEnded('ws', actor3)
     row = await h.row()
     assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified claim three', h.caller(row.execution.judge!))).ok, true)
+  } finally { h.close() }
+})
+
+test('Actor return after claim2 Judge preparation fault drops unrelated claim1 feedback pair', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const executionId = (await h.row()).execution.executionId
+    const actor1 = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim one' }, actor1)
+    await h.engine.handleTurnEnded('ws', actor1)
+    let row = await h.row()
+    await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', 'claim one rejected', h.caller(row.execution.judge!))
+
+    row = await h.row()
+    const actor2 = h.caller(row.execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim two after preparation fault' }, actor2)
+    h.engine.cwdResolver = async () => { throw new Error('Judge cwd unavailable') }
+    await h.engine.handleTurnEnded('ws', actor2)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.equal(blocked.execution.judge, undefined)
+    assert.equal(blocked.execution.judgment?.claimId, blocked.execution.previousClaim?.id)
+
+    h.engine.cwdResolver = async () => h.home
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Manager returns claim two after Judge preparation failed.', 'manager', 'actor')).ok, true)
+    const returned = await h.row()
+    assert.equal(returned.execution.executionId, executionId)
+    assert.equal(returned.execution.previousClaim?.handoff, 'claim two after preparation fault')
+    assert.equal(returned.execution.previousJudge, undefined)
+    assert.equal(returned.execution.judgment, undefined)
+    assert.deepEqual(h.drains, [], 'unrelated claim1 Judge history is not drained')
+    assert.match(h.messages.at(-1)!.text, /claim two after preparation fault/)
+    assert.ok((await h.store.events('ws', executionId)).some(event => event.type === 'judgment' && event.snapshot.previousClaim?.handoff === 'claim one'))
+
+    const actor3 = h.caller(returned.execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim three' }, actor3)
+    await h.engine.handleTurnEnded('ws', actor3)
+    row = await h.row()
+    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'claim three verified', h.caller(row.execution.judge!))).ok, true)
   } finally { h.close() }
 })
 
@@ -476,7 +520,17 @@ test('Manager can return NEED_CONTEXT work to Actor with the exact feedback and 
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'cannot reconcile the repository fact', h.caller(row.execution.judge!))
     row = await h.row()
+    const oldJudge = structuredClone(row.execution.judge)!
+    const events = await h.store.events('ws', row.execution.executionId)
+    h.setDrainFailure(new Error('NEED_CONTEXT Judge still active'))
+    const failed = await h.engine.handleResume('ws', row.execution.nodeToken, 'Recheck the named file and report the discrepancy.', 'manager', 'actor')
+    assert.equal(failed.ok, false)
+    assert.match(failed.reason!, /NEED_CONTEXT Judge still active/)
+    assert.deepEqual(await h.row(), row)
+    assert.deepEqual(await h.store.events('ws', row.execution.executionId), events)
+    h.setDrainFailure(undefined)
     assert.equal((await h.engine.handleResume('ws', row.execution.nodeToken, 'Recheck the named file and report the discrepancy.', 'manager', 'actor')).ok, true)
+    assert.deepEqual(h.drains, [oldJudge.sessionId, oldJudge.sessionId])
     const returned = await h.row()
     assert.equal(returned.execution.phase, 'working')
     assert.equal(returned.execution.claim, undefined)
@@ -573,6 +627,110 @@ test('Judge drain failure BLOCKs before fresh spawn and preserves respawn materi
     assert.deepEqual(h.drains.slice(-2), [oldJudge!.sessionId, oldJudge!.sessionId])
     assert.equal(h.judges.length, spawnsBefore + 1)
     assert.equal((await h.row()).execution.resolution?.decision, 'retry replacement')
+  } finally { h.close() }
+})
+
+test('Judge drain CAS rejects a stale Actor resume after a concurrent state winner', async () => {
+  const h = harness()
+  const gate = Promise.withResolvers<void>()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate held by old Judge' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    let row = await h.row()
+    h.setSafe(false)
+    await h.engine.handleTurnEnded('ws', h.caller(row.execution.judge!))
+    const blocked = await h.row()
+    const messagesBefore = h.messages.length
+    const drainStarted = Promise.withResolvers<void>()
+    h.setDrainGate(gate.promise, drainStarted.resolve)
+
+    const pending = h.engine.handleResume('ws', blocked.execution.nodeToken, 'This stale resume must not dispatch.', 'manager', 'actor')
+    await drainStarted.promise
+    await h.store.updateRow('ws', blocked.run, blocked.stateVersion, [])
+    const winner = await h.row()
+    const winnerEvents = await h.store.events('ws', winner.execution.executionId)
+    gate.resolve()
+    const outcome = await pending
+    assert.equal(outcome.ok, false)
+    assert.match(outcome.reason!, /stale actor resume/)
+    assert.deepEqual(await h.row(), winner)
+    assert.deepEqual(await h.store.events('ws', winner.execution.executionId), winnerEvents)
+    assert.equal((await h.row()).execution.resolution, undefined)
+    assert.equal(h.messages.length, messagesBefore)
+    assert.equal(h.judges.length, 1)
+  } finally { gate.resolve(); h.close() }
+})
+
+test('Actor-target resume drains an unjudged unsafe Judge before returning its claim', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const executionId = (await h.row()).execution.executionId
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim returned from unsafe Judge' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    let row = await h.row()
+    const oldJudge = structuredClone(row.execution.judge)!
+    h.setSafe(false)
+    await h.engine.handleTurnEnded('ws', h.caller(oldJudge))
+    const blocked = await h.row()
+
+    h.setDrainFailure(new Error('unsafe Judge drain failed'))
+    const failed = await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Manager returns the claim to Actor.', 'manager', 'actor')
+    assert.equal(failed.ok, false)
+    assert.deepEqual(await h.row(), blocked)
+    assert.equal(h.messages.filter(message => message.text.includes('Manager returns the claim to Actor.')).length, 0)
+
+    h.setDrainFailure(undefined)
+    h.setSafe(true)
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Manager returns the claim to Actor.', 'manager', 'actor')).ok, true)
+    row = await h.row()
+    assert.equal(row.execution.executionId, executionId)
+    assert.equal(row.execution.previousClaim?.handoff, 'claim returned from unsafe Judge')
+    assert.equal(row.execution.previousJudge, undefined)
+    assert.equal(row.execution.judgment, undefined)
+    assert.deepEqual(h.drains, [oldJudge.sessionId, oldJudge.sessionId])
+    assert.match(h.messages.at(-1)!.text, /claim returned from unsafe Judge/)
+    assert.match(h.messages.at(-1)!.text, /Manager returns the claim to Actor/)
+  } finally { h.close() }
+})
+
+test('Judge-target resume drains an unjudged old Judge before fresh spawn and retries the same identity', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate awaiting verdict' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    let row = await h.row()
+    const oldJudge = structuredClone(row.execution.judge)!
+    const oldCaller = h.caller(oldJudge)
+    h.setSafe(false)
+    await h.engine.handleTurnEnded('ws', oldCaller)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.equal(blocked.execution.judgment, undefined)
+
+    h.setDrainFailure(new Error('old Judge still active'))
+    const failed = await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Retry judgment after the old activity stops.', 'manager', 'judge')
+    assert.equal(failed.ok, false)
+    assert.match(failed.reason!, /old Judge still active/)
+    assert.deepEqual(await h.row(), blocked)
+    assert.equal(h.judges.length, 1)
+    assert.equal(h.followups.length, 0)
+
+    h.setDrainFailure(undefined)
+    h.setSafe(true)
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Retry judgment after the old activity stops.', 'manager', 'judge')).ok, true)
+    row = await h.row()
+    assert.deepEqual(h.drains, [oldJudge.sessionId, oldJudge.sessionId])
+    assert.notEqual(row.execution.judge?.sessionId, oldJudge.sessionId)
+    assert.equal(h.judges.length, 2)
+    assert.equal(h.followups.length, 0)
+    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'late old Judge', oldCaller)).ok, false)
+    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'fresh Judge verified', h.caller(row.execution.judge!))).ok, true)
   } finally { h.close() }
 })
 

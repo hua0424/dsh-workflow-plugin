@@ -58,7 +58,7 @@ CREATE TABLE node_execution_events (
   snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
   PRIMARY KEY(execution_id, sequence)
 ) STRICT;
-PRAGMA user_version = 4;
+PRAGMA user_version = 5;
 `
 
 function json(value: unknown): string {
@@ -99,7 +99,7 @@ export class StateStore {
       if (names.length === 0 && version.user_version === 0) {
         this.db.exec('BEGIN IMMEDIATE')
         try { this.db.exec(CREATE_SQL); this.db.exec('COMMIT') } catch (error) { this.db.exec('ROLLBACK'); throw error }
-      } else if (version.user_version !== 4 || names.length !== 3 || !['runs', 'node_executions', 'node_execution_events'].every(name => names.includes(name))) {
+      } else if (version.user_version !== 5 || names.length !== 3 || !['runs', 'node_executions', 'node_execution_events'].every(name => names.includes(name))) {
         throw new Error('incompatible state format; original data retained; authorized backup/reset required')
       }
       this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000')

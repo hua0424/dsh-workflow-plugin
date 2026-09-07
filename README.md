@@ -8,17 +8,17 @@ T1–T4 已完成；三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT�
 Manager 定向 resume/Judge respawn、争议协议和 Manager-only 有界历史。`scripts/e2e-smoke.mjs`
 已迁移到真实 Runtime/SQLite 的 T4 受控闭环；这仍不是目标宿主真实 Run。T3 基线见
 [`T3 报告`](docs/test-reports/issue-10-work-order-loop.md)，最终全量验收仍由后续票/T9 收口。
-T4 验证：build、114 项相关测试、T3 smoke、迁移后的 e2e 通过；全量仍保留
-103 项已知失败（旧 `engine` MemState、旧单表 `state` 与 T7 Program），未删除或 skip。
+T4 验证：build、121 项相关测试、T3 smoke、迁移后的 e2e 通过；全量 274 项中
+171 PASS、103 项已知后票失败（旧 `engine` MemState、旧单表 `state` 与 T7 Program），0 skip/cancelled。
 
 当前 claim 合同为 `node_claim({outcome, handoff})`：handoff 必填、trim 后
 1..8000 字符，completed/failed 对称，END 也交付；明确拒绝旧 summary/handoffContext。
 claim 不携带 nodeToken，运行时核对真实派发身份。Judge、Manager、后继与最终结果
 共用原文，无独立摘要或 fallback。Catalog v2 保持，v1 Catalog 被拒绝。
 
-State format 为 `agent-workflow-state/v4`：`runs`、`node_executions`、
-`node_execution_events` 保存位置、当前工作与关键快照；旧 v3/legacy 有数据时保留并
-fail-closed，不静默迁移。REJECT 后当前单保留完整 previous claim 与统一 judgment 关联，
+State format 为 `agent-workflow-state/v5`：`runs`、`node_executions`、
+`node_execution_events` 保存位置、当前工作与关键快照；旧 v3/v4/legacy 有数据时保留并
+fail-closed，不静默迁移。REJECT 后当前单保留一代完整 previous claim/Judge 与统一 judgment 关联，
 补充/恢复材料只保留当前完整版本，旧值由 events 解释；正常恢复不回放 events。
 
 当前接通 Actor Task 的 ACCEPT/REJECT/NEED_CONTEXT、正常 BLOCK 的 auto/actor/judge

@@ -5,7 +5,7 @@
  */
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v4' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v5' as const
 export const STATE_TABLE_NAME = 'runs' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
@@ -197,6 +197,12 @@ export interface ExecutionClaim extends NodeClaim {
   dispatchId: string
 }
 
+export interface ExecutionJudge extends ExecutionDispatch {
+  sessionId: string
+  claimId: string
+  inputVersion: number
+}
+
 /** 最新 Judge 判定/反馈；保留 claim/Judge/input 关联，只有 ACCEPT 可交接。 */
 export interface ExecutionJudgment extends JudgeResult {
   claimId: string
@@ -235,7 +241,9 @@ export interface NodeExecution {
   claim?: ExecutionClaim
   /** REJECT/显式退回后保留的已失效旧 claim；不授予当前提交资格。 */
   previousClaim?: ExecutionClaim
-  judge?: ExecutionDispatch & { claimId: string; inputVersion: number }
+  judge?: ExecutionJudge
+  /** 最近被替换的 Judge 身份；只保留一代，完整历史由 events 保存。 */
+  previousJudge?: ExecutionJudge
   judgment?: ExecutionJudgment
   resolution?: ExecutionResolution
   inputVersion: number
