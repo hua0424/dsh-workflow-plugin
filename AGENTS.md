@@ -40,6 +40,11 @@ DSH Agent-Team Workflow plugin (`dsh-agent-team-workflow`) — a Cordis plugin f
 
 Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages are devDependencies — at runtime they resolve from the DSH installation via the profile fallback. Do not move them into `dependencies`.
 
+## DSH 运行基线（用户确认）
+
+- 当前运行版本：`0.1.2-rc.1`；对应源码：`D:\project\github\deepseek-harness`。分析宿主兼容性、continuable Actor、compact 或 Session 行为时，查询此版本源码。
+- 该仓库已用 codebase-memory 索引，project：`D-project-github-deepseek-harness`；优先图查询，引用前检查 coverage，必要时读取源文件核实。源码仓库与已安装运行产物是不同路径。
+
 ## Commands
 
 - Build / typecheck: `pnpm run build` (tsc → `lib/`；无独立 lint script，tsc 即类型检查).
@@ -70,6 +75,7 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 
 ## Docs to read first
 
+- `refact` 分支的重构开发/评审先读 `docs/design/node-execution-runtime.md` 与 `docs/specs/node-execution-runtime.md`：三表工作单、outcome+handoff 单文本、Role 复用/compact、BLOCK 争议处理的目标基线；旧 PRD/Issue #6 已被替代。未实现前，以下领域文档仍用于理解当前代码。
 - `CONTEXT.md` — 领域术语表（Manager、Role Actor、Judge、Run Frame、nodeToken、BLOCK、pendingClaim、Handoff Context 等含义精确，代码/文档中使用原词）.
 - `docs/design/configurable-agent-workflow-graph.md` — v1 权威设计.
 - `docs/testing/acceptance-test-plan.md` / `acceptance-report.md` — 冻结的验收标准与现状.
