@@ -61,7 +61,7 @@ export interface ToolHost {
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
-  judgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  judgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   respawnJudge(workspaceKey: string, nodeToken: string, reason: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
 
   // Inspection wrappers (read-only, enum operations)
@@ -249,7 +249,7 @@ export const workflowTools: ToolDefinition[] = [
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       const reasonError = lengthError('reason', args.reason, LIMITS.reasonMin, LIMITS.reasonMax, true)
       if (reasonError !== undefined) return `拒绝：${reasonError}`
-      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason.trim(), auth.caller)
+      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason.trim(), claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },

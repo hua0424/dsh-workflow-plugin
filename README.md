@@ -1,33 +1,35 @@
 # dsh-workflow-plugin
 
 DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
-workflows (`agent-workflow/v2`). Implementation complete; offline-verifiable
-acceptance items all pass (unit tests + isolated smoke e2e). The one
-remaining item is the live-model Web GUI e2e after a DSH restart.
+workflows (`agent-workflow/v2`).
 
-v2 (PRD 20260903-workflow-hardening A1, breaking semantic change): `node_claim`
-carries no nodeToken (admission binds to the one-shot dispatch lease of the
-calling turn); the Judge only **confirms** the Actor's claim via
-`ACCEPT | REJECT | NEED_CONTEXT` — the Graph PASS/FAIL verdict is derived from
-the claimed outcome, and a REJECT re-dispatches the SAME node to the ORIGINAL
-actor with the rejection as the correction instruction (`CORRECT` trace event).
-v1 catalogs are rejected by the loader.
+**当前 `refact` 是集成中间态，不能部署，也不能宣称全量验收通过。**
+T1/T2 已完成；T3 引入真实 SQLite 的 Actor → Judge ACCEPT → 后继/END 三表闭环。
+构建、本票 69 项相关测试和 `scripts/t3-smoke.mjs` 通过，但全量仍有 107 项
+旧接口/后续行为测试失败，原 `pnpm run test:e2e` 尚未迁移。证据与未接通范围见
+[`T3 报告`](docs/test-reports/issue-10-work-order-loop.md)；最终全量验收由 T9 收口。
 
-T2 (#9) 切换当前工具合同：`node_claim({outcome, handoff})`，handoff 必填、trim 后
+当前 claim 合同为 `node_claim({outcome, handoff})`：handoff 必填、trim 后
 1..8000 字符，completed/failed 对称，END 也交付；明确拒绝旧 summary/handoffContext。
-Judge、Manager 状态预览（前500字符）、后继与最终结果共用原文，无独立摘要或 fallback。
-State format 为 `agent-workflow-state/v2`，仍是现有单行状态存储，**三表尚未实现**。
-仅 completed 的 `finalHandoff` 暂存 END 结果；新 Run 不继承该材料。
-旧格式行读取、写入和 Reset 均 fail-closed 并保留原数据；请勿直接部署到有旧 Run 的
-环境。授权备份/导出与退出路径留 T8，本票不提供迁移或自动清库。
-真实宿主端到端验证留 T9；隔离 smoke 不代表真实模型执行。
+claim 不携带 nodeToken，运行时核对真实派发身份。Judge、Manager、后继与最终结果
+共用原文，无独立摘要或 fallback。Catalog v2 保持，v1 Catalog 被拒绝。
+
+State format 为 `agent-workflow-state/v3`：`runs`、`node_executions`、
+`node_execution_events` 保存位置、当前工作与关键快照。最终交付从终局工作单读取，
+不再保留 Run pending 材料镜像或 T2 的临时 finalHandoff 字段。
+
+当前只接通 Actor Task 的上述闭环和必要安全门控。REJECT/NEED_CONTEXT、公开历史、
+完整恢复/replacement、Program/Child、授权 Reset/旧格式退出按 T4–T8 接通；
+未支持入口明确拒绝，不退回旧引擎。旧格式有数据时保留并拒绝启动新存储，
+不自动迁移或清库。真实宿主组合验收留 T9，受控派发 smoke 不代表真实外部模型执行。
 
 ## Current documentation
 
-- [`CONTEXT.md`](CONTEXT.md) — canonical domain glossary.
-- [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — confirmed v1 requirements and design (authoritative).
-- [`docs/testing/acceptance-test-plan.md`](docs/testing/acceptance-test-plan.md) — acceptance criteria, test matrix, e2e scenarios (frozen before implementation).
-- [`docs/testing/acceptance-report.md`](docs/testing/acceptance-report.md) — current acceptance status and the remaining live-GUI checklist.
+- [`CONTEXT.md`](CONTEXT.md) — 当前领域术语与 T3 实现边界。
+- [`docs/design/node-execution-runtime.md`](docs/design/node-execution-runtime.md) / [`spec`](docs/specs/node-execution-runtime.md) — refact 目标设计与验收基线。
+- [`docs/work-plans/runtime-refact.md`](docs/work-plans/runtime-refact.md) — 工单依赖、当前进度与分票证据。
+- [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — 旧版设计参考，不覆盖 refact 新规格。
+- [`docs/testing/acceptance-test-plan.md`](docs/testing/acceptance-test-plan.md) / [`report`](docs/testing/acceptance-report.md) — 原实现验收资料，不表示当前重构已通过。
 - [`docs/example/`](docs/example/) — copyable workflow config template (`workflow-template.yaml`) + config/model reference for new workflows.
 
 Superseded `feature-delivery/v1` designs remain available in Git history.
@@ -58,6 +60,8 @@ cordis.patch.yml      profile-bundle patch (inserts the plugin row)
 
 ## Installation (development)
 
+下列是完成集成验收后的部署流程；当前 refact 中间态不要执行，本轮没有部署。
+
 The plugin is a DSH Profile Bundle, deployed wfgate-style into a local bundle
 directory under the web profile (the same layout the shipped bundles use, so
 `@deepseek-ai/*` resolves to the HOST's instances via the profiles fallback).
@@ -76,6 +80,10 @@ owns runtime deps (`yaml`, `zod`).
 Workflow configs live in `%DSH_HOME%\workflows\*.yaml` (e.g. `milestone-delivery.yaml`, `smoke-test.yaml`). New workflows: copy [`docs/example/workflow-template.yaml`](docs/example/workflow-template.yaml) and adapt it (see [`docs/example/README.md`](docs/example/README.md) for the model-route and config-surface reference).
 
 ## Run trace logs
+
+以下完整字段清单是原 trace 约定。T3 已保留基本 START/CLAIM/JUDGE/ROUTE/BLOCK
+与脱敏/转义能力，后票专属日志及旧细字段/时序仍待 T9 同步；关键业务历史以三表为准，
+不要用旧 trace 格式或先写日志的时序替代当前事务事实。
 
 Every workflow run writes a human-readable trace log beside its catalog
 config file (`src/engine/tracelog.ts`):

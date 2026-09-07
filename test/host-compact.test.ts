@@ -41,7 +41,7 @@ function makeRun(actorForDeveloper: string | undefined): RunState {
     roleActors: actorForDeveloper === undefined ? {} : { developer: actorForDeveloper },
     modelOverrides: {},
     blockReason: null,
-    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+    currentExecutionId: 'execution',
   }
 }
 
@@ -199,11 +199,11 @@ test('resident idle actor: compacted in place, never materialized', async () => 
   assert.equal(f.resumes.length, 0)
 })
 
-test('resident busy actor (Judge raced the actor turn tail): degrades to a skip', async () => {
+test('resident busy actor (Judge raced the actor turn tail): fails closed', async () => {
   const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
   const { host } = makeHost({ ...f, resident: {} as Agent, compactError: manualError('busy', 'agent is active') })
   const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
-  assert.deepEqual(result, { ok: true, detail: 'resident actor busy; skipped' })
+  assert.deepEqual(result, { ok: false, detail: 'resident actor busy' })
   assert.equal(f.resumes.length, 0)
 })
 
@@ -214,7 +214,7 @@ test('resident actor non-busy manual failure fail-closes', async () => {
   assert.deepEqual(result, { ok: false, detail: 'compaction commit: durable marker lost' })
 })
 
-test('missing compaction service skips without touching the registry', async () => {
+test('missing compaction service fails closed without touching the registry', async () => {
   const events: string[] = []
   const fakeCtx = {
     get: () => undefined,
@@ -229,7 +229,7 @@ test('missing compaction service skips without touching the registry', async () 
     registerRoleActorSession: () => {},
   }
   const host = makeSubagentHost(adapters, () => ({}))
-  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'no compaction service' })
+  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: false, detail: 'no compaction service' })
   assert.deepEqual(events, [])
 })
 

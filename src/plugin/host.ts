@@ -115,21 +115,23 @@ export function makeStateHost(store: StateStore): StateHost {
     async get(workspaceKey) {
       const row = await store.get(workspaceKey)
       if (row === undefined) return undefined
-      return { run: row.run, version: row.stateVersion }
+      return { run: row.run, execution: row.execution, version: row.stateVersion }
     },
-    async put(workspaceKey, run, expectedVersion) {
-      await store.updateRow(workspaceKey, run, expectedVersion)
+    async put(workspaceKey, run, expectedVersion, changes) {
+      await store.updateRow(workspaceKey, run, expectedVersion, changes)
     },
-    async create(workspaceKey, run) {
-      const row = await store.createRow(workspaceKey, run)
+    async create(workspaceKey, run, execution) {
+      const row = await store.createRow(workspaceKey, run, execution)
       return row.stateVersion
     },
     async remove(workspaceKey) {
       await store.deleteRow(workspaceKey)
     },
+    execution: (workspaceKey, executionId) => store.execution(workspaceKey, executionId),
+    events: (workspaceKey, executionId, after, limit) => store.events(workspaceKey, executionId, after, limit),
     async listRuns() {
       const rows = await store.list()
-      return rows.map(row => ({ workspaceKey: row.workspaceKey, run: row.run, version: row.stateVersion }))
+      return rows.map(row => ({ workspaceKey: row.workspaceKey, run: row.run, execution: row.execution, version: row.stateVersion }))
     },
   }
 }
@@ -178,8 +180,56 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
   }
 }
 
-export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { provider?: string; model?: string }): SubagentHost {
+export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { provider?: string; model?: string }): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+  // ponytail: 单进程插件生命周期内保留Session引用（冷释放早于setImmediate）；T5再收窄到Run子树。
+  const observed = new Map<string, Agent>()
+  const unsafe = new Set<string>()
+  interface Jobs {
+    list(agent: Agent): Array<{ status: string; detail?: string }>
+    onJobDone(listener: (job: { detail?: string }, owner?: Agent) => void): () => void
+  }
+  const jobs = adapters.ctx.get?.('jobs') as Jobs | undefined
+  const stopObservingJobs = jobs?.onJobDone((job, owner) => {
+    if (owner && job.detail?.includes('work may be orphaned')) unsafe.add(owner.id)
+  })
+  adapters.ctx.effect?.(() => () => {
+    stopObservingJobs?.()
+    observed.clear()
+    unsafe.clear()
+  })
   return {
+    observeTurnEnd(sessionId) {
+      const agent = adapters.ctx.agents.get(SessionId(sessionId))
+      if (agent) observed.set(sessionId, agent)
+    },
+    async safeToInspect(sessionId) {
+      const agent = adapters.ctx.agents.get(SessionId(sessionId)) ?? observed.get(sessionId)
+      if (!agent || !jobs || unsafe.has(sessionId)) return false
+      try {
+        await agent.whenIdle()
+        const descendants = await adapters.ctx.subagents.listDescendants(SessionId(sessionId))
+        if (descendants.some(child => child.kind === 'diagnostic')) return false
+        const ids = new Set([sessionId, ...descendants.map(child => String(child.id))])
+        // listing 可省略尚未写descriptor的live child；真实registry补齐此窗口。
+        const live = adapters.ctx.agents.list()
+        for (let size = -1; size !== ids.size;) {
+          size = ids.size
+          for (const child of live) if (child.session.header.parentSession && ids.has(child.session.header.parentSession)) ids.add(child.id)
+        }
+        const agents: Agent[] = []
+        for (const id of ids) {
+          const candidate = adapters.ctx.agents.get(SessionId(id)) ?? observed.get(id)
+          if (!candidate || candidate.status !== 'idle' || candidate.inbox.hasPending || unsafe.has(id)) return false
+          agents.push(candidate)
+        }
+        await Promise.all(agents.map(candidate => candidate.whenIdle()))
+        return agents.every(candidate => {
+          const current = adapters.ctx.agents.get(candidate.id)
+          return (current === undefined || current === candidate) && candidate.status === 'idle' && !candidate.inbox.hasPending && !unsafe.has(candidate.id)
+            && jobs.list(candidate).every(job => ['completed', 'failed', 'killed'].includes(job.status) && !job.detail?.includes('work may be orphaned'))
+        })
+      } catch { return false }
+    },
     async ensureRoleActor(run, roleKey, initialText) {
       const existing = run.roleActors[roleKey]
       if (existing !== undefined) {
@@ -229,7 +279,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // long after the actor's Activation auto-settled (DSH releases continuable
       // children when quiescent), and the durable Session log still holds the
       // node's actor history either way.
-      const executorSessionId = run.nodeBoundary.executorSessionId
+      const executorSessionId = input.boundary.executorSessionId
       let actorSession: ProjectionSource | undefined
       if (executorSessionId !== undefined) {
         const actorAgent = adapters.ctx.agents.get(SessionId(executorSessionId))
@@ -239,11 +289,11 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
           actorSession = await inspectPersistedSession(adapters.ctx, executorSessionId)
         }
       }
-      const transcript = projectNodeLocal(manager.session, run.nodeBoundary, actorSession)
+      const transcript = projectNodeLocal(manager.session, input.boundary, actorSession)
 
       const prompt = renderJudgePrompt({
         nodeToken: input.nodeToken,
-        nodeInstruction: input.instruction,
+        nodeInstruction: `[当前工作单 input]\n${input.input}\n\n[instruction]\n${input.instruction}`,
         criteria: input.criteria,
         workerOutcome: input.claim.outcome,
         workerHandoff: input.claim.handoff,
@@ -324,7 +374,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
       const compaction = adapters.ctx.get('compaction') as CompactionService | undefined
       if (compaction === undefined || typeof compaction.compactNow !== 'function') {
-        return { ok: true, detail: 'no compaction service' }
+        return { ok: false, detail: 'no compaction service' }
       }
       const signal = new AbortController().signal
       // A4 plan A (docs/prd/20260903-workflow-hardening/a4-code-findings.md §3):
@@ -337,17 +387,14 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // cold-resumes the compacted surface.
       const resident = adapters.ctx.agents.get(childId as SessionId)
       if (resident !== undefined) {
-        // Rare race (findings §1): the Judge finished while the actor's own
-        // turn is still draining. Compact in place; a busy actor degrades to a
-        // skip — the dispatch message queues FIFO behind the running turn
-        // exactly as it did before plan A.
+        // 收口后仍可能被外部唤醒；busy 必须拒绝，不能以FIFO排队冒充compact通过。
         try {
           const result = await compaction.compactNow(resident, signal)
           if (result === null) return { ok: true, detail: 'no compactable range' }
           return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
         } catch (error) {
           if (isManualCompactionError(error) && error.code === 'busy') {
-            return { ok: true, detail: 'resident actor busy; skipped' }
+            return { ok: false, detail: 'resident actor busy' }
           }
           return { ok: false, detail: compactErrorDetail(error) }
         }

@@ -27,7 +27,7 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
     runProgram: async (ws, nodeToken, parameters) => { calls.push({ name: 'runProgram', args: { ws, nodeToken, parameters } }); return { ok: true, message: 'ran' } },
     resolveProgram: async (ws, nodeToken, result, reason) => { calls.push({ name: 'resolveProgram', args: { ws, nodeToken, result, reason } }); return { ok: true, message: 'resolved' } },
     setRoleModel: async (ws, roleKey, provider, modelId) => { calls.push({ name: 'setRoleModel', args: { ws, roleKey, provider, modelId } }); return { ok: true, message: 'set' } },
-    judgeClaim: async (ws, nodeToken, result, reason, judgeSessionId) => { calls.push({ name: 'judgeClaim', args: { ws, nodeToken, result, reason, judgeSessionId } }); return { ok: true, message: 'claimed' } },
+    judgeClaim: async (ws, nodeToken, result, reason, caller) => { calls.push({ name: 'judgeClaim', args: { ws, nodeToken, result, reason, caller } }); return { ok: true, message: 'claimed' } },
     respawnJudge: async (ws, nodeToken, reason, caller) => { calls.push({ name: 'respawnJudge', args: { ws, nodeToken, reason, caller } }); return { ok: true, message: 'respawned' } },
     status: async () => ({ ok: true, status: { runId: 'r1', status: 'running' } }),
     inspectGit: async (_ws, operation) => ({ ok: true, value: `git:${operation}` }),
@@ -140,7 +140,7 @@ test('judge_claim routes to host.judgeClaim and concludes the turn on success', 
   const token = randomUUID()
   const result = await tool.execute({ nodeToken: token, result: 'ACCEPT', reason: 'verified' }, exec as never)
   assert.equal(result, 'claimed')
-  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'ACCEPT', reason: 'verified', judgeSessionId: '' } })
+  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'ACCEPT', reason: 'verified', caller: { sessionId: '', turnUserMessageIds: new Set<string>() } } })
   assert.equal(concluded, true)
 })
 
@@ -213,6 +213,7 @@ test('target host Session snapshot binds native claim to its dispatch, excluding
   const dispatch = createUserMessage({ content: [{ type: 'text', text: 'work' }], source: { kind: 'user' } })
   session.append('user/message', dispatch, { surfaceOp: 'append' })
   session.append('tool/call', { turn: 1, step: 1, callId: 'native-claim', name: 'node_claim', arguments: '{}' } as never)
+  session.append('tool/call', { turn: 1, step: 1, callId: 'judge-call', name: 'judge_claim', arguments: '{}' } as never)
   session.append('turn/end', { turn: 1, reason: { kind: 'completed' } } as never)
   session.append('turn/start', { turn: 2 } as never)
   session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'new work' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
@@ -220,6 +221,12 @@ test('target host Session snapshot binds native claim to its dispatch, excluding
     ...EXEC, agent: { session }, callId: 'native-claim', rootCallId: 'native-claim',
   } as never)
   assert.deepEqual((host.calls[0]!.args as { caller: unknown }).caller, {
+    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
+  })
+  await findTool('judge_claim').execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: 'verified' }, {
+    ...EXEC, agent: { session }, callId: 'judge-call', rootCallId: 'judge-call',
+  } as never)
+  assert.deepEqual((host.calls[1]!.args as { caller: unknown }).caller, {
     sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
   })
 })

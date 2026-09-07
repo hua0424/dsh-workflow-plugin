@@ -10,7 +10,7 @@ import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateStore, workspaceKeyOf, StateConflictError } from './state/store.ts'
-import { topFrame } from './state/invariants.ts'
+import { endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
@@ -59,7 +59,7 @@ export function apply(ctx: Context) {
   function revokeJudgeSession(sessionId: string): void {
     judgeSessions.delete(sessionId)
     judgeWorkspaces.delete(sessionId)
-    sessionWorkspaces.delete(sessionId)
+    // 历史routing保留；授权只认当前工作单，不因撤权丢最后turn/end。
   }
 
   /**
@@ -70,7 +70,7 @@ export function apply(ctx: Context) {
    */
   async function durableJudgeWorkspace(sessionId: string): Promise<string | undefined> {
     for (const row of await store.list()) {
-      if (row.run.judgeSessionId === sessionId) return row.workspaceKey
+      if (row.execution.judge?.sessionId === sessionId) return row.workspaceKey
     }
     return undefined
   }
@@ -83,16 +83,13 @@ export function apply(ctx: Context) {
    */
   async function isJudgeSessionOf(sessionId: string, workspaceKey: string): Promise<boolean> {
     const admittedWorkspace = judgeWorkspaces.get(sessionId)
-    if (admittedWorkspace !== undefined) {
-      // A known live mapping is workspace-scoped: it cannot authorize another
-      // workspace even when the session id remains admitted.
-      return admittedWorkspace === workspaceKey
-    }
+    if (admittedWorkspace !== undefined && admittedWorkspace !== workspaceKey) return false
     // Missing mapping can be a registration race (async realpath) or a host
     // restart. Fall back to the durable row in either case; a positive match
     // repairs the live mappings.
     const row = await store.get(workspaceKey)
-    if (row !== undefined && row.run.judgeSessionId === sessionId) {
+    if (row !== undefined && row.run.status === 'running' && row.execution.phase === 'checking'
+      && row.execution.judgment === undefined && row.execution.judge?.sessionId === sessionId) {
       judgeSessions.add(sessionId)
       judgeWorkspaces.set(sessionId, workspaceKey)
       sessionWorkspaces.set(sessionId, workspaceKey)
@@ -111,19 +108,6 @@ export function apply(ctx: Context) {
     sessionRoles.set(sessionId, roleKey)
   }
 
-  /**
-   * Per-workspace mutation serialization (design §5: one short mutation
-   * queue). Engine handlers are chained so concurrent claims/programs settle
-   * in order; the in-flight async Judge/Program phase runs OUTSIDE the queue.
-   */
-  const workspaceQueues = new Map<string, Promise<unknown>>()
-  function enqueue<T>(workspaceKey: string, fn: () => Promise<T>): Promise<T> {
-    const prev = workspaceQueues.get(workspaceKey) ?? Promise.resolve()
-    const next = prev.then(fn, fn)
-    workspaceQueues.set(workspaceKey, next.catch(() => {}))
-    return next
-  }
-
   function managerOf(run: RunState): Agent | undefined {
     return ctx.agents.get(run.managerSessionId as SessionId)
   }
@@ -140,9 +124,10 @@ export function apply(ctx: Context) {
     return ctx.agents.currentInitiator()
   }
 
+  const subagentHost = makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute)
   const engine: WorkflowEngine = new WorkflowEngine(
     makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
-    makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute),
+    subagentHost,
     makeProgramHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
     makeStateHost(store),
   )
@@ -208,14 +193,14 @@ export function apply(ctx: Context) {
 
   const toolHost: ToolHost = {
     authorize,
-    claim: (ws, claim, caller) => enqueue(ws, () => engine.handleClaim(ws, claim, caller).then(outcomeOf)),
-    block: (ws, nodeToken, reason, caller) => enqueue(ws, () => engine.handleBlock(ws, nodeToken, reason, caller).then(outcomeOf)),
-    resume: (ws, nodeToken, resolutionContext, caller) => enqueue(ws, () => engine.handleResume(ws, nodeToken, resolutionContext, caller).then(outcomeOf)),
-    runProgram: (ws, nodeToken, parameters, caller) => enqueue(ws, () => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf)),
-    resolveProgram: (ws, nodeToken, result, reason, caller) => enqueue(ws, () => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf)),
-    setRoleModel: (ws, roleKey, provider, modelId) => enqueue(ws, () => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf)),
-    judgeClaim: (ws, nodeToken, result, reason, judgeSessionId) => enqueue(ws, () => engine.handleJudgeClaim(ws, nodeToken, result, reason, judgeSessionId).then(outcomeOf)),
-    respawnJudge: (ws, nodeToken, reason, caller) => enqueue(ws, () => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf)),
+    claim: (ws, claim, caller) => engine.handleClaim(ws, claim, caller).then(outcomeOf),
+    block: (ws, nodeToken, reason, caller) => engine.handleBlock(ws, nodeToken, reason, caller).then(outcomeOf),
+    resume: (ws, nodeToken, resolutionContext, caller) => engine.handleResume(ws, nodeToken, resolutionContext, caller).then(outcomeOf),
+    runProgram: (ws, nodeToken, parameters, caller) => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf),
+    resolveProgram: (ws, nodeToken, result, reason, caller) => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf),
+    setRoleModel: (ws, roleKey, provider, modelId) => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf),
+    judgeClaim: (ws, nodeToken, result, reason, caller) => engine.handleJudgeClaim(ws, nodeToken, result, reason, caller).then(outcomeOf),
+    respawnJudge: (ws, nodeToken, reason, caller) => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf),
     status: (ws) => engine.status(ws),
     inspectGit: async (_ws, operation) => {
       const cwd = ambientAgent()?.session.header.cwd
@@ -289,7 +274,7 @@ export function apply(ctx: Context) {
       const row = await store.get(ws)
       if (row === undefined) return
       // S1: a cold-resumed JUDGE child re-registers via the durable row.
-      if (row.run.judgeSessionId === info.id) {
+      if (row.execution.judge?.sessionId === info.id) {
         judgeSessions.add(info.id)
         judgeWorkspaces.set(info.id, ws)
         return
@@ -315,17 +300,9 @@ export function apply(ctx: Context) {
         if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
         const run = engine.buildInitialRun(agent.session.id, workflowId, entry.config, entry.definitionHash)
         sessionWorkspaces.set(agent.session.id, workspaceKey)
-        const outcome = await engine.startRun(workspaceKey, run, entry.path)
+        const outcome = await engine.startRun(workspaceKey, run, entry.path, extraText)
         if (!outcome.ok) return { ok: false, reason: outcome.reason }
-        // Design §2.6: extra text only enters the steer message to the Manager.
-        if (extraText !== '') {
-          const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
-          agent.steer(createUserMessage({
-            content: [{ type: 'text', text: extraText }],
-            source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' },
-          }))
-        }
-        return { ok: true, message: `started ${workflowId} (run ${outcome.run.runId})${extraText !== '' ? `; steered: ${extraText}` : ''}` }
+        return { ok: true, message: `started ${workflowId} (run ${outcome.run.runId})` }
       } catch (error) {
         if (error instanceof StateConflictError) return { ok: false, reason: error.message }
         return { ok: false, reason: String(error) }
@@ -346,46 +323,20 @@ export function apply(ctx: Context) {
   const disposeCommand = ctx.commands.register(makeDshFlowCommand(commandHost))
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
 
-  // ---- Turn-settlement observation (design §4.2 D6) ----
-  // MANAGER and mapped ROLE ACTOR sessions settle workflow turns. Judge
-  // sessions settle through handleJudgeTurnEnded (technical-fault detection).
+  // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。
   ctx.on('session/event', (session, event) => {
     if (event.type !== 'turn/end') return
-    // Defer: never mutate state inside the append publication lock (design).
-    // Route through the same per-workspace mutation queue as tool-driven
-    // engine calls so a settlement never races an in-flight judge_claim.
-    void (async () => {
-      // S1: in-memory Judge sets are empty after a host restart — fall back to
-      // the durable rows so a cold-resumed Judge's turn/end still routes to
-      // handleJudgeTurnEnded (A4 R4/A1 R12).
-      const liveWs = judgeWorkspaces.get(session.id)
-      if (liveWs !== undefined) {
-        const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } })?.reason
-        const kind = reason?.kind ?? 'unknown'
-        const errorMessage = reason?.kind === 'error' && reason.error?.message !== undefined ? `: ${reason.error.message}` : ''
-        const detail = kind === 'completed'
-          ? 'judge turn ended without judge_claim'
-          : `judge turn ended (${kind})${errorMessage}`
-        await enqueue(liveWs, () => engine.handleJudgeTurnEnded(liveWs, session.id, detail).then(() => undefined))
-        return
-      }
-      const durableWs = await durableJudgeWorkspace(session.id)
-      if (durableWs !== undefined) {
-        judgeWorkspaces.set(session.id, durableWs)
-        sessionWorkspaces.set(session.id, durableWs)
-        const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } })?.reason
-        const kind = reason?.kind ?? 'unknown'
-        const errorMessage = reason?.kind === 'error' && reason.error?.message !== undefined ? `: ${reason.error.message}` : ''
-        const detail = kind === 'completed'
-          ? 'judge turn ended without judge_claim'
-          : `judge turn ended (${kind})${errorMessage}`
-        await enqueue(durableWs, () => engine.handleJudgeTurnEnded(durableWs, session.id, detail).then(() => undefined))
-        return
-      }
-      const ws = sessionWorkspaces.get(session.id)
-      if (ws === undefined) return
-      await enqueue(ws, () => engine.handleTurnEnded(ws, session.id).then(() => undefined))
-    })()
+    const ids = endedTurnUserMessageIds(session.snapshotEvents(), event)
+    if (ids === undefined) return
+    subagentHost.observeTurnEnd(session.id)
+    const caller = { sessionId: session.id, turnUserMessageIds: ids }
+    setImmediate(() => {
+      void (async () => {
+        const ws = sessionWorkspaces.get(session.id) ?? await durableJudgeWorkspace(session.id)
+          ?? await workspaceKeyOf(session.header.cwd)
+        if (ws !== undefined) await engine.handleTurnEnded(ws, caller)
+      })().catch(error => ctx.logger.warn(`workflow turn settlement failed: ${String(error)}`))
+    })
   })
 
   ctx.effect(() => () => {

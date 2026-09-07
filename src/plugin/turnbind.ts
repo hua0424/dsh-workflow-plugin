@@ -85,6 +85,20 @@ export function callerTurnUserMessageIds(
     if (locateSeq === undefined) return undefined
   }
 
+  return turnUserMessageIds(events, locateSeq, turn)
+}
+
+/** 精确结束事件的派发来源；延迟处理也不能借用后续 Turn。 */
+export function endedTurnUserMessageIds(events: ReadonlyArray<TurnBindEvent>, end: TurnBindEvent): ReadonlySet<string> | undefined {
+  if (end.type !== 'turn/end') return undefined
+  const turn = dataOf(end)?.['turn']
+  if (typeof turn !== 'number' || !Number.isSafeInteger(turn)) return undefined
+  const logged = events.find(event => event.seq === end.seq)
+  if (logged?.type !== 'turn/end' || dataOf(logged)?.['turn'] !== turn) return undefined
+  return turnUserMessageIds(events, end.seq, turn)
+}
+
+function turnUserMessageIds(events: ReadonlyArray<TurnBindEvent>, locateSeq: number, turn: number | undefined): ReadonlySet<string> | undefined {
   // 3. Single reverse scan from the locating event: collect `user/message`
   //    ids until the `turn/start` that opened `turn`. Crossing a turn
   //    boundary without hitting it, or running off the log head, is a log
@@ -93,6 +107,7 @@ export function callerTurnUserMessageIds(
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const event = events[i]!
     if (event.seq > locateSeq) continue
+    if (event.type === 'turn/end' && event.seq !== locateSeq) return undefined
     if (event.type === 'turn/start') {
       const data = dataOf(event)
       return data !== undefined && data['turn'] === turn ? ids : undefined

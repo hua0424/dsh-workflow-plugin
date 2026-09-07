@@ -5,8 +5,8 @@
  */
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v2' as const
-export const STATE_TABLE_NAME = 'workflow_state' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v3' as const
+export const STATE_TABLE_NAME = 'runs' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
 
@@ -160,10 +160,7 @@ export interface ModelOverride {
   modelId: string
 }
 
-/**
- * The minimal persistent runtime state (design §5). Serialized as
- * `snapshot_json.definitionSnapshot`-sibling fields on the state row.
- */
+/** Run只管位置/控制/固定Snapshot/Role映射；节点材料属于NodeExecution。 */
 export interface RunState {
   runId: string
   managerSessionId: string
@@ -175,35 +172,8 @@ export interface RunState {
   roleActors: Record<string, string>
   modelOverrides: Record<string, ModelOverride>
   blockReason: string | null
-  /** Current Node's precise context boundary (A1 R2/R4). */
-  nodeBoundary: NodeContextBoundary
-  /** Current active/pending Judge session id for this Node (A1/A4). */
-  judgeSessionId?: string
-  /** 判定阶段唯一候选交付；首次、返工和 Judge 重建共用。 */
-  pendingClaim?: NodeClaim
-  /** ponytail: T2 仅在 completed 保存 END 交付；T3 移入终局工作单，不作活动材料镜像。 */
-  finalHandoff?: string
-  /**
-   * A1 §6.4 (D4): the durable REJECT evidence for the current node — the
-   * Judge's rejection reason plus a snapshot of the claim it rejected.
-   * Written on every REJECT (overwriting), retained through re-claims /
-   * NEED_CONTEXT / judge-fault BLOCKs / correction-dispatch-failure BLOCKs
-   * (resume rebuilds the correction message from it), and cleared by
-   * `advance()` when the node finally leaves.
-   */
-  pendingCorrection?: PendingCorrection
-  /**
-   * 20260906-claim-handoff-symmetry: the one-shot transient context of a
-   * DEFERRED dispatch, persisted with the advanced run by `persistDeferred`
-   * so the window between the accepted claim (PASS/FAIL) and the deferred
-   * dispatch cannot lose the handoff on a host restart — the in-memory
-   * DispatchBook dies with the process, this field does not. Consumed by
-   * exactly one successful dispatch (`dispatchNow` clears it) or by a resume
-   * (the actor-path resume re-delivers it alongside the Manager's resolution).
-   * Only set while `status === 'running'`: a FAIL without onFail BLOCKs with
-   * the claim consumed, so it never carries a pending dispatch.
-   */
-  pendingDispatchContext?: TransientDispatch
+  /** 当前 visit；completed 时仍指向终局工作单，最终交付从该工作单读取。 */
+  currentExecutionId: string
   /**
    * Absolute path of this run's trace log file (A3). Persisted so events
    * after a host restart (restart-reconcile BLOCK, post-restart resume)
@@ -214,11 +184,59 @@ export interface RunState {
   traceLogPath?: string
 }
 
+/** 派发意图先存；messageId 只由真实 Host 返回，不能由模型填写。 */
+export interface ExecutionDispatch {
+  id: string
+  sessionId?: string
+  messageId?: string
+  settled: boolean
+}
+
+/** 一次 Graph visit 的唯一当前材料。revision 与派发/claim 身份互不替代。 */
+export interface NodeExecution {
+  executionId: string
+  runId: string
+  workflowId: string
+  nodeId: string
+  nodeToken: string
+  visit: number
+  revision: number
+  input: string
+  phase: 'ready' | 'working' | 'checking' | 'settling' | 'exited'
+  predecessorId?: string
+  successorId?: string
+  boundary?: NodeContextBoundary
+  dispatch?: ExecutionDispatch
+  claim?: NodeClaim & { id: string; dispatchId: string }
+  judge?: ExecutionDispatch & { claimId: string; inputVersion: number }
+  judgment?: JudgeResult & { claimId: string; judgeDispatchId: string }
+  inputVersion: number
+  blockReason: string | null
+  enteredAt: string
+  exitedAt?: string
+}
+
+export interface NodeExecutionEvent {
+  executionId: string
+  sequence: number
+  type: 'entered' | 'actor-arranged' | 'claim' | 'judge-arranged' | 'judgment' | 'exited' | 'blocked'
+  at: string
+  snapshot: NodeExecution
+}
+
+/** 一个短事务可同时保存前驱、后继及所有对应关键快照。 */
+export interface ExecutionChange {
+  execution: NodeExecution
+  expectedRevision: number | null
+  events: NodeExecutionEvent['type'][]
+}
+
 export interface StateRow {
   workspaceKey: string
   formatVersion: typeof STATE_FORMAT_VERSION
   stateVersion: number
   run: RunState
+  execution: NodeExecution
   updatedAt: string
 }
 
@@ -235,19 +253,6 @@ export interface ClaimCaller {
   sessionId: string
   turnUserMessageIds: ReadonlySet<string>
 }
-
-/**
- * A1 §3 + 20260906-claim-handoff-symmetry: one-shot transient context for the
- * next dispatch — `handoff` (an accepted PASS/FAIL edge / resolution) or
- * `correction` (a REJECTed claim re-dispatched to the same node). Identical
- * rules for completed and failed: the outcome only picks the onPass/onFail
- * edge, never the framing. Threading the kind through DispatchBook /
- * persistDeferred / dispatchNow keeps the delayed correction's header
- * distinct from `[handoff]`.
- */
-export type TransientDispatch =
-  | { kind: 'handoff'; text: string }
-  | { kind: 'correction'; text: string }
 
 /** A worker's completion claim. No nodeToken (A1 AC2): admission binds the
  * claim to the current dispatch lease, so the claim carries only its payload. */
