@@ -6,7 +6,7 @@
 
 | 票 | Issue | 交付 | Blocked by | 状态 |
 |---|---|---|---|---|
-| T1 | [#8](https://github.com/hua0424/dsh-workflow-plugin/issues/8) | DSH 0.1.2-rc.1 兼容基线 | 无 | 实施中 |
+| T1 | [#8](https://github.com/hua0424/dsh-workflow-plugin/issues/8) | DSH 0.1.2-rc.1 兼容基线 | 无 | 完成 |
 | T2 | [#9](https://github.com/hua0424/dsh-workflow-plugin/issues/9) | outcome+handoff 单文本闭环 | #8 | 待开始 |
 | T3 | [#10](https://github.com/hua0424/dsh-workflow-plugin/issues/10) | 三表工作单 Actor/Judge 事务闭环 | #9 | 待开始 |
 | T4 | [#11](https://github.com/hua0424/dsh-workflow-plugin/issues/11) | 同节点返工、历史与争议协调 | #10 | 待开始 |
@@ -30,5 +30,7 @@ T8 与 T4–T7 的阻塞关系不同，但同一共享工作区默认顺序实�
 - 目标版本已经提供 JSON helper 所在的 `dsh-util-values`；必要时将其作为宿主 devDependency 显式声明，复用原 helper，不引入运行依赖或兼容 shim。
 
 ## 实施证据
+
+- T1：`docs/test-reports/issue-8-host-baseline.md`；目标依赖适配后 build、222/222 unit、隔离 smoke 通过，父任务独立复验通过；Standards 0 项、Spec 0 项。
 
 逐票在完成后补充测试报告/commit/审查结论。尚未完成的票不能仅凭设计或代码存在被标记通过。

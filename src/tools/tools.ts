@@ -19,7 +19,7 @@ function lengthError(field: string, value: string | undefined, min: number, max:
 
 /** Minimal shape of the exec's caller agent the binding needs. */
 interface CallerAgentLike {
-  session: { id: string; events?: unknown }
+  session: { id: string; snapshotEvents?: () => unknown }
 }
 
 /**
@@ -33,7 +33,7 @@ function claimCallerOf(exec: { agent?: unknown; callId?: string; rootCallId?: st
     ? (exec.agent as CallerAgentLike)
     : undefined
   const sessionId = agent?.session.id ?? ''
-  const events = agent?.session.events
+  const events = typeof agent?.session.snapshotEvents === 'function' ? agent.session.snapshotEvents() : undefined
   const callId = typeof exec.callId === 'string' ? exec.callId : ''
   const rootCallId = typeof exec.rootCallId === 'string' ? exec.rootCallId : callId
   const ids = Array.isArray(events) && callId !== ''

@@ -6,7 +6,7 @@
 import { mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import { snapshotJsonValue, isJsonValue } from '@deepseek-ai/dsh-session'
+import { snapshotJsonValue, isJsonValue } from '@deepseek-ai/dsh-util-values'
 import { CATALOG_DIR_NAME, STATE_DB_NAME, STATE_FORMAT_VERSION, STATE_TABLE_NAME, type RunState, type StateRow } from '../types.ts'
 
 interface RowShape {

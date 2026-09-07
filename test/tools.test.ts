@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { workflowTools, setToolHost, type ToolHost } from '../src/tools/tools.ts'
 import { makeDshFlowCommand, type CommandHost } from '../src/commands/dsh-flow.ts'
 import { randomUUID } from 'node:crypto'
+import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 /** Find a registered tool by name. */
 function findTool(name: string) {
@@ -212,6 +214,49 @@ test('authorize denial surfaces in control tools', async () => {
   const tool = findTool('node_claim')
   const result = await tool.execute({ outcome: 'completed', summary: 's' }, EXEC as never)
   assert.match(result as string, /拒绝：only manager/)
+})
+
+test('target host Session snapshot binds native claim to its dispatch, excluding later turns', async () => {
+  const host = makeToolHost()
+  const session = Session.create(SessionId('native-caller'))
+  session.append('turn/start', { turn: 1 } as never)
+  const dispatch = createUserMessage({ content: [{ type: 'text', text: 'work' }], source: { kind: 'user' } })
+  session.append('user/message', dispatch, { surfaceOp: 'append' })
+  session.append('tool/call', { turn: 1, step: 1, callId: 'native-claim', name: 'node_claim', arguments: '{}' } as never)
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } } as never)
+  session.append('turn/start', { turn: 2 } as never)
+  session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'new work' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+  await findTool('node_claim').execute({ outcome: 'completed', summary: 'done' }, {
+    ...EXEC, agent: { session }, callId: 'native-claim', rootCallId: 'native-claim',
+  } as never)
+  assert.deepEqual((host.calls[0]!.args as { caller: unknown }).caller, {
+    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
+  })
+})
+
+test('target host Code Mode snapshot binds claim/block only with the real root and subcall', async () => {
+  const session = Session.create(SessionId('code-caller'))
+  session.append('turn/start', { turn: 1 } as never)
+  const dispatch = createUserMessage({ content: [{ type: 'text', text: 'work' }], source: { kind: 'user' } })
+  session.append('user/message', dispatch, { surfaceOp: 'append' })
+  session.append('tool/call', { turn: 1, step: 1, callId: 'root', name: 'run_code', arguments: '{}' } as never)
+  session.append('tool/code-dispatch-start', { rootCallId: 'root', parentCallId: 'root', subCallId: 'root:code:1', name: 'node_claim', arguments: {} } as never)
+  const callers: unknown[] = []
+  makeToolHost({
+    claim: async (_ws, _claim, caller) => { callers.push(caller); return { ok: true } },
+    block: async (_ws, _token, _reason, caller) => { callers.push(caller); return { ok: true } },
+  })
+  const exec = { ...EXEC, agent: { session }, callId: 'root:code:1', rootCallId: 'root' }
+  await findTool('node_claim').execute({ outcome: 'completed', summary: 'done' }, exec as never)
+  await findTool('node_block').execute({ nodeToken: randomUUID(), reason: 'pause' }, exec as never)
+  await findTool('node_claim').execute({ outcome: 'completed', summary: 'forged root' }, { ...exec, rootCallId: 'other-root' } as never)
+  await findTool('node_claim').execute({ outcome: 'completed', summary: 'forged subcall' }, { ...exec, callId: 'root:code:2' } as never)
+  assert.deepEqual(callers, [
+    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set() },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set() },
+  ])
 })
 
 // ---- command tests ----

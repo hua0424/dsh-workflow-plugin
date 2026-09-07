@@ -4,7 +4,9 @@ import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
-import { makeSubagentHost } from '../src/plugin/host.ts'
+import { makeDispatchTargets, makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
+import { queueSubagentPrompt, type HostPromptQueue } from '@deepseek-ai/dsh-subagent/internal'
+import { MessageId } from '@deepseek-ai/dsh-llm'
 import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
@@ -42,6 +44,38 @@ function makeRun(actorForDeveloper: string | undefined): RunState {
     nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
   }
 }
+
+test('Role and Judge continuation use host distinct-turn queue with exact Manager authority', async () => {
+  const manager = { session: { id: 'manager' } } as unknown as Agent
+  const deliveries: Array<{ parent: Agent; childId: string; text: string; source: unknown }> = []
+  const queue: HostPromptQueue = {
+    async [queueSubagentPrompt](parent, childId, content, source, signal) {
+      assert.equal(signal.aborted, false)
+      deliveries.push({ parent, childId, text: (content[0] as { text: string }).text, source })
+      return MessageId(`dispatch-${deliveries.length}`)
+    },
+  }
+  const adapters: HostAdapters = {
+    ctx: { subagents: queue } as unknown as Context,
+    managerAgentOf: () => manager,
+    cwdOfManager: async () => undefined,
+    registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+  }
+  const run = makeRun('sess-dev')
+  const dispatch = makeDispatchTargets(adapters)
+  const host = makeSubagentHost(adapters, () => ({}))
+  assert.deepEqual(await dispatch.sendRoleActor(run, 'developer', 'next node'), { messageId: 'dispatch-1' })
+  assert.deepEqual(await host.ensureRoleActor(run, 'developer', 'resume node'), { childId: 'sess-dev', messageId: 'dispatch-2' })
+  await host.followupJudge(run, 'sess-judge', 'more evidence')
+  assert.deepEqual(deliveries, [
+    { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
+    { parent: manager, childId: 'sess-dev', text: 'resume node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
+    { parent: manager, childId: 'sess-judge', text: 'more evidence', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
+  ])
+  adapters.managerAgentOf = () => undefined
+  await assert.rejects(dispatch.sendRoleActor(run, 'developer', 'unauthorized'), /manager agent is not live/)
+  assert.equal(deliveries.length, 3)
+})
 
 function manualError(code: string, message: string): Error & { code: string } {
   return Object.assign(new Error(message), { name: 'ManualCompactionError', code })

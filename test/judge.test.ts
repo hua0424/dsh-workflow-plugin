@@ -23,7 +23,7 @@ function makeSource(id: string, events: Array<{ time: number; seq: number; type:
   return {
     id,
     seq: events.reduce((max, e) => Math.max(max, e.seq + 1), 0),
-    events: events.map(e => ({ type: e.type, seq: e.seq, time: e.time, data: e.data, surfaceOp: e.surfaceOp ?? 'append' }) as SessionEvent),
+    snapshotEvents: () => events.map(e => ({ type: e.type, seq: e.seq, time: e.time, data: e.data, surfaceOp: e.surfaceOp ?? 'append' }) as SessionEvent),
   }
 }
 
@@ -173,6 +173,20 @@ test('ACTOR projection keeps coordinator relay dispatch text; MANAGER projection
   const actorView = projectSessionSurface(s, 0, 'ACTOR')
   assert.equal(actorView.length, 1)
   assert.match(actorView[0]!.text, /repo=acme\/server/)
+})
+
+test('target host Workflow queue provenance projects only for the Actor and only after its dispatch', () => {
+  const dispatch = createUserMessage({ content: [{ type: 'text', text: 'current work' + SUBMISSION_CONSTRAINT }], source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } })
+  const actor = makeSession([
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'old work' }], source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } }), surfaceOp: 'append' },
+    { type: 'user/message', data: dispatch, surfaceOp: 'append' },
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'unrelated notice' }], source: { kind: 'plugin', plugin: 'other-plugin' } }), surfaceOp: 'append' },
+  ])
+  const text = projectNodeLocal(makeSession([]), {
+    dispatchedAt: 0, managerFromSeq: 0, executorSessionId: actor.id, executorDispatchMessageId: dispatch.id,
+  }, actor)
+  assert.equal(text, '[ACTOR]\ncurrent work')
+  assert.deepEqual(projectSessionSurface(actor, 0, 'MANAGER'), [])
 })
 
 test('the A3 submission constraint is stripped from the projected dispatch text (A3 R1/AC6)', () => {

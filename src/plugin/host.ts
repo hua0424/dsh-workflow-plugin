@@ -4,7 +4,7 @@
  */
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-subagent'
+import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { StateStore } from '../state/store.ts'
@@ -61,7 +61,7 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   const events = inspection.events.slice()
   return {
     id: inspection.meta.id,
-    events,
+    snapshotEvents: () => events,
     seq: events.length > 0 ? events[events.length - 1]!.seq + 1 : 0,
   }
 }
@@ -165,10 +165,9 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const childId = run.roleActors[roleKey]
       if (childId === undefined) throw new WorkflowError(`no actor mapped for role "${roleKey}"`)
-      const messageId = await adapters.ctx.subagents.followup(manager, childId as SessionId, textBlocks(text), {
-        source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
-        signal: new AbortController().signal,
-      })
+      // Workflow 派发必须是独立 child turn，不可用 nearest-step sendMessage。
+      const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(childId), textBlocks(text),
+        { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
       return { messageId }
     },
     managerSessionSeq(run) {
@@ -188,10 +187,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         // correct continuation for an existing mapping.
         const manager = adapters.managerAgentOf(run)
         if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-        const messageId = await adapters.ctx.subagents.followup(manager, existing as SessionId, textBlocks(initialText), {
-          source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
-          signal: new AbortController().signal,
-        })
+        const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(existing), textBlocks(initialText),
+          { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
         return { childId: existing, messageId }
       }
       const manager = adapters.managerAgentOf(run)
@@ -302,10 +299,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async followupJudge(run, judgeSessionId, text) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      await adapters.ctx.subagents.followup(manager, SessionId(judgeSessionId), textBlocks(text), {
-        source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
-        signal: new AbortController().signal,
-      })
+      await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(judgeSessionId), textBlocks(text),
+        { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
     },
 
     async retireJudge(run, judgeSessionId) {

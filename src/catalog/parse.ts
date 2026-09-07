@@ -13,7 +13,7 @@
  * materialization; we double-check with a lossless-JSON pass).
  */
 import { parseAllDocuments, isAlias, isMap, isScalar, isSeq, isCollection, type Node } from 'yaml'
-import { snapshotJsonValue } from '@deepseek-ai/dsh-session'
+import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import type { WorkflowConfig } from '../types.ts'
 import { parseWorkflowConfig } from './schema.ts'
 
