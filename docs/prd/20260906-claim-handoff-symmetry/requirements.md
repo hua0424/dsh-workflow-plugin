@@ -1,6 +1,6 @@
 # 新需求：completed / failed 的 Handoff Context 对称传递
 
-- 状态：待独立开发；本文仅记录需求与背景，不代表已实现。
+- 状态：已开发完成（2026-09-06；实现决策与交付记录见 §8，配置迁移见 [migration.md](./migration.md)）；本文其余部分为需求原始记录。
 - 来源：用户在真实 milestone-delivery 工作流返工停滞诊断后明确提出。
 - 用户决策：completed 与 failed 应拥有完全一致的信息流能力，两者仅对应不同的节点路由。用户将另行安排开发，完成后重新运行工作流；本次试跑现有交付变更由用户作废重来，不作为该需求的验收成果。
 - 操作边界：记录本文不代表授权自动 reset、删除分支、关闭 Issue、改写历史、清理工作区或恢复当前 Run。
@@ -108,3 +108,48 @@ Active Run 使用 immutable Definition Snapshot。配置修改不应宣称自动
 补充工具校验、状态 round-trip、Judge 恢复及 deferred dispatch 回归测试；执行构建、单测和隔离 e2e。不得修改当前真实 Run 来做测试，也不得将沙箱导致的未执行测试记为通过。
 
 独立开发完成后向用户交付代码、配置迁移说明及测试证据。用户再以新 Run 重跑 milestone-delivery；旧 Run 和旧交付的处置由用户另行决定。
+
+## 8. 实现决策与交付记录（2026-09-06 开发时追加）
+
+评审阶段确认的四个设计决策（评审对话中用户拍板）：
+
+1. **AC7 边界定死为“claim 被消费”**：`advance()` 在 FAIL-无-onFail 分支之前已删除
+   `pendingClaim`，该 BLOCK 后 State 不保留 claim/handoff，也不设置
+   `pendingDispatchContext`；恢复信息由 Manager 的 `resolutionContext` 提供，claim 记录
+   以 trace log 为准。**不得**改为“原地保留 pendingClaim”——`node_resume` 先检查
+   `pendingClaim !== undefined` 会误走判定阶段分支（重建 Judge）而不是同节点重派。
+   已用测试 pin 住：该 BLOCK 后 resume 不 spawn Judge、走 actor 路径、不注入旧 handoff。
+2. **deferred 派发崩溃窗口对称修复（超出本文原始范围）**：ACCEPT 持久化与 deferred
+   派发之间，handoff 此前只存于内存 DispatchBook，宿主崩溃即丢失（PASS/FAIL 对称存在的
+   既有 seam）。新增 State 字段 `pendingDispatchContext`（一次性 transient 镜像，仅
+   running 且已 advance 未派发时存在），重启 BLOCK → resume 时连同 Manager resolution
+   一起重投。两种 outcome 同时受益。
+3. **Judgment Packet 维持只含 outcome/summary**（A1 R7 不变）：Judge 判 claim 可信性，
+   不验证 handoff 内容；decide-pr 的 executor 是 Manager 本人，其会话已在 node-local
+   投影窗口内可交叉核对。实现未把 handoff 加进 packet。
+4. **不区分 PASS/FAIL 派发头**（用户决策）：每个 Node 的执行独立，不感知来源节点/出口，
+   只消费传入的 `[handoff]` 上下文。返工来源信息按 R5 由 catalog 指令约定写进 handoff
+   文本本身。
+
+代码改动：`src/tools/tools.ts`（对称校验+描述）、`src/engine/engine.ts`（对称持久化、
+pendingDispatchContext 三处链路、过时注释）、`src/types.ts`（字段与注释）。无
+STATE_FORMAT_VERSION 迁移（run 为整体 JSON snapshot，新增可选字段向后兼容）。
+
+测试证据（2026-09-06，Windows 本机）：`pnpm test` 218 项全部通过（含本需求新增 9 项：
+对称接口、FAIL 立即/deferred 派发、同输入同目标 AC3 对比、NEED_CONTEXT 恢复、重启
+crash-window 恢复、REJECT 保留 handoff、无 onFail 边界、事故回归 AC8 + 复用 Actor
+compaction 断言、工具层对称边界）；`pnpm run test:e2e` PASS（真实 engine + SQLite +
+catalog loader 新增“诚实 failed + handoff → ACCEPT → FAIL 自环重派”链路，含真实
+StateStore 中的 `pendingDispatchContext` round-trip 与 trace 断言）。
+
+文档同步：CONTEXT.md（Handoff Context / Node Claim / Judge / Workflow State Store）、
+docs/design/configurable-agent-workflow-graph.md（§2.6、§5.2、§5 状态形状、§6 中断恢复、
+§7.1）、docs/testing/acceptance-test-plan.md（G2）、docs/example/workflow-template.yaml。
+历史 PRD 附件 `docs/prd/20260903-workflow-hardening/milestone-delivery*.yaml` 按不改写
+历史的原则未动，其"failed 上下文写 summary"的约定自本需求起被取代。
+
+Catalog 迁移：更新版见本目录 [milestone-delivery.yaml](./milestone-delivery.yaml)
+（仅 decide-pr 与 test 两节点文案，图结构未变），已同步部署到
+`~/.dsh/workflows/milestone-delivery.yaml`（自动备份
+`milestone-delivery.yaml.20260906-225234.bak`），真实 loader 加载校验通过。
+既有 Run 使用 immutable snapshot 不受影响；待用户以新 Run 重跑验证（AC8 的真实复现）。

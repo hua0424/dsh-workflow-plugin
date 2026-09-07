@@ -20,6 +20,12 @@
 #
 # YAML 限制：单文档；禁止 duplicate key / anchor / alias / merge key /
 # 自定义 tag；不支持模板插值。
+#
+# handoffContext 对 completed / failed 完全对称（20260906）：两种 outcome
+# 都可在 claim 时可选携带（trim 后 1..8000 字符）；Judge ACCEPT 后 completed
+# 沿 onPass、failed 沿 onFail 原样送达后继节点。声明 failed 时把返工所需的
+# 完整业务上下文（对象标识、发现、修正要求）写进 handoffContext，summary
+# 只概括退回原因——不要把返工上下文塞进 summary（它不会转发给后继节点）。
 # =============================================================================
 
 schemaVersion: agent-workflow/v2
@@ -98,30 +104,35 @@ workflow:
         instruction: |
           按 handoff 与 instruction 完成实现。声明 completed 时，在
           handoffContext 中携带实现摘要与关键产物（涉及文件/提交等），
-          供 Judge 与后续节点核对。
+          供 Judge 与后续节点核对；确实无法完成时声明 failed，并在
+          handoffContext 中携带已完成部分、阻塞原因与返工要求，供
+          onFail 后继节点继续。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
             实现与 handoff 声明一致，所需检查已执行，handoff 携带实现
-            摘要与关键产物。
+            摘要与关键产物；可信的 failed 声明应 ACCEPT 并沿 onFail 返工。
       onPass: review
-      onFail: implement      # FAIL 沿 onFail 退回重做；onFail 不能指向 END
+      onFail: implement      # FAIL 沿 onFail 退回重做（failed claim 的 handoff 会送达该后继）；onFail 不能指向 END
 
     review:
       execution:
         type: actor-task
         role: reviewer
         instruction: |
-          以只读方式评审 implement 的结果。评审完成后即声明 completed
-          （无论结论如何），并在 handoffContext 中记录 approved（yes/no）
-          与阻断性发现（approved 时为空）。
+          以只读方式评审 implement 的结果，按结论声明：无阻断性发现时声明
+          completed，handoffContext 记录 approved=yes 与评审对象标识；存在
+          阻断性发现时声明 failed，handoffContext 记录 approved=no、对象
+          标识与每条发现的具体修正要求——failed 沿 onFail 把这些上下文
+          原样交给返工节点，不要写进 summary。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            评审确实以只读方式完成且结论与事实一致；仅当 approved=yes 且
-            无阻断性发现时 PASS，否则 FAIL。
+            评审确实以只读方式完成且结论与事实一致；可信的 completed 与
+            可信的 failed（发现真实、修正要求可执行且位于 handoff）都应
+            ACCEPT，由 claim outcome 决定沿 onPass 还是 onFail 路由。
       onPass: END
       onFail: implement
 

@@ -183,10 +183,11 @@ export interface RunState {
   judgeSessionId?: string
   /**
    * Worker claim held during the judgment phase (A4 R9). The optional
-   * `handoffContext` is persisted together with the claim (20260902-fixbug
-   * review resolution "方案2") so a host restart during judgment cannot
-   * silently drop the handoff; it is cleared together with the claim when
-   * the verdict lands.
+   * `handoffContext` is persisted together with the claim for BOTH outcomes
+   * (20260902-fixbug review resolution "方案2"; 20260906-claim-handoff-symmetry
+   * extends it to failed) so a host restart during judgment cannot silently
+   * drop the handoff; it is cleared together with the claim when the verdict
+   * lands.
    */
   pendingClaim?: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
   /**
@@ -198,6 +199,18 @@ export interface RunState {
    * `advance()` when the node finally leaves.
    */
   pendingCorrection?: PendingCorrection
+  /**
+   * 20260906-claim-handoff-symmetry: the one-shot transient context of a
+   * DEFERRED dispatch, persisted with the advanced run by `persistDeferred`
+   * so the window between the accepted claim (PASS/FAIL) and the deferred
+   * dispatch cannot lose the handoff on a host restart — the in-memory
+   * DispatchBook dies with the process, this field does not. Consumed by
+   * exactly one successful dispatch (`dispatchNow` clears it) or by a resume
+   * (the actor-path resume re-delivers it alongside the Manager's resolution).
+   * Only set while `status === 'running'`: a FAIL without onFail BLOCKs with
+   * the claim consumed, so it never carries a pending dispatch.
+   */
+  pendingDispatchContext?: TransientDispatch
   /**
    * Absolute path of this run's trace log file (A3). Persisted so events
    * after a host restart (restart-reconcile BLOCK, post-restart resume)
@@ -231,10 +244,13 @@ export interface ClaimCaller {
 }
 
 /**
- * A1 §3: one-shot transient context for the next dispatch — `handoff`
- * (PASS edge / resolution) or `correction` (a REJECTed claim re-dispatched to
- * the same node). Threading the kind through DispatchBook / persistDeferred /
- * dispatchNow keeps the delayed correction's header distinct from `[handoff]`.
+ * A1 §3 + 20260906-claim-handoff-symmetry: one-shot transient context for the
+ * next dispatch — `handoff` (an accepted PASS/FAIL edge / resolution) or
+ * `correction` (a REJECTed claim re-dispatched to the same node). Identical
+ * rules for completed and failed: the outcome only picks the onPass/onFail
+ * edge, never the framing. Threading the kind through DispatchBook /
+ * persistDeferred / dispatchNow keeps the delayed correction's header
+ * distinct from `[handoff]`.
  */
 export type TransientDispatch =
   | { kind: 'handoff'; text: string }

@@ -114,7 +114,7 @@ export const workflowTools: ToolDefinition[] = [
     parameters: {
       outcome: { type: 'string', required: true, enum: ['completed', 'failed'], description: 'completed | failed' },
       summary: { type: 'string', required: true, description: '工作摘要（1..4000 字符）' },
-      handoffContext: { type: 'string', description: '交给下一 Node 的上下文（仅 completed 可用，1..8000 字符）' },
+      handoffContext: { type: 'string', description: '交给下一 Node 的上下文（completed 与 failed 均可携带，1..8000 字符；failed 时用于向后继返工/修复节点传递完整业务上下文）' },
     },
     output: stringOut,
     async execute(args, exec) {
@@ -123,8 +123,9 @@ export const workflowTools: ToolDefinition[] = [
       const host = thisHost()
       const summaryError = lengthError('summary', args.summary, LIMITS.summaryMin, LIMITS.summaryMax, true)
       if (summaryError !== undefined) return `拒绝：${summaryError}`
+      // 20260906-claim-handoff-symmetry R1: handoffContext accepts the SAME
+      // contract for completed and failed — the outcome only picks the edge.
       if (args.handoffContext !== undefined) {
-        if (args.outcome !== 'completed') return '拒绝：handoffContext 仅 completed 可用'
         const handoffError = lengthError('handoffContext', args.handoffContext, 1, LIMITS.handoffMax, false)
         if (handoffError !== undefined) return `拒绝：${handoffError}`
       }

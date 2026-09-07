@@ -75,7 +75,8 @@
 
 - G1 工具集合恰好十一个；所有 Node mutation 必须携带 current frame nodeToken；过期拒绝。
 - G2 `node_claim`：仅 running + token 匹配；completed|failed；summary 1..4000；
-  handoffContext 仅 completed 时 1..8000。
+  handoffContext 对 completed/failed 对称可用，trim 后 1..8000（20260906-claim-handoff-symmetry；
+  此前"仅 completed 可用"的限制已由该需求取代）。
 - G3 `node_block`：running + token 匹配；写 BLOCK；BLOCK 后迟到 claim 因非 running 拒绝。
 - G4 `node_resume`：仅 Manager、blocked、token 匹配、目标 Actor 无 active turn；
   resolutionContext 1..8000；生成新 token；派发失败再次 BLOCK。

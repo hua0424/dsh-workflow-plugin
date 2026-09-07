@@ -16,6 +16,11 @@
  * correction re-dispatch → correct work → re-claim → async ACCEPT) → END loop
  * on production code paths for BOTH a Manager node and a Role node —
  * token-less claims bound by the dispatch lease, and the CORRECT trace event.
+ *
+ * 20260906-claim-handoff-symmetry coverage: an honest FAILED claim with
+ * handoffContext → ACCEPT → FAIL edge → deferred re-dispatch of the SAME node
+ * carrying the [handoff] text, with the durable pendingDispatchContext mirror
+ * visible in the REAL SQLite row before the turn settles.
  */
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -48,6 +53,7 @@ workflow:
       execution: { type: actor-task, role: worker, instruction: Append the single line "worker ok" to smoke/result.txt. }
       checker: { checkerId: judge.claim-correct, config: { criteria: smoke/result.txt holds "smoke ok" then "worker ok", exactly two lines. } }
       onPass: END
+      onFail: worker-echo
 `
 mkdirSync(join(home, 'workflows'), { recursive: true })
 const catalogPath = join(home, 'workflows', 'smoke-test.yaml')
@@ -111,8 +117,14 @@ try {
       const ok = isHello
         ? lines.length === 1 && lines[0] === 'smoke ok'
         : lines.length === 2 && lines[0] === 'smoke ok' && lines[1] === 'worker ok'
-      const verdict = ok ? 'ACCEPT' : 'REJECT'
-      const reason = ok ? 'content matches criteria' : `content does not match criteria yet: ${JSON.stringify(content)}`
+      // 20260906 symmetry: the Judge confirms whether the CLAIM is
+      // trustworthy — a failed claim over genuinely unmet criteria is honest
+      // and ACCEPTs (the Graph FAIL then comes from the claim outcome).
+      const honest = input.claim.outcome === 'completed' ? ok : !ok
+      const verdict = honest ? 'ACCEPT' : 'REJECT'
+      const reason = honest
+        ? (ok ? 'content matches criteria' : 'genuine failure: criteria not met')
+        : `content does not match criteria yet: ${JSON.stringify(content)}`
       // Defer to a macrotask so the verdict lands AFTER handleClaim persists the
       // judgment phase (await continuations are microtasks; setTimeout(0) runs
       // after them), mirroring a real async judge turn. The Judge must use the
@@ -197,11 +209,46 @@ try {
   console.log('   frame after ACCEPT:', topFrame(current.run).nodeId, '| dispatch:', dispatchLog.at(-1))
   if (topFrame(current.run).nodeId !== 'worker-echo') throw new Error(`verdict did not advance/dispatch: ${topFrame(current.run).nodeId}`)
 
-  // 4. The worker actor does WRONG work: REJECT re-dispatches the correction
-  //    to the ORIGINAL actor session (same-node followup).
+  // 4. 20260906-claim-handoff-symmetry: the worker honestly reports the work
+  //    NOT done as a FAILED claim with handoffContext → ACCEPT → FAIL edge
+  //    (self-loop rework) → deferred re-dispatch carrying the [handoff] text.
+  const REWORK = 'rework: append the exact line "worker ok"'
+  const claimFail = await engine.handleClaim(workspaceKey, {
+    outcome: 'failed', summary: 'criteria not met yet', handoffContext: REWORK,
+  }, actorCaller())
+  console.log('4. claim worker-echo (honest failed + handoff):', claimFail.ok, claimFail.message)
+  // NO turn settlement yet → the ACCEPT takes the DEFERRED dispatch path and
+  // the durable handoff mirror is visible in the REAL SQLite row.
+  await waitVerdict()
+  {
+    const row = await stateHost.get(workspaceKey)
+    if (row === undefined) throw new Error('row vanished after failed ACCEPT')
+    if (topFrame(row.run).nodeId !== 'worker-echo') throw new Error(`FAIL edge moved the node: ${topFrame(row.run).nodeId}`)
+    if (row.run.pendingDispatchContext?.kind !== 'handoff' || row.run.pendingDispatchContext.text !== REWORK) {
+      throw new Error(`durable handoff mirror missing in the real store: ${JSON.stringify(row.run.pendingDispatchContext)}`)
+    }
+    if ((dispatchLog.at(-1) ?? '').includes('[handoff]')) throw new Error('deferred dispatch fired before turn settlement')
+    console.log('   FAIL edge deferred | durable mirror:', JSON.stringify(row.run.pendingDispatchContext))
+  }
+  await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
+  {
+    const row = await stateHost.get(workspaceKey)
+    // The dispatch log records only the first line — the [handoff] header.
+    // (The full text is asserted by the unit tests; here the durable mirror
+    // above proved what the header wraps.)
+    const sent = dispatchLog.at(-1) ?? ''
+    if (!sent.includes('role[worker]: [handoff]')) {
+      throw new Error(`rework handoff did not reach the re-dispatch: ${sent}`)
+    }
+    if (row.run.pendingDispatchContext !== undefined) throw new Error('dispatched mirror not consumed')
+    console.log('   rework re-dispatch carries the handoff ✓ | dispatch:', sent)
+  }
+
+  // 5. The worker actor does WRONG work and claims completed: REJECT
+  //    re-dispatches the correction to the ORIGINAL actor session.
   writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\nwrong worker\n', 'utf8')
   const claim2 = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'appended worker ok (wrong)' }, actorCaller())
-  console.log('4. claim worker-echo (wrong work):', claim2.ok, claim2.message)
+  console.log('5. claim worker-echo (wrong work):', claim2.ok, claim2.message)
   await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
   await waitVerdict()
   {
@@ -214,22 +261,22 @@ try {
   // Corrected actor work → re-claim → ACCEPT → END.
   writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\nworker ok\n', 'utf8')
   const claim2b = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'appended worker ok' }, actorCaller())
-  console.log('5. re-claim worker-echo (corrected):', claim2b.ok, claim2b.message)
+  console.log('6. re-claim worker-echo (corrected):', claim2b.ok, claim2b.message)
   await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
   await waitVerdict()
   const final = await stateHost.get(workspaceKey)
   if (final === undefined) throw new Error('row vanished at the end')
-  console.log('6. FINAL:', final.run.status, '| callStack:', JSON.stringify(final.run.callStack))
+  console.log('7. FINAL:', final.run.status, '| callStack:', JSON.stringify(final.run.callStack))
 
   let pass = final.run.status === 'completed' && final.run.callStack.length === 0
 
-  // 7. run trace log assertions (workflow-run-logging AC1/AC2 + A3 fmt=2 events + A1 CORRECT)
+  // 8. run trace log assertions (workflow-run-logging AC1/AC2 + A3 fmt=2 events + A1 CORRECT)
   const TS = '\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]'
   const TOK = '[0-9a-f]{8}'
   const logDir = join(dirname(entry.path), 'smoke-test')
   const logFiles = existsSync(logDir) ? readdirSync(logDir).filter(f => f.endsWith('.txt')) : []
   if (logFiles.length !== 1 || !/^\d{8}-\d{6}-[0-9a-f-]{8}\.txt$/.test(logFiles[0])) {
-    console.log('7. trace log FAIL: expected one yyyyMMdd-HHmmss-<runId8>.txt in', logDir, '| got:', JSON.stringify(logFiles))
+    console.log('8. trace log FAIL: expected one yyyyMMdd-HHmmss-<runId8>.txt in', logDir, '| got:', JSON.stringify(logFiles))
     pass = false
   } else {
     const log = readFileSync(join(logDir, logFiles[0]), 'utf8')
@@ -238,6 +285,7 @@ try {
     // re-escape instead of hand-counting backslashes.
     const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const wrongReason = JSON.stringify('content does not match criteria yet: ' + JSON.stringify('wrong content\n'))
+    const reworkHandoff = JSON.stringify('rework: append the exact line "worker ok"')
     const expectations = [
       new RegExp(`${TS} START workflow=smoke-test run=${run.runId} fmt=2\\n`),
       new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt \\(wrong\\)" handoff=null\\n`),
@@ -246,6 +294,9 @@ try {
       new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt" handoff=null\\n`),
       new RegExp(`${TS} JUDGE workflow=smoke-test node=hello token=${TOK} result=ACCEPT reason="content matches criteria" judge=${TOK}\\n`),
       new RegExp(`${TS} ROUTE workflow=smoke-test node=hello token=${TOK} result=PASS target=worker-echo\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=failed summary="criteria not met yet" handoff=${reEscape(reworkHandoff)}\\n`),
+      new RegExp(`${TS} JUDGE workflow=smoke-test node=worker-echo token=${TOK} result=ACCEPT reason="genuine failure: criteria not met" judge=${TOK}\\n`),
+      new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo token=${TOK} result=FAIL target=worker-echo\\n`),
       new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok \\(wrong\\)" handoff=null\\n`),
       new RegExp(`${TS} CORRECT workflow=smoke-test node=worker-echo token=${TOK} role=worker judge=${TOK} detail=.+\\n`),
       new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok" handoff=null\\n`),
@@ -254,7 +305,7 @@ try {
     ]
     for (const [i, re] of expectations.entries()) {
       const ok = re.test(log)
-      console.log(`7.${i + 1} trace log line ${ok ? 'OK' : 'MISSING'}: ${re.source}`)
+      console.log(`8.${i + 1} trace log line ${ok ? 'OK' : 'MISSING'}: ${re.source}`)
       if (!ok) pass = false
     }
     if (pass) console.log('   trace log:', join(logDir, logFiles[0]))

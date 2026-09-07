@@ -156,6 +156,38 @@ test('trim-bounded payloads reach the host trimmed — a whitespace bomb never l
   assert.equal((host.calls[2]!.args as { reason: string }).reason, 'x')
 })
 
+test('node_claim accepts handoffContext for failed with the SAME contract as completed (20260906 AC1)', async () => {
+  const host = makeToolHost()
+  const nodeClaim = findTool('node_claim')
+  // failed + handoff passes the tool layer exactly like completed.
+  const okFailed = await nodeClaim.execute({ outcome: 'failed', summary: 'review blocked', handoffContext: 'fix=X' }, EXEC as never)
+  assert.equal(okFailed, 'claimed')
+  assert.deepEqual(
+    (host.calls[0]!.args as { claim: { outcome: string; summary: string; handoffContext: string } }).claim,
+    { outcome: 'failed', summary: 'review blocked', handoffContext: 'fix=X' },
+  )
+  // Omitting handoffContext stays valid for BOTH outcomes (no auto-context).
+  const okNoHandoff = await nodeClaim.execute({ outcome: 'failed', summary: 'rework' }, EXEC as never)
+  assert.equal(okNoHandoff, 'claimed')
+  // Identical boundary rules for both outcomes: overlong and whitespace-only
+  // handoffs are rejected with the SAME message.
+  const long = 'x'.repeat(8001)
+  const rejectCompleted = await nodeClaim.execute({ outcome: 'completed', summary: 's', handoffContext: long }, EXEC as never)
+  const rejectFailed = await nodeClaim.execute({ outcome: 'failed', summary: 's', handoffContext: long }, EXEC as never)
+  assert.equal(rejectCompleted, rejectFailed)
+  assert.match(rejectCompleted as string, /handoffContext must be at most 8000 characters after trim/)
+  const blankCompleted = await nodeClaim.execute({ outcome: 'completed', summary: 's', handoffContext: '   ' }, EXEC as never)
+  const blankFailed = await nodeClaim.execute({ outcome: 'failed', summary: 's', handoffContext: '   ' }, EXEC as never)
+  assert.equal(blankCompleted, blankFailed)
+  assert.match(blankFailed as string, /handoffContext must be at least 1 characters after trim/)
+  // Trim normalization is outcome-neutral too.
+  await nodeClaim.execute({ outcome: 'failed', summary: 's', handoffContext: '  h  ' }, EXEC as never)
+  assert.deepEqual(
+    (host.calls.at(-1)!.args as { claim: { handoffContext: string } }).claim.handoffContext,
+    'h',
+  )
+})
+
 test('judge_respawn routes to host.respawnJudge', async () => {
   const host = makeToolHost()
   const tool = findTool('judge_respawn')

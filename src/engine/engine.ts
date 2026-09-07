@@ -161,9 +161,10 @@ export interface NodeView {
  *   NEXT node dispatch is deferred until the old turn settles (design §4.2:
  *   "dispatch next Node only after old Turn settles").
  * - transientContext: one-shot context to prepend to the next dispatch
- *   message (handoff on PASS / resolution on resume / correction evidence on
- *   REJECT). Never persisted; consumed by exactly one dispatch (design
- *   §2.6/§5.2 G4).
+ *   message (handoff on an accepted PASS/FAIL / resolution on resume /
+ *   correction evidence on REJECT). In-memory only — the DEFERRED variant is
+ *   mirrored into `run.pendingDispatchContext` so a host restart cannot lose
+ *   it (20260906); consumed by exactly one dispatch (design §2.6/§5.2 G4).
  * - workerSettled: the dispatched executor's turn already ended while a
  *   judgment was pending (the async-Judge era: the worker's `node_claim` ends
  *   its turn long before the verdict). When true, a later PASS/FAIL verdict
@@ -695,6 +696,10 @@ export class WorkflowEngine {
     if (run.status === 'running') {
       try {
         identity = await this.dispatchCurrent(run, transientContext)
+        // 20260906: the dispatch delivered the (possibly deferred) transient —
+        // its durable mirror is consumed. A dispatch FAILURE keeps the mirror
+        // so the resume re-delivers the handoff with the resolution context.
+        delete run.pendingDispatchContext
       } catch (error) {
         run.status = 'blocked'
         // A2 R4/AC5: a node-boundary compact failure gets its own clean
@@ -739,6 +744,17 @@ export class WorkflowEngine {
 
   /** Persist an advanced run WITHOUT dispatching (deferred until turn settlement). */
   private async persistDeferred(workspaceKey: string, run: RunState, version: number, transientContext: TransientDispatch | null = null): Promise<void> {
+    // 20260906-claim-handoff-symmetry: mirror the deferred transient into the
+    // durable snapshot. The in-memory book dies with the process, but the
+    // deferred dispatch (and its handoff, for BOTH the PASS and FAIL edges)
+    // must survive a host restart until the old turn settles. Only a running
+    // advancement carries one — a FAIL-without-onFail BLOCK keeps the node
+    // with the claim consumed, and a completed run has no next dispatch.
+    if (run.status === 'running' && transientContext !== null) {
+      run.pendingDispatchContext = transientContext
+    } else {
+      delete run.pendingDispatchContext
+    }
     await this.state.put(workspaceKey, run, version)
     if (run.status === 'running') {
       const previous = this.dispatchBook.get(workspaceKey)
@@ -855,7 +871,11 @@ export class WorkflowEngine {
       }
       const reservedJudgeSessionId = newNodeToken()
       entered.run.pendingClaim = { outcome: claim.outcome, summary }
-      if (claim.outcome === 'completed' && handoff !== undefined && handoff !== '') {
+      // 20260906-claim-handoff-symmetry R2: the handoff persists for BOTH
+      // outcomes — completed and failed differ only in the edge their ACCEPT
+      // takes (onPass/onFail), never in information capacity. The Judge packet
+      // below still receives only outcome/summary (A1 R7).
+      if (handoff !== undefined && handoff !== '') {
         entered.run.pendingClaim.handoffContext = handoff
       }
       entered.run.judgeSessionId = reservedJudgeSessionId
@@ -1130,7 +1150,8 @@ export class WorkflowEngine {
         instruction: node.execution.instruction ?? '',
         criteria,
         // A1 R7: the Judgment Packet receives only outcome/summary; handoff
-        // remains persisted in pendingClaim for the next node after PASS.
+        // remains persisted in pendingClaim for the successor node after an
+        // accepted PASS or FAIL (20260906: both outcomes).
         claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
         // A1 §6.4: judge-fault/NEED_CONTEXT BLOCKs keep the correction
         // evidence — the rebuilt packet still sees what was rejected.
@@ -1278,7 +1299,8 @@ export class WorkflowEngine {
           instruction: node.execution.instruction ?? '',
           criteria,
           // A1 R7: only outcome/summary enter the rebuilt Judgment Packet;
-          // handoff stays in pendingClaim for delivery after a PASS.
+          // handoff stays in pendingClaim for delivery after an accepted
+          // PASS or FAIL (20260906: both outcomes).
           claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
           // A1 §6.4: the spawn-rebuild keeps the prior rejection evidence.
           previousRejection: run.pendingCorrection,
@@ -1332,9 +1354,16 @@ export class WorkflowEngine {
     // no pendingClaim) rebuilds the FULL R7 evidence so the Actor receives
     // [judge rejection] + [previous claim] + [manager resolution] + the
     // [instruction] wrapper — independent of the Manager copying from trace.
+    // 20260906: a resume in the deferred-dispatch crash window (e.g. after a
+    // restart-reconcile BLOCK) re-delivers the persisted handoff mirror
+    // alongside the Manager's resolution — the advanced node's context must
+    // not depend on the in-memory book having survived.
+    const carriedHandoff = run.pendingDispatchContext?.kind === 'handoff' && run.pendingDispatchContext.text !== ''
+      ? `${run.pendingDispatchContext.text}\n\n[manager resolution]\n${resolutionContext}`
+      : resolutionContext
     const transient: TransientDispatch = run.pendingCorrection !== undefined && run.pendingClaim === undefined
       ? { kind: 'correction', text: `${correctionEvidence(run.pendingCorrection)}\n\n[manager resolution]\n${resolutionContext}` }
-      : { kind: 'handoff', text: resolutionContext }
+      : { kind: 'handoff', text: carriedHandoff }
     await this.dispatchNow(workspaceKey, run, version, transient)
     return { ok: true, run, message: run.blockReason ?? `resumed: ${resolutionContext.slice(0, 120)}` }
   }

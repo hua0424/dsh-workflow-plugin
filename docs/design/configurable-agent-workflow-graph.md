@@ -147,11 +147,11 @@ Schema已确认精确`agent-workflow/v2`，输入使用受限YAML 1.2：单文�
 
 ### 2.6 Manager Session Context与消息Handoff
 
-已确认Run State不保存Root inputContext或持久化handoffContext。`/dsh-flow start <id> [extra text]`启动后steer当前Manager；Manager天然使用当前主会话conversation、workspace instructions、Skills和Tools执行Root Node。Command附加文本只进入该steer消息，不复制到SQLite。
+已确认Run State不保存Root inputContext，也不把handoffContext作为业务对象持久化；它只随最小判定/派发边界随行：判定阶段存于`pendingClaim.handoffContext`（20260902-fixbug），deferred派发窗口存于一次性镜像`pendingDispatchContext`（20260906-claim-handoff-symmetry），送达即清除。`/dsh-flow start <id> [extra text]`启动后steer当前Manager；Manager天然使用当前主会话conversation、workspace instructions、Skills和Tools执行Root Node。Command附加文本只进入该steer消息，不复制到SQLite。
 
 不引入Child inputSchema、inputResolver、通用变量或output binding。需要动态选择业务对象时，在Graph中显式增加一个`actor-task`交给Manager/Role Actor判断。
 
-Worker完成Node时可在临时claim中提交bounded `handoffContext`文本。Checker PASS后，Engine/Manager把该文本原样放进发给下一Node或Child Workflow Actor的消息；Engine不解析其中的Issue/repository/branch字段，也不持久化。发送窗口中断时重新询问前一Actor或由Manager按真实现场重建。
+Worker完成Node时可在临时claim中提交bounded `handoffContext`文本，**completed与failed契约完全对称**（20260906-claim-handoff-symmetry）：类型、长度（trim后1..8000）、空值处理、存储与派发规则不因outcome不同而改变；outcome只决定Judge ACCEPT后走onPass还是onFail。判定ACCEPT后，Engine/Manager把该文本原样放进发给后继Node或Child Workflow Actor的消息（`[handoff]`头 + 原文 + `[instruction]`，PASS/FAIL同构，不标注来源节点/出口）；Engine不解析其中的Issue/repository/branch字段。发送窗口中断时由`pendingDispatchContext`镜像恢复（重启BLOCK后resume重投），或由Manager按真实现场重建。
 
 例如Manager选择下一个Issue后提交：
 
@@ -230,7 +230,7 @@ Judge错误、超时、invalid output、缺少读取能力或现场不可读不�
 │  → 找到/创建Role Actor
 │  → Worker工作并node_claim(completed|failed,summary,handoffContext?)   [无token；dispatch lease准入]
 │  → 运行checkerId对应Checker（judge确认ACCEPT/REJECT）
-│  → ACCEPT时按claim outcome映射PASS/FAIL；PASS把opaque handoffContext传给下一个Node/Child frame
+│  → ACCEPT时按claim outcome映射PASS/FAIL；两种结论都把opaque handoffContext原样传给后继Node/Child frame（20260906对称化）
 │  → REJECT时同Node correction重派（token轮换+CORRECT事件）
 │  → PASS | FAIL
 ├─ builtin-program
@@ -317,13 +317,14 @@ Definition Snapshot直接保存在该Row的`snapshot_json.definitionSnapshot`；
   blockReason: string | null,
   nodeBoundary: NodeContextBoundary,
   judgeSessionId?: string,
-  pendingClaim?: { outcome, summary, handoffContext? },
+  pendingClaim?: { outcome, summary, handoffContext? },   // 判定阶段claim（handoff对completed/failed对称持久化，20260906）
   pendingCorrection?: { judgeReason, previousClaim: { outcome, summary, handoffContext? } },   // A1: REJECT纠正证据（节点离开时清除）
+  pendingDispatchContext?: { kind: handoff|correction, text },   // 20260906: deferred派发的一次性transient镜像（running专属；送达或resume消费后清除，FAIL无onFail的BLOCK不携带）
   traceLogPath?: string   // A3: Run trace log 文件路径（可选派生元数据，仅日志定位；host 重启后事件仍写同一文件；非 workflow 状态）
 }
 ```
 
-ActorDispatchLease（`dispatchMessageId`/`leaseConsumed`）与 deferred 派发簿记是Engine内存中的DispatchBook派生产物，**不持久化**：host重启后running run一律BLOCK，恢复必经resume→重新dispatch→新lease。
+ActorDispatchLease（`dispatchMessageId`/`leaseConsumed`）与 deferred 派发簿记是Engine内存中的DispatchBook派生产物，**不持久化**：host重启后running run一律BLOCK，恢复必经resume→重新dispatch→新lease。唯一例外是deferred transient的`pendingDispatchContext`镜像（20260906）：它在advance持久化时随行写入，使重启BLOCK→resume能连同Manager resolution一起重投handoff，而不是只依赖内存book存活。
 
 Manager不进mapping；Judge只以`judgeSessionId`引用进State（当前active/pending），不保存Judge历史。ModelOverrides只保存current值不保存历史。State不保存lastError或block kind。Strict invariants：running/blocked要求callStack非空，completed要求callStack=[]；blocked iff blockReason非空且对应top frame token，running/completed要求reason=null；每个frame nodeToken是UUID；roleActors keys只能来自Definition roles，modelOverrides keys只能来自roles或judge。SQLite不保存recentEvents；Command/Tool/Manager/Child过程历史完全复用DSH Session log，Status只读current facts。
 
@@ -362,7 +363,7 @@ judge_respawn({ nodeToken, reason? })
 
 除`node_claim`外的Node mutation tool必须回传current frame nodeToken，过期token拒绝（`workflow_status`的`currentFrame.nodeToken`仍返回，供resume/respawn/resolve使用）。每次进入新Node、BLOCK后resume同一Node、REJECT correction重派或Actor replacement重新派发时生成新UUID并覆盖；不保存旧token/history。Token是尽力而为的stale防护（防凭记忆用旧token，防不住迟到方实时查`workflow_status`拿新token伪装——已知限制）。`node_claim`的admission由ActorDispatchLease承担：当前调用turn的user/message id集合必须包含本次dispatch的message id且lease未消费（Code Mode嵌套调用经`tool/code-dispatch-start`双绑定解析），不匹配拒绝且不改State、不spawn Judge；lease消费时点在持久化成功之后。Tool description固定要求claim/block为当前Turn最后动作，成功后后续输出/tool语义上忽略；首期不调用DSH interrupt。
 
-Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、actor-task节点、`judge.claim-correct` checker、lease绑定、completed|failed、1..4000 summary和仅completed可用的1..8000 handoff；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn——actor-task节点的精确executor须同时通过lease绑定（同一dispatch的第二个claim/block与旧turn迟到block被拒），builtin-program/child节点与Manager对role-executor节点的block为控制面；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext——correction派发失败的BLOCK在resume时从`pendingCorrection`重建完整correction消息；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和trim后非空、provider≤64/modelId≤128的route，目标Worker active时拒绝——当前Node的role在pendingClaim/pendingCorrection期间（running）override被拒（按Node role+boundary判定），blocked+pendingCorrection时接受且重置boundary（replacement逃生通道）；Judge override只影响下一次Judge重建。Unknown字段拒绝。Judge不调用Workflow Tool，使用专用`judge_claim({nodeToken,result,reason})`提交`ACCEPT|REJECT|NEED_CONTEXT`；`judge_respawn({nodeToken,reason?})`为Manager显式重建当前Judge。claim进入判定阶段后其`{outcome,summary,handoffContext?}`作为`pendingClaim`持久化（判定结束清除；`handoffContext`仅completed且非空时写入，20260902-fixbug 评审方案 2），REJECT写入`pendingCorrection`（advance离开Node时清除），parameters/resolutionContext/result details均不持久化。
+Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/current Role Actor；`node_claim`要求Run running、actor-task节点、`judge.claim-correct` checker、lease绑定、completed|failed、1..4000 summary和completed/failed对称可用的1..8000 handoff（20260906-claim-handoff-symmetry：契约不因outcome不同而改变）；`node_block`允许current Worker或Manager在Run running且token匹配时调用，写BLOCK但不interrupt当前Turn——actor-task节点的精确executor须同时通过lease绑定（同一dispatch的第二个claim/block与旧turn迟到block被拒），builtin-program/child节点与Manager对role-executor节点的block为控制面；BLOCK后迟到claim因status不再running而拒绝。`node_resume`要求Manager、Run blocked、token匹配、current Role Actor无active turn和1..8000 resolutionContext，生成新token且context不持久化；若派发失败再次BLOCK，Manager下次resume必须重新提供resolutionContext——correction派发失败的BLOCK在resume时从`pendingCorrection`重建完整correction消息；`node_run_program`要求Manager、Run running、token匹配和current Program strict parameters；`node_resolve_program`要求Manager、Run blocked、token匹配、current builtin-program、PASS|FAIL和1..4000 reason；`workflow_set_role_model`要求Manager、roleKey|judge和trim后非空、provider≤64/modelId≤128的route，目标Worker active时拒绝——当前Node的role在pendingClaim/pendingCorrection期间（running）override被拒（按Node role+boundary判定），blocked+pendingCorrection时接受且重置boundary（replacement逃生通道）；Judge override只影响下一次Judge重建。Unknown字段拒绝。Judge不调用Workflow Tool，使用专用`judge_claim({nodeToken,result,reason})`提交`ACCEPT|REJECT|NEED_CONTEXT`；`judge_respawn({nodeToken,reason?})`为Manager显式重建当前Judge。claim进入判定阶段后其`{outcome,summary,handoffContext?}`作为`pendingClaim`持久化（判定结束清除；`handoffContext`对completed/failed对称、trim后非空才写入——20260902-fixbug 评审方案 2 引入completed持久化，20260906-claim-handoff-symmetry 扩展到failed），REJECT写入`pendingCorrection`（advance离开Node时清除），deferred派发的transient镜像写入`pendingDispatchContext`（送达/resume消费后清除），parameters/resolutionContext/result details均不持久化。
 
 ### 5.3 BLOCK是当前Node上的可恢复暂停
 
@@ -393,7 +394,7 @@ Tool exact合同已确认：`workflow_status({})`只读且仅current Manager/cur
 
 ## 6. 中断恢复
 
-已确认不区分working/checking/interrupted/recovery phase。Active Run始终只停在current Node。判定阶段的`pendingClaim`持久化供Judge重建；correction阶段的`pendingCorrection`持久化供resume重建correction消息（派发失败/重启后证据不丢）；其余claim/Judge过程存在于当前DSH对话和调用过程，中断窗口丢失就让Worker重新claim。PASS后只把handoffContext发送给下一Actor/Manager，不持久化；发送窗口丢失时重新询问或重建。
+已确认不区分working/checking/interrupted/recovery phase。Active Run始终只停在current Node。判定阶段的`pendingClaim`持久化供Judge重建；correction阶段的`pendingCorrection`持久化供resume重建correction消息（派发失败/重启后证据不丢）；其余claim/Judge过程存在于当前DSH对话和调用过程，中断窗口丢失就让Worker重新claim。判定ACCEPT后（PASS或FAIL）把handoffContext发送给后继Actor/Manager：立即派发路径随消息一次性送达；deferred路径先持久化`pendingDispatchContext`镜像，turn结算时送达并清除，宿主重启则由restart-BLOCK→resume连同Manager resolution重投（20260906）。
 
 中断后Manager统一处理：
 
@@ -445,7 +446,7 @@ all-issues-complete?
   FAIL → develop-next-issue
 ```
 
-`initialize-milestone`是builtin-program；`all-issues-complete?`是builtin-program读取live GitHub Milestone Issues。Engine不复制Issue列表/状态。循环中先经过一个Manager `actor-task`选择下一个未完成Issue，在临时completion claim的opaque handoffContext中写Issue URL/repository，Checker PASS后作为消息发给后续开发Node或Child Workflow；不写State。系统中断后同一Actor检查Milestone/Issue现场再继续，不做精准外部Effect恢复。
+`initialize-milestone`是builtin-program；`all-issues-complete?`是builtin-program读取live GitHub Milestone Issues。Engine不复制Issue列表/状态。循环中先经过一个Manager `actor-task`选择下一个未完成Issue，在临时completion claim的opaque handoffContext中写Issue URL/repository，判定ACCEPT后（无论沿onPass交付还是沿onFail返工）作为消息发给后继开发Node或Child Workflow；不作为业务对象写State（仅判定/派发窗口的最小随行持久化，见§2.6）。系统中断后同一Actor检查Milestone/Issue现场再继续，不做精准外部Effect恢复。
 
 重复的单Issue开发/Review/Test/Delivery/Close区域可以定义为Child Workflow，由`develop-next-issue`调用；每次调用push Child Run frame，结束后返回Parent检查节点。
 

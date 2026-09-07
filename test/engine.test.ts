@@ -2008,3 +2008,310 @@ test('persistDeferred with no prior book falls back to an empty executor and the
   assert.ok(correction !== undefined && correction.includes('[correction]'), 'deferred correction dispatched after the settlement')
   assert.match(correction, /\[judge rejection\]\ntests missing/)
 })
+
+// ---- 20260906-claim-handoff-symmetry: completed/failed carry the SAME
+// handoffContext capability; the outcome only picks the onPass/onFail edge. ----
+
+/** plan (manager) → build (developer). plan's onPass and onFail BOTH target
+ * build, so completed/failed with identical input differ ONLY in the edge. */
+const SYM_CONFIG = validateAndNormalize(parseCatalogConfig(`
+  schemaVersion: agent-workflow/v2
+  roles:
+    developer: { persona: D }
+  judgeRole: { persona: J }
+  workflow:
+    startNode: plan
+    nodes:
+      plan:
+        execution: { type: actor-task, role: manager, instruction: Plan. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS when planned. } }
+        onPass: build
+        onFail: build
+      build:
+        execution: { type: actor-task, role: developer, instruction: Build. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS when built. } }
+        onPass: END
+`), { workflowId: 'sym-handoff' })
+
+function symRun(): RunState {
+  return {
+    runId: crypto.randomUUID(),
+    managerSessionId: MANAGER,
+    catalogWorkflowId: 'sym-handoff',
+    definitionHash: computeDefinitionHash(SYM_CONFIG),
+    definitionSnapshot: SYM_CONFIG,
+    status: 'running',
+    callStack: [{ workflowId: 'sym-handoff', nodeId: 'plan', nodeToken: newNodeToken() }],
+    roleActors: {},
+    modelOverrides: {},
+    blockReason: null,
+    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+  }
+}
+
+test('failed handoff reaches the onFail successor via the deferred path, persisted in pendingClaim + the durable mirror (AC1/AC2/AC4)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', symRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  const HANDOFF = 'issue=#5 branch=feat/5 sha=abc123 fix=remove-legacy-path'
+  const claim = await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'review blocked the PR', handoffContext: HANDOFF }, mgr(h))
+  assert.ok(claim.ok)
+  // AC1/R2: pendingClaim persists the failed handoff exactly like completed.
+  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'failed', summary: 'review blocked the PR', handoffContext: HANDOFF })
+  // A1 R7 (unchanged): the Judge packet still receives only outcome/summary.
+  assert.deepEqual(h.judgeSpawnInputs[0]!.claim, { outcome: 'failed', summary: 'review blocked the PR' })
+  // The worker's turn is still open → the advancement defers; nothing sent yet.
+  assert.equal(h.actorMessages.length, 0)
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'rework justified', reservedJudgeId(h))
+  assert.ok(verdict.ok)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+  // The deferred dispatch is deferred (turn still open) and the handoff
+  // mirror is durable in the snapshot (crash-window hardening).
+  assert.equal(h.actorMessages.length, 0)
+  assert.deepEqual(h.mem.run!.pendingDispatchContext, { kind: 'handoff', text: HANDOFF })
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  // AC2: the FAIL successor's dispatch carries the FULL handoff verbatim,
+  // framed identically to a PASS handoff.
+  assert.equal(h.actorMessages.length, 1)
+  assert.match(h.actorMessages[0]!, new RegExp(`\\[handoff\\]\\n${HANDOFF.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n\\n\\[instruction\\]\\nBuild\\.`))
+  assert.match(h.actorMessages[0]!, /\[提交要求\]/)
+  // The delivered dispatch consumed the durable mirror.
+  assert.equal(h.mem.run!.pendingDispatchContext, undefined)
+})
+
+test('failed handoff reaches the onFail successor when the worker already settled — immediate dispatch (AC4)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', symRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'rework needed', handoffContext: 'fix=X' }, mgr(h))
+  // Production async-Judge ordering: the claiming turn settles BEFORE the verdict.
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  assert.equal(h.mem.run!.status, 'running')
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  assert.ok(verdict.ok)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+  assert.equal(h.actorMessages.length, 1)
+  assert.match(h.actorMessages[0]!, /\[handoff\]\nfix=X\n\n\[instruction\]\nBuild\./)
+  // Immediate dispatch leaves no stale mirror behind.
+  assert.equal(h.mem.run!.pendingDispatchContext, undefined)
+})
+
+test('completed handoff framing is unchanged; identical input yields an identical dispatch for both outcomes (AC3)', async () => {
+  const runOnce = async (outcome: 'completed' | 'failed'): Promise<{ message: string | undefined; nodeId: string }> => {
+    const h = makeHarness()
+    await h.engine.startRun('ws', symRun())
+    const token = topFrame(h.mem.run!).nodeToken
+    await h.engine.handleClaim('ws', { outcome, summary: 'same summary', handoffContext: 'fix=X' }, mgr(h))
+    const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+    assert.ok(verdict.ok)
+    await h.engine.handleTurnEnded('ws', MANAGER)
+    return { message: h.actorMessages[0], nodeId: topFrame(h.mem.run!).nodeId }
+  }
+  const pass = await runOnce('completed')
+  const fail = await runOnce('failed')
+  // Same diamond config: both routes end on build, and the dispatch messages
+  // are byte-identical — outcome only picked the edge, never the framing.
+  assert.equal(pass.nodeId, 'build')
+  assert.equal(fail.nodeId, 'build')
+  assert.ok(pass.message !== undefined && fail.message !== undefined)
+  assert.equal(pass.message, fail.message)
+  assert.match(pass.message!, /\[handoff\]\nfix=X/)
+})
+
+test('failed handoff survives NEED_CONTEXT resume token rotation (AC5)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', symRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'rework', handoffContext: 'fix=X' }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', token, 'NEED_CONTEXT', 'missing PR identity', reservedJudgeId(h))
+  assert.equal(h.mem.run!.status, 'blocked')
+  // NEED_CONTEXT keeps the pendingClaim — failed handoff included.
+  assert.deepEqual(h.mem.run!.pendingClaim, { outcome: 'failed', summary: 'rework', handoffContext: 'fix=X' })
+  const resumed = await h.engine.handleResume('ws', token, 'PR #123 head sha-old', MANAGER)
+  assert.ok(resumed.ok)
+  const rotated = topFrame(h.mem.run!).nodeToken
+  const verdict = await h.engine.handleJudgeClaim('ws', rotated, 'ACCEPT', 'ok now', reservedJudgeId(h))
+  assert.ok(verdict.ok)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+  assert.match(h.actorMessages[0]!, /\[handoff\]\nfix=X\n\n\[instruction\]\nBuild\./)
+})
+
+test('deferred failed-handoff survives a host-restart-equivalent: resume re-delivers the persisted mirror (AC5 crash window)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', symRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'rework', handoffContext: 'fix=X' }, mgr(h))
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'ok', reservedJudgeId(h))
+  assert.ok(verdict.ok)
+  // Advancement persisted, dispatch deferred (worker turn still open): the
+  // ONLY durable copy of the handoff is the snapshot mirror.
+  assert.equal(h.actorMessages.length, 0)
+  assert.equal(h.mem.run!.status, 'running')
+  assert.deepEqual(h.mem.run!.pendingDispatchContext, { kind: 'handoff', text: 'fix=X' })
+  // "Restart": a brand-new engine (empty in-memory book) over the same state.
+  const h2 = makeHarness(h.mem)
+  await h2.engine.handleRestartReconcile()
+  assert.equal(h2.mem.run!.status, 'blocked')
+  assert.match(h2.mem.run!.blockReason ?? '', /host-restarted-before-node-result/)
+  // The mirror survived the restart inside the snapshot.
+  assert.deepEqual(h2.mem.run!.pendingDispatchContext, { kind: 'handoff', text: 'fix=X' })
+  const blockedToken = topFrame(h2.mem.run!).nodeToken
+  const resumed = await h2.engine.handleResume('ws', blockedToken, 'continue after restart', MANAGER)
+  assert.ok(resumed.ok)
+  // The successor dispatch re-delivers the ORIGINAL handoff alongside the
+  // Manager's resolution — not the resolution alone.
+  assert.match(h2.actorMessages[0]!, /\[handoff\]\nfix=X\n\n\[manager resolution\]\ncontinue after restart\n\n\[instruction\]\nBuild\./)
+  assert.equal(h2.mem.run!.pendingDispatchContext, undefined)
+})
+
+test('REJECT of a failed claim keeps the handoff in previousClaim and quotes it in the correction; ACCEPT of the re-claim routes by the FINAL claim (AC6)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', symRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'rework', handoffContext: 'fix=X' }, mgr(h))
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'REJECT', 'incomplete findings', reservedJudgeId(h))
+  assert.ok(verdict.ok)
+  // REJECT took NO edge: still on plan, but the token rotated for the correction.
+  assert.equal(topFrame(h.mem.run!).nodeId, 'plan')
+  assert.deepEqual(h.mem.run!.pendingCorrection, {
+    judgeReason: 'incomplete findings',
+    previousClaim: { outcome: 'failed', summary: 'rework', handoffContext: 'fix=X' },
+  })
+  // The correction message to the SAME executor quotes the rejected claim's handoff.
+  const correction = h.steers.at(-1)!
+  assert.match(correction, /\[correction\]/)
+  assert.match(correction, /handoffContext: fix=X/)
+  // Corrected re-claim completed → ACCEPT routes by the FINAL claim (PASS).
+  const token2 = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'fixed', handoffContext: 'fix=Y' }, mgr(h))
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  const verdict2 = await h.engine.handleJudgeClaim('ws', token2, 'ACCEPT', 'ok', reservedJudgeId(h))
+  assert.ok(verdict2.ok)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'build')
+  assert.match(h.actorMessages[0]!, /\[handoff\]\nfix=Y\n\n\[instruction\]\nBuild\./)
+})
+
+test('failed without onFail BLOCKs with the claim consumed; resume takes the actor path with no handoff injection (AC7)', async () => {
+  const h = makeHarness()
+  await h.engine.startRun('ws', initialRun())
+  const token = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'cannot plan', handoffContext: 'context=X' }, mgr(h))
+  const verdict = await h.engine.handleJudgeClaim('ws', token, 'ACCEPT', 'genuinely blocked', reservedJudgeId(h))
+  assert.ok(verdict.ok)
+  assert.equal(h.mem.run!.status, 'blocked')
+  assert.match(h.mem.run!.blockReason ?? '', /no onFail edge/)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'plan')
+  // No successor dispatched and none pending: the claim (and its handoff) is
+  // CONSUMED — recovery context comes from the Manager's resolutionContext;
+  // the durable record of the claim lives in the trace log.
+  assert.equal(h.actorMessages.length, 0)
+  assert.equal(h.steers.length, 1)
+  assert.equal(h.mem.run!.pendingClaim, undefined)
+  assert.equal(h.mem.run!.pendingDispatchContext, undefined)
+  // Resume must take the ACTOR path (same-node re-dispatch), NOT a judge
+  // rebuild — the pendingClaim-precedence trap is pinned here.
+  const judgesBefore = h.judges
+  const resumed = await h.engine.handleResume('ws', token, 're-plan with new info', MANAGER)
+  assert.ok(resumed.ok)
+  assert.equal(h.judges, judgesBefore)
+  assert.equal(h.mem.run!.status, 'running')
+  assert.equal(topFrame(h.mem.run!).nodeId, 'plan')
+  assert.match(h.steers.at(-1)!, /re-plan with new info/)
+  // The consumed claim's handoff is NOT auto-injected into the resume dispatch.
+  assert.doesNotMatch(h.steers.at(-1)!, /context=X/)
+})
+
+/** AC8 shape: the incident's rework loop implement → review → decide-pr →
+ * (failed handoff) → implement, on a config mirroring issue-delivery. */
+const INCIDENT_CONFIG = validateAndNormalize(parseCatalogConfig(`
+  schemaVersion: agent-workflow/v2
+  roles:
+    developer: { persona: D }
+    reviewer: { persona: R }
+  judgeRole: { persona: J }
+  workflow:
+    startNode: kickoff
+    nodes:
+      kickoff:
+        execution: { type: actor-task, role: manager, instruction: Kickoff. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS when kicked off. } }
+        onPass: implement
+      implement:
+        execution: { type: actor-task, role: developer, instruction: Implement the issue. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS when implemented. } }
+        onPass: review
+        onFail: implement
+      review:
+        execution: { type: actor-task, role: reviewer, instruction: Review the PR. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS when reviewed. } }
+        onPass: decide-pr
+      decide-pr:
+        execution: { type: actor-task, role: manager, instruction: Decide the PR. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS when decided. } }
+        onPass: END
+        onFail: implement
+`), { workflowId: 'incident-regression' })
+
+test('incident regression: failed handoff from decide-pr reaches the re-dispatched implement AND compacts the reused developer (AC8)', async () => {
+  const h = makeHarness()
+  const run: RunState = {
+    runId: crypto.randomUUID(),
+    managerSessionId: MANAGER,
+    catalogWorkflowId: 'incident-regression',
+    definitionHash: computeDefinitionHash(INCIDENT_CONFIG),
+    definitionSnapshot: INCIDENT_CONFIG,
+    status: 'running',
+    callStack: [{ workflowId: 'incident-regression', nodeId: 'kickoff', nodeToken: newNodeToken() }],
+    roleActors: {},
+    modelOverrides: {},
+    blockReason: null,
+    nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
+  }
+  await h.engine.startRun('ws', run)
+  // 0. Manager kickoff hands the issue identity to implement.
+  const kickoffToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', { outcome: 'completed', summary: 'kickoff', handoffContext: 'issue=#5 branch=feat/5' }, mgr(h))
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  await h.engine.handleJudgeClaim('ws', kickoffToken, 'ACCEPT', 'go', h.mem.run!.judgeSessionId!)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'implement')
+  // 1. Developer delivers (claims completed with delivery handoff).
+  const implementToken1 = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', {
+    outcome: 'completed', summary: 'implemented',
+    handoffContext: 'issue=#5 pr=123 branch=feat/5 head=sha-old',
+  }, actorCaller(h))
+  await h.engine.handleTurnEnded('ws', 'actor-child-1')
+  await h.engine.handleJudgeClaim('ws', implementToken1, 'ACCEPT', 'delivered', h.mem.run!.judgeSessionId!)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'review')
+  // 2. Reviewer reviews and reports approved=no with a uniquely-marked finding.
+  const reviewToken = topFrame(h.mem.run!).nodeToken
+  await h.engine.handleClaim('ws', {
+    outcome: 'completed', summary: 'reviewed',
+    handoffContext: 'approved=no findings=[F1: legacy path still reachable]',
+  }, actorCaller(h))
+  await h.engine.handleTurnEnded('ws', 'actor-child-1')
+  await h.engine.handleJudgeClaim('ws', reviewToken, 'ACCEPT', 'review complete', h.mem.run!.judgeSessionId!)
+  assert.equal(topFrame(h.mem.run!).nodeId, 'decide-pr')
+  // 3. Manager decides rework: failed + handoff carrying the correction
+  //    requirements (the exact capability missing in the incident).
+  const decideToken = topFrame(h.mem.run!).nodeToken
+  const REWORK = '退回 head=sha-old；修正要求 F1: remove legacy path；修复后更新 PR 123'
+  await h.engine.handleClaim('ws', { outcome: 'failed', summary: 'review blocked', handoffContext: REWORK }, mgr(h))
+  await h.engine.handleJudgeClaim('ws', decideToken, 'ACCEPT', 'rework justified', reservedJudgeId(h))
+  assert.equal(topFrame(h.mem.run!).nodeId, 'implement')
+  // Deferred dispatch (the Manager's claiming turn is still open): so far
+  // only the two actor CREATIONS (implement, review) were sent.
+  assert.equal(h.actorMessages.length, 2)
+  await h.engine.handleTurnEnded('ws', MANAGER)
+  // 4. The re-dispatched implement actually RECEIVED the rework requirements —
+  //    not just in the trace log or the Manager session.
+  assert.equal(h.actorMessages.length, 3)
+  const reworkDispatch = h.actorMessages[2]!
+  assert.match(reworkDispatch, new RegExp(`\\[handoff\\]\\n${REWORK.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n\\n\\[instruction\\]\\nImplement the issue\\.`))
+  assert.match(reworkDispatch, /\[提交要求\]/)
+  assert.notEqual(topFrame(h.mem.run!).nodeToken, implementToken1, 'FAIL edge rotated the node token')
+  // 5. Stale-context mitigation: the reused developer actor was COMPACTED
+  //    before the rework re-dispatch (fresh node entry, not a same-node resume).
+  assert.deepEqual(h.compacts, ['developer'])
+})
