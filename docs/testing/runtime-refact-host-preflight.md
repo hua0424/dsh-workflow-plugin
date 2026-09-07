@@ -35,6 +35,12 @@ Activation 被释放后的 cold-resume 不等于整个进程重启。若报告�
 
 ## 实施时的前置检查
 
-T9 的 #15/#12 依赖完成；目标 Node、宿主现有依赖/测试工具、源码 alias 可解析且版本一致。宿主 manifest 指定的 pnpm 版本与当前插件环境可能不同，执行前核实实际可用入口，不为跑测试擅改宿主 tracked files 或声称未运行的命令成功。
+T9 的 #15/#12 依赖完成后，核实目标 Node 与实际测试依赖版本。新组合 fixture 和最终执行报告必须在 refact 项目中保留，不为跑测试擅改宿主 tracked files，不复制庞大测试框架或引入新运行依赖。
 
-可先运行宿主已有 continuation/manual-compaction 测试建立 fixture 基线，但这本身不算插件 A30 通过。新组合 fixture 和最终执行报告必须在 refact 项目中保留；优先复用已有宿主测试设施，不复制庞大测试框架或引入新运行依赖。
+### 本机已核实的限制与更小替代路径
+
+- 宿主源码 checkout 保持 Git 洁净，但没有 node_modules，也没有可直接执行的 Vitest；检查目录失败的原因就是依赖未安装，不是已执行测试失败。当前未运行宿主已有 continuation/manual-compaction 测试，也没有安装整个宿主仓库。
+- 宿主 manifest 指定 pnpm 11.7.0，插件当前为 10.10.0。不要为了这一预检修改宿主 package/lock 或假报已有源码 fixture 可运行。
+- 已通过只读 registry 查询确认以下精确 `0.1.2-rc.1` 发布包存在：agent-loop-testkit、agent-loop、session-persistence-jsonl、session-projection、subagent-spawn-in-process、compaction-basic、token-meter（均为 `@deepseek-ai/dsh-` 前缀）。尚未安装或运行它们的组合场景。
+- 更小的优先路线：沿用插件已有 node:test，按需要声明目标版本宿主 devDependencies，复用已发布的 `mountAgentLoopTestDependencies` 等原生服务；只写薄的脚本化 LlmAdapter 与场景装配，不增加 Vitest/第二套测试框架，也不在源码 checkout 安装全仓库依赖。实际安装后仍须核对 exports 与 SDK 单一模块闭包，避免加载两份私有 Symbol/Context 服务。
+- 如果后来确实使用宿主源码 fixture，才核实其工具/alias 环境；已有宿主测试通过也只算设施基线，不算插件 A30 通过。
