@@ -75,6 +75,7 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 
 ## Docs to read first
 
+- 工单实施/审查先读 `docs/agents/issue-tracker.md` 和 `docs/work-plans/runtime-refact.md`，获取实际工单依赖、完成状态与用户改动保护范围。
 - `refact` 分支的重构开发/评审先读 `docs/design/node-execution-runtime.md` 与 `docs/specs/node-execution-runtime.md`：三表工作单、outcome+handoff 单文本、Role 复用/compact、BLOCK 争议处理的目标基线；旧 PRD/Issue #6 已被替代。未实现前，以下领域文档仍用于理解当前代码。
 - `CONTEXT.md` — 领域术语表（Manager、Role Actor、Judge、Run Frame、nodeToken、BLOCK、pendingClaim、Handoff Context 等含义精确，代码/文档中使用原词）.
 - `docs/design/configurable-agent-workflow-graph.md` — v1 权威设计.
