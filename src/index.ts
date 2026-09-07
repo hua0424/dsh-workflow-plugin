@@ -216,24 +216,7 @@ export function apply(ctx: Context) {
     setRoleModel: (ws, roleKey, provider, modelId) => enqueue(ws, () => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf)),
     judgeClaim: (ws, nodeToken, result, reason, judgeSessionId) => enqueue(ws, () => engine.handleJudgeClaim(ws, nodeToken, result, reason, judgeSessionId).then(outcomeOf)),
     respawnJudge: (ws, nodeToken, reason, caller) => enqueue(ws, () => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf)),
-    status: async (ws) => {
-      const row = await store.get(ws)
-      if (row === undefined) return { ok: true, status: 'no active run' }
-      const run = row.run
-      return {
-        ok: true,
-        status: {
-          runId: run.runId,
-          catalogWorkflowId: run.catalogWorkflowId,
-          status: run.status,
-          callStack: run.callStack.map(f => ({ workflowId: f.workflowId, nodeId: f.nodeId, nodeToken: f.nodeToken })),
-          currentFrame: run.callStack.length > 0 ? topFrame(run) : null,
-          roleActors: run.roleActors,
-          modelOverrides: run.modelOverrides,
-          blockReason: run.blockReason,
-        },
-      }
-    },
+    status: (ws) => engine.status(ws),
     inspectGit: async (_ws, operation) => {
       const cwd = ambientAgent()?.session.header.cwd
       if (cwd === undefined) return { ok: false, reason: 'no cwd' }

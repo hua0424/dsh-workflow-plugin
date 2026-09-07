@@ -18,7 +18,7 @@
  * token-less claims bound by the dispatch lease, and the CORRECT trace event.
  *
  * 20260906-claim-handoff-symmetry coverage: an honest FAILED claim with
- * handoffContext → ACCEPT → FAIL edge → deferred re-dispatch of the SAME node
+ * handoff → ACCEPT → FAIL edge → deferred re-dispatch of the SAME node
  * carrying the [handoff] text, with the durable pendingDispatchContext mirror
  * visible in the REAL SQLite row before the turn settles.
  */
@@ -176,7 +176,7 @@ try {
   //    node re-dispatches to the Manager with the correction evidence.
   mkdirSync(join(ws, 'smoke'), { recursive: true })
   writeFileSync(join(ws, 'smoke', 'result.txt'), 'wrong content\n', 'utf8')
-  const claim1 = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'wrote smoke/result.txt (wrong)' }, managerCaller())
+  const claim1 = await engine.handleClaim(workspaceKey, { outcome: 'completed', handoff: 'wrote smoke/result.txt (wrong)' }, managerCaller())
   console.log('2. claim hello (wrong work):', claim1.ok, claim1.message)
   // PRODUCTION ORDERING (F1/F2 regression): the worker's own turn ends
   // IMMEDIATELY after node_claim, while the async Judge is still evaluating.
@@ -200,7 +200,7 @@ try {
   // The corrected Manager turn does the work correctly and re-claims (the
   // re-claim binds to the CORRECTION dispatch's lease).
   writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\n', 'utf8')
-  const claim1b = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'wrote smoke/result.txt' }, managerCaller())
+  const claim1b = await engine.handleClaim(workspaceKey, { outcome: 'completed', handoff: 'wrote smoke/result.txt' }, managerCaller())
   console.log('3. re-claim hello (corrected):', claim1b.ok, claim1b.message)
   await engine.handleTurnEnded(workspaceKey, 'manager-session-e2e')
   await waitVerdict()
@@ -210,11 +210,12 @@ try {
   if (topFrame(current.run).nodeId !== 'worker-echo') throw new Error(`verdict did not advance/dispatch: ${topFrame(current.run).nodeId}`)
 
   // 4. 20260906-claim-handoff-symmetry: the worker honestly reports the work
-  //    NOT done as a FAILED claim with handoffContext → ACCEPT → FAIL edge
+  //    NOT done as a FAILED claim with handoff → ACCEPT → FAIL edge
   //    (self-loop rework) → deferred re-dispatch carrying the [handoff] text.
   const REWORK = 'rework: append the exact line "worker ok"'
+  const dispatchesBeforeFailedClaim = dispatchLog.length
   const claimFail = await engine.handleClaim(workspaceKey, {
-    outcome: 'failed', summary: 'criteria not met yet', handoffContext: REWORK,
+    outcome: 'failed', handoff: REWORK,
   }, actorCaller())
   console.log('4. claim worker-echo (honest failed + handoff):', claimFail.ok, claimFail.message)
   // NO turn settlement yet → the ACCEPT takes the DEFERRED dispatch path and
@@ -227,7 +228,7 @@ try {
     if (row.run.pendingDispatchContext?.kind !== 'handoff' || row.run.pendingDispatchContext.text !== REWORK) {
       throw new Error(`durable handoff mirror missing in the real store: ${JSON.stringify(row.run.pendingDispatchContext)}`)
     }
-    if ((dispatchLog.at(-1) ?? '').includes('[handoff]')) throw new Error('deferred dispatch fired before turn settlement')
+    if (dispatchLog.length !== dispatchesBeforeFailedClaim) throw new Error('deferred dispatch fired before turn settlement')
     console.log('   FAIL edge deferred | durable mirror:', JSON.stringify(row.run.pendingDispatchContext))
   }
   await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
@@ -247,7 +248,7 @@ try {
   // 5. The worker actor does WRONG work and claims completed: REJECT
   //    re-dispatches the correction to the ORIGINAL actor session.
   writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\nwrong worker\n', 'utf8')
-  const claim2 = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'appended worker ok (wrong)' }, actorCaller())
+  const claim2 = await engine.handleClaim(workspaceKey, { outcome: 'completed', handoff: 'appended worker ok (wrong)' }, actorCaller())
   console.log('5. claim worker-echo (wrong work):', claim2.ok, claim2.message)
   await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
   await waitVerdict()
@@ -260,7 +261,7 @@ try {
   }
   // Corrected actor work → re-claim → ACCEPT → END.
   writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\nworker ok\n', 'utf8')
-  const claim2b = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'appended worker ok' }, actorCaller())
+  const claim2b = await engine.handleClaim(workspaceKey, { outcome: 'completed', handoff: 'appended worker ok' }, actorCaller())
   console.log('6. re-claim worker-echo (corrected):', claim2b.ok, claim2b.message)
   await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
   await waitVerdict()
@@ -270,7 +271,7 @@ try {
 
   let pass = final.run.status === 'completed' && final.run.callStack.length === 0
 
-  // 8. run trace log assertions (workflow-run-logging AC1/AC2 + A3 fmt=2 events + A1 CORRECT)
+  // 8. run trace log assertions (workflow-run-logging AC1/AC2 + A3 fmt=3 events + A1 CORRECT)
   const TS = '\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]'
   const TOK = '[0-9a-f]{8}'
   const logDir = join(dirname(entry.path), 'smoke-test')
@@ -287,19 +288,19 @@ try {
     const wrongReason = JSON.stringify('content does not match criteria yet: ' + JSON.stringify('wrong content\n'))
     const reworkHandoff = JSON.stringify('rework: append the exact line "worker ok"')
     const expectations = [
-      new RegExp(`${TS} START workflow=smoke-test run=${run.runId} fmt=2\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt \\(wrong\\)" handoff=null\\n`),
+      new RegExp(`${TS} START workflow=smoke-test run=${run.runId} fmt=3\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed handoff="wrote smoke/result.txt \\(wrong\\)"\\n`),
       new RegExp(`${TS} JUDGE workflow=smoke-test node=hello token=${TOK} result=REJECT reason=${reEscape(wrongReason)} judge=${TOK}\\n`),
       new RegExp(`${TS} CORRECT workflow=smoke-test node=hello token=${TOK} role=manager judge=${TOK} detail=${reEscape(wrongReason)}\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt" handoff=null\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed handoff="wrote smoke/result.txt"\\n`),
       new RegExp(`${TS} JUDGE workflow=smoke-test node=hello token=${TOK} result=ACCEPT reason="content matches criteria" judge=${TOK}\\n`),
       new RegExp(`${TS} ROUTE workflow=smoke-test node=hello token=${TOK} result=PASS target=worker-echo\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=failed summary="criteria not met yet" handoff=${reEscape(reworkHandoff)}\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=failed handoff=${reEscape(reworkHandoff)}\\n`),
       new RegExp(`${TS} JUDGE workflow=smoke-test node=worker-echo token=${TOK} result=ACCEPT reason="genuine failure: criteria not met" judge=${TOK}\\n`),
       new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo token=${TOK} result=FAIL target=worker-echo\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok \\(wrong\\)" handoff=null\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed handoff="appended worker ok \\(wrong\\)"\\n`),
       new RegExp(`${TS} CORRECT workflow=smoke-test node=worker-echo token=${TOK} role=worker judge=${TOK} detail=.+\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok" handoff=null\\n`),
+      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed handoff="appended worker ok"\\n`),
       new RegExp(`${TS} JUDGE workflow=smoke-test node=worker-echo token=${TOK} result=ACCEPT reason="content matches criteria" judge=${TOK}\\n`),
       new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo token=${TOK} result=PASS target=END\\n`),
     ]

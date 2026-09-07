@@ -45,12 +45,19 @@ test('parseJudgeClaim rejects invalid shapes', () => {
   assert.equal(parseJudgeClaim(null), undefined)
 })
 
+test('T2 Judge packet preserves the actual handoff literally, without a summary', () => {
+  const handoff = '实际交付 $& {workspaceCwd} {transcript}'
+  const text = renderJudgePrompt({ nodeToken: 'token', nodeInstruction: 'work', criteria: 'verify', workerOutcome: 'failed', workerHandoff: handoff, workspaceCwd: '.', transcript: '' })
+  assert.ok(text.includes(`Worker handoff:\n${handoff}`))
+  assert.doesNotMatch(text, /Worker summary/)
+})
+
 test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_claim protocol', () => {
   const text = renderJudgePrompt({
     nodeToken: 'tok-1',
     nodeInstruction: 'Build it',
     criteria: 'PASS when built',
-    workerSummary: 'I built it',
+    workerHandoff: 'I built it',
     workerOutcome: 'completed',
     workspaceCwd: 'C:\\ws',
     transcript: 'USER\nhello',
@@ -74,16 +81,16 @@ test('renderJudgePrompt renders the [previous rejection] evidence before the cla
     nodeToken: 'tok-1',
     nodeInstruction: 'Build it',
     criteria: 'PASS when built',
-    workerSummary: 'I built it',
+    workerHandoff: 'I built it',
     workerOutcome: 'completed',
     workspaceCwd: 'C:\\ws',
     transcript: '',
     previousRejection: {
       judgeReason: 'tests missing',
-      previousClaim: { outcome: 'completed', summary: 'built v1', handoffContext: 'notes' },
+      previousClaim: { outcome: 'completed', handoff: 'notes' },
     },
   })
-  assert.match(text, /# Previous judgment on this node \(REJECTED\)\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nsummary: built v1\nhandoffContext: notes\n/)
+  assert.match(text, /# Previous judgment on this node \(REJECTED\)\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nhandoff: notes\n/)
   const evidenceAt = text.indexOf('[judge rejection]')
   const claimAt = text.indexOf('Worker claimed outcome')
   assert.ok(evidenceAt !== -1 && claimAt !== -1 && evidenceAt < claimAt, 'evidence precedes the worker claim')
@@ -91,7 +98,7 @@ test('renderJudgePrompt renders the [previous rejection] evidence before the cla
 
 test('renderJudgePrompt renders an empty transcript placeholder', () => {
   const text = renderJudgePrompt({
-    nodeToken: 'tok-1', nodeInstruction: 'x', criteria: 'y', workerSummary: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+    nodeToken: 'tok-1', nodeInstruction: 'x', criteria: 'y', workerHandoff: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
   })
   assert.match(text, /no node-local conversation since dispatch/)
 })

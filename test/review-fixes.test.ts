@@ -77,7 +77,7 @@ test('node_resolve_program advances to a non-END target without staying blocked'
   }
   await engine.startRun('ws', run)
   const token1 = topFrame(mem.run!).nodeToken
-  await engine.handleClaim('ws', { outcome: 'completed', summary: 'begun' }, { sessionId: 'm', turnUserMessageIds: new Set(['m']) })
+  await engine.handleClaim('ws', { outcome: 'completed', handoff: 'begun' }, { sessionId: 'm', turnUserMessageIds: new Set(['m']) })
   await engine.handleJudgeClaim('ws', token1, 'ACCEPT', 'begun', mem.run!.judgeSessionId!)
   await engine.handleTurnEnded('ws', 'm') // deferred dispatch of prog node
   const progToken = topFrame(mem.run!).nodeToken

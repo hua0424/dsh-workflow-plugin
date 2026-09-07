@@ -246,7 +246,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         nodeInstruction: input.instruction,
         criteria: input.criteria,
         workerOutcome: input.claim.outcome,
-        workerSummary: input.claim.summary,
+        workerHandoff: input.claim.handoff,
         workspaceCwd: input.cwd,
         transcript,
         // A1 §7.1: prior REJECT evidence for this same node, when present.

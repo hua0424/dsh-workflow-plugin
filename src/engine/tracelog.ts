@@ -6,7 +6,7 @@
  * `~/.dsh/workflows/<workflow-id>.yaml` → `~/.dsh/workflows/<workflow-id>/`
  * containing `yyyyMMdd-HHmmss-<runId前8位>.txt` files (local time).
  *
- * Event line format (A3 §3, `fmt=2`, announced on the START line): a single
+ * Event line format (A3 §3, `fmt=3`, announced on the START line): a single
  * line of space-separated `key=value` tokens. Identifier values (ids, enum
  * names) are written raw; free-text values are JSON-string escaped so the
  * one-event-per-line invariant survives newlines/quotes/backslashes and stays
@@ -84,7 +84,7 @@ export function appendLine(logPath: string, line: string, now: Date = new Date()
   }
 }
 
-// ---- A3 §3/§4 event-line format helpers (fmt=2) ----
+// ---- A3 §3/§4 event-line format helpers (fmt=3) ----
 
 /** Short stable prefix of an id (nodeToken / session id) for trace lines. */
 export function shortId(id: string): string {
@@ -155,7 +155,7 @@ function rawField(value: string | number | boolean): string {
 }
 
 /**
- * Build one fmt=2 event line: `EVENT k=v k=v …` in field insertion order.
+ * Build one fmt=3 event line: `EVENT k=v k=v …` in field insertion order.
  * - `undefined` fields are omitted entirely;
  * - `null` renders as `null`;
  * - plain strings/numbers/booleans are raw identifiers (re-checked);

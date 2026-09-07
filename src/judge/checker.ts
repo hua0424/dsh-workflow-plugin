@@ -28,7 +28,7 @@ export interface JudgePromptInput {
   nodeInstruction: string
   criteria: string
   workerOutcome: 'completed' | 'failed'
-  workerSummary: string
+  workerHandoff: string
   workspaceCwd: string
   transcript: string
   /**
@@ -64,8 +64,8 @@ Goal criteria (authoritative):
 {previousRejection}
 Worker claimed outcome: {workerOutcome}
 
-Worker summary:
-{workerSummary}
+Worker handoff:
+{workerHandoff}
 
 # Workspace
 cwd: {workspaceCwd}
@@ -76,21 +76,16 @@ cwd: {workspaceCwd}
 /** Render the [previous rejection]/[previous claim] evidence block (A1 §7.1). */
 function renderPreviousRejection(pc: PendingCorrection | undefined): string {
   if (pc === undefined) return ''
-  const handoff = pc.previousClaim.handoffContext !== undefined
-    ? `\nhandoffContext: ${pc.previousClaim.handoffContext}`
-    : ''
-  return `\n# Previous judgment on this node (REJECTED)\n[judge rejection]\n${pc.judgeReason}\n\n[previous claim]\noutcome: ${pc.previousClaim.outcome}\nsummary: ${pc.previousClaim.summary}${handoff}\n`
+  return `\n# Previous judgment on this node (REJECTED)\n[judge rejection]\n${pc.judgeReason}\n\n[previous claim]\noutcome: ${pc.previousClaim.outcome}\nhandoff: ${pc.previousClaim.handoff}\n`
 }
 
 /** Render the Judgment Packet sent as the Judge's initial user message (A1 R7). */
 export function renderJudgePrompt(input: JudgePromptInput): string {
-  return PROMPT_TEMPLATE
-    .replaceAll('{nodeToken}', input.nodeToken)
-    .replace('{nodeInstruction}', input.nodeInstruction)
-    .replace('{criteria}', input.criteria)
-    .replace('{previousRejection}', renderPreviousRejection(input.previousRejection))
-    .replace('{workerOutcome}', input.workerOutcome)
-    .replace('{workerSummary}', input.workerSummary)
-    .replace('{workspaceCwd}', input.workspaceCwd)
-    .replace('{transcript}', input.transcript === '' ? '(no node-local conversation since dispatch)' : input.transcript)
+  const fields: Record<string, string> = {
+    ...input,
+    previousRejection: renderPreviousRejection(input.previousRejection),
+    transcript: input.transcript === '' ? '(no node-local conversation since dispatch)' : input.transcript,
+  }
+  // 单次替换：交付文本中的占位符和 $& 是原文，不再次解释。
+  return PROMPT_TEMPLATE.replace(/\{(\w+)\}/g, (placeholder, key: string) => fields[key] ?? placeholder)
 }

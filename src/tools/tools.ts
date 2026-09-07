@@ -3,9 +3,9 @@
  * wrappers. Pure definitions + execute closures over a ToolHost interface, so
  * the whole tool layer is unit-testable without the host.
  */
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, ToolArgsError } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { LIMITS, type ClaimOutcome, type ClaimCaller } from '../types.ts'
+import { LIMITS, normalizeNodeClaim, type ClaimOutcome, type ClaimCaller } from '../types.ts'
 import { callerTurnUserMessageIds } from '../plugin/turnbind.ts'
 
 /** Length-check a tool text argument per the design bounds. */
@@ -54,7 +54,7 @@ export interface ToolHost {
   // Engine mutations (callers already passed authorize; `caller` identifies
   // the calling agent's session — for claim/block it also carries the calling
   // turn's user-message id snapshot for dispatch-lease admission, A1 R2/R3).
-  claim(workspaceKey: string, claim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
+  claim(workspaceKey: string, claim: { outcome: ClaimOutcome; handoff: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   block(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -113,29 +113,23 @@ export const workflowTools: ToolDefinition[] = [
     description: '提交当前 Node 的工作结果声明（candidate result）。由 Checker 独立确认 ACCEPT/REJECT。无需任何 token——绑定由派发 lease 自动完成。这必须是当前 Turn 的最后一个动作。',
     parameters: {
       outcome: { type: 'string', required: true, enum: ['completed', 'failed'], description: 'completed | failed' },
-      summary: { type: 'string', required: true, description: '工作摘要（1..4000 字符）' },
-      handoffContext: { type: 'string', description: '交给下一 Node 的上下文（completed 与 failed 均可携带，1..8000 字符；failed 时用于向后继返工/修复节点传递完整业务上下文）' },
+      handoff: { type: 'string', required: true, description: '唯一结果与交接说明（trim 后 1..8000 字符，completed/failed 对称，END 也必填）：实际结果、产物位置与核验依据、剩余问题和后续约束。Judge、Manager、后继读取同一文本；不接受旧 summary/handoffContext。' },
     },
     output: stringOut,
     async execute(args, exec) {
       const auth = await controlWorkspace(exec.agent, 'node_claim')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
+      // 宿主 defineTool 的参数根是 open object；显式拒绝旧字段及其它业务入口。
+      const unknown = Object.keys(args).filter(key => key !== 'outcome' && key !== 'handoff')
+      if (unknown.length > 0) throw new ToolArgsError(unknown.map(key => `unsupported node_claim property "${key}"; use outcome and handoff`))
       const host = thisHost()
-      const summaryError = lengthError('summary', args.summary, LIMITS.summaryMin, LIMITS.summaryMax, true)
-      if (summaryError !== undefined) return `拒绝：${summaryError}`
-      // 20260906-claim-handoff-symmetry R1: handoffContext accepts the SAME
-      // contract for completed and failed — the outcome only picks the edge.
-      if (args.handoffContext !== undefined) {
-        const handoffError = lengthError('handoffContext', args.handoffContext, 1, LIMITS.handoffMax, false)
-        if (handoffError !== undefined) return `拒绝：${handoffError}`
+      let claim
+      try {
+        claim = normalizeNodeClaim(args)
+      } catch (error) {
+        return `拒绝：${error instanceof Error ? error.message : String(error)}`
       }
-      const outcome = await host.claim(auth.workspaceKey, {
-        outcome: args.outcome,
-        // Review fix: length checks are trim-based, so the STORED payloads are
-        // the trim results — a whitespace bomb must never reach State.
-        summary: args.summary.trim(),
-        handoffContext: args.handoffContext !== undefined ? args.handoffContext.trim() : undefined,
-      }, claimCallerOf(exec))
+      const outcome = await host.claim(auth.workspaceKey, claim, claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },

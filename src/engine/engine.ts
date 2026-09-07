@@ -4,7 +4,7 @@
  * wires real DSH services into these.
  */
 import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome, ClaimCaller, TransientDispatch, PendingCorrection } from '../types.ts'
-import { WorkflowError, LIMITS, normalizeModelRoute } from '../types.ts'
+import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { createRunLog, appendLine, jsonField, redact, shortId, traceEvent } from './tracelog.ts'
 import { SUBMISSION_CONSTRAINT } from './texts.ts'
@@ -44,9 +44,8 @@ function compactFaultNotice(run: RunState, nodeId: string, detail: string): stri
  * appends `[instruction]`; a resume rebuild additionally appends
  * `[manager resolution]`. Lengths are bounded by the entry LIMITS chain.
  */
-export function correctionEvidence(pc: { judgeReason: string; previousClaim: { outcome: ClaimOutcome; summary: string; handoffContext?: string } }): string {
-  const claim = `[previous claim]\noutcome: ${pc.previousClaim.outcome}\nsummary: ${pc.previousClaim.summary}`
-    + (pc.previousClaim.handoffContext !== undefined ? `\nhandoffContext: ${pc.previousClaim.handoffContext}` : '')
+export function correctionEvidence(pc: PendingCorrection): string {
+  const claim = `[previous claim]\noutcome: ${pc.previousClaim.outcome}\nhandoff: ${pc.previousClaim.handoff}`
   return `[judge rejection]\n${pc.judgeReason}\n\n${claim}`
 }
 
@@ -69,8 +68,8 @@ export interface JudgeSpawnInput {
   nodeToken: string
   instruction: string
   criteria: string
-  /** A1 R7: the Judge sees only the worker's claim outcome/summary. */
-  claim: { outcome: ClaimOutcome; summary: string }
+  /** Judge 核验的材料就是后继将收到的完整交付。 */
+  claim: NodeClaim
   /** A1 §7.1: REJECT evidence from a previous correction round on this node, when present. */
   previousRejection?: PendingCorrection
   cwd: string
@@ -246,6 +245,28 @@ export class WorkflowEngine {
     this.state = state
   }
 
+  /** 工具与命令共用状态投影；预览仅截取原文，不另存摘要。 */
+  async status(workspaceKey: string) {
+    const row = await this.state.get(workspaceKey)
+    if (row === undefined) return { ok: true, status: 'no active run' }
+    const run = row.run
+    return {
+      ok: true,
+      status: {
+        runId: run.runId,
+        catalogWorkflowId: run.catalogWorkflowId,
+        status: run.status,
+        callStack: run.callStack.map(f => ({ ...f })),
+        currentFrame: run.callStack.length > 0 ? topFrame(run) : null,
+        roleActors: run.roleActors,
+        modelOverrides: run.modelOverrides,
+        blockReason: run.blockReason,
+        handoffPreview: (run.status === 'completed' ? run.finalHandoff : run.pendingClaim?.handoff)?.slice(0, 500) ?? null,
+        finalHandoff: run.finalHandoff ?? null,
+      },
+    }
+  }
+
   buildInitialRun(managerSessionId: string, workflowId: string, config: WorkflowConfig, definitionHash: string): RunState {
     return {
       runId: crypto.randomUUID(),
@@ -293,7 +314,7 @@ export class WorkflowEngine {
     // Written BEFORE the row creation per the §10 order (validate → trace →
     // persist): a crash between leaves an orphan START in an orphan file
     // (at-least-once); the reverse gap (row without START) does not exist.
-    this.logLine(run, traceEvent('START', { workflow: run.catalogWorkflowId, run: run.runId, fmt: 2 }))
+    this.logLine(run, traceEvent('START', { workflow: run.catalogWorkflowId, run: run.runId, fmt: 3 }))
     let version: number
     try {
       version = await this.state.create(workspaceKey, run)
@@ -338,18 +359,17 @@ export class WorkflowEngine {
     }
   }
 
-  // ---- A3 trace events (fmt=2). Free-text fields go through `jsonField`
+  // ---- A3 trace events (fmt=3). Free-text fields go through `jsonField`
   // at their protocol bounds (§4); ids use short prefixes (§5/§10). ----
 
   /** A3 R1: an accepted Actor claim, logged after admission, before Judge spawn. */
-  private logClaim(run: RunState, frame: CallFrame, role: string, outcome: ClaimOutcome, summary: string, handoff: string | null): void {
+  private logClaim(run: RunState, frame: CallFrame, role: string, outcome: ClaimOutcome, handoff: string): void {
     this.logLine(run, traceEvent('CLAIM', {
       workflow: frame.workflowId,
       node: frame.nodeId,
       token: shortId(frame.nodeToken),
       role,
       outcome,
-      summary: jsonField(summary, LIMITS.summaryMax),
       handoff: jsonField(handoff, LIMITS.handoffMax),
     }))
   }
@@ -782,7 +802,7 @@ export class WorkflowEngine {
     // A3 review S3: release the one-warning marker — a completed run's log is final.
     this.traceWarnedRuns.delete(run.runId)
     try {
-      await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。`)
+      await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。${run.finalHandoff !== undefined ? `\n\n[handoff]\n${run.finalHandoff}` : ''}`)
     } catch {
       // Completion notification is best-effort: the completed state is durable.
     }
@@ -815,6 +835,11 @@ export class WorkflowEngine {
    * technical fault, via handleJudgeTurnEnded.
    */
   async handleClaim(workspaceKey: string, claim: NodeClaim, caller: ClaimCaller): Promise<EngineOutcome> {
+    try {
+      claim = normalizeNodeClaim(claim)
+    } catch (error) {
+      return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+    }
     const row = await this.state.get(workspaceKey)
     if (row === undefined) return { ok: false, reason: 'no active run' }
     const { run, version } = row
@@ -851,12 +876,7 @@ export class WorkflowEngine {
     }
     this.inFlight.set(flightKey, 'judge')
     try {
-      // A1 review fix: the tool layer validates trim-based lengths, so the
-      // payloads persisted/traced here are trimmed defensively too — a
-      // whitespace-padded summary can never bloat State or the correction
-      // message regardless of how the caller reached the engine.
-      const summary = claim.summary.trim()
-      const handoff = claim.handoffContext?.trim()
+      const handoff = claim.handoff.trim()
       // Prepare every fallible packet input BEFORE publishing the reserved id.
       const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
       const cwd = await this.cwdResolver(run)
@@ -870,14 +890,7 @@ export class WorkflowEngine {
         return { ok: false, reason: 'stale claim discarded: the node moved or blocked meanwhile' }
       }
       const reservedJudgeSessionId = newNodeToken()
-      entered.run.pendingClaim = { outcome: claim.outcome, summary }
-      // 20260906-claim-handoff-symmetry R2: the handoff persists for BOTH
-      // outcomes — completed and failed differ only in the edge their ACCEPT
-      // takes (onPass/onFail), never in information capacity. The Judge packet
-      // below still receives only outcome/summary (A1 R7).
-      if (handoff !== undefined && handoff !== '') {
-        entered.run.pendingClaim.handoffContext = handoff
-      }
+      entered.run.pendingClaim = { outcome: claim.outcome, handoff }
       entered.run.judgeSessionId = reservedJudgeSessionId
       // A3 R1 + §10 crash-seam order: validate → trace → persist. The CLAIM
       // line is written BEFORE the durable acceptance (at-least-once: a
@@ -889,8 +902,7 @@ export class WorkflowEngine {
         topFrame(entered.run),
         node.execution.role ?? 'manager',
         claim.outcome,
-        summary,
-        entered.run.pendingClaim.handoffContext ?? null,
+        handoff,
       )
       await this.state.put(workspaceKey, entered.run, entered.version)
       // A1 §3.2 acceptance boundary: consume the lease only AFTER the durable
@@ -907,7 +919,7 @@ export class WorkflowEngine {
           nodeToken: frame.nodeToken,
           instruction: node.execution.instruction ?? '',
           criteria,
-          claim: { outcome: claim.outcome, summary },
+          claim: entered.run.pendingClaim,
           // A1 §7.1: a re-claim after a REJECT carries the prior evidence.
           previousRejection: entered.run.pendingCorrection,
           cwd,
@@ -1055,8 +1067,9 @@ export class WorkflowEngine {
     // the Judge confirmed, it did not rewrite the result.
     const verdict = run.pendingClaim.outcome === 'completed' ? 'PASS' : 'FAIL'
     // PASS/FAIL: apply the edge and retire the judge.
-    const handoff = run.pendingClaim?.handoffContext
+    const handoff = run.pendingClaim.handoff
     this.advance(run, verdict, reason, 'judge')
+    if (run.callStack.length === 0) run.finalHandoff = handoff
     // A1 R11: retire the judge (revoke authorization; the resident Activation
     // is released by DSH's settlement watcher once its turn ends). Never drain
     // from inside the judge's own tool call — see SubagentHost.retireJudge.
@@ -1149,10 +1162,7 @@ export class WorkflowEngine {
         nodeToken: frame.nodeToken,
         instruction: node.execution.instruction ?? '',
         criteria,
-        // A1 R7: the Judgment Packet receives only outcome/summary; handoff
-        // remains persisted in pendingClaim for the successor node after an
-        // accepted PASS or FAIL (20260906: both outcomes).
-        claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
+        claim: run.pendingClaim,
         // A1 §6.4: judge-fault/NEED_CONTEXT BLOCKs keep the correction
         // evidence — the rebuilt packet still sees what was rejected.
         previousRejection: run.pendingCorrection,
@@ -1271,7 +1281,7 @@ export class WorkflowEngine {
       this.logResume(run, frame, nodeToken, 'judge', resolutionContext)
       if (run.judgeSessionId !== undefined) {
         // followup the SAME judge (A1 R10 / A4 R3); do not re-dispatch the actor.
-        const followup = `[manager resolution]\n${resolutionContext}\n\n请用新的 nodeToken "${frame.nodeToken}" 继续判定，并再次调用 judge_claim 提交。`
+        const followup = `[current claim]\noutcome: ${run.pendingClaim.outcome}\nhandoff: ${run.pendingClaim.handoff}\n\n[manager resolution]\n${resolutionContext}\n\n只读核验上述交付，不补做工作。请用新的 nodeToken "${frame.nodeToken}" 继续判定，并再次调用 judge_claim 提交。`
         try {
           await this.subagents.followupJudge(run, run.judgeSessionId, followup)
         } catch (error) {
@@ -1298,10 +1308,7 @@ export class WorkflowEngine {
           nodeToken: frame.nodeToken,
           instruction: node.execution.instruction ?? '',
           criteria,
-          // A1 R7: only outcome/summary enter the rebuilt Judgment Packet;
-          // handoff stays in pendingClaim for delivery after an accepted
-          // PASS or FAIL (20260906: both outcomes).
-          claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
+          claim: run.pendingClaim,
           // A1 §6.4: the spawn-rebuild keeps the prior rejection evidence.
           previousRejection: run.pendingCorrection,
           cwd,

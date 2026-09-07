@@ -5,7 +5,7 @@
  */
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v1' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v2' as const
 export const STATE_TABLE_NAME = 'workflow_state' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
@@ -22,8 +22,6 @@ export const LIMITS = {
   criteriaMax: 8000,
   reasonMin: 1,
   reasonMax: 2000,
-  summaryMin: 1,
-  summaryMax: 4000,
   handoffMax: 8000,
   resolutionMin: 1,
   resolutionMax: 8000,
@@ -181,15 +179,10 @@ export interface RunState {
   nodeBoundary: NodeContextBoundary
   /** Current active/pending Judge session id for this Node (A1/A4). */
   judgeSessionId?: string
-  /**
-   * Worker claim held during the judgment phase (A4 R9). The optional
-   * `handoffContext` is persisted together with the claim for BOTH outcomes
-   * (20260902-fixbug review resolution "方案2"; 20260906-claim-handoff-symmetry
-   * extends it to failed) so a host restart during judgment cannot silently
-   * drop the handoff; it is cleared together with the claim when the verdict
-   * lands.
-   */
-  pendingClaim?: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
+  /** 判定阶段唯一候选交付；首次、返工和 Judge 重建共用。 */
+  pendingClaim?: NodeClaim
+  /** ponytail: T2 仅在 completed 保存 END 交付；T3 移入终局工作单，不作活动材料镜像。 */
+  finalHandoff?: string
   /**
    * A1 §6.4 (D4): the durable REJECT evidence for the current node — the
    * Judge's rejection reason plus a snapshot of the claim it rejected.
@@ -260,8 +253,19 @@ export type TransientDispatch =
  * claim to the current dispatch lease, so the claim carries only its payload. */
 export interface NodeClaim {
   outcome: ClaimOutcome
-  summary: string
-  handoffContext?: string
+  handoff: string
+}
+
+/** 工具与 Runtime 共用同一交付合同；失败不产生部分 claim。 */
+export function normalizeNodeClaim(claim: NodeClaim): NodeClaim {
+  if (Object.keys(claim).some(key => key !== 'outcome' && key !== 'handoff')) {
+    throw new WorkflowError('node_claim only accepts outcome and handoff; summary/handoffContext are not supported')
+  }
+  if (claim.outcome !== 'completed' && claim.outcome !== 'failed') throw new WorkflowError('invalid claim outcome')
+  if (typeof claim.handoff !== 'string' || claim.handoff.trim() === '') throw new WorkflowError('handoff is required')
+  const handoff = claim.handoff.trim()
+  if (handoff.length > LIMITS.handoffMax) throw new WorkflowError(`handoff must be at most ${LIMITS.handoffMax} characters after trim`)
+  return { outcome: claim.outcome, handoff }
 }
 
 /** A1 §6.4: persisted REJECT evidence for the current node's correction cycle. */
@@ -269,7 +273,7 @@ export interface PendingCorrection {
   /** The Judge's REJECT reason (≤ reasonMax) — reused verbatim as the correction instruction. */
   judgeReason: string
   /** Snapshot of the claim the Judge rejected. */
-  previousClaim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
+  previousClaim: NodeClaim
 }
 
 /** Judge decision submitted through the `judge_claim` protocol (A1 R9). */

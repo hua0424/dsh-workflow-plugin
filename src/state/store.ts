@@ -17,6 +17,12 @@ interface RowShape {
   updated_at: string
 }
 
+function assertCompatibleFormat(row: RowShape): void {
+  if (row.format_version !== STATE_FORMAT_VERSION) {
+    throw new Error(`incompatible state format for ${row.workspace_key}: ${row.format_version}; expected ${STATE_FORMAT_VERSION}. Original data retained; authorized backup/reset required before reuse.`)
+  }
+}
+
 const CREATE_SQL = `
 CREATE TABLE IF NOT EXISTS ${STATE_TABLE_NAME} (
   workspace_key  TEXT PRIMARY KEY,
@@ -65,13 +71,14 @@ export class StateStore {
     return this.enqueue(() => {
       const row = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).get(workspaceKey) as RowShape | undefined
       if (row === undefined) return undefined
+      assertCompatibleFormat(row)
       const parsed: unknown = JSON.parse(row.snapshot_json)
       if (!isJsonValue(parsed) || typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
         throw new Error(`state row for ${workspaceKey} is corrupt`)
       }
       return {
         workspaceKey: row.workspace_key,
-        formatVersion: row.format_version as typeof STATE_FORMAT_VERSION,
+        formatVersion: STATE_FORMAT_VERSION,
         stateVersion: row.state_version,
         run: (parsed as { run: RunState }).run,
         updatedAt: row.updated_at,
@@ -84,10 +91,11 @@ export class StateStore {
     return this.enqueue(() => {
       const rows = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME}`).all() as unknown as RowShape[]
       return rows.map(row => {
+        assertCompatibleFormat(row)
         const parsed = JSON.parse(row.snapshot_json) as { run: RunState }
         return {
           workspaceKey: row.workspace_key,
-          formatVersion: row.format_version as typeof STATE_FORMAT_VERSION,
+          formatVersion: STATE_FORMAT_VERSION,
           stateVersion: row.state_version,
           run: parsed.run,
           updatedAt: row.updated_at,
@@ -104,6 +112,7 @@ export class StateStore {
     return this.enqueue(() => {
       const existing = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).get(workspaceKey) as RowShape | undefined
       if (existing !== undefined) {
+        assertCompatibleFormat(existing)
         const parsed = JSON.parse(existing.snapshot_json) as { run: RunState }
         if (parsed.run.status !== 'completed') {
           throw new StateConflictError(workspaceKey, parsed.run.status)
@@ -121,6 +130,7 @@ export class StateStore {
     return this.enqueue(() => {
       const existing = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).get(workspaceKey) as RowShape | undefined
       if (existing === undefined) throw new StateGoneError(workspaceKey)
+      assertCompatibleFormat(existing)
       if (existing.state_version !== expectedVersion) {
         throw new StateVersionError(workspaceKey, existing.state_version, expectedVersion)
       }
@@ -128,9 +138,11 @@ export class StateStore {
     })
   }
 
-  /** Delete one row (reset). Idempotent. */
+  /** Delete one compatible row (reset). Idempotent. */
   deleteRow(workspaceKey: string): Promise<void> {
     return this.enqueue(() => {
+      const existing = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).get(workspaceKey) as RowShape | undefined
+      if (existing !== undefined) assertCompatibleFormat(existing)
       this.db.prepare(`DELETE FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).run(workspaceKey)
     })
   }

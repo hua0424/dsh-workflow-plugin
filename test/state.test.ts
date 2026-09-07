@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { DatabaseSync } from 'node:sqlite'
 import { StateStore, StateConflictError, StateVersionError, stateDbPath } from '../src/state/store.ts'
 import { checkStateInvariants, newNodeToken, topFrame } from '../src/state/invariants.ts'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
@@ -62,6 +63,43 @@ test('create + get roundtrip', async () => {
     assert.ok(got)
     assert.equal(got!.run.runId, run.runId)
     assert.equal(got!.run.callStack.length, 1)
+  })
+})
+
+test('incompatible state rejects access and mutations without changing original rows', async () => {
+  await withStore(async (store, home) => {
+    const raw = new DatabaseSync(stateDbPath(home))
+    try {
+      for (const status of ['running', 'completed']) {
+        const snapshot = JSON.stringify({ run: {
+          ...makeRun(), status,
+          pendingClaim: { outcome: 'completed', summary: '旧结果', handoffContext: '原始交接\n材料' },
+        } }, null, 2)
+        raw.prepare('INSERT INTO workflow_state VALUES (?, ?, ?, ?, ?)')
+          .run(status, 'agent-workflow-state/v1', 7, snapshot, '2026-01-01T00:00:00.000Z')
+      }
+      const inspect = () => raw.prepare('SELECT *, hex(snapshot_json) AS snapshot_bytes FROM workflow_state ORDER BY workspace_key').all()
+      const original = inspect()
+      const incompatible = /incompatible state format.*agent-workflow-state\/v1.*agent-workflow-state\/v2/i
+      for (const key of ['running', 'completed']) {
+        await assert.rejects(() => store.get(key), incompatible)
+        await assert.rejects(() => store.list(), incompatible)
+        await assert.rejects(() => store.updateRow(key, makeRun(), 7), incompatible)
+        await assert.rejects(() => store.createRow(key, makeRun()), incompatible)
+        await assert.rejects(() => store.deleteRow(key), incompatible)
+        assert.deepEqual(inspect(), original)
+      }
+      store.close()
+      const reopened = new StateStore(home)
+      try {
+        await assert.rejects(() => reopened.get('completed'), incompatible)
+        assert.deepEqual(inspect(), original)
+      } finally {
+        reopened.close()
+      }
+    } finally {
+      raw.close()
+    }
   })
 })
 

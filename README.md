@@ -11,8 +11,16 @@ calling turn); the Judge only **confirms** the Actor's claim via
 `ACCEPT | REJECT | NEED_CONTEXT` — the Graph PASS/FAIL verdict is derived from
 the claimed outcome, and a REJECT re-dispatches the SAME node to the ORIGINAL
 actor with the rejection as the correction instruction (`CORRECT` trace event).
-v1 catalogs are rejected by the loader; old v1 run rows fail closed (exit via
-`/dsh-flow reset`).
+v1 catalogs are rejected by the loader.
+
+T2 (#9) 切换当前工具合同：`node_claim({outcome, handoff})`，handoff 必填、trim 后
+1..8000 字符，completed/failed 对称，END 也交付；明确拒绝旧 summary/handoffContext。
+Judge、Manager 状态预览（前500字符）、后继与最终结果共用原文，无独立摘要或 fallback。
+State format 为 `agent-workflow-state/v2`，仍是现有单行状态存储，**三表尚未实现**。
+仅 completed 的 `finalHandoff` 暂存 END 结果；新 Run 不继承该材料。
+旧格式行读取、写入和 Reset 均 fail-closed 并保留原数据；请勿直接部署到有旧 Run 的
+环境。授权备份/导出与退出路径留 T8，本票不提供迁移或自动清库。
+真实宿主端到端验证留 T9；隔离 smoke 不代表真实模型执行。
 
 ## Current documentation
 
@@ -77,13 +85,13 @@ config file (`src/engine/tracelog.ts`):
   `~/.dsh/workflows/smoke-test/`).
 - **Naming**: `yyyyMMdd-HHmmss-<runId前8位>.txt` (local time; the run-id
   prefix avoids same-second collisions), appended in UTF-8.
-- **Format** (`fmt=2`, announced on the START line): one line per event,
+- **Format** (`fmt=3`, announced on the START line): one line per event,
   prefixed with `[YYYY-MM-DD HH:mm:ss]` (local time), made of
   space-separated `key=value` tokens. Identifier values are raw; free-text
   values are JSON-string escaped (newlines never break the one-line rule)
   and bounded at their protocol max (over-bound text gets `…[truncated]`):
-  - `[ts] START workflow=<id> run=<runId> fmt=2`
-  - `[ts] CLAIM workflow=<id> node=<node> token=<8> role=<role> outcome=<completed|failed> summary=<json> handoff=<json|null>` — every accepted Actor claim (after lease admission, before Judge spawn).
+  - `[ts] START workflow=<id> run=<runId> fmt=3`
+  - `[ts] CLAIM workflow=<id> node=<node> token=<8> role=<role> outcome=<completed|failed> handoff=<json>` — every accepted Actor claim (after lease admission, before Judge spawn).
   - `[ts] JUDGE workflow=<id> node=<node> token=<8> result=<ACCEPT|REJECT|NEED_CONTEXT> reason=<json> judge=<8>` — every accepted Judge confirmation (v2).
   - `[ts] ROUTE workflow=<id> node=<node> token=<8> result=<PASS|FAIL> target=<node|END|BLOCK>` — the finally-adopted Graph edge direction (ACCEPT maps the claimed outcome; REJECT routes nothing).
   - `[ts] CORRECT workflow=<id> node=<node> token=<8 new> role=<role> judge=<8 old> detail=<json>` — the REJECT re-dispatch boundary (same node, rotated token, retired judge).
@@ -96,8 +104,8 @@ config file (`src/engine/tracelog.ts`):
   (`traceLogPath`), so events after a DSH host restart (restart-reconcile
   BLOCK, post-restart resume) still append to the SAME file. The log itself
   remains a derived artifact outside SQLite.
-- **Privacy**: only Engine-accepted protocol payloads are logged (summary /
-  handoff / judge reason / block reason / resolution context, bounded). No
+- **Privacy**: only Engine-accepted protocol payloads are logged (handoff /
+  judge reason / block reason / resolution context, bounded). No
   reasoning, no tool transcripts, no program parameters. Credential text is
   doubly guarded: auth/credential errors keep the Host's sanitized wording
   (primary), and the trace boundary redacts credential-shaped patterns
