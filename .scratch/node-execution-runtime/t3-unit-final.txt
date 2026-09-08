@@ -1,0 +1,1356 @@
+
+> dsh-agent-team-workflow@0.1.0 test D:\project\my\dsh-workflow-plugins
+> node --test "test/*.test.ts"
+
+✔ manager may call every workflow tool (3.373ms)
+✔ role actor may call only claim/block/status (0.4548ms)
+✔ cold-resumed actor (no live mapping) still resolves from roleActors table (0.2891ms)
+✔ unknown session is rejected (0.1882ms)
+✔ judge sessions may call the inspection wrappers and judge_claim (0.2956ms)
+✔ an actor id not present in roleActors is rejected even with a live mapping (0.1666ms)
+✔ valid config parses and normalizes (45.7619ms)
+✔ v1 schemaVersion is rejected (A1 D1: in-place upgrade, no dual-track) (5.6567ms)
+✔ model route caps: provider ≤64 / modelId ≤128 after trim (A1 D3) (9.6ms)
+✔ duplicate keys are rejected (1.1263ms)
+✔ anchors and aliases are rejected (0.9959ms)
+✔ merge keys are rejected (0.9087ms)
+✔ custom tags are rejected (1.1474ms)
+✔ multi-document input is rejected (0.8014ms)
+✔ unknown fields are rejected (1.2818ms)
+✔ root startNode must be a manager actor-task (1.9168ms)
+✔ onFail END is rejected (4.8146ms)
+✔ unknown role is rejected (2.205ms)
+✔ unreachable node is rejected (2.0303ms)
+✔ child workflow cycle is rejected (5.2102ms)
+✔ definition hash is stable and content-sensitive (3.9318ms)
+✔ criteria bounds are enforced (2.6284ms)
+✔ classifyCatalogFilename rules (0.2632ms)
+✔ scanCatalog ignores invalid files and lists valid ones (54.5225ms)
+✔ scanCatalog on a missing directory returns empty (13.2151ms)
+✔ builtin program ids are validated (1.7618ms)
+✔ prototype-pollution role names are rejected (hasOwn checks) (1.7008ms)
+✖ startRun persists and dispatches the root node to the manager (29.9275ms)
+✖ claim spawns a judge, judge_claim PASS advances and defers next dispatch until turn end (1.0201ms)
+✖ real ordering: worker turn settles before the verdict — no false BLOCK, dispatch happens (F1/F2) (1.7211ms)
+✖ claim outcome failed + ACCEPT maps to the FAIL edge; no onFail edge blocks (AC6) (0.9303ms)
+✖ NEED_CONTEXT verdict blocks and keeps the judge session (0.7814ms)
+✖ resume in judgment phase with judgeSessionId followups the same judge (A4 AC3) (0.7375ms)
+✖ resume in judgment phase without judgeSessionId spawns a fresh judge (A4 AC4) (0.7467ms)
+✖ judge_respawn drains the old judge and spawns a new one (A4 AC5) (1.8403ms)
+✖ judge_respawn preparation failure leaves the old blocked Judge mapping untouched (0.9861ms)
+✖ judge technical fault (spawn failure) blocks with a judge fault detail (A4 AC1) (0.9663ms)
+✖ spawn failure clears the never-admitted reserved Judge id so node_resume rebuilds (A4 R4/R8) (0.7223ms)
+✖ judge turn ended without judge_claim blocks with a fault detail and KEEPS judgeSessionId (A4 R5) (0.5586ms)
+✖ stale judge spawn is drained when the run changes during materialization (A1 R11) (0.4677ms)
+✖ failed stale respawn cannot block a replacement run (0.4834ms)
+✖ stale judge_claim from an old judge session is rejected (A1 AC9) (0.6131ms)
+✖ claims carry no token — the lease is the token truth (A1 AC2) (0.4515ms)
+✖ claim from a non-executor is rejected (0.4275ms)
+✖ claim on non-running run is rejected (0.4104ms)
+✖ second claim on the same token is rejected (judge already spawned) (0.399ms)
+✖ AC1: a claim for an advanced-but-not-dispatched node is rejected without state mutation or judge spawn (0.337ms)
+✖ AC1: a claim against a pendingDispatch book (node advanced, dispatch deferred) is rejected (0.2937ms)
+✖ AC3: a stale turn (old dispatch id only) cannot claim the new dispatch (0.3992ms)
+✖ AC4: claim-then-block and block-then-claim on one dispatch are both rejected (0.3711ms)
+✖ A1 §3.2 acceptance boundary: a failed acceptance put leaves the lease unconsumed and retryable (0.2746ms)
+✖ A1 §3.2: a failed BLOCK put keeps the book intact for a verbatim retry (0.2719ms)
+✖ A1 §5.2: Manager node_block on a builtin-program node is control-plane (no lease required) (2.3096ms)
+✖ A1 §5.2: Manager node_block on a role-executor actor node is control-plane (no lease) (0.6091ms)
+✖ turn ended without any accepted result blocks the node and notifies the manager (A3 AC5) (0.4717ms)
+✖ turn ended by a non-executor session is ignored (0.4768ms)
+✖ resume rotates the token and re-dispatches (0.4831ms)
+✖ resume by a non-manager is rejected (0.4301ms)
+✖ restart reconciliation blocks every running row (0.4313ms)
+✖ restart reconciliation clears a reserved Judge id whose Session never materialized (0.6061ms)
+✖ restart reconciliation keeps an existing Judge session id (0.6504ms)
+✖ restart reconciliation contains a row conflict and continues with later workspaces (2.098ms)
+✖ reset removes the row (0.6887ms)
+✖ role model override is rejected while the role actor turn is active; idle actor is replaced (0.6931ms)
+✖ model override routes are trim-normalized and capped (A1 D3) (0.5226ms)
+✖ node-boundary compact runs before dispatching a fresh role node (A2 AC1) (0.3815ms)
+✖ compact failure blocks the node and notifies the Manager (A2 AC5/R4) (0.3634ms)
+✖ same-node resume of a role actor retains the boundary and skips compact (A1 R4/AC5, A2 R6) (0.3796ms)
+✖ handoff survives NEED_CONTEXT resume token rotation (S3/A4 R9) (0.3698ms)
+✖ handoff survives a host-restart-equivalent: a fresh engine over durable state (方案 2) (0.3967ms)
+✖ first role creation skips compact (A2 AC3) (0.3754ms)
+✖ builtin-program dispatch does not inject the submission constraint (A3 AC2) (2.2422ms)
+✖ child-workflow pushes a frame and dispatches the child start node (0.5182ms)
+✖ child END pops the frame and treats the parent node as PASS (0.2029ms)
+✖ startRun creates the trace log and writes the START line with fmt=3 (AC1) (4.0331ms)
+✖ accepted claim and judge verdict produce CLAIM + JUDGE + ROUTE lines (AC1/AC3) (5.0927ms)
+✖ CLAIM free text is JSON-escaped onto one line and bounded at protocol max (AC9) (5.529ms)
+✖ over-bound handoff is rejected before tracing or persistence (T2) (4.7448ms)
+✖ FAIL routes to onFail, and FAIL -> BLOCK emits ROUTE + BLOCK source=judge (AC5) (5.8447ms)
+✖ JUDGE NEED_CONTEXT emits JUDGE + BLOCK source=judge, then RESUME target=judge (AC4-correction base/AC5/AC6) (3.6523ms)
+✖ node_block by the Manager emits BLOCK source=manager; actor-path resume emits RESUME target=actor (AC5/AC6) (2.8988ms)
+✖ actor turn ending without a result emits BLOCK source=actor (AC5: no 52-minute silence) (3.0954ms)
+✖ judge_respawn emits RESPAWN with the fresh judge prefix (AC6) (3.9077ms)
+✖ trace log covers child PUSH/POP with explicit pairing (AC7) (1.6131ms)
+✖ builtin program outcomes emit PROGRAM (+BLOCK on ERROR) and RESOLVE on manual fix (AC8/AC6) (2.7867ms)
+✖ model override emits MODEL with ids only (AC6/AC10) (5.1711ms)
+✖ host-restart reconcile emits BLOCK source=restart into the SAME log via the durable traceLogPath (AC5/AC6) (3.8617ms)
+✖ log creation/append failure never breaks run startup or routing, and warns once (AC11/§10) (2.431ms)
+✖ untrusted raw identifier values cannot inject extra log lines (A3 review S1 / AC9) (4.6248ms)
+✖ credential-like text is redacted at the trace boundary (A3 AC10 fixture) (4.185ms)
+✖ crash seam: CLAIM is written BEFORE persistence — at-least-once with a distinguishable orphan (A3 review S4 / PRD §10) (3.2092ms)
+✖ crash seam: RESPAWN is written BEFORE persistence — at-least-once like CLAIM (A3 review round 2 / PRD §10) (4.9009ms)
+✖ conflicted startRun leaves NO orphan trace file (A3 review round 2: common conflict path is clean) (3.4134ms)
+✖ credential-shaped raw identifiers (provider/model) are redacted, but legit structural ids survive (A3 review round 3 S1 / AC10/AC1) (2.8513ms)
+✖ legit secret-pattern-colliding workflow id is NOT redacted (A3 review round 3 S1 regression) (4.42ms)
+✖ crash seam: START is written BEFORE state.create — failure leaves a declared orphan file (A3 review round 3 Spec2 / PRD §10) (3.4956ms)
+✖ AC7/AC8: REJECT re-dispatches the SAME node to the ORIGINAL actor with full evidence (4.6183ms)
+✖ AC10: the retired Judge cannot submit again after a REJECT (token + session double rejection) (0.6177ms)
+✖ AC9 regression: NEED_CONTEXT and judge faults keep pendingCorrection for packet rebuilds (0.3409ms)
+✖ Manager-path correction evidence: the next packet carries [previous rejection] without projection (review 补充4) (0.2907ms)
+✖ correction dispatch failure BLOCKs with the evidence intact; resume rebuilds the full message (review 补充4/中5) (0.2797ms)
+✖ correction × host restart: reconcile BLOCKs, resume rebuilds the evidence (review 第二轮) (0.2942ms)
+✖ override guard: pendingClaim/pendingCorrection reject overrides for the CURRENT node role (mapping-independent) (0.2974ms)
+✖ blocked escape hatch: correction BLOCK + override resets the boundary → resume spawns a replacement with the evidence (review 第二轮) (0.311ms)
+✖ NEED_CONTEXT BLOCK + override keeps the boundary (idle-replacement semantics, corner recorded) (0.3511ms)
+✖ model override on a completed run does not throw (review: empty callStack) (0.2832ms)
+✖ a sibling role actor cannot block a node whose executor mapping drifted (lease fail-closed) (0.2479ms)
+✖ the Manager-executor node requires the lease for the Manager itself (empty turn ids rejected) (0.2255ms)
+✖ padded protocol payloads are stored/traced trimmed (engine defensive normalize) (0.2601ms)
+✖ persistDeferred with no prior book falls back to an empty executor and the deferred correction still dispatches on turn/end (review gap) (0.2667ms)
+✖ failed handoff reaches the onFail successor via the deferred path, persisted in pendingClaim + the durable mirror (AC1/AC2/AC4) (0.3363ms)
+✖ failed handoff reaches the onFail successor when the worker already settled — immediate dispatch (AC4) (0.2589ms)
+✖ completed handoff framing is unchanged; identical input yields an identical dispatch for both outcomes (AC3) (0.306ms)
+✖ failed handoff survives NEED_CONTEXT resume token rotation (AC5) (0.3478ms)
+✖ deferred failed-handoff survives a host-restart-equivalent: resume re-delivers the persisted mirror (AC5 crash window) (0.32ms)
+✖ REJECT of a failed claim keeps the handoff in previousClaim and quotes it in the correction; ACCEPT of the re-claim routes by the FINAL claim (AC6) (0.2871ms)
+✖ failed without onFail BLOCKs with the claim consumed; resume takes the actor path with no handoff injection (AC7) (0.271ms)
+✖ incident regression: failed handoff from decide-pr reaches the re-dispatched implement AND compacts the reused developer (AC8) (0.4493ms)
+✔ Role and Judge continuation use host distinct-turn queue with exact Manager authority (3.8657ms)
+✔ cold actor: materialize → compactNow → dispose, role route passed to resume (0.8418ms)
+✔ cold actor: null compact result continues with cold-noop detail and still disposes (0.3289ms)
+✔ cold actor: ManualCompactionError fail-closes but the materialization is still released (0.439ms)
+✔ cold actor: resume failure fail-closes without compact or dispose (0.3828ms)
+✔ cold actor: dispose failure fail-closes (a leaked resident agent would break the followup) (0.3339ms)
+✔ cold actor with no role model and no frozen route resumes with undefined agentOptions (0.5589ms)
+✔ resident idle actor: compacted in place, never materialized (0.242ms)
+✔ resident busy actor (Judge raced the actor turn tail): fails closed (0.3366ms)
+✔ resident actor non-busy manual failure fail-closes (0.3885ms)
+✔ missing compaction service fails closed without touching the registry (0.2599ms)
+✔ unmapped role is a no-op (0.2434ms)
+✔ turn/end binds its exact completed turn, never a later dispatch (2.5805ms)
+✔ safe inspection waits exact Agent, rejects job tail and retains cold/orphan evidence (1.653ms)
+✔ parseJudgeClaim accepts ACCEPT/REJECT/NEED_CONTEXT (A1 v2) (2.2424ms)
+✔ parseJudgeClaim rejects invalid shapes (0.344ms)
+✔ T2 Judge packet preserves the actual handoff literally, without a summary (0.6572ms)
+✔ renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_claim protocol (0.3628ms)
+✔ renderJudgePrompt renders the [previous rejection] evidence before the claim (A1 §7.1) (0.2642ms)
+✔ renderJudgePrompt renders an empty transcript placeholder (0.1927ms)
+✔ projectNodeLocal projects only post-boundary user/manager/actor messages, ordered by time (9.9809ms)
+✔ projectNodeLocal excludes pre-boundary actor history via the dispatch message id (A1 AC2/AC3) (0.9803ms)
+✔ projectNodeLocal fails CLOSED when the dispatch message id is missing (A1 R2: no time fallback) (0.7295ms)
+✔ ACTOR projection keeps coordinator relay dispatch text; MANAGER projection drops it (A1 R5/R6) (0.7142ms)
+✔ target host Workflow queue provenance projects only for the Actor and only after its dispatch (0.9891ms)
+✔ the A3 submission constraint is stripped from the projected dispatch text (A3 R1/AC6) (0.6731ms)
+✔ stripping preserves the surrounding instruction and handoff text verbatim (A3 AC3) (0.5184ms)
+✔ manager-session user messages project as USER, assistant output as MANAGER (A1 R3) (0.4615ms)
+✔ equal-time cross-session events order by stable session id, seq only within a session (A1 R3/AC4) (6.7917ms)
+✔ messageText extracts only text blocks (0.2276ms)
+✔ projectSessionSurface filters plugin/user and assistant text (0.9269ms)
+✔ parseOriginRepo handles git ssh form (1.95ms)
+✔ parseOriginRepo handles https form (0.451ms)
+✔ parseOriginRepo rejects non-github remotes (0.2095ms)
+✔ runProgram captures output of a real command (193.8537ms)
+✔ runProgram reports ENOENT for missing commands (4.1967ms)
+✔ buildGhArgs never emits jq pipelines and encodes the query (2.2991ms)
+✖ node_resolve_program advances to a non-END target without staying blocked (1.275ms)
+✔ ghApi FAIL paths return ERROR not a malformed pipeline (3.3368ms)
+✔ builtin program catalog exposes the two fixed ids (0.2807ms)
+✔ role model route resolves: override > def > inherit (2.3535ms)
+✔ judge route resolves: override > def > inherit (0.2971ms)
+✔ role deny list (0.2306ms)
+✔ judge spawn plan: fixed allow-list + persona + route (0.2779ms)
+✔ judge label carries the current node id (0.1605ms)
+✔ judge allow-list contains the fixed read-only tools plus judge_claim (0.1741ms)
+✔ callStack token/node drift fails closed and leaves execution and events unchanged (65.076ms)
+✔ competing SQLite CAS writers cannot overwrite a winner or cross workspace Run identity (95.8513ms)
+✔ Manager controls Role BLOCK, but sibling mapping drift cannot impersonate the current dispatch (100.4803ms)
+✔ Manager Actor needs its exact message for claim/BLOCK, and accepted claim prevents later Actor BLOCK (36.8058ms)
+✔ BLOCK event failure preserves dispatch qualification; successful BLOCK refuses later claim (48.8373ms)
+✔ ACCEPT and successor entered failure commits neither work order nor events; exact Judge can retry once (74.944ms)
+✔ Store rejects mutable input/snapshot and BLOCK retains the workspace slot (44.1401ms)
+✔ legacy state fails closed without creating empty replacement tables or changing original data (13.0789ms)
+✔ claim event failure rolls back current work; original dispatch retries and survives SQLite reopen (64.0425ms)
+✔ start persists root input before dispatch; claim waits for its Actor tail (64.3468ms)
+✔ END final handoff persists; a retired read-only Judge missing end does not lock workspace (90.8532ms)
+✔ work order transitions retain best-effort redacted trace without using it as state (88.9931ms)
+✔ Actor tail and stale turn-end cannot start a Judge; interrupt acceptance is not settlement (55.0987ms)
+✔ same Role across visits reuses Session and compacts; old dispatch cannot claim current visit (96.0426ms)
+✔ a block while Role safety check waits prevents subsequent compact and dispatch (78.8175ms)
+✖ T2: invalid runtime claims do not persist or consume the dispatch (69.7408ms)
+✖ T2: NEED_CONTEXT followup and restart rebuild judge the same failed handoff (46.7092ms)
+✖ T2: correction and explicit Judge respawn keep the full single claim (66.2866ms)
+✖ T2: accepted handoff is identical in Judge, successor and durable END result (50.6291ms)
+✔ state db path is under workflows (0.8893ms)
+✖ create + get roundtrip (33.4249ms)
+✖ incompatible state rejects access and mutations without changing original rows (40.4941ms)
+✖ create on a running row conflicts (26.7771ms)
+✖ completed row allows a new start (overwrite) (39.4603ms)
+✖ updateRow with stale version throws (30.7128ms)
+✖ deleteRow is idempotent (29.8015ms)
+✖ multiple workspaces are independent (31.0179ms)
+✖ invariants: completed requires empty stack + null reason (5.9325ms)
+✖ invariants: completed with non-empty stack is rejected (1.1979ms)
+✖ invariants: blocked requires non-empty reason (1.8146ms)
+✖ invariants: roleActors/modelOverrides keys are validated (0.5329ms)
+✔ invariants: nodeToken must be UUID (0.3367ms)
+✔ topFrame returns the deepest frame (0.1068ms)
+✔ eleven workflow tools + judge_claim/judge_respawn are registered (2.5456ms)
+✔ node_claim routes to host.claim and concludes the turn on success (1.8891ms)
+✔ node_block routes to host.block and concludes the turn on success (0.9406ms)
+✔ node_resume routes to host.resume (0.46ms)
+✔ node_run_program routes to host.runProgram (0.374ms)
+✔ node_resolve_program routes to host.resolveProgram (0.3542ms)
+✔ workflow_set_role_model routes to host.setRoleModel (0.447ms)
+✔ workflow_status renders host status (0.5874ms)
+✔ judge_claim routes to host.judgeClaim and concludes the turn on success (1.0984ms)
+✔ trim-bounded payloads reach the host trimmed — a whitespace bomb never lands (A1 review fix) (0.9295ms)
+✔ T2 public schema rejects legacy fields and invalid handoff symmetrically (2.6672ms)
+✔ judge_respawn routes to host.respawnJudge (0.5213ms)
+✔ inspection wrappers reject when authorize fails (0.2567ms)
+✔ authorize denial surfaces in control tools (0.1602ms)
+✔ target host Session snapshot binds native claim to its dispatch, excluding later turns (3.8126ms)
+✔ target host Code Mode snapshot binds claim/block only with the real root and subcall (1.0359ms)
+✔ dsh-flow with no arguments returns usage (0.5094ms)
+✔ dsh-flow list renders entries and diagnostics (0.2597ms)
+✔ dsh-flow start parses workflow id and extra text (0.3216ms)
+✔ dsh-flow start rejects a missing workflow id (0.1217ms)
+✔ dsh-flow start rejects invalid workflow ids (0.1339ms)
+✔ dsh-flow status renders host status (0.2081ms)
+✔ dsh-flow unknown verb returns usage (0.1478ms)
+✔ runLogDir: config path stem becomes sibling directory (1.5795ms)
+✔ lineTimestamp: [YYYY-MM-DD HH:mm:ss] local-time format (9.2074ms)
+✔ createRunLog: creates sibling directory and yyyyMMdd-HHmmss-<runId8>.txt file (5.3144ms)
+✔ appendLine: appends timestamped lines, accumulating content (9.536ms)
+✔ createRunLog: unwritable location returns undefined without throwing (3.6158ms)
+✔ appendLine: unwritable target is silently ignored and reports false (A3 §10) (1.9616ms)
+✔ shortId: first 8 chars (0.2872ms)
+✔ bounded: clamps to the protocol bound and marks truncation (A3 §4) (0.1779ms)
+✔ jsonField: escapes free text onto one line; null for absent (A3 §3) (0.7076ms)
+✔ traceEvent: key=value tokens in insertion order; undefined omitted, null kept (0.7459ms)
+✔ traceEvent: a raw string LOOKING like escaped JSON is re-checked (A3 review S1: no multi-line injection) (0.2446ms)
+✔ redact: credential-shaped substrings never survive jsonField (A3 AC10) (0.2165ms)
+✔ native path: collects the turn user/message ids up to the tool call (10.9208ms)
+✔ native path: mid-turn steers join the id set (set membership, not first-message) (0.6082ms)
+✔ native path: an old turn cannot see a newer dispatch id (0.551ms)
+✔ Code Mode path: subCallId + rootCallId double binding locates the root run_code turn (0.8177ms)
+✔ Code Mode path: nested run_code resolves through the shared rootCallId (0.3678ms)
+✔ fail-closed: forged code-style callId without a matching start event (0.2806ms)
+✔ fail-closed: start event exists but rootCallId does not match (1.4985ms)
+✔ fail-closed: subCallId matches but the root tool/call is missing (0.3282ms)
+✔ fail-closed: unknown callId anywhere (0.2261ms)
+✔ fail-closed: tool/call without a numeric turn field (0.3344ms)
+✔ fail-closed: turn/start mismatch while scanning back (log anomaly) (0.1772ms)
+✔ fail-closed: log truncated before the turn start (0.1328ms)
+✔ fail-closed: empty log (0.1239ms)
+ℹ tests 245
+ℹ suites 0
+ℹ pass 138
+ℹ fail 107
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1156.1608
+
+✖ failing tests:
+
+test at test\engine.test.ts:214:1
+✖ startRun persists and dispatches the root node to the manager (29.9275ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:217:19)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)
+
+test at test\engine.test.ts:229:1
+✖ claim spawns a judge, judge_claim PASS advances and defers next dispatch until turn end (1.0201ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:231:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:259:1
+✖ real ordering: worker turn settles before the verdict — no false BLOCK, dispatch happens (F1/F2) (1.7211ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:261:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:282:1
+✖ claim outcome failed + ACCEPT maps to the FAIL edge; no onFail edge blocks (AC6) (0.9303ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:284:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:293:1
+✖ NEED_CONTEXT verdict blocks and keeps the judge session (0.7814ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:295:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:306:1
+✖ resume in judgment phase with judgeSessionId followups the same judge (A4 AC3) (0.7375ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:308:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:321:1
+✖ resume in judgment phase without judgeSessionId spawns a fresh judge (A4 AC4) (0.7467ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:323:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:336:1
+✖ judge_respawn drains the old judge and spawns a new one (A4 AC5) (1.8403ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:338:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:352:1
+✖ judge_respawn preparation failure leaves the old blocked Judge mapping untouched (0.9861ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:354:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:371:1
+✖ judge technical fault (spawn failure) blocks with a judge fault detail (A4 AC1) (0.9663ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:373:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:390:1
+✖ spawn failure clears the never-admitted reserved Judge id so node_resume rebuilds (A4 R4/R8) (0.7223ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:392:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:409:1
+✖ judge turn ended without judge_claim blocks with a fault detail and KEEPS judgeSessionId (A4 R5) (0.5586ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:411:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:429:1
+✖ stale judge spawn is drained when the run changes during materialization (A1 R11) (0.4677ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:431:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:447:1
+✖ failed stale respawn cannot block a replacement run (0.4834ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:449:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:473:1
+✖ stale judge_claim from an old judge session is rejected (A1 AC9) (0.6131ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:475:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:483:1
+✖ claims carry no token — the lease is the token truth (A1 AC2) (0.4515ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:485:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:499:1
+✖ claim from a non-executor is rejected (0.4275ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:501:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:510:1
+✖ claim on non-running run is rejected (0.4104ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:512:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:520:1
+✖ second claim on the same token is rejected (judge already spawned) (0.399ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:522:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:536:1
+✖ AC1: a claim for an advanced-but-not-dispatched node is rejected without state mutation or judge spawn (0.337ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:538:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:553:1
+✖ AC1: a claim against a pendingDispatch book (node advanced, dispatch deferred) is rejected (0.2937ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:555:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:572:1
+✖ AC3: a stale turn (old dispatch id only) cannot claim the new dispatch (0.3992ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:574:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:593:1
+✖ AC4: claim-then-block and block-then-claim on one dispatch are both rejected (0.3711ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:595:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:617:1
+✖ A1 §3.2 acceptance boundary: a failed acceptance put leaves the lease unconsumed and retryable (0.2746ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:619:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:631:1
+✖ A1 §3.2: a failed BLOCK put keeps the book intact for a verbatim retry (0.2719ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:633:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:643:1
+✖ A1 §5.2: Manager node_block on a builtin-program node is control-plane (no lease required) (2.3096ms)
+  TypeError: Cannot read properties of undefined (reading 'judgeSessionId')
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:693:73)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:703:1
+✖ A1 §5.2: Manager node_block on a role-executor actor node is control-plane (no lease) (0.6091ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:705:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:724:1
+✖ turn ended without any accepted result blocks the node and notifies the manager (A3 AC5) (0.4717ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:726:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:734:1
+✖ turn ended by a non-executor session is ignored (0.4768ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:736:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:742:1
+✖ resume rotates the token and re-dispatches (0.4831ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:744:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:754:1
+✖ resume by a non-manager is rejected (0.4301ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:756:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:764:1
+✖ restart reconciliation blocks every running row (0.4313ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:766:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:772:1
+✖ restart reconciliation clears a reserved Judge id whose Session never materialized (0.6061ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:774:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:792:1
+✖ restart reconciliation keeps an existing Judge session id (0.6504ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:794:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:803:1
+✖ restart reconciliation contains a row conflict and continues with later workspaces (2.098ms)
+  AssertionError [ERR_ASSERTION]: later row is still reconciled
+  + actual - expected
+  
+  + 'running'
+  - 'blocked'
+  
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:846:10)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 'running',
+    expected: 'blocked',
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test\engine.test.ts:849:1
+✖ reset removes the row (0.6887ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:851:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:856:1
+✖ role model override is rejected while the role actor turn is active; idle actor is replaced (0.6931ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:858:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:879:1
+✖ model override routes are trim-normalized and capped (A1 D3) (0.5226ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:881:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:902:1
+✖ node-boundary compact runs before dispatching a fresh role node (A2 AC1) (0.3815ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:904:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:915:1
+✖ compact failure blocks the node and notifies the Manager (A2 AC5/R4) (0.3634ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:917:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:932:1
+✖ same-node resume of a role actor retains the boundary and skips compact (A1 R4/AC5, A2 R6) (0.3796ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:934:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:960:1
+✖ handoff survives NEED_CONTEXT resume token rotation (S3/A4 R9) (0.3698ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:962:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:987:1
+✖ handoff survives a host-restart-equivalent: a fresh engine over durable state (方案 2) (0.3967ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:989:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1031:1
+✖ first role creation skips compact (A2 AC3) (0.3754ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1033:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1043:1
+✖ builtin-program dispatch does not inject the submission constraint (A3 AC2) (2.2422ms)
+  TypeError: Cannot read properties of undefined (reading 'judgeSessionId')
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1095:73)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1149:1
+✖ child-workflow pushes a frame and dispatches the child start node (0.5182ms)
+  TypeError: Cannot read properties of undefined (reading 'callStack')
+      at topFrame (file:///D:/project/my/dsh-workflow-plugins/src/state/invariants.ts:87:21)
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1152:22)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1162:1
+✖ child END pops the frame and treats the parent node as PASS (0.2029ms)
+  TypeError: Cannot read properties of undefined (reading 'callStack')
+      at topFrame (file:///D:/project/my/dsh-workflow-plugins/src/state/invariants.ts:87:21)
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1165:22)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1206:1
+✖ startRun creates the trace log and writes the START line with fmt=3 (AC1) (4.0331ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1210:21
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1207:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1222:1
+✖ accepted claim and judge verdict produce CLAIM + JUDGE + ROUTE lines (AC1/AC3) (5.0927ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1225:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1223:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1236:1
+✖ CLAIM free text is JSON-escaped onto one line and bounded at protocol max (AC9) (5.529ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1239:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1237:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1251:1
+✖ over-bound handoff is rejected before tracing or persistence (T2) (4.7448ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1254:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1252:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1263:1
+✖ FAIL routes to onFail, and FAIL -> BLOCK emits ROUTE + BLOCK source=judge (AC5) (5.8447ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1297:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1295:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1320:1
+✖ JUDGE NEED_CONTEXT emits JUDGE + BLOCK source=judge, then RESUME target=judge (AC4-correction base/AC5/AC6) (3.6523ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1323:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1321:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1339:1
+✖ node_block by the Manager emits BLOCK source=manager; actor-path resume emits RESUME target=actor (AC5/AC6) (2.8988ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1342:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1340:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1355:1
+✖ actor turn ending without a result emits BLOCK source=actor (AC5: no 52-minute silence) (3.0954ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1358:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1356:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1367:1
+✖ judge_respawn emits RESPAWN with the fresh judge prefix (AC6) (3.9077ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1370:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1368:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1383:1
+✖ trace log covers child PUSH/POP with explicit pairing (AC7) (1.6131ms)
+  TypeError: Cannot read properties of undefined (reading 'callStack')
+      at topFrame (file:///D:/project/my/dsh-workflow-plugins/src/state/invariants.ts:87:21)
+      at file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1387:24
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1384:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1404:1
+✖ builtin program outcomes emit PROGRAM (+BLOCK on ERROR) and RESOLVE on manual fix (AC8/AC6) (2.7867ms)
+  TypeError: Cannot read properties of undefined (reading 'callStack')
+      at topFrame (file:///D:/project/my/dsh-workflow-plugins/src/state/invariants.ts:87:21)
+      at file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1434:19
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1420:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1453:1
+✖ model override emits MODEL with ids only (AC6/AC10) (5.1711ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1456:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1454:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1464:1
+✖ host-restart reconcile emits BLOCK source=restart into the SAME log via the durable traceLogPath (AC5/AC6) (3.8617ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1467:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1465:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1478:1
+✖ log creation/append failure never breaks run startup or routing, and warns once (AC11/§10) (2.431ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1488:21)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1510:1
+✖ untrusted raw identifier values cannot inject extra log lines (A3 review S1 / AC9) (4.6248ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1513:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1511:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1526:1
+✖ credential-like text is redacted at the trace boundary (A3 AC10 fixture) (4.185ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1529:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1527:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1552:1
+✖ crash seam: CLAIM is written BEFORE persistence — at-least-once with a distinguishable orphan (A3 review S4 / PRD §10) (3.2092ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1555:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1553:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1571:1
+✖ crash seam: RESPAWN is written BEFORE persistence — at-least-once like CLAIM (A3 review round 2 / PRD §10) (4.9009ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1574:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1572:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1592:1
+✖ conflicted startRun leaves NO orphan trace file (A3 review round 2: common conflict path is clean) (3.4134ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1595:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1593:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1606:1
+✖ credential-shaped raw identifiers (provider/model) are redacted, but legit structural ids survive (A3 review round 3 S1 / AC10/AC1) (2.8513ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1609:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1607:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1619:1
+✖ legit secret-pattern-colliding workflow id is NOT redacted (A3 review round 3 S1 regression) (4.42ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1647:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1634:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1659:1
+✖ crash seam: START is written BEFORE state.create — failure leaves a declared orphan file (A3 review round 3 Spec2 / PRD §10) (3.4956ms)
+  AssertionError [ERR_ASSERTION]: The input did not match the regular expression /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] START workflow=eng-test run=cb6d7d20-6b10-4129-9454-b06f7fec1261 fmt=3\n/. Input:
+  
+  ''
+  
+      at file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1669:12
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1660:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: '',
+    expected: /^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] START workflow=eng-test run=cb6d7d20-6b10-4129-9454-b06f7fec1261 fmt=3\n/,
+    operator: 'match',
+    diff: 'simple'
+  }
+
+test at test\engine.test.ts:1685:1
+✖ AC7/AC8: REJECT re-dispatches the SAME node to the ORIGINAL actor with full evidence (4.6183ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1688:5
+      at async withTempCatalog (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1188:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1686:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1737:1
+✖ AC10: the retired Judge cannot submit again after a REJECT (token + session double rejection) (0.6177ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1739:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1754:1
+✖ AC9 regression: NEED_CONTEXT and judge faults keep pendingCorrection for packet rebuilds (0.3409ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1756:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1778:1
+✖ Manager-path correction evidence: the next packet carries [previous rejection] without projection (review 补充4) (0.2907ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1780:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1798:1
+✖ correction dispatch failure BLOCKs with the evidence intact; resume rebuilds the full message (review 补充4/中5) (0.2797ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1800:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1820:1
+✖ correction × host restart: reconcile BLOCKs, resume rebuilds the evidence (review 第二轮) (0.2942ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1822:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1844:1
+✖ override guard: pendingClaim/pendingCorrection reject overrides for the CURRENT node role (mapping-independent) (0.2974ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1846:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1870:1
+✖ blocked escape hatch: correction BLOCK + override resets the boundary → resume spawns a replacement with the evidence (review 第二轮) (0.311ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1872:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1900:1
+✖ NEED_CONTEXT BLOCK + override keeps the boundary (idle-replacement semantics, corner recorded) (0.3511ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1902:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1918:1
+✖ model override on a completed run does not throw (review: empty callStack) (0.2832ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1920:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1939:1
+✖ a sibling role actor cannot block a node whose executor mapping drifted (lease fail-closed) (0.2479ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1941:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1958:1
+✖ the Manager-executor node requires the lease for the Manager itself (empty turn ids rejected) (0.2255ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1960:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1971:1
+✖ padded protocol payloads are stored/traced trimmed (engine defensive normalize) (0.2601ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1973:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:1986:1
+✖ persistDeferred with no prior book falls back to an empty executor and the deferred correction still dispatches on turn/end (review gap) (0.2667ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:1988:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2049:1
+✖ failed handoff reaches the onFail successor via the deferred path, persisted in pendingClaim + the durable mirror (AC1/AC2/AC4) (0.3363ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2051:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2079:1
+✖ failed handoff reaches the onFail successor when the worker already settled — immediate dispatch (AC4) (0.2589ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2081:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2096:1
+✖ completed handoff framing is unchanged; identical input yields an identical dispatch for both outcomes (AC3) (0.306ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async runOnce (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2099:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2107:16)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2118:1
+✖ failed handoff survives NEED_CONTEXT resume token rotation (AC5) (0.3478ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2120:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2136:1
+✖ deferred failed-handoff survives a host-restart-equivalent: resume re-delivers the persisted mirror (AC5 crash window) (0.32ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2138:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2164:1
+✖ REJECT of a failed claim keeps the handoff in previousClaim and quotes it in the correction; ACCEPT of the re-claim routes by the FINAL claim (AC6) (0.2871ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2166:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2192:1
+✖ failed without onFail BLOCKs with the claim consumed; resume takes the actor path with no handoff injection (AC7) (0.271ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2194:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\engine.test.ts:2253:1
+✖ incident regression: failed handoff from decide-pr reaches the re-dispatched implement AND compacts the reused developer (AC8) (0.4493ms)
+  TypeError: Cannot read properties of undefined (reading 'phase')
+      at WorkflowEngine.drive (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:160:11)
+      at async WorkflowEngine.startRun (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:150:5)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/engine.test.ts:2268:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\review-fixes.test.ts:48:1
+✖ node_resolve_program advances to a non-END target without staying blocked (1.275ms)
+  TypeError: Cannot read properties of undefined (reading 'callStack')
+      at topFrame (file:///D:/project/my/dsh-workflow-plugins/src/state/invariants.ts:87:21)
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/review-fixes.test.ts:79:18)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\single-handoff.test.ts:49:1
+✖ T2: invalid runtime claims do not persist or consume the dispatch (69.7408ms)
+  TypeError: Cannot read properties of undefined (reading 'claim')
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/single-handoff.test.ts:61:36)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:385:3)
+
+test at test\single-handoff.test.ts:65:1
+✖ T2: NEED_CONTEXT followup and restart rebuild judge the same failed handoff (46.7092ms)
+  TypeError: Cannot read properties of undefined (reading 'includes')
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/single-handoff.test.ts:74:31)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\single-handoff.test.ts:87:1
+✖ T2: correction and explicit Judge respawn keep the full single claim (66.2866ms)
+  TypeError: Cannot read properties of undefined (reading 'messageId')
+      at matches (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:68:56)
+      at WorkflowEngine.handleTurnEnded (file:///D:/project/my/dsh-workflow-plugins/src/engine/engine.ts:301:19)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/single-handoff.test.ts:94:5)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\single-handoff.test.ts:109:1
+✖ T2: accepted handoff is identical in Judge, successor and durable END result (50.6291ms)
+  TypeError: Cannot read properties of undefined (reading 'claim')
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/single-handoff.test.ts:115:36)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\state.test.ts:57:1
+✖ create + get roundtrip (33.4249ms)
+  Error: state is not lossless JSON
+      at json (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:66:37)
+      at StateStore.createRow (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:207:49)
+      at file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:60:29
+      at withStore (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:46:11)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:58:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\state.test.ts:69:1
+✖ incompatible state rejects access and mutations without changing original rows (40.4941ms)
+  Error: no such table: workflow_state
+      at file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:78:13
+      at withStore (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:46:11)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:70:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7) {
+    code: 'ERR_SQLITE_ERROR',
+    errcode: 1,
+    errstr: 'SQL logic error'
+  }
+
+test at test\state.test.ts:106:1
+✖ create on a running row conflicts (26.7771ms)
+  Error: state is not lossless JSON
+      at json (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:66:37)
+      at StateStore.createRow (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:207:49)
+      at file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:108:17
+      at withStore (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:46:11)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:107:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\state.test.ts:113:1
+✖ completed row allows a new start (overwrite) (39.4603ms)
+  Error: state is not lossless JSON
+      at json (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:66:37)
+      at StateStore.createRow (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:207:49)
+      at file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:119:17
+      at withStore (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:46:11)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:114:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\state.test.ts:126:1
+✖ updateRow with stale version throws (30.7128ms)
+  Error: state is not lossless JSON
+      at json (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:66:37)
+      at StateStore.createRow (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:207:49)
+      at file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:129:17
+      at withStore (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:46:11)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:127:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\state.test.ts:136:1
+✖ deleteRow is idempotent (29.8015ms)
+  Error: state is not lossless JSON
+      at json (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:66:37)
+      at StateStore.createRow (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:207:49)
+      at file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:138:17
+      at withStore (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:46:11)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:137:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\state.test.ts:145:1
+✖ multiple workspaces are independent (31.0179ms)
+  Error: state is not lossless JSON
+      at json (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:66:37)
+      at StateStore.createRow (file:///D:/project/my/dsh-workflow-plugins/src/state/store.ts:207:49)
+      at file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:147:17
+      at withStore (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:46:11)
+      at async TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:146:3)
+      at async Test.run (node:internal/test_runner/test:1313:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7)
+
+test at test\state.test.ts:156:1
+✖ invariants: completed requires empty stack + null reason (5.9325ms)
+  AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+  
+    assert.ok(checkStateInvariants(run).some(p => p.includes('null blockReason')))
+  
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:161:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1306:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:897:18)
+      at Test.postRun (node:internal/test_runner/test:1447:19)
+      at Test.run (node:internal/test_runner/test:1372:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at test\state.test.ts:166:1
+✖ invariants: completed with non-empty stack is rejected (1.1979ms)
+  AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+  
+    assert.ok(checkStateInvariants(run).some(p => p.includes('empty callStack')))
+  
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:170:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1306:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:897:18)
+      at Test.postRun (node:internal/test_runner/test:1447:19)
+      at Test.run (node:internal/test_runner/test:1372:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at test\state.test.ts:173:1
+✖ invariants: blocked requires non-empty reason (1.8146ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+  + [
+  +   '[\n' +
+  +     '  {\n' +
+  +     '    "expected": "string",\n' +
+  +     '    "code": "invalid_type",\n' +
+  +     '    "path": [\n' +
+  +     '      "currentExecutionId"\n' +
+  +     '    ],\n' +
+  +     '    "message": "Invalid input: expected string, received undefined"\n' +
+  +     '  },\n' +
+  +     '  {\n' +
+  +     '    "code": "unrecognized_keys",\n' +
+  +     '    "keys": [\n' +
+  +     '      "nodeBoundary"\n' +
+  +     '    ],\n' +
+  +     '    "path": [],\n' +
+  +     '    "message": "Unrecognized key: \\"nodeBoundary\\""\n' +
+  +     '  }\n' +
+  +     ']'
+  + ]
+  - []
+  
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:179:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1306:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:897:18)
+      at Test.postRun (node:internal/test_runner/test:1447:19)
+      at Test.run (node:internal/test_runner/test:1372:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [ '[\n  {\n    "expected": "string",\n    "code": "invalid_type",\n    "path": [\n      "currentExecutionId"\n    ],\n    "message": "Invalid input: expected string, received undefined"\n  },\n  {\n    "code": "unrecognized_keys",\n    "keys": [\n      "nodeBoundary"\n    ],\n    "path": [],\n    "message": "Unrecognized key: \\"nodeBoundary\\""\n  }\n]' ],
+    expected: [],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at test\state.test.ts:182:1
+✖ invariants: roleActors/modelOverrides keys are validated (0.5329ms)
+  AssertionError [ERR_ASSERTION]: The expression evaluated to a falsy value:
+  
+    assert.ok(checkStateInvariants(run).some(p => p.includes('roleActors')))
+  
+      at TestContext.<anonymous> (file:///D:/project/my/dsh-workflow-plugins/test/state.test.ts:185:10)
+      at Test.runInAsyncScope (node:async_hooks:227:14)
+      at Test.run (node:internal/test_runner/test:1306:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:897:18)
+      at Test.postRun (node:internal/test_runner/test:1447:19)
+      at Test.run (node:internal/test_runner/test:1372:12)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:897:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+ ELIFECYCLE  Test failed. See above for more details.
