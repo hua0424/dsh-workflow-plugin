@@ -15,6 +15,15 @@ const CONFIG = {
     checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } }, onPass: 'END',
   } } },
 }
+function configWithWorker(onFail?: string): import('../src/types.ts').WorkflowConfig {
+  const config = structuredClone(CONFIG) as import('../src/types.ts').WorkflowConfig
+  config.workflow.nodes.plan.onPass = 'work'
+  config.workflow.nodes.work = {
+    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
+    checker: CONFIG.workflow.nodes.plan.checker, onPass: 'END', ...(onFail ? { onFail } : {}),
+  }
+  return config
+}
 function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   const home = mkdtempSync(join(tmpdir(), 'workflow-t3-'))
   const store = new StateStore(home)
@@ -23,7 +32,14 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   const followups: Array<import('../src/engine/engine.ts').JudgeSpawnInput> = []
   const drains: string[] = []
   const compacts: string[] = []
+  const lifecycle: string[] = []
   let safe = true
+  let compactOutcome: { ok: boolean; detail?: string } = { ok: true }
+  let compactGate: Promise<void> | undefined
+  let compactEntered: (() => void) | undefined
+  let boundaryPersistGate: Promise<void> | undefined
+  let boundaryPersistEntered: (() => void) | undefined
+  let roleSendFailure: Error | undefined
   let followupFailure: Error | undefined
   let drainFailure: Error | undefined
   let drainGate: Promise<void> | undefined
@@ -34,24 +50,40 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
     const messageId = `message-${messages.length + 1}`
     messages.push({ sessionId, messageId, text }); return { messageId }
   }
+  const stateHost = makeStateHost(store)
+  const put = stateHost.put
+  stateHost.put = async (ws, run, expectedVersion, changes) => {
+    await put(ws, run, expectedVersion, changes)
+    const gate = boundaryPersistGate
+    if (gate && changes.some(change => change.events.length === 0 && change.execution.roleBoundaryPrepared
+      && change.execution.dispatch?.messageId === undefined)) {
+      boundaryPersistGate = undefined
+      boundaryPersistEntered?.()
+      await gate
+    }
+  }
   const engine = new WorkflowEngine({
     async steerManager(_run, text) { return send('manager', text) },
-    async sendRoleActor(_run, _role, text) { return send('worker-session', text) },
+    async sendRoleActor(_run, role, text) { lifecycle.push(`send:${role}`); if (roleSendFailure) throw roleSendFailure; return send('worker-session', text) },
     managerSessionSeq() { return 0 },
   }, {
     async ensureRoleActor(_run, _role, text) { return { ...send('worker-session', text), childId: 'worker-session' } },
     async startJudge(_run, input) { judges.push(input); return { ...send(input.judgeSessionId, 'Judge'), judgeSessionId: input.judgeSessionId } },
-    async safeToInspect(sessionId) { if (safetyGate && gatedSession === sessionId) await safetyGate; return safe },
+    async safeToInspect(sessionId) { lifecycle.push(`safe:${sessionId}`); if (safetyGate && gatedSession === sessionId) await safetyGate; return safe },
     async retireJudge() {}, async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); drainEntered?.(); if (drainGate) await drainGate; if (drainFailure) throw drainFailure },
-    async compactRoleActor(_run, role) { compacts.push(role); return { ok: true } },
+    async compactRoleActor(_run, role) { compacts.push(role); lifecycle.push(`compact:${role}`); compactEntered?.(); if (compactGate) await compactGate; return compactOutcome },
     async followupJudge(_run, judgeSessionId, input) { followups.push(input); if (followupFailure) throw followupFailure; return send(judgeSessionId, 'Judge followup') },
     async judgeSessionExists() { return true },
-  }, { async run() { throw new Error('T7') } }, makeStateHost(store))
+  }, { async run() { throw new Error('T7') } }, stateHost)
   engine.cwdResolver = async () => home
   const caller = (dispatch: { sessionId?: string; messageId?: string }) => ({ sessionId: dispatch.sessionId!, turnUserMessageIds: new Set([dispatch.messageId!]) })
   return {
-    home, store, engine, messages, judges, followups, drains, compacts, caller,
+    home, store, engine, messages, judges, followups, drains, compacts, lifecycle, caller,
     setSafe(value: boolean) { safe = value },
+    setCompactOutcome(value: { ok: boolean; detail?: string }) { compactOutcome = value },
+    setCompactGate(gate: Promise<void> | undefined, onEntered?: () => void) { compactGate = gate; compactEntered = onEntered },
+    setBoundaryPersistGate(gate: Promise<void> | undefined, onEntered?: () => void) { boundaryPersistGate = gate; boundaryPersistEntered = onEntered },
+    setRoleSendFailure(error: Error | undefined) { roleSendFailure = error },
     setFollowupFailure(error: Error | undefined) { followupFailure = error },
     setDrainFailure(error: Error | undefined) { drainFailure = error },
     setDrainGate(gate: Promise<void> | undefined, onEntered?: () => void) { drainGate = gate; drainEntered = onEntered },
@@ -187,9 +219,9 @@ test('failed Actor arrangement transaction leaves visible ready BLOCK without di
   } finally { faults.close(); h.close() }
 })
 
-async function acceptCurrent(h: ReturnType<typeof harness>, handoff = 'artifact') {
+async function acceptCurrent(h: ReturnType<typeof harness>, handoff = 'artifact', outcome: 'completed' | 'failed' = 'completed') {
   const actor = h.caller((await h.row()).execution.dispatch!)
-  assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff }, actor)).ok, true)
+  assert.equal((await h.engine.handleClaim('ws', { outcome, handoff }, actor)).ok, true)
   await h.engine.handleTurnEnded('ws', actor)
   const row = await h.row()
   const judge = h.caller(row.execution.judge!)
@@ -252,10 +284,7 @@ test('Actor tail and stale turn-end cannot start a Judge; interrupt acceptance i
 })
 
 test('same Role across visits reuses Session and compacts; old dispatch cannot claim current visit', async () => {
-  const config = structuredClone(CONFIG) as import('../src/types.ts').WorkflowConfig
-  config.workflow.nodes.plan.onPass = 'work'
-  config.workflow.nodes.work = { execution: { type: 'actor-task', role: 'worker', instruction: 'Work' }, checker: CONFIG.workflow.nodes.plan.checker, onPass: 'END', onFail: 'work' }
-  const h = harness(config)
+  const h = harness(configWithWorker('work'))
   try {
     await h.start()
     await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'root handoff'))
@@ -272,10 +301,12 @@ test('same Role across visits reuses Session and compacts; old dispatch cannot c
     assert.equal(successor.execution.nodeId, first.execution.nodeId)
     assert.equal(successor.execution.input, 'repair this artifact')
     assert.equal(successor.execution.phase, 'ready')
+    h.lifecycle.length = 0
     await h.engine.handleTurnEnded('ws', judge)
     const current = await h.row()
     assert.equal(current.execution.dispatch?.sessionId, 'worker-session')
     assert.deepEqual(h.compacts, ['worker'])
+    assert.deepEqual(h.lifecycle, [`safe:${judge.sessionId}`, 'safe:worker-session', 'compact:worker', 'send:worker'])
     assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'stale' }, oldCaller)).ok, false)
     await h.engine.handleTurnEnded('ws', oldCaller)
     assert.equal((await h.row()).run.status, 'running')
@@ -283,6 +314,130 @@ test('same Role across visits reuses Session and compacts; old dispatch cannot c
     await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'final repaired artifact'))
     assert.equal((await h.row()).run.status, 'completed')
   } finally { h.close() }
+})
+
+test('same-execution Role correction reuses its Session without node-boundary compact', async () => {
+  const h = harness(configWithWorker())
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan ready'))
+    const before = await h.row()
+    assert.deepEqual(before.run.roleActors, { worker: 'worker-session' })
+    assert.deepEqual(h.compacts, [], 'first Role use and Manager work do not compact')
+    const actor = h.caller(before.execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    const checking = await h.row()
+    const sentBefore = h.messages.filter(message => message.sessionId === 'worker-session').length
+    await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'REJECT', 'fix the evidence', h.caller(checking.execution.judge!))
+    const corrected = await h.row()
+    assert.equal(corrected.execution.executionId, before.execution.executionId)
+    assert.equal(corrected.execution.dispatch?.sessionId, 'worker-session')
+    assert.notEqual(corrected.execution.dispatch?.id, before.execution.dispatch?.id)
+    assert.deepEqual(h.compacts, [])
+    assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore + 1)
+  } finally { h.close() }
+})
+
+test('node-boundary compact failure BLOCKs the new visit and resume retries the mandatory compact before dispatch', async () => {
+  const h = harness(configWithWorker('work'))
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan ready'))
+    const firstWorkerJudge = await acceptCurrent(h, 'worker handoff', 'failed')
+    h.setCompactOutcome({ ok: false, detail: 'compaction busy: maintenance raced' })
+    const sentBefore = h.messages.filter(message => message.sessionId === 'worker-session').length
+    await h.engine.handleTurnEnded('ws', firstWorkerJudge)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.equal(blocked.execution.phase, 'working')
+    assert.equal(blocked.execution.roleBoundaryPrepared, false)
+    assert.equal(blocked.execution.input, 'worker handoff')
+    assert.equal(blocked.execution.dispatch?.sessionId, 'worker-session')
+    assert.equal(blocked.execution.dispatch?.messageId, undefined)
+    assert.match(blocked.execution.blockReason!, /node-boundary compact failed: compaction busy/)
+    assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore)
+
+    h.setCompactOutcome({ ok: true })
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Retry the required Node-boundary compact.', 'manager', 'actor')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.run.status, 'running')
+    assert.ok(resumed.execution.dispatch?.messageId)
+    assert.deepEqual(h.compacts, ['worker', 'worker'])
+    assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore + 1)
+  } finally { h.close() }
+})
+
+test('compact success is persisted before Queue so send failure resume does not compact the new visit twice', async () => {
+  const h = harness(configWithWorker('work'))
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan ready'))
+    const firstWorkerJudge = await acceptCurrent(h, 'worker handoff', 'failed')
+    h.setRoleSendFailure(new Error('Queue acceptance unknown'))
+    const sentBefore = h.messages.filter(message => message.sessionId === 'worker-session').length
+    await h.engine.handleTurnEnded('ws', firstWorkerJudge)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.equal(blocked.execution.roleBoundaryPrepared, true)
+    assert.equal(blocked.execution.dispatch?.messageId, undefined)
+    assert.match(blocked.execution.blockReason!, /Queue acceptance unknown/)
+    assert.deepEqual(h.compacts, ['worker'])
+    assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore)
+
+    h.setRoleSendFailure(undefined)
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Retry Queue after checking the prior acceptance.', 'manager', 'actor')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.run.status, 'running')
+    assert.ok(resumed.execution.dispatch?.messageId)
+    assert.deepEqual(h.compacts, ['worker'], 'the persisted boundary fact prevents a second compact')
+    assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore + 1)
+  } finally { h.close() }
+})
+
+test('a concurrent BLOCK after boundary preparation persists prevents the stale Host Queue send', async () => {
+  const h = harness(configWithWorker('work'))
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan ready'))
+    const firstWorkerJudge = await acceptCurrent(h, 'worker handoff', 'failed')
+    h.setBoundaryPersistGate(release.promise, entered.resolve)
+    const sentBefore = h.messages.filter(message => message.sessionId === 'worker-session').length
+    const pending = h.engine.handleTurnEnded('ws', firstWorkerJudge)
+    await entered.promise
+    const prepared = await h.row()
+    assert.equal(prepared.execution.roleBoundaryPrepared, true)
+    assert.equal((await h.engine.handleBlock('ws', prepared.execution.nodeToken, 'stop after boundary preparation', {
+      sessionId: 'manager', turnUserMessageIds: new Set(),
+    })).ok, true)
+    release.resolve(); await pending
+    assert.equal((await h.row()).run.status, 'blocked')
+    assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore)
+  } finally { release.resolve(); h.close() }
+})
+
+test('a concurrent BLOCK while compact awaits prevents the stale new-visit dispatch', async () => {
+  const h = harness(configWithWorker('work'))
+  const entered = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan ready'))
+    const firstWorkerJudge = await acceptCurrent(h, 'worker handoff', 'failed')
+    h.setCompactGate(release.promise, entered.resolve)
+    const sentBefore = h.messages.filter(message => message.sessionId === 'worker-session').length
+    const pending = h.engine.handleTurnEnded('ws', firstWorkerJudge)
+    await entered.promise
+    const arranged = await h.row()
+    assert.equal((await h.engine.handleBlock('ws', arranged.execution.nodeToken, 'stop while compacting', {
+      sessionId: 'manager', turnUserMessageIds: new Set(),
+    })).ok, true)
+    release.resolve(); await pending
+    assert.equal((await h.row()).run.status, 'blocked')
+    assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore)
+  } finally { release.resolve(); h.close() }
 })
 
 test('REJECT keeps one execution and binds the corrected claim to a fresh Judge turn', async () => {

@@ -21,7 +21,7 @@ const runSchema = z.object({
 const executionSchema = z.object({
   executionId: text, runId: text, workflowId: text, nodeId: text, nodeToken: z.uuid(),
   visit: z.number().int().positive(), revision, input: z.string(),
-  phase: z.enum(['ready', 'working', 'checking', 'settling', 'exited']),
+  phase: z.enum(['ready', 'working', 'checking', 'settling', 'exited']), roleBoundaryPrepared: z.boolean(),
   predecessorId: text.optional(), successorId: text.optional(),
   boundary: z.object({ dispatchedAt: revision, managerFromSeq: revision, executorSessionId: text.optional(), executorDispatchMessageId: text.optional() }).strict().optional(),
   dispatch: dispatch.optional(), claim: claim.optional(), previousClaim: claim.optional(),

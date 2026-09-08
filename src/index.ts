@@ -21,7 +21,7 @@ import { makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
 
 export const name = 'dsh-agent-team-workflow'
-export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions'] as const
+export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs', 'compaction'] as const
 
 export function apply(ctx: Context) {
   const home = resolveDshHome()

@@ -5,7 +5,7 @@
  */
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v5' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v6' as const
 export const STATE_TABLE_NAME = 'runs' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
@@ -234,6 +234,8 @@ export interface NodeExecution {
   revision: number
   input: string
   phase: 'ready' | 'working' | 'checking' | 'settling' | 'exited'
+  /** 当前 visit 的 Role 边界 compact 已完成或无需执行；Host Queue 前持久化。 */
+  roleBoundaryPrepared: boolean
   predecessorId?: string
   successorId?: string
   boundary?: NodeContextBoundary

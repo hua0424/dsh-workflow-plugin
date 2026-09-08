@@ -1,6 +1,6 @@
 # Domain Glossary
 
-> `refact` 当前为 T4 集成态，未部署。目标架构见 `docs/design/node-execution-runtime.md`，当前工单范围见 `docs/work-plans/runtime-refact.md`。以下区分已接通行为与后续票，不能据此操作真实 Run。
+> `refact` 当前为 T5 集成态，未部署。目标架构见 `docs/design/node-execution-runtime.md`，当前工单范围见 `docs/work-plans/runtime-refact.md`。以下区分已接通行为与后续票，不能据此操作真实 Run。
 
 ## Agent Team Workflow / Manager
 
@@ -30,7 +30,7 @@ nodeToken 是控制面过期检查，不是授权凭证。**旧 Turn 即使查�
 
 ## Node Execution（工作单）
 
-`node_executions` 是一次 Graph visit 的当前事实。每次沿 Edge 进入（包括自环、回边）创建独立 execution；REJECT、补充、普通 resume 与 Judge respawn 更新同一单，完整重启/replacement 仍由 T5/T6 收口。
+`node_executions` 是一次 Graph visit 的当前事实。每次沿 Edge 进入（包括自环、回边）创建独立 execution；REJECT、补充、普通 resume 与 Judge respawn 更新同一单，完整重启/replacement 仍由 T6 收口。
 
 工作单保存 input 快照、phase、Actor 安排与真实 Host message ID、Node-local 投影边界、当前 claim/Judge/判定、版本与暂停原因，以及前驱/后继关联。input 进入时固定，不被前驱修改或后续补充覆盖。
 
@@ -64,7 +64,7 @@ Role Definition 定义 persona、model route 与 tool restrictions，Preset 提�
 
 Role 首次使用创建 Session；再次承担新 visit 前先确认无冲突活动，再执行 Node 边界 compact，之后用 exact Host queue 交付本次 input/instruction/criteria。T1 已对齐 `queueHostSubagentPrompt` 与 `snapshotEvents()`，不用 nearest-step sendMessage 替代独立派发。
 
-compact 的 cold-resume/维护/释放在 Host Adapter 内。成功与合法 no-op 可以继续；缺服务、busy、失败均不伪装成功。T5 补齐完整生命周期与 replacement 策略。
+T5 已把 `jobs`、`compaction` 设为标准 Web composition 的 required service，并在 Host Adapter 内用正式接口完成 cold resume（无 prompt）、idle maintenance、释放和原 Session Queue 续接。成功与合法 no-range 可继续；busy、压缩/resume/dispose 失败均不伪装成功，工作单保留并 BLOCK。完整中断恢复/replacement 留 T6。
 
 ## Judge Role / Judge Agent
 
@@ -80,7 +80,7 @@ Judgment Packet 来自本次工作单 input、instruction/criteria、claim.hando
 
 claim 入库之后先等待**对应真实 Actor Turn**安全收口，才启动 Judge。旧 Session 的其他 Turn/end 不能结算当前 visit。interrupt 回执不代表工具/后台任务已经停止。
 
-session/event 同步回调只捕获该 turn/end 对应的精确消息集合和 Agent 生命周期引用，退出 append publication lock 后由 setImmediate 触发 Runtime。Host 使用 whenIdle、inbox、已知后代和 jobs 原生事实检查普通工具 tail、running/stopping/未知任务；可疑 orphan 或无法可靠确认时 fail-closed，交 Manager 核查。
+session/event 同步回调只捕获该 turn/end 对应的精确消息集合和 Agent 生命周期引用，退出 append publication lock 后由 setImmediate 触发 Runtime。Host 使用正式 jobs、whenIdle、inbox、durable descendant 与 live registry 检查当代/observed exact Agent：durable inactive descendant 无 Activation 可通过；running 却不可观察、live 非 idle、pending inbox、非 terminal job、diagnostic 或 orphan 证据均 fail-closed。orphan 不因 job 行消失洗白，插件 effect 清理观察引用。这里只保证可观察 Host 活动，不证明未登记外部副作用停止。
 
 Judge ACCEPT 工具内只提交事务和撤权，**不 await 自己 whenIdle/drain**。后继派发由该 Judge 工具返回后的精确收口事件驱动。Root END 已完成时，Actor 已在判断前安全收口，撤权后的只读 Judge 不因缺失最终 turn/end 另占 workspace 或形成新的业务锁。未结束 Run 的 cold/无可靠证据活动仍保守 BLOCK；恢复/授权退出由 T6/T8 接通。
 
@@ -92,7 +92,7 @@ T4 支持显式 node_block、Actor 未提交结果、Judge 未提交结论、NEE
 
 以下入口在 refact 集成期明确拒绝，无旧引擎 fallback：
 
-- T5/T6：完整 Role replacement、冷重启与未知外部进度恢复；T4 只接通正常 BLOCK 补充/返工/判定闭环。
+- T6：完整 Role replacement、冷重启与未知外部进度恢复；T5 只完成正常运行内的 Role Session 复用、Node 边界 compact 与可观察 Host 安全收口。
 - T7：Builtin Program、Child Workflow、FAIL 无出口重开与 model replacement 控制。含 Program/Child 的 Root 图在启动前拒绝；已有 onFail 的 Actor FAIL 对称交接已支持。
 - T8：授权 Reset/terminated 与旧格式备份退出；当前 Reset 不删除材料。
 
@@ -100,7 +100,7 @@ Program 的目标合同为参数先存再执行、确定结果交接、不确定
 
 ## Workflow State Store / 可观察性
 
-使用内置 node:sqlite、WAL、单连接短事务；SQL active-workspace unique/FK 与 Run/Execution CAS 共同保护位置。旧 workflow_state 有行、未知格式/坏快照必须明确拒绝，保留原数据，不静默迁移或创建空库遮盖。T4 为一代 previous claim/Judge 的严格身份关联将 State format 升为 `agent-workflow-state/v5`；旧 v3/v4 同样 fail-closed，不静默迁移。
+使用内置 node:sqlite、WAL、单连接短事务；SQL active-workspace unique/FK 与 Run/Execution CAS 共同保护位置。旧 workflow_state 有行、未知格式/坏快照必须明确拒绝，保留原数据，不静默迁移或创建空库遮盖。T5 为新 visit 的 Role 边界准备事实将 State format 升为 `agent-workflow-state/v6`；旧 v3/v4/v5 同样 fail-closed，不静默迁移。
 
 命令仍是 `/dsh-flow list|start <id> [extra text]|status|reset`，Root extraText 在首次派发前作为 input 保存。默认 status 只展示当前 execution/phase/角色/原因、input/handoff 有界预览与恢复方向，不暴露完整 claim、previousClaim、Manager context 或内部 dispatch；最终通知 best-effort，失败不撤销终局事务。
 

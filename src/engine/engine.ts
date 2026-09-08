@@ -110,8 +110,11 @@ export class WorkflowEngine {
   }
   private newExecution(run: RunState, input: string, visit: number, predecessorId?: string): NodeExecution {
     const frame = topFrame(run)
+    const execution = this.nodeAt(run, frame)?.execution
+    const role = execution?.type === 'actor-task' ? execution.role : undefined
+    const roleBoundaryPrepared = role === undefined || role === 'manager' || run.roleActors[role] === undefined
     return { executionId: run.currentExecutionId, runId: run.runId, ...frame, visit, revision: 0,
-      input, phase: 'ready', inputVersion: 1, blockReason: null, enteredAt: new Date().toISOString(),
+      input, phase: 'ready', roleBoundaryPrepared, inputVersion: 1, blockReason: null, enteredAt: new Date().toISOString(),
       ...(predecessorId === undefined ? {} : { predecessorId }) }
   }
   private judgePacket(run: RunState, e: NodeExecution, cwd: string): JudgeSpawnInput {
@@ -200,7 +203,6 @@ export class WorkflowEngine {
       const node = this.nodeAt(run, topFrame(run))!
       if (node.execution.type !== 'actor-task') { await this.blockRow(ws, row, 'T7 execution type not connected'); return }
       const role = node.execution.role!
-      const sameExecutionRedispatch = e.dispatch !== undefined
       const previousDispatchSettled = e.dispatch?.settled === true
       let committedVersion = version
       try {
@@ -209,15 +211,22 @@ export class WorkflowEngine {
         e.boundary = { dispatchedAt: Date.now(), managerFromSeq: this.targets.managerSessionSeq(run), ...(role === 'manager' ? {} : e.dispatch.sessionId ? { executorSessionId: e.dispatch.sessionId } : {}) }
         await this.state.put(ws, run, version, [change(e, 'actor-arranged')])
         committedVersion = version + 1
-        const arrangedVersion = committedVersion
+        let arrangedVersion = committedVersion
         if (role !== 'manager' && run.roleActors[role]) {
           if (!previousDispatchSettled) {
             if (!await this.subagents.safeToInspect(run.roleActors[role])) throw new WorkflowError('previous Role execution is not safely closed')
             if (!await this.stillCurrent(ws, e, arrangedVersion)) return
           }
-          if (!sameExecutionRedispatch) {
+          if (!e.roleBoundaryPrepared) {
             const compact = await this.subagents.compactRoleActor(run, role)
             if (!compact.ok) throw new WorkflowError(`node-boundary compact failed: ${compact.detail ?? 'unknown'}`)
+            const current = await this.stillCurrent(ws, e, arrangedVersion)
+            if (!current) return
+            current.execution.roleBoundaryPrepared = true
+            await this.state.put(ws, current.run, current.version, [change(current.execution)])
+            e.roleBoundaryPrepared = true
+            arrangedVersion = current.version + 1
+            committedVersion = arrangedVersion
             if (!await this.stillCurrent(ws, e, arrangedVersion)) return
           }
         }

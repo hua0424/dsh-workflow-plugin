@@ -4,32 +4,35 @@ DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
 workflows (`agent-workflow/v2`).
 
 **当前 `refact` 是集成中间态，不能部署，也不能宣称全量验收通过。**
-T1–T4 已完成；三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT、
-Manager 定向 resume/Judge respawn、争议协议和 Manager-only 有界历史。`scripts/e2e-smoke.mjs`
-已迁移到真实 Runtime/SQLite 的 T4 受控闭环；这仍不是目标宿主真实 Run。T3 基线见
-[`T3 报告`](docs/test-reports/issue-10-work-order-loop.md)，最终全量验收仍由后续票/T9 收口。
-T4 验证：build、121 项相关测试、T3 smoke、迁移后的 e2e 通过；全量 274 项中
-171 PASS、103 项已知后票失败（旧 `engine` MemState、旧单表 `state` 与 T7 Program），0 skip/cancelled。
+T1–T5 已完成；三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT、
+Manager 定向 resume/Judge respawn、争议协议和 Manager-only 有界历史。Role Actor 在新 visit
+（含自环）前安全收口并 compact 后续接同一 continuable Session；同 execution 返工/resume
+不做 Node 边界 compact。`scripts/e2e-smoke.mjs` 已迁移到真实 Runtime/SQLite 的受控闭环；
+这仍不是目标宿主真实 Run。T3 基线见 [`T3 报告`](docs/test-reports/issue-10-work-order-loop.md)，
+最终全量验收仍由后续票/T9 收口。T5 本地验证已通过 frozen install、build、145 项相关测试、
+T3 smoke 与受控 e2e；全量 286 项为 183 PASS / 103 个已知后票 FAIL / 0 skip/cancelled
+（旧 `engine` 91、旧 `state` 11、T7 Program 1）。
 
 当前 claim 合同为 `node_claim({outcome, handoff})`：handoff 必填、trim 后
 1..8000 字符，completed/failed 对称，END 也交付；明确拒绝旧 summary/handoffContext。
 claim 不携带 nodeToken，运行时核对真实派发身份。Judge、Manager、后继与最终结果
 共用原文，无独立摘要或 fallback。Catalog v2 保持，v1 Catalog 被拒绝。
 
-State format 为 `agent-workflow-state/v5`：`runs`、`node_executions`、
-`node_execution_events` 保存位置、当前工作与关键快照；旧 v3/v4/legacy 有数据时保留并
+State format 为 `agent-workflow-state/v6`：`runs`、`node_executions`、
+`node_execution_events` 保存位置、当前工作与关键快照；旧 v3/v4/v5/legacy 有数据时保留并
 fail-closed，不静默迁移。REJECT 后当前单保留一代完整 previous claim/Judge 与统一 judgment 关联，
 补充/恢复材料只保留当前完整版本，旧值由 events 解释；正常恢复不回放 events。
 
 当前接通 Actor Task 的 ACCEPT/REJECT/NEED_CONTEXT、正常 BLOCK 的 auto/actor/judge
 resume、有效 claim 下 Judge respawn，以及 `workflow_status` 的 Manager-only 当前 Run
-execution 历史分页（stable after、limit ≤ 50）。完整冷重启/replacement、Program/Child、
-授权 Reset/旧格式退出仍按 T5–T8 接通；未支持入口明确拒绝，不退回旧引擎。
+execution 历史分页（stable after、limit ≤ 50）。标准 Web profile 必须提供正式 `jobs` 与
+`compaction` service；缺服务时插件不激活，不维护 optional fallback。完整冷重启/replacement、
+Program/Child、授权 Reset/旧格式退出仍按 T6–T8 接通；未支持入口明确拒绝，不退回旧引擎。
 真实宿主组合验收留 T9，受控派发 smoke 不代表真实外部模型执行。
 
 ## Current documentation
 
-- [`CONTEXT.md`](CONTEXT.md) — 当前领域术语与 T4 实现边界。
+- [`CONTEXT.md`](CONTEXT.md) — 当前领域术语与 T5 实现边界。
 - [`docs/design/node-execution-runtime.md`](docs/design/node-execution-runtime.md) / [`spec`](docs/specs/node-execution-runtime.md) — refact 目标设计与验收基线。
 - [`docs/work-plans/runtime-refact.md`](docs/work-plans/runtime-refact.md) — 工单依赖、当前进度与分票证据。
 - [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — 旧版设计参考，不覆盖 refact 新规格。
@@ -60,7 +63,7 @@ cordis.patch.yml      profile-bundle patch (inserts the plugin row)
 
 - Build: `pnpm run build` (tsc → `lib/`). The profile bundle loads `lib/index.js`; Node refuses to strip `.ts` inside node_modules, so the compiled output is the runtime artifact.
 - Test: `pnpm test` (node:test, runs the `.ts` sources directly — no build step needed).
-- Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles.
+- Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.1.2-rc.1` types and are required Host services, not plugin runtime dependencies.
 
 ## Installation (development)
 

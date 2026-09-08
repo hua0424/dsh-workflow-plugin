@@ -7,6 +7,7 @@ import { validateAndNormalize } from '../src/catalog/validate.ts'
 import { makeDispatchTargets, makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
 import { queueSubagentPrompt, type HostPromptQueue } from '@deepseek-ai/dsh-subagent/internal'
 import { MessageId } from '@deepseek-ai/dsh-llm'
+import { ManualCompactionError, type ManualCompactionErrorCode } from '@deepseek-ai/dsh-compaction'
 import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
@@ -56,7 +57,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
     },
   }
   const adapters: HostAdapters = {
-    ctx: { subagents: queue } as unknown as Context,
+    ctx: { subagents: queue, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
     cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
@@ -88,7 +89,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
 test('Judge drain propagates missing Manager and host drain failures', async () => {
   const manager = { session: { id: 'manager' } } as unknown as Agent
   const adapters: HostAdapters = {
-    ctx: { subagents: { drainContinuableChildren: async () => { throw new Error('drain failed') } } } as unknown as Context,
+    ctx: { subagents: { drainContinuableChildren: async () => { throw new Error('drain failed') } }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
     cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
@@ -99,14 +100,14 @@ test('Judge drain propagates missing Manager and host drain failures', async () 
   await assert.rejects(host.drainJudge(makeRun(undefined), 'judge-old'), /manager agent is not live/)
 })
 
-function manualError(code: string, message: string): Error & { code: string } {
-  return Object.assign(new Error(message), { name: 'ManualCompactionError', code })
+function manualError(code: ManualCompactionErrorCode, message: string): ManualCompactionError {
+  return new ManualCompactionError(code, message)
 }
 
 interface CompactCall { agent: Agent; }
 interface ResumeCall { resumeSessionId: unknown; agentOptions: unknown }
 
-/** Fake host surface for compactRoleActor: ctx.get('compaction'), ctx.agents. */
+/** compactRoleActor 测试 Host：required ctx.compaction 与 ctx.agents。 */
 function makeHost(options: {
   resident?: Agent
   resumeResult?: { handle?: AgentHandle; error?: Error }
@@ -127,7 +128,10 @@ function makeHost(options: {
   }
   const materialized: Agent = { id: 'materialized' } as unknown as Agent
   const fakeCtx = {
-    get: (key: string) => (key === 'compaction' ? compaction : undefined),
+    get: () => { throw new Error('required compaction must use Context.compaction') },
+    compaction,
+    jobs: { list: () => [], onJobDone: () => () => {} },
+    effect: () => {},
     agents: {
       get: (id: unknown) => (options.resident !== undefined && id === 'sess-dev' ? options.resident : undefined),
       resume: async (call: ResumeCall) => {
@@ -163,6 +167,7 @@ test('cold actor: materialize → compactNow → dispose, role route passed to r
   assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
   assert.equal(f.resumes.length, 1)
   assert.equal(f.resumes[0]!.resumeSessionId, 'sess-dev')
+  assert.deepEqual(Object.keys(f.resumes[0]!).sort(), ['agentOptions', 'resumeSessionId'], 'cold maintenance resume carries no prompt')
   assert.deepEqual(f.resumes[0]!.agentOptions, { provider: 'p1', model: 'm1' })
   assert.equal(f.compacts[0]!.agent, materialized)
 })
@@ -181,6 +186,18 @@ test('cold actor: ManualCompactionError fail-closes but the materialization is s
   const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
   assert.deepEqual(result, { ok: false, detail: 'compaction summary: summarizer exploded' })
   assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
+})
+
+test('cold actor: busy and ordinary compact failures remain distinct and always dispose', async () => {
+  for (const [error, detail] of [
+    [manualError('busy', 'maintenance raced'), 'compaction busy: maintenance raced'],
+    [new Error('unexpected backend fault'), 'unexpected backend fault'],
+  ] as const) {
+    const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+    const { host } = makeHost({ ...f, compactError: error })
+    assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: false, detail })
+    assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
+  }
 })
 
 test('cold actor: resume failure fail-closes without compact or dispose', async () => {
@@ -221,6 +238,13 @@ test('resident idle actor: compacted in place, never materialized', async () => 
   assert.equal(f.resumes.length, 0)
 })
 
+test('resident idle actor: null is a successful no-range result', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+  const { host } = makeHost({ ...f, resident: { id: 'sess-dev' } as unknown as Agent, compactResult: null })
+  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'no compactable range' })
+  assert.deepEqual(f.events, ['compact'])
+})
+
 test('resident busy actor (Judge raced the actor turn tail): fails closed', async () => {
   const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
   const { host } = makeHost({ ...f, resident: {} as Agent, compactError: manualError('busy', 'agent is active') })
@@ -234,25 +258,6 @@ test('resident actor non-busy manual failure fail-closes', async () => {
   const { host } = makeHost({ ...f, resident: {} as Agent, compactError: manualError('commit', 'durable marker lost') })
   const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
   assert.deepEqual(result, { ok: false, detail: 'compaction commit: durable marker lost' })
-})
-
-test('missing compaction service fails closed without touching the registry', async () => {
-  const events: string[] = []
-  const fakeCtx = {
-    get: () => undefined,
-    agents: { get: () => undefined, resume: async () => { throw new Error('must not resume') } },
-  }
-  const adapters = {
-    ctx: fakeCtx as unknown as Context,
-    managerAgentOf: () => undefined,
-    cwdOfManager: async () => undefined,
-    registerJudgeSession: () => {},
-    revokeJudgeSession: () => {},
-    registerRoleActorSession: () => {},
-  }
-  const host = makeSubagentHost(adapters, () => ({}))
-  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: false, detail: 'no compaction service' })
-  assert.deepEqual(events, [])
 })
 
 test('unmapped role is a no-op', async () => {

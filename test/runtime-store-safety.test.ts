@@ -420,6 +420,32 @@ test('v4 three-table state is rejected without changing its rows or version', as
   } finally { f.cleanup() }
 })
 
+test('v5 state without the Role boundary fact is rejected without changing its rows or version', async () => {
+  const f = await fixture()
+  try {
+    f.store.close()
+    f.sql.exec(`
+      UPDATE runs SET format_version = 'agent-workflow-state/v5';
+      UPDATE node_executions SET snapshot_json = json_remove(snapshot_json, '$.roleBoundaryPrepared');
+      UPDATE node_execution_events SET snapshot_json = json_remove(snapshot_json, '$.roleBoundaryPrepared');
+      PRAGMA user_version = 5;
+    `)
+    const before = {
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }
+    assert.throws(() => new StateStore(f.home), /incompatible state format/)
+    assert.deepEqual({
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }, before)
+  } finally { f.cleanup() }
+})
+
 test('claim event failure rolls back current work; original dispatch retries and survives SQLite reopen', async () => {
   const f = await fixture()
   try {
