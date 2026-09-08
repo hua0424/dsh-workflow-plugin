@@ -7,7 +7,7 @@ This project uses codebase-memory-mcp to maintain a knowledge graph of the codeb
 ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.
 
 - Project name (pass as `project` in every call): `D-project-my-dsh-workflow-plugins`
-- Index mode: `moderate`（496 nodes / 1418 edges，含 SEMANTICALLY_RELATED 语义边，支持 semantic_query；T4 follow-up 后刷新）
+- Index mode: `moderate`（496 nodes / 1432 edges，含 SEMANTICALLY_RELATED 语义边，支持 semantic_query；T5 后刷新）
 - In DSH all tools carry the `mcp__codebase-memory__` prefix.
 
 ## Priority Order
