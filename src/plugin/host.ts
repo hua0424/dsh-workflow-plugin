@@ -2,9 +2,13 @@
  * Host adapters: wire the real DSH services into the engine's narrow
  * interfaces (design §2.3 deployment / §4 runtime).
  */
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import { ManualCompactionError } from '@deepseek-ai/dsh-compaction'
+import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-compaction'
+// Type-only：让 ctx.get('agentPresets') 解析到 preset 服务类型。运行期该服务
+// 经 DSH 安装解析；roster 缺席（base-only profile / 旧版 dsh）时 get 返回
+// undefined，走宿主平面回退——与 dsh-subagent/child-agent.ts 的用法一致。
+import type {} from '@deepseek-ai/dsh-agent-presets'
 import type { JobStatus } from '@deepseek-ai/dsh-jobs'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -123,6 +127,28 @@ function errorDetail(error: unknown): string {
 function compactErrorDetail(error: unknown): string {
   if (error instanceof ManualCompactionError) return `compaction ${error.code}: ${error.message}`
   return errorDetail(error)
+}
+
+/**
+ * 该 agent 会话平面所拥有的压缩后端。
+ *
+ * dsh 0.1.1-rc.7 引入 agent presets 后，`compaction` 不再挂载在宿主平面
+ * （web-app bundle 显式禁用宿主平面副本），而是由每个会话的 preset 在自己
+ * 的 isolate 域挂载；宿主插件行 inject 它只会永久 `waiting for service` 并
+ * 卡死 boot。按目标 agent 解析：先经 `agentPresets.serviceFor` 取该 agent
+ * 自己的 preset 实例（"请求来自会话外部、操作目标是某个会话"的规范读法），
+ * preset 未挂或 roster 缺席再回退宿主平面挂载（base-only profile / 旧版
+ * dsh）；两者都无 → undefined，调用方按良性跳过处理并告警。
+ */
+function compactionFor(ctx: Context, agent: Agent): CompactionEngine | undefined {
+  const presets = ctx.get('agentPresets')
+  return presets?.serviceFor(agent, 'compaction') ?? ctx.get('compaction')
+}
+
+/** 无任何压缩后端时的良性跳过（与 "no actor mapped" 同级），附 host 侧告警。 */
+function noCompactionBackend(ctx: Context, sessionId: string): { ok: true; detail: string } {
+  ctx.logger.warn(`workflow boundary compact skipped: session ${sessionId} has no compaction backend (neither its agent preset nor the host plane mounts one)`)
+  return { ok: true, detail: 'no compaction backend; boundary compact skipped' }
 }
 
 export function makeStateHost(source: StateStore | (() => StateStore)): StateHost {
@@ -429,9 +455,11 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // cold-resumes the compacted surface.
       const resident = adapters.ctx.agents.get(childId as SessionId)
       if (resident !== undefined) {
+        const compaction = compactionFor(adapters.ctx, resident)
+        if (compaction === undefined) return noCompactionBackend(adapters.ctx, childId)
         // 收口后仍可能被外部唤醒；busy 必须拒绝，不能以FIFO排队冒充compact通过。
         try {
-          const result = await adapters.ctx.compaction.compactNow(resident, signal)
+          const result = await compaction.compactNow(resident, signal)
           if (result === null) return { ok: true, detail: 'no compactable range' }
           return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
         } catch (error) {
@@ -442,6 +470,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         }
       }
       const route = resolveRoleModel(run, roleKey, frozenRoute())
+      const manager = adapters.managerAgentOf(run)
       let handle: AgentHandle
       try {
         handle = await adapters.ctx.agents.resume({
@@ -452,16 +481,38 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
           // latest routed request), so the summary model may differ from the
           // actor's model.
           agentOptions: route.provider !== undefined || route.model !== undefined ? route : undefined,
+          // Maintenance materialization must join the parent preset too: the
+          // compaction backend (and every model-facing row) lives in the
+          // preset's isolate domain, and an unjoined agent resolves no backend
+          // via serviceFor (dsh also warns about publishing unjoined agents).
+          // Mirrors applyChildComposition's join step only — persona/tool
+          // filter are turn-facing and irrelevant to a compact-only surface.
+          // Join failure degrades to the host-plane fallback / skip below, so
+          // it is logged rather than failing the resume.
+          ...(manager === undefined ? {} : {
+            setup: ((agentCtx: Context) => {
+              try {
+                agentCtx.get('agentPresets')?.composeFrom(agentCtx, manager.ctx)
+              } catch (error) {
+                agentCtx.logger.warn(`workflow maintenance preset join skipped: ${errorDetail(error)}`)
+              }
+            }) satisfies AgentSetup,
+          }),
         })
       } catch (error) {
         return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
       }
       let outcome: { ok: boolean; detail: string }
       try {
-        const result = await adapters.ctx.compaction.compactNow(handle.agent, signal)
-        outcome = result === null
-          ? { ok: true, detail: 'cold: no compactable range' }
-          : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+        const compaction = compactionFor(adapters.ctx, handle.agent)
+        if (compaction === undefined) {
+          outcome = noCompactionBackend(adapters.ctx, childId)
+        } else {
+          const result = await compaction.compactNow(handle.agent, signal)
+          outcome = result === null
+            ? { ok: true, detail: 'cold: no compactable range' }
+            : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+        }
       } catch (error) {
         outcome = { ok: false, detail: compactErrorDetail(error) }
       }

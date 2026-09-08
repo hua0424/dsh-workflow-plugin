@@ -107,18 +107,25 @@ function manualError(code: ManualCompactionErrorCode, message: string): ManualCo
 }
 
 interface CompactCall { agent: Agent; }
-interface ResumeCall { resumeSessionId: unknown; agentOptions: unknown }
+interface ResumeCall { resumeSessionId: unknown; agentOptions: unknown; setup?: unknown }
 
-/** compactRoleActor 测试 Host：required ctx.compaction 与 ctx.agents。 */
+/**
+ * compactRoleActor 测试 Host：compaction 经 `ctx.get('compaction')` 解析
+ * （preset serviceFor 优先、宿主平面回退），可选 presets roster 与告警记录。
+ */
 function makeHost(options: {
   resident?: Agent
+  manager?: Agent
   resumeResult?: { handle?: AgentHandle; error?: Error }
   compactResult?: { shadowedSeqs: number[]; shadowedTokenCount: number } | null
   compactError?: Error
   disposeError?: Error
+  presets?: { serviceFor: (agent: Agent, name: string) => unknown; composeFrom?: (agentCtx: unknown, parentCtx: unknown) => void }
+  noHostCompaction?: boolean
   events: string[]
   resumes: ResumeCall[]
   compacts: CompactCall[]
+  warns?: string[]
 }) {
   const compaction = {
     compactNow: async (agent: Agent, _signal: AbortSignal) => {
@@ -129,9 +136,15 @@ function makeHost(options: {
     },
   }
   const materialized: Agent = { id: 'materialized' } as unknown as Agent
+  const logger = { warn: (message: string) => { options.warns?.push(message) } }
+  const get = (key: string) => {
+    if (key === 'agentPresets') return options.presets
+    if (key === 'compaction') return options.noHostCompaction === true ? undefined : compaction
+    return undefined
+  }
   const fakeCtx = {
-    get: () => { throw new Error('required compaction must use Context.compaction') },
-    compaction,
+    get,
+    logger,
     jobs: { list: () => [], onJobDone: () => () => {} },
     effect: () => {},
     agents: {
@@ -140,6 +153,7 @@ function makeHost(options: {
         options.resumes.push(call)
         options.events.push('resume')
         if (options.resumeResult?.error !== undefined) throw options.resumeResult.error
+        if (call.setup !== undefined) await (call.setup as (agentCtx: unknown) => unknown)({ get, logger })
         return options.resumeResult?.handle ?? {
           agent: materialized,
           dispose: async () => {
@@ -152,7 +166,7 @@ function makeHost(options: {
   }
   const adapters = {
     ctx: fakeCtx as unknown as Context,
-    managerAgentOf: () => undefined,
+    managerAgentOf: () => options.manager,
     cwdOfManager: async () => undefined,
     registerJudgeSession: () => {},
     revokeJudgeSession: () => {},
@@ -265,6 +279,70 @@ test('resident actor non-busy manual failure fail-closes', async () => {
 test('unmapped role is a no-op', async () => {
   const { host } = makeHost({ events: [], resumes: [], compacts: [] })
   assert.deepEqual(await host.compactRoleActor(makeRun(undefined), 'developer'), { ok: true, detail: 'no actor mapped' })
+})
+
+test('preset-scoped compaction instance is preferred over the host-plane service', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+  const resident = { id: 'sess-dev' } as unknown as Agent
+  const presetCompaction = {
+    compactNow: async (agent: Agent) => {
+      f.compacts.push({ agent })
+      f.events.push('preset-compact')
+      return { shadowedSeqs: [9], shadowedTokenCount: 99 }
+    },
+  }
+  const { host } = makeHost({
+    ...f, resident,
+    presets: { serviceFor: (agent, name) => name === 'compaction' && agent === resident ? presetCompaction : undefined },
+  })
+  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'compacted 1 items (~99 tokens)' })
+  assert.deepEqual(f.events, ['preset-compact'], 'the host-plane stub (events: compact) must never run')
+})
+
+test('resident actor with no backend anywhere: benign skip plus one host warning', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const { host } = makeHost({ ...f, resident: { id: 'sess-dev' } as unknown as Agent, noHostCompaction: true })
+  const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
+  assert.equal(result.ok, true)
+  assert.match(result.detail!, /no compaction backend/)
+  assert.deepEqual(f.events, [])
+  assert.equal(f.warns.length, 1)
+})
+
+test('cold actor with no backend anywhere: still materializes and disposes, compact skipped with warning', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const { host } = makeHost({ ...f, noHostCompaction: true, compactResult: null })
+  const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
+  assert.equal(result.ok, true)
+  assert.match(result.detail!, /no compaction backend/)
+  assert.deepEqual(f.events, ['resume', 'dispose'], 'the maintenance materialization must not leak')
+  assert.equal(f.warns.length, 1)
+})
+
+test('cold maintenance resume joins the live manager preset inside the creation window', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const joins: Array<{ agentCtx: unknown; parentCtx: unknown }> = []
+  const manager = { id: 'manager', ctx: { tag: 'manager-ctx' } } as unknown as Agent
+  const { host } = makeHost({
+    ...f, manager, compactResult: null,
+    presets: {
+      serviceFor: () => undefined,
+      composeFrom: (agentCtx, parentCtx) => { joins.push({ agentCtx, parentCtx }) },
+    },
+  })
+  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'cold: no compactable range' })
+  assert.equal(typeof f.resumes[0]!.setup, 'function', 'resume must carry the joining setup when the manager is live')
+  assert.equal(joins.length, 1)
+  assert.equal((joins[0]!.parentCtx as { tag?: string }).tag, 'manager-ctx')
+  assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
+})
+
+test('cold maintenance resume carries no setup when the manager is not live', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+  const { host } = makeHost({ ...f, compactResult: null })
+  await host.compactRoleActor(makeRun('sess-dev'), 'developer')
+  assert.equal(f.resumes[0]!.setup, undefined)
+  assert.deepEqual(Object.keys(f.resumes[0]!).sort(), ['agentOptions', 'resumeSessionId'])
 })
 
 test('Role/Judge Session availability distinguishes durable absence from unreadable persistence', async () => {

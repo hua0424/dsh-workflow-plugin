@@ -11,8 +11,11 @@ function makeSafetyHost(ctx: Context, manager: Agent) {
     registerJudgeSession() {}, revokeJudgeSession() {}, registerRoleActorSession() {} } satisfies HostAdapters, () => ({}))
 }
 
-test('plugin requires the standard Web jobs and compaction services', () => {
-  assert.deepEqual(inject, ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs', 'compaction'])
+test('plugin injects the standard Web services but never compaction (preset-plane since dsh rc.7)', () => {
+  // compaction 由每个会话的 preset 在 isolate 域挂载（web-app bundle 禁用了
+  // 宿主平面副本），宿主行 inject 只会永久 pending 并卡死 boot；运行期按
+  // agent 解析（host.ts compactionFor）。
+  assert.deepEqual(inject, ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs'])
 })
 
 test('turn/end binds its exact completed turn, never a later dispatch', () => {

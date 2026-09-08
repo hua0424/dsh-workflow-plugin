@@ -21,7 +21,11 @@ import { isRootCommandAgent, makeDshFlowCommand, type CommandHost } from './comm
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
 
 export const name = 'dsh-agent-team-workflow'
-export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs', 'compaction'] as const
+// compaction 不可注入：dsh 0.1.1-rc.7 引入 agent presets 后，压缩后端移入每个
+// 会话 preset 的 isolate 域（web-app bundle 显式禁用宿主平面副本），宿主行
+// inject 它只会永久 `waiting for service: compaction` 并卡死整个 boot。
+// 改为运行期按目标 agent 解析（plugin/host.ts 的 compactionFor）。
+export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs'] as const
 
 export function apply(ctx: Context) {
   const home = resolveDshHome()

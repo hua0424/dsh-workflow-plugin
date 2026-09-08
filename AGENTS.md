@@ -90,6 +90,7 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 
 ## Gotchas
 
+- **`compaction` 不可 inject**（0.1.1-rc.7+ agent presets 起挂在每个会话 preset 的 isolate 域，web-app bundle 禁用了宿主平面副本；宿主行 inject 会永久 pending 卡死 boot）。运行期按 agent 解析：`host.ts` 的 `compactionFor`（`agentPresets.serviceFor` 优先 → 宿主平面回退 → 跳过+告警）；冷物化必须带 preset-join `setup`。详见 `docs/pending-discussions/compaction-service-plane-after-presets.md`。
 - Node 不在 node_modules 内剥 `.ts`，编译产物 `lib/` 才是运行时工件：deploy 前必须 `pnpm run build`，且每次 build 后重跑 `scripts/deploy-web.mjs`.
 - Catalog YAML 是受限单文档 YAML 1.2：禁止 duplicate key、anchor/alias/merge、custom tag、模板插值；文件名必须是小写 `[a-z][a-z0-9-]*.yaml`（拒绝 `.yml`）；invalid 文件只阻塞自身.
 - Trace log 是 best-effort 派生产物，写在 catalog 配置旁 `<catalogDir>/<workflowId>/`，失败静默、绝不阻断 Run；日志**内容**不进 SQLite，仅文件路径以可选 `traceLogPath` 元数据随行持久化（host 重启后事件仍写同一文件）.
