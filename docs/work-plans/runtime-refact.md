@@ -11,10 +11,10 @@
 | T3 | [#10](https://github.com/hua0424/dsh-workflow-plugin/issues/10) | 三表工作单 Actor/Judge 事务闭环 | #9 | 完成 |
 | T4 | [#11](https://github.com/hua0424/dsh-workflow-plugin/issues/11) | 同节点返工、历史与争议协调 | #10 | 完成（含follow-up） |
 | T5 | [#13](https://github.com/hua0424/dsh-workflow-plugin/issues/13) | Role 复用、compact 与安全收口 | #11 | 完成 |
-| T6 | [#14](https://github.com/hua0424/dsh-workflow-plugin/issues/14) | 统一中断恢复与现场检查 | #13 | 完成，待最终提交/结案 |
-| T7 | [#15](https://github.com/hua0424/dsh-workflow-plugin/issues/15) | Program/Child/FAIL 交接恢复 | #14 | 完成，待最终提交/结案 |
-| T8 | [#12](https://github.com/hua0424/dsh-workflow-plugin/issues/12) | 旧格式保护与 Reset 历史 | #10 | 完成，待最终提交/结案 |
-| T9 | [#16](https://github.com/hua0424/dsh-workflow-plugin/issues/16) | 删除旧逻辑、整体验收与文档同步 | #15、#12 | 完成，待最终提交/结案 |
+| T6 | [#14](https://github.com/hua0424/dsh-workflow-plugin/issues/14) | 统一中断恢复与现场检查 | #13 | 完成并关闭 |
+| T7 | [#15](https://github.com/hua0424/dsh-workflow-plugin/issues/15) | Program/Child/FAIL 交接恢复 | #14 | 完成并关闭 |
+| T8 | [#12](https://github.com/hua0424/dsh-workflow-plugin/issues/12) | 旧格式保护与 Reset 历史 | #10 | 完成并关闭 |
+| T9 | [#16](https://github.com/hua0424/dsh-workflow-plugin/issues/16) | 删除旧逻辑、整体验收与文档同步 | #15、#12 | 完成并关闭 |
 
 T8 与 T4–T7 的阻塞关系不同，但同一共享工作区默认顺序实施，避免同时改动状态模型。新鲜实施子会话按单票读取规格与本索引，不依赖上一票的聊天记忆。
 
@@ -42,6 +42,7 @@ T8 与 T4–T7 的阻塞关系不同，但同一共享工作区默认顺序实�
 - T7：`docs/test-reports/issue-15-program-child-fail.md`。Program 6片、Child 3片、Actor FAIL reopen、terminal effective handoff及model replacement完成；并修T6 Session availability三态/unjudged Judge followup。State v8；focused 13/13、扩展定向118/118、build通过。按统一流程未跑full/review/commit，#14/#15保持open。
 - T8：`docs/test-reports/issue-12-upgrade-reset.md`。State v9 terminated、旧历史授权、新Run安全门、StateAccess maintenance、WAL一致backup/corrupt raw archive/root全库cutover完成；focused13/13与build通过，按统一流程未commit/close。
 - T9 起始点是当前T6–T8未提交工作树。
-- T9：`docs/testing/node-execution-runtime-acceptance.md`、`docs/testing/runtime-refact-test-migration.md`、`docs/test-reports/issue-16-integrate-verify.md`。旧MemState/单表测试完成逐组迁移后删除；最终State v9唯一Runtime full 229/229、T3/e2e、真实Host interrupt A30全绿。A01–A30均PASS；审查修复A26跨Run拒绝、A30真实interrupt、root授权和事件名单源。最终Standards Hard 0（1项已登记非阻断possible）、Spec确定问题0。CBM 522 nodes/1612 edges、0 skipped/partial。
+- T9：最终实现提交`c263e64a7d69d3bacb4936654aaa595951d1d3c5`；`docs/testing/node-execution-runtime-acceptance.md`、`docs/testing/runtime-refact-test-migration.md`、`docs/test-reports/issue-16-integrate-verify.md`。旧MemState/单表测试完成逐组迁移后删除；最终State v9唯一Runtime full 229/229、T3/e2e、真实Host interrupt A30全绿。A01–A30均PASS；审查修复A26跨Run拒绝、A30真实interrupt、root授权和事件名单源。最终Standards Hard 0（1项已登记非阻断possible）、Spec确定问题0。CBM 522 nodes/1612 edges、0 skipped/partial。
+- Issue结案：#14、#15、#12、#16按依赖关闭；父规格#7独立关闭。未push、部署或操作真实Run。
 
 逐票在完成后补充测试报告/commit/审查结论。尚未完成的票不能仅凭设计或代码存在被标记通过。

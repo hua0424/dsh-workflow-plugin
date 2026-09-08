@@ -2,7 +2,7 @@
 
 - 工单：<https://github.com/hua0424/dsh-workflow-plugin/issues/16>；Parent #7。
 - 分支：refact；基线为同一未提交工作树中的T6–T8实现（最后已提交点`1db6302`）。
-- 状态：T6–T9实现、统一测试与最终双轴审查完成；A01–A30全部PASS，待最终提交并按依赖结案Issues。
+- 状态：T6–T9实现、统一测试与最终双轴审查完成；A01–A30全部PASS。实现提交`c263e64a7d69d3bacb4936654aaa595951d1d3c5`，#14/#15/#12/#16与父#7均已关闭。
 - 不修改用户示例，不push、部署或操作真实Run。
 - 用户确认：长尾问题可登记后续讨论，交付门槛聚焦主要流程与功能测试；确定性授权/数据完整性/核心验收缺陷仍必须修复。清单见`docs/pending-discussions/runtime-refact-long-tail.md`。
 

@@ -45,4 +45,4 @@ T7已修复上述三项；T9最终统一full 229/229、T3/e2e和真实Host inter
 
 ## Standards / Spec
 
-最终统一审查：Standards Hard 0（`handleResume`长度为已登记的非阻断possible judgement）；Spec确定问题0。随最终提交结案#14。
+最终统一审查：Standards Hard 0（`handleResume`长度为已登记的非阻断possible judgement）；Spec确定问题0。已随提交`c263e64`结案#14。
