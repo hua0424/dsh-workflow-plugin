@@ -5,7 +5,7 @@
  */
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v6' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v9' as const
 export const STATE_TABLE_NAME = 'runs' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
@@ -29,6 +29,7 @@ export const LIMITS = {
   /** A1 D3: model-route component caps (characters, after trim). */
   providerMax: 64,
   modelIdMax: 128,
+  programParametersMax: 8000,
 } as const
 
 export interface RoleModel {
@@ -124,7 +125,7 @@ export interface WorkflowConfig {
   childWorkflows?: Record<string, WorkflowDef>
 }
 
-export type RunStatus = 'running' | 'blocked' | 'completed'
+export type RunStatus = 'running' | 'blocked' | 'completed' | 'terminated'
 
 /**
  * The precise local cursor for one Node's context isolation (A1 R2). Built when
@@ -153,6 +154,7 @@ export interface CallFrame {
   workflowId: string
   nodeId: string
   nodeToken: string
+  executionId: string
 }
 
 export interface ModelOverride {
@@ -215,15 +217,32 @@ export type ResumeTarget = 'auto' | 'actor' | 'judge'
 
 /** 当前完整补充/恢复材料；后续补充替换它，旧值由 events 保留。 */
 export interface ExecutionResolution {
-  target: Exclude<ResumeTarget, 'auto'>
+  target: Exclude<ResumeTarget, 'auto'> | 'child'
   /** 每次 node_resume 提供的完整当前补充；respawn 不伪造补充。 */
   context?: string
   /** 最近一次 Manager 恢复/重建决定，供事件解释，不作为新 criteria。 */
   decision?: string
+  /** Judge 恢复沿普通 driver 续接持久 Session 或重新创建。 */
+  judgeMode?: 'followup' | 'fresh'
+  judgeSessionId?: string
   inputVersion: number
 }
 
-/** 一次 Graph visit 的唯一当前材料。revision 与派发/claim 身份互不替代。 */
+export interface ExecutionProgram {
+  id: string
+  parameters: Record<string, unknown>
+  result?:
+    | { kind: 'PASS' | 'FAIL'; handoff: string; reason?: string }
+    | { kind: 'ERROR'; reason: string }
+}
+
+export interface ExecutionChild {
+  workflowId: string
+  executionId: string
+  result?: { terminalExecutionId: string; handoff: string }
+}
+
+/** 一次 Graph visit 的唯一当前材料。revision 与派发/claim/Program 身份互不替代。 */
 export interface NodeExecution {
   executionId: string
   runId: string
@@ -236,6 +255,8 @@ export interface NodeExecution {
   phase: 'ready' | 'working' | 'checking' | 'settling' | 'exited'
   /** 当前 visit 的 Role 边界 compact 已完成或无需执行；Host Queue 前持久化。 */
   roleBoundaryPrepared: boolean
+  /** Host 重启已观察到；Manager resume 消费该标记，不依赖中断事件是否存在。 */
+  restartPending: boolean
   predecessorId?: string
   successorId?: string
   boundary?: NodeContextBoundary
@@ -248,16 +269,21 @@ export interface NodeExecution {
   previousJudge?: ExecutionJudge
   judgment?: ExecutionJudgment
   resolution?: ExecutionResolution
+  program?: ExecutionProgram
+  child?: ExecutionChild
   inputVersion: number
   blockReason: string | null
   enteredAt: string
   exitedAt?: string
 }
 
+export const EVENT_TYPES = ['entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited', 'blocked', 'manager-context', 'resumed', 'judge-respawned', 'interrupted', 'program-ready', 'program-arranged', 'program-result', 'program-resolved', 'child-entered', 'child-returned', 'model-changed', 'terminated'] as const
+export type NodeExecutionEventType = typeof EVENT_TYPES[number]
+
 export interface NodeExecutionEvent {
   executionId: string
   sequence: number
-  type: 'entered' | 'actor-arranged' | 'claim' | 'judge-arranged' | 'judgment' | 'exited' | 'blocked' | 'manager-context' | 'resumed' | 'judge-respawned'
+  type: NodeExecutionEventType
   at: string
   snapshot: NodeExecution
 }
@@ -266,7 +292,7 @@ export interface NodeExecutionEvent {
 export interface ExecutionChange {
   execution: NodeExecution
   expectedRevision: number | null
-  events: NodeExecutionEvent['type'][]
+  events: NodeExecutionEventType[]
 }
 
 export interface StateRow {
@@ -319,9 +345,9 @@ export interface JudgeResult {
 
 /** Builtin program terminal outcome. */
 export type ProgramResult =
-  | { kind: 'PASS'; details?: unknown }
-  | { kind: 'FAIL'; reason?: string }
-  | { kind: 'ERROR'; reason: string }
+  | { kind: 'PASS'; handoff?: string; details?: unknown }
+  | { kind: 'FAIL'; reason?: string; handoff?: string; details?: unknown }
+  | { kind: 'ERROR'; reason: string; details?: unknown }
 
 /** Tool-facing result codes surfaced as tool error text. */
 export class WorkflowError extends Error {

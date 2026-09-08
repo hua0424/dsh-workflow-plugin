@@ -8,6 +8,7 @@ import { makeDispatchTargets, makeSubagentHost, type HostAdapters } from '../src
 import { queueSubagentPrompt, type HostPromptQueue } from '@deepseek-ai/dsh-subagent/internal'
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { ManualCompactionError, type ManualCompactionErrorCode } from '@deepseek-ai/dsh-compaction'
+import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
@@ -71,7 +72,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
     nodeToken: run.callStack[0]!.nodeToken, instruction: 'Do.', criteria: 'PASS.', input: 'root input',
     boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
     previousFeedback: { result: 'NEED_CONTEXT', reason: 'need facts', claim: { outcome: 'completed', handoff: 'candidate' } },
-    managerContext: 'more evidence', cwd: '.', judgeSessionId: 'sess-judge',
+    managerContext: 'more evidence', cwd: '.', judgeSessionId: 'sess-judge', recovery: true,
   }), { messageId: 'dispatch-3' })
   assert.deepEqual(deliveries.slice(0, 2), [
     { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
@@ -81,6 +82,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
   assert.match(deliveries[2]!.text, /Worker handoff:\ncandidate/)
   assert.match(deliveries[2]!.text, /need facts/)
   assert.match(deliveries[2]!.text, /more evidence/)
+  assert.match(deliveries[2]!.text, /只读核验当前 claim 与实际现场，不补做 Actor 工作/)
   adapters.managerAgentOf = () => undefined
   await assert.rejects(dispatch.sendRoleActor(run, 'developer', 'unauthorized'), /manager agent is not live/)
   assert.equal(deliveries.length, 3)
@@ -263,4 +265,33 @@ test('resident actor non-busy manual failure fail-closes', async () => {
 test('unmapped role is a no-op', async () => {
   const { host } = makeHost({ events: [], resumes: [], compacts: [] })
   assert.deepEqual(await host.compactRoleActor(makeRun(undefined), 'developer'), { ok: true, detail: 'no actor mapped' })
+})
+
+test('Role/Judge Session availability distinguishes durable absence from unreadable persistence', async () => {
+  const live = { id: 'live-session' } as unknown as Agent
+  const ctx = {
+    agents: { get: (id: unknown) => id === 'live-session' ? live : undefined },
+    get: (key: string) => key === 'sessionPersistence' ? {
+      inspect: async (id: string) => {
+        if (id === 'broken-session') throw new Error('persistence read failed')
+        if (id === 'missing-session') throw new SessionPersistenceNotFoundError(id as never)
+        return { meta: { id }, events: [] }
+      },
+    } : undefined,
+    jobs: { onJobDone: () => () => {} }, effect: () => {},
+  } as unknown as Context
+  const host = makeSubagentHost({
+    ctx, managerAgentOf: () => undefined, cwdOfManager: async () => undefined,
+    registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+  }, () => ({}))
+  assert.equal(await host.roleSessionAvailability('live-session'), 'available')
+  assert.equal(await host.roleSessionAvailability('durable-session'), 'available')
+  assert.equal(await host.roleSessionAvailability('missing-session'), 'missing')
+  assert.equal(await host.judgeSessionAvailability('broken-session'), 'unknown')
+  const noService = makeSubagentHost({
+    ...({ ctx: { ...ctx, get: () => undefined } as unknown as Context } as HostAdapters),
+    managerAgentOf: () => undefined, cwdOfManager: async () => undefined,
+    registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+  }, () => ({}))
+  assert.equal(await noService.roleSessionAvailability('cold-session'), 'unknown')
 })

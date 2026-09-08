@@ -1,6 +1,6 @@
 # T9 / A30：隔离真实宿主验收预检
 
-状态：只读准备完成，尚未编写或运行组合 fixture；不解除 T9 的工单阻塞关系，也不代表 A30 已通过。用户已批准后续实施，实际执行仍按工单依赖进行。
+状态：预检已转为 `test/runtime-real-host.test.ts` 的可重复组合验收；A30 主流程已通过，最终命令与边界见 `node-execution-runtime-acceptance.md`。未部署、未操作真实 Run。
 
 ## 目标与证据边界
 
@@ -30,7 +30,7 @@ Activation 被释放后的 cold-resume 不等于整个进程重启。若报告�
 - 只注册可控 mock LLM 路由，禁止继承真实 provider、用户 profile 或凭据。
 - 挂真实宿主服务与完成重构后的插件 Runtime/Store/Host Adapter，执行 Role→claim→Judge→下一 visit。
 - 等待 Role Activation 确实消失后续接同 Session；下一 visit 前执行真正 compact，验证 summary/compaction 事件及后续请求内容，不把 null/no-op 当已真正压缩。
-- 另做挂起→宿主 interrupt→插件 resume，观察旧 claim/Turn 无权误结算、同 execution 继续、不额外触发 Node 边界 compact。
+- 已验证挂起→正式 Host interrupt→持久 Turn `aborted`→Runtime `actor-turn-ended-without-result` BLOCK→Manager status/resume；旧 Turn 未发出 claim，同 execution 继续、nodeToken 轮换且不额外触发 Node 边界 compact。
 - Windows 清理前先 dispose Context、persistence 和 SQLite；不操作现有 GUI、不部署真实 profile、不触碰用户 Run。
 
 ## 实施时的前置检查
@@ -41,6 +41,6 @@ T9 的 #15/#12 依赖完成后，核实目标 Node 与实际测试依赖版本�
 
 - 宿主源码 checkout 保持 Git 洁净，但没有 node_modules，也没有可直接执行的 Vitest；检查目录失败的原因就是依赖未安装，不是已执行测试失败。当前未运行宿主已有 continuation/manual-compaction 测试，也没有安装整个宿主仓库。
 - 宿主 manifest 指定 pnpm 11.7.0，插件当前为 10.10.0。不要为了这一预检修改宿主 package/lock 或假报已有源码 fixture 可运行。
-- 已通过只读 registry 查询确认以下精确 `0.1.2-rc.1` 发布包存在：agent-loop-testkit、agent-loop、session-persistence-jsonl、session-projection、subagent-spawn-in-process、compaction-basic、token-meter（均为 `@deepseek-ai/dsh-` 前缀）。尚未安装或运行它们的组合场景。
-- 更小的优先路线：沿用插件已有 node:test，按需要声明目标版本宿主 devDependencies，复用已发布的 `mountAgentLoopTestDependencies` 等原生服务；只写薄的脚本化 LlmAdapter 与场景装配，不增加 Vitest/第二套测试框架，也不在源码 checkout 安装全仓库依赖。实际安装后仍须核对 exports 与 SDK 单一模块闭包，避免加载两份私有 Symbol/Context 服务。
+- 已核实并 exact 安装 `0.1.2-rc.1` 的 AgentLoop/Testkit、JSONL persistence、SessionProjection、in-process Spawn、BasicCompaction、TokenMeter，以及真实组合所需 JobsLocal、SessionQuery/SQLite；全部仅为 devDependencies。
+- 最终沿用项目 node:test 与包 exports，复用 `mountAgentLoopTestDependencies`；只在 LlmAdapter 层脚本化模型文本/tool choice/usage，不增加 Vitest、不开 Web、不修改宿主 checkout，也不加载第二份 SDK 私有 symbols。
 - 如果后来确实使用宿主源码 fixture，才核实其工具/alias 环境；已有宿主测试通过也只算设施基线，不算插件 A30 通过。

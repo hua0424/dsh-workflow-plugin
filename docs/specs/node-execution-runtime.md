@@ -1,6 +1,6 @@
 # Spec：工作单驱动的 Workflow Runtime 重构
 
-- 状态：待开发；实施分支 `refact`。本文是新开发入口，不表示功能已经实现。
+- 状态：`refact` 实现与 A01–A30 自动化验收已冻结，待父代理最终 Standards/Spec 审查和 commit；未部署。逐项证据见 [`node-execution-runtime-acceptance.md`](../testing/node-execution-runtime-acceptance.md)。
 - 跟踪 Issue：[hua0424/dsh-workflow-plugin#7](https://github.com/hua0424/dsh-workflow-plugin/issues/7)，标签 `ready-for-agent`。
 - 仓库文档：`docs/specs/node-execution-runtime.md`；架构依据：`docs/design/node-execution-runtime.md`。机制与职责以设计为准，本文补齐工具合同、验收与实施计划；二者如有冲突，应先统一文档而非自行择一。
 - 替代：旧 PRD `docs/prd/20260907-node-execution-simplification/requirements.md` / [Issue #6](https://github.com/hua0424/dsh-workflow-plugin/issues/6)。旧 Issue 关闭不代表其方案已实现。
@@ -184,7 +184,7 @@ Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须�
 
 不按 provider/网络/硬件的每个错误码扩展状态机。测试验证安全拒绝、材料送达与可继续结果，不要求所有微状态恢复。
 
-运行 build/typecheck、unit、隔离 smoke；真实宿主冒烟单列。未执行、环境不具备和失败都如实记录，不以静态审查或 stub 通过代替真实宿主结果。本次规格编写尚未运行这些开发验收。
+运行 build/typecheck、unit、隔离 smoke；真实宿主组合单列。未执行、环境不具备和失败都如实记录，不以静态审查或 stub 通过代替真实宿主结果。T9 的最终动态证据与真实 Host 边界记录于 `docs/testing/node-execution-runtime-acceptance.md`。
 
 ## Out of Scope
 
@@ -222,7 +222,7 @@ Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须�
 - Role/compact/Judge：`src/plugin/host.ts`、`src/roles/roles.ts`、`src/judge/checker.ts`、`src/judge/projection.ts`。
 - 测试复用：`test/engine.test.ts`、`test/state.test.ts`、`test/host-compact.test.ts`、`scripts/e2e-smoke.mjs`。按已存在职责补充测试，不假定必须新建同名架构文件。
 
-当前 devDependencies 的 DSH 包版本为 0.1.1-rc.2；目标运行版本为 0.1.2-rc.1。S0 要核实真实兼容性并对齐必要包/锁文件，不能为旧类型缺口增加新架构兼容 shim，也不能盲目设定不存在的发布版本。
+T9 已将所需 DSH Host 测试包按已发布 exact `0.1.2-rc.1` 固定为 devDependencies，并通过包 exports 组成真实 Host fixture；插件运行依赖仍只有 `yaml` 与 `zod`，没有为类型缺口增加兼容 shim。
 
 ### F3. 文档、Issue 与升级说明
 

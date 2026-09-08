@@ -27,7 +27,7 @@ function harness() {
     ensureRoleActor: async () => { throw new Error('unexpected role') },
     startJudge: async (_run, input) => { packets.push(structuredClone(input)); return { judgeSessionId: input.judgeSessionId, messageId: `judge-${++sequence}` } },
     followupJudge: async (_run, _id, input) => { followups.push(structuredClone(input)); return { messageId: `judge-followup-${++sequence}` } },
-    judgeSessionExists: async () => true,
+    judgeSessionAvailability: async () => 'available', roleSessionAvailability: async () => 'available',
     retireJudge: async () => {}, drainJudge: async () => {}, compactRoleActor: async () => ({ ok: true }), safeToInspect: async () => true,
   }
   function engine() {

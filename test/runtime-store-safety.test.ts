@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { StateStore, stateDbPath } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
-import type { ClaimCaller, WorkflowConfig } from '../src/types.ts'
+import { EVENT_TYPES, type ClaimCaller, type WorkflowConfig } from '../src/types.ts'
 
 const config: WorkflowConfig = {
   schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
@@ -30,7 +30,7 @@ async function fixture(roleReview = false) {
   }, {
     async ensureRoleActor(_run, role) { return { childId: `role-${role}`, messageId: `actor-message-${++message}` } },
     async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge-message-1' } },
-    async followupJudge() {}, async judgeSessionExists() { return true },
+    async followupJudge() { return { messageId: `judge-followup-${++message}` } }, async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
     async retireJudge() {}, async drainJudge() {}, async compactRoleActor() { return { ok: true } },
     async safeToInspect() { return true },
   }, { async run() { throw new Error('unexpected Program') } }, makeStateHost(store))
@@ -48,6 +48,15 @@ async function fixture(roleReview = false) {
     cleanup() { sql.close(); store.close(); rmSync(home, { recursive: true, force: true }) },
   }
 }
+
+test('event type constant drives the v9 SQLite CHECK contract', async () => {
+  const f = await fixture()
+  try {
+    const schema = (f.sql.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'node_execution_events'").get() as { sql: string }).sql
+    for (const type of EVENT_TYPES) assert.match(schema, new RegExp(`'${type}'`))
+    assert.equal((schema.match(/'[^']+'/g) ?? []).length, EVENT_TYPES.length)
+  } finally { f.cleanup() }
+})
 
 test('callStack token/node drift fails closed and leaves execution and events unchanged', async () => {
   const f = await fixture()
@@ -321,6 +330,33 @@ test('Store rejects invalid current and same-claim historical REJECT verdict pos
   } finally { f.cleanup() }
 })
 
+test('Store binds Judge followup mode to the exact historical NEED_CONTEXT Judge Session', async () => {
+  const f = await fixture()
+  try {
+    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, f.actor)
+    await f.engine.handleTurnEnded('ws', f.actor)
+    let row = (await f.store.get('ws'))!
+    const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-message-1']) }
+    await f.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'need exact context', judge)
+    row = (await f.store.get('ws'))!
+    await f.engine.handleResume('ws', row.execution.nodeToken, 'authoritative context', 'manager', 'judge')
+    row = (await f.store.get('ws'))!
+    assert.equal(row.execution.resolution?.judgeMode, 'followup')
+    assert.equal(row.execution.resolution?.judgeSessionId, row.execution.previousJudge?.sessionId)
+
+    const wrongSession = structuredClone(row.execution)
+    wrongSession.resolution!.judgeSessionId = 'forged-followup-session'
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: wrongSession, expectedRevision: row.execution.revision, events: [] }]), /Judge followup.*historical/)
+    const missingMode = structuredClone(row.execution)
+    delete missingMode.resolution!.judgeMode
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: missingMode, expectedRevision: row.execution.revision, events: [] }]), /recovery mode/)
+    const freshWithSession = structuredClone(row.execution)
+    freshWithSession.resolution!.judgeMode = 'fresh'
+    await assert.rejects(f.store.updateRow('ws', row.run, row.stateVersion, [{ execution: freshWithSession, expectedRevision: row.execution.revision, events: [] }]), /followup requires exactly one Session/)
+    assert.deepEqual(await f.store.get('ws'), row)
+  } finally { f.cleanup() }
+})
+
 test('failed respawn arrangement keeps the old Judge identity and reports failure', async () => {
   const f = await fixture()
   try {
@@ -429,6 +465,56 @@ test('v5 state without the Role boundary fact is rejected without changing its r
       UPDATE node_executions SET snapshot_json = json_remove(snapshot_json, '$.roleBoundaryPrepared');
       UPDATE node_execution_events SET snapshot_json = json_remove(snapshot_json, '$.roleBoundaryPrepared');
       PRAGMA user_version = 5;
+    `)
+    const before = {
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }
+    assert.throws(() => new StateStore(f.home), /incompatible state format/)
+    assert.deepEqual({
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }, before)
+  } finally { f.cleanup() }
+})
+
+test('v6 state without restart and Judge recovery facts is rejected without changing its rows or version', async () => {
+  const f = await fixture()
+  try {
+    f.store.close()
+    f.sql.exec(`
+      UPDATE runs SET format_version = 'agent-workflow-state/v6';
+      UPDATE node_executions SET snapshot_json = json_remove(snapshot_json, '$.restartPending', '$.resolution.judgeMode', '$.resolution.judgeSessionId');
+      UPDATE node_execution_events SET snapshot_json = json_remove(snapshot_json, '$.restartPending', '$.resolution.judgeMode', '$.resolution.judgeSessionId');
+      PRAGMA user_version = 6;
+    `)
+    const before = {
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }
+    assert.throws(() => new StateStore(f.home), /incompatible state format/)
+    assert.deepEqual({
+      version: f.sql.prepare('PRAGMA user_version').get(),
+      runs: f.sql.prepare('SELECT * FROM runs ORDER BY sequence').all(),
+      executions: f.sql.prepare('SELECT * FROM node_executions ORDER BY execution_id').all(),
+      events: f.sql.prepare('SELECT * FROM node_execution_events ORDER BY execution_id, sequence').all(),
+    }, before)
+  } finally { f.cleanup() }
+})
+
+test('v7-shaped rows without CallFrame execution identity are rejected unchanged', async () => {
+  const f = await fixture()
+  try {
+    f.store.close()
+    f.sql.exec(`
+      UPDATE runs SET format_version = 'agent-workflow-state/v7', snapshot_json = json_remove(snapshot_json, '$.callStack[0].executionId');
+      PRAGMA user_version = 7;
     `)
     const before = {
       version: f.sql.prepare('PRAGMA user_version').get(),

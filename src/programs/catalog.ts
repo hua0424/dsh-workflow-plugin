@@ -69,6 +69,7 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
 
   return {
     kind: 'PASS',
+    handoff: `GitHub milestone #${milestoneNumber} "${title.trim()}" is open; branch "${branchName}" exists locally and on origin for ${owner}/${repo}.`,
     details: { milestoneNumber, milestoneTitle: title.trim(), branchName, owner, repo },
   }
 }
@@ -97,9 +98,9 @@ async function allMilestoneIssuesComplete(ctx: ProgramContext, parameters: Recor
   const open = issues.filter(i => i.state === 'open')
   const closed = issues.filter(i => i.state === 'closed')
   if (issues.length === 0 || open.length > 0) {
-    return { kind: 'FAIL', reason: `${open.length} open of ${issues.length} milestone issues` }
+    return { kind: 'FAIL', reason: `${open.length} open of ${issues.length} milestone issues`, handoff: `Milestone #${raw} has ${open.length} open of ${issues.length} issues.` }
   }
-  return { kind: 'PASS', details: { total: issues.length, open: 0, closed: closed.length } }
+  return { kind: 'PASS', handoff: `Milestone #${raw} has ${closed.length} closed issues and no open issues.`, details: { total: issues.length, open: 0, closed: closed.length } }
 }
 
 export const BUILTIN_PROGRAMS: Record<string, ProgramDefinition> = {

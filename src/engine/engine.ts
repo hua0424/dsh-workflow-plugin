@@ -1,9 +1,10 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
-import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget } from '../types.ts'
-import { WorkflowError, LIMITS, normalizeNodeClaim } from '../types.ts'
+import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
+import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
-import { SUBMISSION_CONSTRAINT } from './texts.ts'
+import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
+import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
 export interface DispatchTargets {
@@ -22,12 +23,15 @@ export interface JudgeSpawnInput {
   managerContext?: string
   cwd: string
   judgeSessionId: string
+  recovery?: boolean
 }
+export type SessionAvailability = 'available' | 'missing' | 'unknown'
 export interface SubagentHost {
   ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<{ childId: string; messageId: string }>
   startJudge(run: RunState, input: JudgeSpawnInput): Promise<{ judgeSessionId: string; messageId: string }>
   followupJudge(run: RunState, judgeSessionId: string, input: JudgeSpawnInput): Promise<{ messageId: string }>
-  judgeSessionExists(judgeSessionId: string): Promise<boolean>
+  judgeSessionAvailability(judgeSessionId: string): Promise<SessionAvailability>
+  roleSessionAvailability(roleSessionId: string): Promise<SessionAvailability>
   retireJudge(run: RunState, judgeSessionId: string): Promise<void>
   drainJudge(run: RunState, judgeSessionId: string): Promise<void>
   compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
@@ -35,17 +39,17 @@ export interface SubagentHost {
   safeToInspect(sessionId: string): Promise<boolean>
 }
 export interface ProgramHost {
-  run(run: RunState, programId: string, parameters: Record<string, unknown>, cwd: string): Promise<{ kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string; details?: unknown }>
+  run(run: RunState, programId: string, parameters: Record<string, unknown>, cwd: string): Promise<ProgramResult>
 }
 export interface RuntimeRow { run: RunState; execution: NodeExecution; version: number }
 export interface StateHost {
   get(workspaceKey: string): Promise<RuntimeRow | undefined>
   put(workspaceKey: string, run: RunState, expectedVersion: number, changes: ExecutionChange[]): Promise<void>
   create(workspaceKey: string, run: RunState, execution: NodeExecution): Promise<number>
-  remove(workspaceKey: string): Promise<void>
   listRuns(): Promise<Array<RuntimeRow & { workspaceKey: string }>>
   execution(workspaceKey: string, executionId: string): Promise<NodeExecution | undefined>
   events(workspaceKey: string, executionId: string, after?: number, limit?: number): Promise<NodeExecutionEvent[]>
+  historyOwner(workspaceKey: string, executionId: string): Promise<{ runId: string; managerSessionId: string } | undefined>
 }
 export type EngineOutcome = { ok: true; run: RunState; message: string } | { ok: false; reason: string }
 export interface NodeView {
@@ -61,10 +65,13 @@ export function executorSessionOf(run: RunState): string {
   return execution?.type === 'actor-task' && execution.role !== 'manager' ? run.roleActors[execution.role] ?? '' : run.managerSessionId
 }
 const rejected = (reason: string): EngineOutcome => ({ ok: false, reason })
-const unsupported = (ticket: string): EngineOutcome => rejected(`refact integration: not connected until ${ticket}; no legacy fallback`)
 const matches = (dispatch: ExecutionDispatch | undefined, caller: ClaimCaller): boolean =>
   dispatch?.sessionId === caller.sessionId && dispatch.messageId !== undefined && caller.turnUserMessageIds.has(dispatch.messageId)
+const executionHandoff = (execution: NodeExecution): string | undefined => execution.claim?.handoff
+  ?? (execution.program?.result?.kind === 'PASS' || execution.program?.result?.kind === 'FAIL' ? execution.program.result.handoff : undefined)
+  ?? execution.child?.result?.handoff
 const change = (execution: NodeExecution, ...events: NodeExecutionEvent['type'][]): ExecutionChange => ({ execution, expectedRevision: execution.revision, events })
+export const TERMINATED_REASON = 'terminated; external effects not cancelled'
 
 export class WorkflowEngine {
   cwdResolver: (run: RunState) => Promise<string> = async () => { throw new WorkflowError('cwd resolver is not wired') }
@@ -74,6 +81,7 @@ export class WorkflowEngine {
   traceWarn: ((message: string) => void) | undefined
   private readonly targets: DispatchTargets
   private readonly subagents: SubagentHost
+  private readonly programs: ProgramHost
   private readonly state: StateHost
   private readonly traceWarned = new Set<string>()
   private trace(run: RunState, event: string, fields: Parameters<typeof traceEvent>[1]): void {
@@ -84,9 +92,10 @@ export class WorkflowEngine {
     this.traceWarned.add(run.runId)
     try { this.traceWarn?.(`workflow trace unavailable for run ${run.runId}; SQLite remains authoritative`) } catch {}
   }
-  constructor(targets: DispatchTargets, subagents: SubagentHost, _programs: ProgramHost, state: StateHost) {
+  constructor(targets: DispatchTargets, subagents: SubagentHost, programs: ProgramHost, state: StateHost) {
     this.targets = targets
     this.subagents = subagents
+    this.programs = programs
     this.state = state
   }
 
@@ -101,11 +110,12 @@ export class WorkflowEngine {
   }
   buildInitialRun(managerSessionId: string, workflowId: string, config: WorkflowConfig, _definitionHash: string): RunState {
     const snapshot = validateAndNormalize(structuredClone(config), { workflowId })
+    const currentExecutionId = newNodeToken()
     return {
       runId: newNodeToken(), managerSessionId, catalogWorkflowId: workflowId,
       definitionHash: computeDefinitionHash(snapshot), definitionSnapshot: snapshot,
-      status: 'running', callStack: [{ workflowId, nodeId: snapshot.workflow.startNode, nodeToken: newNodeToken() }],
-      currentExecutionId: newNodeToken(), roleActors: {}, modelOverrides: {}, blockReason: null,
+      status: 'running', callStack: [{ workflowId, nodeId: snapshot.workflow.startNode, nodeToken: newNodeToken(), executionId: currentExecutionId }],
+      currentExecutionId, roleActors: {}, modelOverrides: {}, blockReason: null,
     }
   }
   private newExecution(run: RunState, input: string, visit: number, predecessorId?: string): NodeExecution {
@@ -113,8 +123,8 @@ export class WorkflowEngine {
     const execution = this.nodeAt(run, frame)?.execution
     const role = execution?.type === 'actor-task' ? execution.role : undefined
     const roleBoundaryPrepared = role === undefined || role === 'manager' || run.roleActors[role] === undefined
-    return { executionId: run.currentExecutionId, runId: run.runId, ...frame, visit, revision: 0,
-      input, phase: 'ready', roleBoundaryPrepared, inputVersion: 1, blockReason: null, enteredAt: new Date().toISOString(),
+    return { runId: run.runId, ...frame, visit, revision: 0,
+      input, phase: 'ready', roleBoundaryPrepared, restartPending: false, inputVersion: 1, blockReason: null, enteredAt: new Date().toISOString(),
       ...(predecessorId === undefined ? {} : { predecessorId }) }
   }
   private judgePacket(run: RunState, e: NodeExecution, cwd: string): JudgeSpawnInput {
@@ -129,6 +139,7 @@ export class WorkflowEngine {
       input: e.input, boundary: e.boundary!, claim: { outcome: e.claim!.outcome, handoff: e.claim!.handoff }, cwd, judgeSessionId: e.judge!.sessionId!,
       ...(feedback ? { previousFeedback: feedback } : {}),
       ...(e.resolution?.context ? { managerContext: e.resolution.context } : {}),
+      ...(e.resolution?.target === 'judge' ? { recovery: true } : {}),
     }
   }
   async status(ws: string, caller = '', history?: { executionId: string; after?: number; limit?: number }) {
@@ -136,20 +147,22 @@ export class WorkflowEngine {
     if (!row) return { ok: true, status: 'no active run' }
     const { run, execution } = row
     if (history) {
-      if (caller !== run.managerSessionId) return { ok: false, reason: 'workflow history is Manager-only' }
       const after = history.after ?? 0
       const limit = history.limit ?? 50
       if (!history.executionId.trim() || !Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
         return { ok: false, reason: 'history requires executionId, after >= 0, and limit 1..50' }
       }
       try {
+        const owner = await this.state.historyOwner(ws, history.executionId)
+        if (!owner || owner.runId !== run.runId) return { ok: false, reason: 'workflow history execution is not in the current Run' }
+        if (caller !== owner.managerSessionId) return { ok: false, reason: 'workflow history is Manager-only' }
         const events = await this.state.events(ws, history.executionId, after, limit)
-        return { ok: true, status: { runId: run.runId, history: { executionId: history.executionId, after, limit, events, nextAfter: events.length === limit ? events.at(-1)!.sequence : null } } }
+        return { ok: true, status: { runId: owner.runId, history: { executionId: history.executionId, after, limit, events, nextAfter: events.length === limit ? events.at(-1)!.sequence : null } } }
       } catch (error) { return { ok: false, reason: error instanceof Error ? error.message : String(error) }
       }
     }
     const node = run.status === 'completed' ? undefined : this.nodeAt(run, topFrame(run))
-    const handoffPreview = execution.claim?.handoff.slice(0, 500) ?? null
+    const handoffPreview = executionHandoff(execution)?.slice(0, 500) ?? null
     return { ok: true, status: {
       runId: run.runId, catalogWorkflowId: run.catalogWorkflowId, status: run.status,
       currentFrame: run.callStack.at(-1) ?? null,
@@ -161,6 +174,7 @@ export class WorkflowEngine {
         judgment: execution.judgment ? { result: execution.judgment.result, reasonPreview: execution.judgment.reason.slice(0, 500) } : null,
         inputPreview: execution.input.slice(0, 500), handoffPreview,
         blockReason: execution.blockReason ?? run.blockReason, recoveryTarget: execution.resolution?.target ?? null,
+        restartPending: execution.restartPending,
       },
       blockReason: execution.blockReason ?? run.blockReason,
       handoffPreview,
@@ -169,10 +183,31 @@ export class WorkflowEngine {
   }
   async startRun(ws: string, run: RunState, configPath?: string, extraText = ''): Promise<EngineOutcome> {
     if (extraText.length > LIMITS.handoffMax) return rejected(`root input exceeds ${LIMITS.handoffMax} characters`)
-    // T7 接通前明确拒绝整份含未支持执行类型的流程，绝不启动旧路径。
-    if (Object.values(run.definitionSnapshot.workflow.nodes).some(n => n.execution.type !== 'actor-task')) return unsupported('T7 Program/Child')
     const previous = await this.state.get(ws)
-    if (previous && previous.run.status !== 'completed') return rejected(`workspace already has a ${previous.run.status} run`)
+    if (previous && previous.run.status !== 'completed' && previous.run.status !== 'terminated') return rejected(`workspace already has a ${previous.run.status} run`)
+    if (previous?.run.status === 'terminated') {
+      const previousNode = this.nodeAt(previous.run, topFrame(previous.run))
+      const knownSessions = new Set<string>()
+      if (previousNode?.execution.type === 'actor-task' && previousNode.execution.role !== 'manager') {
+        const actorSessionId = previous.execution.dispatch?.sessionId ?? previous.run.roleActors[previousNode.execution.role!]
+        if (actorSessionId) knownSessions.add(actorSessionId)
+      }
+      if (previous.execution.judge?.sessionId) knownSessions.add(previous.execution.judge.sessionId)
+      if (previous.execution.predecessorId) {
+        const predecessor = await this.state.execution(ws, previous.execution.predecessorId)
+        if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated predecessor inspection')
+        if (predecessor?.judge && !predecessor.judge.settled) knownSessions.add(predecessor.judge.sessionId)
+      }
+      for (const sessionId of knownSessions) {
+        const safe = await this.subagents.safeToInspect(sessionId)
+        if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run safety inspection')
+        if (!safe) {
+          const activity = await this.actorActivity(sessionId)
+          if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run activity inspection')
+          if (activity !== 'unknown') return rejected(`terminated Run session ${sessionId} is not safely closed`)
+        }
+      }
+    }
     this.frozenRoute = await this.managerRoute(run.managerSessionId)
     if (configPath) {
       const path = createRunLog(configPath, run.catalogWorkflowId, run.runId)
@@ -198,10 +233,35 @@ export class WorkflowEngine {
     if (e.phase === 'ready') {
       if (e.predecessorId) {
         const predecessor = await this.state.execution(ws, e.predecessorId)
-        if (!predecessor?.judge?.settled) return
+        if (!predecessor) return
+        const predecessorNode = this.nodeAt(run, { workflowId: predecessor.workflowId, nodeId: predecessor.nodeId, nodeToken: predecessor.nodeToken, executionId: predecessor.executionId })
+        const settled = predecessorNode?.execution.type === 'actor-task'
+          ? predecessor.judge?.settled === true
+          : predecessor.phase === 'exited' && predecessor.successorId === e.executionId
+        if (!settled) return
       }
       const node = this.nodeAt(run, topFrame(run))!
-      if (node.execution.type !== 'actor-task') { await this.blockRow(ws, row, 'T7 execution type not connected'); return }
+      if (node.execution.type === 'builtin-program') {
+        await this.state.put(ws, run, version, [change(e, 'program-ready')])
+        await this.targets.steerManager(run, `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[program]\n${node.execution.programId}\n请调用 node_run_program 提供当前参数；Program 结果由 Runtime 直接结算，不使用 Judge。`).catch(async error => {
+          const current = await this.state.get(ws)
+          if (current?.version === version + 1 && current.execution.executionId === e.executionId) await this.blockRow(ws, current, `dispatch fault: ${error instanceof Error ? error.message : String(error)}`)
+        })
+        return
+      }
+      if (node.execution.type === 'child-workflow') {
+        const child = run.definitionSnapshot.childWorkflows?.[node.execution.workflowId!]
+        if (!child) { await this.blockRow(ws, row, 'Child workflow is missing from the frozen snapshot'); return }
+        const executionId = newNodeToken()
+        e.phase = 'working'
+        e.child = { workflowId: node.execution.workflowId!, executionId }
+        run.currentExecutionId = executionId
+        run.callStack.push({ workflowId: node.execution.workflowId!, nodeId: child.startNode, nodeToken: newNodeToken(), executionId })
+        const first = this.newExecution(run, e.input, e.visit + 1)
+        await this.state.put(ws, run, version, [change(e, 'child-entered'), { execution: first, expectedRevision: null, events: ['entered'] }])
+        await this.drive(ws)
+        return
+      }
       const role = node.execution.role!
       const previousDispatchSettled = e.dispatch?.settled === true
       let committedVersion = version
@@ -214,8 +274,14 @@ export class WorkflowEngine {
         let arrangedVersion = committedVersion
         if (role !== 'manager' && run.roleActors[role]) {
           if (!previousDispatchSettled) {
-            if (!await this.subagents.safeToInspect(run.roleActors[role])) throw new WorkflowError('previous Role execution is not safely closed')
+            const sessionId = run.roleActors[role]
+            const safe = await this.subagents.safeToInspect(sessionId)
             if (!await this.stillCurrent(ws, e, arrangedVersion)) return
+            if (!safe) {
+              const activity = await this.actorActivity(sessionId)
+              if (!await this.stillCurrent(ws, e, arrangedVersion)) return
+              if (e.resolution?.target !== 'actor' || activity !== 'unknown') throw new WorkflowError('previous Role execution is not safely closed')
+            }
           }
           if (!e.roleBoundaryPrepared) {
             const compact = await this.subagents.compactRoleActor(run, role)
@@ -236,7 +302,8 @@ export class WorkflowEngine {
             : `\n\n[Manager 退回的旧 claim；无当前 Judge 反馈]\n[previous claim]\noutcome: ${e.previousClaim.outcome}\nhandoff: ${e.previousClaim.handoff}`
           : ''
         const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
-        const text = `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[criteria]\n${String(node.checker?.config.criteria ?? '')}${correction}${resolution}${SUBMISSION_CONSTRAINT}`
+        const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
+        const text = `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[criteria]\n${String(node.checker?.config.criteria ?? '')}${correction}${resolution}${recovery}${SUBMISSION_CONSTRAINT}`
         const sent = role === 'manager'
           ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
           : run.roleActors[role]
@@ -256,27 +323,27 @@ export class WorkflowEngine {
       } catch (error) { await this.dispatchFault(ws, e, error, committedVersion) }
       return
     }
-    if (e.phase !== 'checking' || !e.claim || !e.dispatch?.settled || e.judge) return
+    if (e.phase !== 'checking' || !e.claim || !e.dispatch?.settled || e.judge?.messageId) return
     // checking 不等于Judge已经运行：只有精确 Actor 收口入口能置settled。
     let committedVersion = version
     try {
       const node = this.nodeAt(run, topFrame(run))!
       const cwd = await this.cwdResolver(run)
       if (!await this.stillCurrent(ws, e, version)) return
-      const continuationSessionId = e.judgment?.result === 'NEED_CONTEXT' && e.judgment.claimId === e.claim.id
-        && e.judgment.inputVersion + 1 === e.inputVersion && e.previousJudge !== undefined
-        && e.judgment.judgeDispatchId === e.previousJudge.id && e.judgment.judgeSessionId === e.previousJudge.sessionId
-        ? e.judgment.judgeSessionId : undefined
-      if (continuationSessionId && !await this.subagents.safeToInspect(continuationSessionId)) throw new WorkflowError('previous Judge turn is not safely closed')
+      const continuationSessionId = e.resolution?.target === 'judge' && e.resolution.judgeMode === 'followup'
+        ? e.resolution.judgeSessionId : undefined
       if (!await this.stillCurrent(ws, e, version)) return
-      e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
-      await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
-      committedVersion = version + 1
+      if (!e.judge) {
+        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+        await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
+        committedVersion = version + 1
+      } else if (e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion
+        || (continuationSessionId !== undefined && e.judge.sessionId !== continuationSessionId)) return
       const packet = this.judgePacket(run, e, cwd)
       const sent = continuationSessionId
         ? { ...await this.subagents.followupJudge(run, continuationSessionId, packet), judgeSessionId: continuationSessionId }
         : await this.subagents.startJudge(run, packet)
-      const fresh = await this.stillCurrent(ws, e, version + 1)
+      const fresh = await this.stillCurrent(ws, e, committedVersion)
       if (!fresh) { await this.subagents.retireJudge(run, e.judge.sessionId!).catch(() => {}); return }
       if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
       fresh.execution.judge!.messageId = sent.messageId
@@ -286,7 +353,13 @@ export class WorkflowEngine {
   private async stillCurrent(ws: string, e: NodeExecution, version: number): Promise<RuntimeRow | undefined> {
     const row = await this.state.get(ws)
     return row?.run.status === 'running' && row.version === version && row.execution.executionId === e.executionId
-      && row.execution.dispatch?.id === e.dispatch?.id && row.execution.claim?.id === e.claim?.id ? row : undefined
+      && row.execution.dispatch?.id === e.dispatch?.id && row.execution.claim?.id === e.claim?.id
+      && row.execution.judge?.id === e.judge?.id ? row : undefined
+  }
+  private async sameRow(ws: string, row: RuntimeRow): Promise<boolean> {
+    const current = await this.state.get(ws)
+    return current?.version === row.version && current.run.runId === row.run.runId
+      && current.execution.executionId === row.execution.executionId
   }
   /** Manager-side destructive Judge handoff: drain first, then prove the same work is still current. */
   private async drainJudgeAndRevalidate(ws: string, row: RuntimeRow, judgeToDrain: ExecutionJudge | undefined): Promise<boolean> {
@@ -301,12 +374,97 @@ export class WorkflowEngine {
     if (row?.run.status !== 'running' || row.run.runId !== e.runId || row.execution.executionId !== e.executionId || row.version !== committedVersion) return
     await this.blockRow(ws, row, `dispatch fault: ${error instanceof Error ? error.message : String(error)}`)
   }
-  private async blockRow(ws: string, row: RuntimeRow, reason: string): Promise<void> {
+  private async blockRow(ws: string, row: RuntimeRow, reason: string, ...beforeBlock: NodeExecutionEvent['type'][]): Promise<void> {
     row.run.status = 'blocked'
     row.execution.blockReason = reason.slice(0, LIMITS.blockReasonMax)
-    await this.state.put(ws, row.run, row.version, [change(row.execution, 'blocked')])
+    await this.state.put(ws, row.run, row.version, [change(row.execution, ...beforeBlock, 'blocked')])
     this.trace(row.run, 'BLOCK', { workflow: row.execution.workflowId, node: row.execution.nodeId, reason: jsonField(row.execution.blockReason, LIMITS.blockReasonMax) })
     await this.targets.steerManager(row.run, `Workflow BLOCK: ${row.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`).catch(() => {})
+  }
+  private programParameters(node: NodeView, supplied: Record<string, unknown>): Record<string, unknown> {
+    if (typeof supplied !== 'object' || supplied === null || Array.isArray(supplied)) throw new WorkflowError('program parameters must be an object')
+    const definition = BUILTIN_PROGRAMS[node.execution.programId!]
+    if (!definition) throw new WorkflowError(`unknown program ${node.execution.programId}`)
+    const parameters = { ...(node.execution.config ?? {}), ...supplied }
+    const unknown = Object.keys(parameters).filter(key => !(key in definition.parameters))
+    if (unknown.length) throw new WorkflowError(`unknown program parameter: ${unknown.join(', ')}`)
+    for (const [key, spec] of Object.entries(definition.parameters)) {
+      const value = parameters[key]
+      if (value === undefined) {
+        if (spec.required) throw new WorkflowError(`program parameter ${key} is required`)
+      } else if (spec.type === 'string' ? typeof value !== 'string' || value.trim() === '' : typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new WorkflowError(`program parameter ${key} must be a ${spec.type}`)
+      }
+    }
+    const encoded = JSON.stringify(parameters)
+    if (encoded.length > LIMITS.programParametersMax) throw new WorkflowError(`program parameters must be at most ${LIMITS.programParametersMax} characters`)
+    return structuredClone(parameters)
+  }
+  private effectiveProgramResult(result: ProgramResult, input: string): NonNullable<NonNullable<NodeExecution['program']>['result']> {
+    if (result.kind === 'ERROR') {
+      const reason = result.reason.trim()
+      if (!reason || reason.length > LIMITS.blockReasonMax) throw new WorkflowError('Program ERROR requires a bounded reason')
+      return { kind: 'ERROR', reason }
+    }
+    const handoff = result.handoff === undefined ? input : result.handoff.trim()
+    if (!handoff || handoff.length > LIMITS.handoffMax) throw new WorkflowError(`Program handoff must be 1..${LIMITS.handoffMax} characters`)
+    const reason = result.kind === 'FAIL' && result.reason?.trim() ? result.reason.trim().slice(0, LIMITS.blockReasonMax) : undefined
+    return { kind: result.kind, handoff, ...(reason ? { reason } : {}) }
+  }
+  private async advanceKnownResult(ws: string, row: RuntimeRow, result: 'PASS' | 'FAIL', handoff: string, ...events: NodeExecutionEvent['type'][]): Promise<EngineOutcome> {
+    const { run, execution: e, version } = row
+    const node = this.nodeAt(run, topFrame(run))!
+    const target = result === 'PASS' ? node.onPass : node.onFail
+    if (!target) {
+      e.phase = 'settling'
+      e.blockReason = `${result} has no configured Graph edge`.slice(0, LIMITS.blockReasonMax)
+      run.status = 'blocked'
+      await this.state.put(ws, run, version, [change(e, ...events, 'blocked')])
+      await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n材料已保存；Manager 核查后可显式恢复。`).catch(() => {})
+      return { ok: true, run, message: e.blockReason }
+    }
+    e.phase = 'exited'
+    e.exitedAt = new Date().toISOString()
+    const changes = [change(e, ...events, 'exited')]
+    const exitedChain = [e]
+    let nextTarget = target
+    let terminalVisit = e.visit
+    while (nextTarget === 'END' && run.callStack.length > 1) {
+      run.callStack.pop()
+      const parentFrame = topFrame(run)
+      const parent = await this.state.execution(ws, parentFrame.executionId)
+      const parentNode = this.nodeAt(run, parentFrame)
+      if (!parent || parentNode?.execution.type !== 'child-workflow' || parent.phase !== 'working'
+        || !parent.child || parent.child.result) throw new WorkflowError('stale or corrupt Child return')
+      parent.child.result = { terminalExecutionId: e.executionId, handoff }
+      parent.phase = 'exited'
+      parent.exitedAt = new Date().toISOString()
+      terminalVisit = Math.max(terminalVisit, parent.visit)
+      exitedChain.push(parent)
+      changes.push(change(parent, 'child-returned', 'exited'))
+      nextTarget = parentNode.onPass
+    }
+    if (nextTarget === 'END') {
+      run.status = 'completed'
+      run.currentExecutionId = exitedChain.at(-1)!.executionId
+      run.callStack = []
+    } else {
+      run.currentExecutionId = newNodeToken()
+      const frame = topFrame(run)
+      frame.nodeId = nextTarget
+      frame.nodeToken = newNodeToken()
+      frame.executionId = run.currentExecutionId
+      const successor = this.newExecution(run, handoff, terminalVisit + 1, e.executionId)
+      for (const exited of exitedChain) exited.successorId = successor.executionId
+      changes.push({ execution: successor, expectedRevision: null, events: ['entered'] })
+    }
+    await this.state.put(ws, run, version, changes)
+    this.trace(run, 'ROUTE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, target })
+    if (run.status === 'completed') {
+      this.traceWarned.delete(run.runId)
+      await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。\n\n[handoff]\n${handoff}`).catch(() => {})
+    }
+    return { ok: true, run, message: `${result} committed` }
   }
   async handleClaim(ws: string, claim: NodeClaim, caller: ClaimCaller): Promise<EngineOutcome> {
     try { claim = normalizeNodeClaim(claim) } catch (error) { return rejected(String(error)) }
@@ -330,6 +488,10 @@ export class WorkflowEngine {
     const alreadyJudged = e.judgment !== undefined && e.judgment.claimId === e.claim?.id && e.judgment.inputVersion === e.inputVersion
     if (e.nodeToken !== token || e.phase !== 'checking' || !e.claim || !e.judge || alreadyJudged
       || e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion || !matches(e.judge, caller)) return rejected('stale or unbound Judge submission')
+    if (e.resolution?.target === 'judge') {
+      delete e.resolution.judgeMode
+      delete e.resolution.judgeSessionId
+    }
     if (result === 'REJECT') {
       const rejectedClaim = e.claim
       const rejectedJudge = e.judge
@@ -367,34 +529,19 @@ export class WorkflowEngine {
       await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n请用 node_resume target=judge 提供完整当前补充；已保存 claim 不会丢失。`).catch(() => {})
       return { ok: true, run, message: 'NEED_CONTEXT committed; Manager context required' }
     }
-    const node = this.nodeAt(run, topFrame(run))!
-    const target = e.claim.outcome === 'completed' ? node.onPass : node.onFail
-    if (!target) return unsupported('T7 FAIL without onFail')
     delete e.previousJudge
     delete e.previousClaim
+    const judgeSessionId = e.judge.sessionId
     e.judgment = {
       result, reason, claimId: e.claim.id, judgeDispatchId: e.judge.id,
-      judgeSessionId: e.judge.sessionId!, inputVersion: e.judge.inputVersion,
+      judgeSessionId, inputVersion: e.judge.inputVersion,
     }
-    e.phase = 'exited'; e.exitedAt = new Date().toISOString()
-    const changes = [change(e, 'judgment', 'exited')]
-    if (target === 'END') { run.status = 'completed'; run.callStack = [] }
-    else {
-      run.currentExecutionId = newNodeToken()
-      run.callStack = [{ workflowId: e.workflowId, nodeId: target, nodeToken: newNodeToken() }]
-      const successor = this.newExecution(run, e.claim.handoff, e.visit + 1, e.executionId)
-      e.successorId = successor.executionId
-      changes.push({ execution: successor, expectedRevision: null, events: ['entered'] })
-    }
-    // 判定/前驱离开/后继输入/进入事件/Run指针一次提交，绝不先消费Judge资格。
-    await this.state.put(ws, run, version, changes)
-    this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(e.judge.sessionId!) })
-    this.trace(run, 'ROUTE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result: e.claim.outcome === 'completed' ? 'PASS' : 'FAIL', target })
-    if (run.status === 'completed') this.traceWarned.delete(run.runId)
-    await this.subagents.retireJudge(run, e.judge.sessionId!).catch(() => {})
-    if (run.status === 'completed') await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。\n\n[handoff]\n${e.claim.handoff}`).catch(() => {})
+    const graphResult = e.claim.outcome === 'completed' ? 'PASS' : 'FAIL'
+    const advanced = await this.advanceKnownResult(ws, row, graphResult, e.claim.handoff, 'judgment')
+    this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(judgeSessionId) })
+    await this.subagents.retireJudge(run, judgeSessionId).catch(() => {})
     // 后继只由Judge的精确、安全turn settlement驱动，绝不在自身提交Turn里drain。
-    return { ok: true, run, message: 'ACCEPT committed' }
+    return advanced
   }
 
   /** Host 必须退出append回调再调用；caller只带该turn/end对应Turn的消息ID。 */
@@ -440,9 +587,12 @@ export class WorkflowEngine {
   }
   async handleRestartReconcile(): Promise<void> {
     for (const row of await this.state.listRuns()) {
-      if (row.run.status !== 'running') continue
-      try { await this.blockRow(row.workspaceKey, row, 'host restarted; saved work retained; T6 recovery not connected') }
-      catch (error) { this.traceWarn?.(`restart reconciliation failed: ${String(error)}`) }
+      if (row.run.status === 'completed' || row.run.status === 'terminated' || row.execution.restartPending) continue
+      try {
+        row.execution.restartPending = true
+        if (row.run.status === 'running') await this.blockRow(row.workspaceKey, row, 'host restarted; saved work retained; Manager resume must confirm the recovery target', 'interrupted')
+        else await this.state.put(row.workspaceKey, row.run, row.version, [change(row.execution, 'interrupted')])
+      } catch (error) { this.traceWarn?.(`restart reconciliation failed: ${String(error)}`) }
     }
   }
   async handleResume(ws: string, token: string, context: string, caller: string, target: ResumeTarget = 'auto'): Promise<EngineOutcome> {
@@ -453,32 +603,109 @@ export class WorkflowEngine {
     const { run, execution: e, version } = row
     if (caller !== run.managerSessionId) return rejected('node_resume is Manager-only')
     const node = this.nodeAt(run, topFrame(run))
-    if (!node || node.execution.type !== 'actor-task' || e.phase === 'exited') return rejected('resume target is not applicable to this execution')
+    if (!node || e.phase === 'exited') return rejected('resume target is not applicable to this execution')
+    let recoveredPredecessor: NodeExecution | undefined
     if (e.phase === 'ready' && e.predecessorId) {
       const predecessor = await this.state.execution(ws, e.predecessorId)
-      if (!predecessor?.judge?.settled) return rejected('predecessor Judge is not safely settled; keep BLOCK until its activity is resolved')
+      if (!await this.sameRow(ws, row)) return rejected('stale resume request after predecessor inspection')
+      if (!predecessor?.judge?.settled) {
+        const terminalAccepted = predecessor?.phase === 'exited' && predecessor.successorId === e.executionId
+          && predecessor.judgment?.result === 'ACCEPT' && predecessor.judgment.claimId === predecessor.claim?.id
+          && predecessor.judgment.judgeDispatchId === predecessor.judge?.id
+        if (!e.restartPending || !terminalAccepted) return rejected('predecessor Judge is not safely settled; keep BLOCK until its activity is resolved')
+        predecessor.judge!.settled = true
+        recoveredPredecessor = predecessor
+      }
     }
+    if (node.execution.type === 'child-workflow') {
+      if (target !== 'auto' || e.phase !== 'ready' || e.child) return rejected('Child resume requires an unentered ready caller and target=auto')
+      e.inputVersion++
+      e.resolution = { target: 'child', context, inputVersion: e.inputVersion }
+      e.restartPending = false
+      e.blockReason = null
+      e.nodeToken = newNodeToken()
+      topFrame(run).nodeToken = e.nodeToken
+      run.status = 'running'
+      run.blockReason = null
+      await this.state.put(ws, run, version, [change(e, 'manager-context', 'resumed'), ...(recoveredPredecessor ? [change(recoveredPredecessor)] : [])])
+      await this.drive(ws)
+      return { ok: true, run, message: 'Child caller resume committed; driver invoked' }
+    }
+    if (node.execution.type !== 'actor-task') return rejected('Program recovery requires node_run_program or node_resolve_program')
     const resolvedTarget: Exclude<ResumeTarget, 'auto'> = target === 'auto'
-      ? e.phase === 'checking' && e.claim && e.judgment?.result !== 'ACCEPT' ? 'judge' : 'actor'
+      ? e.phase === 'checking' && e.claim && e.dispatch?.settled && e.judgment?.result !== 'ACCEPT' ? 'judge' : 'actor'
       : target
+    const role = node.execution.role!
+    let replaceRole = false
+    if (role !== 'manager' && run.roleActors[role] && (resolvedTarget === 'actor' || !e.dispatch?.settled)) {
+      const sessionId = run.roleActors[role]
+      const safe = await this.subagents.safeToInspect(sessionId)
+      if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role safety inspection')
+      if (!safe) {
+        const activity = await this.actorActivity(sessionId)
+        if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role activity inspection')
+        if (activity !== 'unknown') return rejected('previous Role execution is not safely closed')
+        if (resolvedTarget === 'actor') {
+          const availability = await this.subagents.roleSessionAvailability(sessionId)
+          if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role Session inspection')
+          replaceRole = availability === 'missing'
+        }
+      }
+    }
     const oldJudge = e.judge
     const oldJudgeSessionId = oldJudge?.sessionId
+    let judgeMode: 'followup' | 'fresh' | undefined
+    let judgeSessionId: string | undefined
     if (resolvedTarget === 'judge') {
-      if (e.phase !== 'checking' || !e.claim || !e.dispatch?.settled || e.judgment?.result === 'ACCEPT') return rejected('judge resume requires an effective settled claim without a business conclusion')
+      if (e.phase !== 'checking' || !e.claim || !e.dispatch || e.judgment?.result === 'ACCEPT') return rejected('judge resume requires an effective claim without a business conclusion')
+      // auto never takes this branch while unsettled; explicit target=judge is the Manager's takeover decision.
+      if (!e.dispatch.settled) e.dispatch.settled = true
       const sameJudgeNeedContext = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
         && e.judgment.claimId === e.claim.id && e.judgment.inputVersion === e.inputVersion
         && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
-      const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
-      if (!sameJudgeNeedContext && judgeToDrain) {
-        try {
-          if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale judge resume request after Judge drain')
-        } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+      const restartRecovery = e.restartPending
+      const historicalNeedContext = e.judgment?.result === 'NEED_CONTEXT' && e.previousJudge?.claimId === e.claim.id
+        && e.judgment.judgeDispatchId === e.previousJudge.id && e.judgment.judgeSessionId === e.previousJudge.sessionId
+      const unjudgedCurrent = oldJudge !== undefined && (e.judgment === undefined
+        || e.judgment.claimId !== e.claim.id || e.judgment.inputVersion !== e.inputVersion)
+      const judgeToContinue = sameJudgeNeedContext ? oldJudge
+        : historicalNeedContext && !oldJudge ? e.previousJudge
+          : restartRecovery && unjudgedCurrent ? oldJudge : undefined
+      if ((restartRecovery || sameJudgeNeedContext) && judgeToContinue) {
+        const availability = await this.subagents.judgeSessionAvailability(judgeToContinue.sessionId)
+        if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge Session inspection')
+        if (availability !== 'missing') {
+          const safe = await this.subagents.safeToInspect(judgeToContinue.sessionId)
+          if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge safety inspection')
+          if (!safe) {
+            const activity = await this.actorActivity(judgeToContinue.sessionId)
+            if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge activity inspection')
+            if (!restartRecovery || activity !== 'unknown') return rejected('previous Judge turn is not safely closed')
+          }
+          judgeMode = 'followup'
+          judgeSessionId = judgeToContinue.sessionId
+        } else {
+          try {
+            if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')
+          } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+          judgeMode = 'fresh'
+        }
+      } else {
+        const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
+        if (judgeToDrain) {
+          try {
+            if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale judge resume request after Judge drain')
+          } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+        }
+        judgeMode = 'fresh'
       }
       if (sameJudgeNeedContext && oldJudge) e.previousJudge = oldJudge
       delete e.judge
     } else {
+      const acceptedFailureWithoutEdge = e.phase === 'settling' && e.claim?.outcome === 'failed'
+        && e.judgment?.result === 'ACCEPT' && node.onFail === undefined
       const canReturnActor = e.phase === 'ready' || (e.phase === 'working' && !e.claim)
-        || (e.phase === 'checking' && !!e.claim && e.judgment?.result !== 'ACCEPT')
+        || (e.phase === 'checking' && !!e.claim && e.judgment?.result !== 'ACCEPT') || acceptedFailureWithoutEdge
       if (!canReturnActor) return rejected('actor resume would overwrite a transferable conclusion')
       const relatedClaimId = e.claim?.id ?? e.previousClaim?.id
       const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === relatedClaimId ? e.previousJudge : undefined)
@@ -502,14 +729,32 @@ export class WorkflowEngine {
       delete e.judge
       e.phase = 'ready'
     }
+    if (replaceRole) {
+      delete run.roleActors[role]
+      // Fresh replacement has no prior cross-Node context to compact; same-execution correction must not compact it later.
+      e.roleBoundaryPrepared = true
+    }
     e.inputVersion++
-    e.resolution = { target: resolvedTarget, context, inputVersion: e.inputVersion }
+    e.resolution = {
+      target: resolvedTarget, context, inputVersion: e.inputVersion,
+      ...(resolvedTarget === 'judge' ? { judgeMode: judgeMode!, ...(judgeSessionId ? { judgeSessionId } : {}) } : {}),
+    }
+    if (resolvedTarget === 'judge') {
+      e.judge = {
+        id: newNodeToken(), sessionId: judgeSessionId ?? newNodeToken(), claimId: e.claim!.id,
+        inputVersion: e.inputVersion, settled: false,
+      }
+    }
+    e.restartPending = false
     e.blockReason = null
     e.nodeToken = newNodeToken()
     topFrame(run).nodeToken = e.nodeToken
     run.status = 'running'
     run.blockReason = null
-    await this.state.put(ws, run, version, [change(e, 'manager-context', 'resumed')])
+    await this.state.put(ws, run, version, [
+      change(e, 'manager-context', 'resumed', ...(resolvedTarget === 'judge' ? ['judge-arranged' as const] : [])),
+      ...(recoveredPredecessor ? [change(recoveredPredecessor)] : []),
+    ])
     if (oldJudgeSessionId) await this.subagents.retireJudge(run, oldJudgeSessionId).catch(() => {})
     await this.drive(ws)
     return { ok: true, run, message: `resume ${resolvedTarget} committed; driver invoked` }
@@ -535,10 +780,11 @@ export class WorkflowEngine {
       e.inputVersion++
       if (currentFeedback && oldJudge) e.previousJudge = oldJudge
       e.resolution = {
-        target: 'judge', inputVersion: e.inputVersion,
+        target: 'judge', inputVersion: e.inputVersion, judgeMode: 'fresh',
         ...(e.resolution?.context ? { context: e.resolution.context } : {}),
         decision: reason || 'Manager requested Judge respawn',
       }
+      e.restartPending = false
       e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
       e.blockReason = null
       run.status = 'running'
@@ -558,8 +804,134 @@ export class WorkflowEngine {
       return rejected(`Judge respawn failed: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  async handleRunProgram(_ws: string, _token: string, _parameters: Record<string, unknown>, _caller: string): Promise<EngineOutcome> { return unsupported('T7 Program') }
-  async handleResolveProgram(_ws: string, _token: string, _result: 'PASS' | 'FAIL', _reason: string, _caller: string): Promise<EngineOutcome> { return unsupported('T7 Program resolution') }
-  async handleSetRoleModel(_ws: string, _role: string, _provider: string, _model: string): Promise<EngineOutcome> { return unsupported('T5/T7 model replacement') }
-  async handleReset(_ws: string): Promise<void> { throw new WorkflowError('T8 authorized termination not connected; original data retained') }
+  async handleRunProgram(ws: string, token: string, supplied: Record<string, unknown>, caller: string): Promise<EngineOutcome> {
+    const row = await this.state.get(ws)
+    if (!row || !['running', 'blocked'].includes(row.run.status) || row.execution.nodeToken !== token) return rejected('node_run_program requires the current Node/token')
+    const { run, execution: e } = row
+    if (caller !== run.managerSessionId) return rejected('node_run_program is Manager-only')
+    const node = this.nodeAt(run, topFrame(run))
+    if (!node || node.execution.type !== 'builtin-program' || !['ready', 'working', 'settling'].includes(e.phase)) return rejected('current execution is not a runnable Program')
+    if (run.status === 'running' && e.program && !e.program.result) return rejected('Program invocation is already in progress')
+    let parameters: Record<string, unknown>
+    try { parameters = this.programParameters(node, supplied) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
+    if (run.status === 'blocked') {
+      e.nodeToken = newNodeToken()
+      topFrame(run).nodeToken = e.nodeToken
+    }
+    e.program = { id: newNodeToken(), parameters }
+    e.phase = 'working'
+    e.restartPending = false
+    e.blockReason = null
+    run.status = 'running'
+    run.blockReason = null
+    await this.state.put(ws, run, row.version, [change(e, 'program-arranged')])
+    const arrangedVersion = row.version + 1
+    const invocationId = e.program.id
+    let result: ProgramResult
+    try {
+      const cwd = await this.cwdResolver(run)
+      const current = await this.state.get(ws)
+      if (!current || current.version !== arrangedVersion || current.run.status !== 'running'
+        || current.execution.executionId !== e.executionId || current.execution.program?.id !== invocationId) return rejected('stale Program invocation before effect')
+      result = await this.programs.run(run, node.execution.programId!, parameters, cwd)
+    } catch (error) {
+      const current = await this.state.get(ws)
+      if (current?.version === arrangedVersion && current.run.status === 'running'
+        && current.execution.executionId === e.executionId && current.execution.program?.id === invocationId) {
+        await this.blockRow(ws, current, `Program result unknown; inspect before retry or resolution: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return rejected('Program result is unknown; Manager inspection required')
+    }
+    const current = await this.state.get(ws)
+    if (!current || current.version !== arrangedVersion || current.run.status !== 'running'
+      || current.execution.executionId !== e.executionId || current.execution.program?.id !== invocationId) return rejected('stale Program result ignored')
+    let normalized: NonNullable<NonNullable<NodeExecution['program']>['result']>
+    try { normalized = this.effectiveProgramResult(result, current.execution.input) } catch (error) {
+      await this.blockRow(ws, current, `Program result unknown; inspect before retry or resolution: ${error instanceof Error ? error.message : String(error)}`)
+      return rejected('invalid Program result; Manager inspection required')
+    }
+    current.execution.program!.result = normalized
+    if (normalized.kind === 'ERROR') {
+      current.execution.phase = 'settling'
+      await this.blockRow(ws, current, `Program ERROR: ${normalized.reason}`, 'program-result')
+      return { ok: true, run: current.run, message: current.execution.blockReason! }
+    }
+    try {
+      const advanced = await this.advanceKnownResult(ws, current, normalized.kind, normalized.handoff, 'program-result')
+      if (advanced.ok && advanced.run.status === 'running') await this.drive(ws)
+      return advanced
+    } catch (error) {
+      const after = await this.state.get(ws)
+      if (after?.version === arrangedVersion && after.run.status === 'running'
+        && after.execution.executionId === e.executionId && after.execution.program?.id === invocationId) {
+        delete after.execution.program.result
+        await this.blockRow(ws, after, `Program result commit unknown; inspect before retry or resolution: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return rejected('Program result commit failed; Manager inspection required')
+    }
+  }
+  async handleResolveProgram(ws: string, token: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<EngineOutcome> {
+    reason = reason.trim()
+    if (!reason || reason.length > LIMITS.blockReasonMax || !['PASS', 'FAIL'].includes(result)) return rejected('invalid Program resolution')
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'blocked' || row.execution.nodeToken !== token) return rejected('node_resolve_program requires the current BLOCK/token')
+    if (caller !== row.run.managerSessionId) return rejected('node_resolve_program is Manager-only')
+    const node = this.nodeAt(row.run, topFrame(row.run))
+    if (node?.execution.type !== 'builtin-program' || !row.execution.program || !['working', 'settling'].includes(row.execution.phase)) return rejected('current execution has no Program result to resolve')
+    const prior = row.execution.program.result
+    const handoff = prior && prior.kind !== 'ERROR' ? prior.handoff : row.execution.input
+    row.execution.program.result = { kind: result, handoff, reason }
+    row.execution.blockReason = null
+    row.execution.restartPending = false
+    row.run.status = 'running'
+    row.run.blockReason = null
+    const advanced = await this.advanceKnownResult(ws, row, result, handoff, 'program-resolved')
+    if (advanced.ok && advanced.run.status === 'running') await this.drive(ws)
+    return advanced
+  }
+  async handleSetRoleModel(ws: string, role: string, provider: string, model: string, caller: string): Promise<EngineOutcome> {
+    const row = await this.state.get(ws)
+    if (!row || row.run.status === 'completed' || row.run.status === 'terminated') return rejected('workflow_set_role_model requires the current active Run')
+    if (caller !== row.run.managerSessionId) return rejected('workflow_set_role_model is Manager-only')
+    if (role !== 'judge' && !(role in row.run.definitionSnapshot.roles)) return rejected(`unknown role "${role}"`)
+    let route
+    try { route = normalizeModelRoute(provider, model) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
+    const existing = row.run.modelOverrides[role]
+    if (existing?.provider === route.provider && existing.modelId === route.modelId) return { ok: true, run: row.run, message: 'model override already applied' }
+    const mapped = role === 'judge' ? undefined : row.run.roleActors[role]
+    const currentNode = this.nodeAt(row.run, topFrame(row.run))
+    const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
+    if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')
+    if (mapped) {
+      const safe = await this.subagents.safeToInspect(mapped)
+      if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role safety inspection')
+      if (!safe) {
+        const activity = await this.actorActivity(mapped)
+        if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role activity inspection')
+        if (activity !== 'unknown') return rejected('active actor cannot be replaced')
+      }
+    }
+    row.run.modelOverrides[role] = route
+    if (mapped) delete row.run.roleActors[role]
+    if (replacesCurrentRole) row.execution.roleBoundaryPrepared = true
+    await this.state.put(ws, row.run, row.version, [change(row.execution, 'model-changed')])
+    this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax) })
+    return { ok: true, run: row.run, message: `model override saved for ${role}` }
+  }
+  async handleReset(ws: string, caller: string): Promise<EngineOutcome> {
+    const row = await this.state.get(ws)
+    if (!row || (row.run.status !== 'running' && row.run.status !== 'blocked')) return rejected('reset requires the current active Run')
+    if (caller !== row.run.managerSessionId) return rejected('reset is Manager-only')
+    const judgeSessionId = row.execution.judge?.sessionId
+    row.run.status = 'terminated'
+    row.run.blockReason = TERMINATED_REASON
+    row.execution.restartPending = false
+    row.execution.blockReason = TERMINATED_REASON
+    row.execution.nodeToken = newNodeToken()
+    topFrame(row.run).nodeToken = row.execution.nodeToken
+    await this.state.put(ws, row.run, row.version, [change(row.execution, 'terminated')])
+    if (judgeSessionId) await this.subagents.retireJudge(row.run, judgeSessionId).catch(() => {})
+    this.traceWarned.delete(row.run.runId)
+    return { ok: true, run: row.run, message: `${TERMINATED_REASON}; saved Run history retained` }
+  }
 }

@@ -59,7 +59,7 @@ export interface ToolHost {
   resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string, target?: 'auto' | 'actor' | 'judge'): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
-  setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string, caller: string, history?: { executionId: string; after?: number; limit?: number }): Promise<{ ok: boolean; reason?: string; status?: unknown }>
   judgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   respawnJudge(workspaceKey: string, nodeToken: string, reason: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -235,7 +235,7 @@ export const workflowTools: ToolDefinition[] = [
     async execute(args, exec) {
       const auth = await controlWorkspace(exec.agent, 'workflow_set_role_model')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
-      return fmtResult(await thisHost().setRoleModel(auth.workspaceKey, args.roleKey, args.provider, args.modelId))
+      return fmtResult(await thisHost().setRoleModel(auth.workspaceKey, args.roleKey, args.provider, args.modelId, auth.caller))
     },
   }),
 

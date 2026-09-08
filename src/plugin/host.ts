@@ -9,6 +9,7 @@ import type { JobStatus } from '@deepseek-ai/dsh-jobs'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionPersistenceNotFoundError, type SessionInspection, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { StateStore } from '../state/store.ts'
 import type { RunState } from '../types.ts'
 import { WorkflowError } from '../types.ts'
@@ -18,6 +19,7 @@ import { judgeLabel, judgeSpawnPlan, JUDGE_ALLOW, JUDGE_MACHINERY_EXEMPT, resolv
 import { topFrame } from '../state/invariants.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
+import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
 
 const TERMINAL_JOB_STATUSES = new Set<JobStatus>(['completed', 'failed', 'killed'])
 
@@ -43,14 +45,9 @@ function liveDescendantIds(seedIds: Iterable<string>, agents: readonly Agent[]):
   return ids
 }
 
-/**
- * Narrow shape of the optional `sessionPersistence` service
- * (`@deepseek-ai/dsh-session-persistence`, ctx key `sessionPersistence`) — the
- * same `inspect()` the subagent continuation manager uses for cold resume.
- * Duck-typed because the package is not a dependency of this plugin.
- */
-interface SessionPersistenceLike {
-  inspect(id: string, signal?: AbortSignal): Promise<{ meta: { id: string }; events: ReadonlyArray<import('@deepseek-ai/dsh-session').SessionEvent> }>
+/** Optional Host service used by the continuation manager for cold Session reads. */
+function sessionPersistence(ctx: Context): SessionPersistence | undefined {
+  return ctx.get('sessionPersistence') as SessionPersistence | undefined
 }
 
 /**
@@ -62,12 +59,13 @@ interface SessionPersistenceLike {
  * packet.
  */
 async function inspectPersistedSession(ctx: Context, sessionId: string): Promise<ProjectionSource | undefined> {
-  const persistence = ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
-  if (persistence === undefined || typeof persistence.inspect !== 'function') return undefined
-  let inspection: Awaited<ReturnType<SessionPersistenceLike['inspect']>>
+  const persistence = sessionPersistence(ctx)
+  if (persistence === undefined) return undefined
+  let inspection: SessionInspection
   try {
-    inspection = await persistence.inspect(sessionId, new AbortController().signal)
+    inspection = await persistence.inspect(SessionId(sessionId), new AbortController().signal)
   } catch (error) {
+    if (error instanceof SessionPersistenceNotFoundError) throw error
     const detail = error instanceof Error ? error.message : String(error)
     throw new WorkflowError(`actor session projection failed: ${detail}`)
   }
@@ -82,15 +80,16 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   }
 }
 
-/** Best-effort durable existence probe for a reserved Judge Session id. */
-async function judgeSessionExistsInPersistence(ctx: Context, sessionId: string): Promise<boolean> {
+/** Only a typed NotFound proves absence; all other persistence uncertainty preserves identity. */
+async function sessionAvailability(ctx: Context, sessionId: string): Promise<import('../engine/engine.ts').SessionAvailability> {
+  if (ctx.agents.get(SessionId(sessionId)) !== undefined) return 'available'
+  const persistence = sessionPersistence(ctx)
+  if (persistence === undefined) return 'unknown'
   try {
     const source = await inspectPersistedSession(ctx, sessionId)
-    return source !== undefined && source.id === sessionId
-  } catch {
-    // A persistence fault is not proof of existence. Fail closed toward
-    // spawn-rebuild, which rebuilds the Judge packet from pendingClaim.
-    return false
+    return source?.id === sessionId ? 'available' : 'unknown'
+  } catch (error) {
+    return error instanceof SessionPersistenceNotFoundError ? 'missing' : 'unknown'
   }
 }
 
@@ -126,27 +125,26 @@ function compactErrorDetail(error: unknown): string {
   return errorDetail(error)
 }
 
-export function makeStateHost(store: StateStore): StateHost {
+export function makeStateHost(source: StateStore | (() => StateStore)): StateHost {
+  const store = (): StateStore => typeof source === 'function' ? source() : source
   return {
     async get(workspaceKey) {
-      const row = await store.get(workspaceKey)
+      const row = await store().get(workspaceKey)
       if (row === undefined) return undefined
       return { run: row.run, execution: row.execution, version: row.stateVersion }
     },
     async put(workspaceKey, run, expectedVersion, changes) {
-      await store.updateRow(workspaceKey, run, expectedVersion, changes)
+      await store().updateRow(workspaceKey, run, expectedVersion, changes)
     },
     async create(workspaceKey, run, execution) {
-      const row = await store.createRow(workspaceKey, run, execution)
+      const row = await store().createRow(workspaceKey, run, execution)
       return row.stateVersion
     },
-    async remove(workspaceKey) {
-      await store.deleteRow(workspaceKey)
-    },
-    execution: (workspaceKey, executionId) => store.execution(workspaceKey, executionId),
-    events: (workspaceKey, executionId, after, limit) => store.events(workspaceKey, executionId, after, limit),
+    execution: (workspaceKey, executionId) => store().execution(workspaceKey, executionId),
+    events: (workspaceKey, executionId, after, limit) => store().events(workspaceKey, executionId, after, limit),
+    historyOwner: (workspaceKey, executionId) => store().historyOwner(workspaceKey, executionId),
     async listRuns() {
-      const rows = await store.list()
+      const rows = await store().list()
       return rows.map(row => ({ workspaceKey: row.workspaceKey, run: row.run, execution: row.execution, version: row.stateVersion }))
     },
   }
@@ -234,7 +232,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     }
     return renderJudgePrompt({
       nodeToken: input.nodeToken,
-      nodeInstruction: `[当前工作单 input]\n${input.input}\n\n[instruction]\n${input.instruction}`,
+      nodeInstruction: `[当前工作单 input]\n${input.input}\n\n[instruction]\n${input.instruction}${input.recovery ? JUDGE_RECOVERY_INSTRUCTION : ''}`,
       criteria: input.criteria,
       workerOutcome: input.claim.outcome,
       workerHandoff: input.claim.handoff,
@@ -384,8 +382,12 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       return { judgeSessionId: started.childId, messageId: started.messageId }
     },
 
-    async judgeSessionExists(judgeSessionId) {
-      return judgeSessionExistsInPersistence(adapters.ctx, judgeSessionId)
+    async judgeSessionAvailability(judgeSessionId) {
+      return sessionAvailability(adapters.ctx, judgeSessionId)
+    },
+
+    async roleSessionAvailability(roleSessionId) {
+      return sessionAvailability(adapters.ctx, roleSessionId)
     },
 
     async followupJudge(run, judgeSessionId, input) {

@@ -73,7 +73,8 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
     async retireJudge() {}, async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); drainEntered?.(); if (drainGate) await drainGate; if (drainFailure) throw drainFailure },
     async compactRoleActor(_run, role) { compacts.push(role); lifecycle.push(`compact:${role}`); compactEntered?.(); if (compactGate) await compactGate; return compactOutcome },
     async followupJudge(_run, judgeSessionId, input) { followups.push(input); if (followupFailure) throw followupFailure; return send(judgeSessionId, 'Judge followup') },
-    async judgeSessionExists() { return true },
+    async judgeSessionAvailability() { return 'available' as const },
+    async roleSessionAvailability() { return 'available' as const },
   }, { async run() { throw new Error('T7') } }, stateHost)
   engine.cwdResolver = async () => home
   const caller = (dispatch: { sessionId?: string; messageId?: string }) => ({ sessionId: dispatch.sessionId!, turnUserMessageIds: new Set([dispatch.messageId!]) })
@@ -906,10 +907,11 @@ test('Actor-target resume does not compact or redispatch while the blocked Role 
     const blocked = await h.row()
     const workerMessages = h.messages.filter(message => message.sessionId === 'worker-session').length
     h.setSafe(false)
-    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Manager asks Actor to preserve evidence and wait for safe continuation.', 'manager', 'actor')).ok, true)
+    h.engine.actorActivity = async () => 'idle'
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Manager asks Actor to preserve evidence and wait for safe continuation.', 'manager', 'actor')).ok, false)
     const stillBlocked = await h.row()
     assert.equal(stillBlocked.run.status, 'blocked')
-    assert.match(stillBlocked.execution.blockReason!, /not safely closed/)
+    assert.equal(stillBlocked.execution.blockReason, blocked.execution.blockReason)
     assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, workerMessages)
     h.setSafe(true)
     assert.equal((await h.engine.handleResume('ws', stillBlocked.execution.nodeToken, 'The prior turn is now verified idle; continue the same work.', 'manager', 'actor')).ok, true)
@@ -918,12 +920,13 @@ test('Actor-target resume does not compact or redispatch while the blocked Role 
   } finally { h.close() }
 })
 
-test('workflow_status history is Manager-only and pages current-Run events by stable sequence', async () => {
+test('workflow_status history is Manager-only and pages retained Run events by stable sequence', async () => {
   const h = harness()
   try {
     await h.start()
     const row = await h.row()
     const executionId = row.execution.executionId
+    const runId = row.run.runId
     const denied = await h.engine.status('ws', 'worker-session', { executionId, after: 0, limit: 1 })
     assert.equal(denied.ok, false)
     const first = await h.engine.status('ws', 'manager', { executionId, after: 0, limit: 1 })
@@ -940,9 +943,12 @@ test('workflow_status history is Manager-only and pages current-Run events by st
     assert.equal(summary.status.execution.executionId, executionId)
     await acceptCurrent(h, 'first run complete')
     assert.equal((await h.start()).ok, true)
+    const retained = await h.store.events('ws', executionId, 0, 50)
+    assert.ok(retained.length > 0, 'retained SQLite history remains directly inspectable for maintenance')
     const crossRun = await h.engine.status('ws', 'manager', { executionId, after: 0, limit: 50 })
     assert.equal(crossRun.ok, false)
-    assert.match(crossRun.reason!, /not in the current run/)
+    assert.match(crossRun.reason!, /current Run/)
+    assert.notEqual((await h.row()).run.runId, runId)
   } finally { h.close() }
 })
 
@@ -999,4 +1005,559 @@ test('a block while Role safety check waits prevents subsequent compact and disp
     release(); await pending
     assert.deepEqual(h.compacts, [], 'external return must revalidate before the next side effect')
   } finally { release?.(); h.close() }
+})
+
+function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-t6-'))
+  let store = new StateStore(home)
+  const messages: Array<{ sessionId: string; messageId: string; text: string }> = []
+  const judgeStarts: Array<import('../src/engine/engine.ts').JudgeSpawnInput> = []
+  const judgeFollowups: Array<import('../src/engine/engine.ts').JudgeSpawnInput> = []
+  const ensuredActors: string[] = []
+  const drains: string[] = []
+  let drainFailure: Error | undefined
+  let judgeFollowupFailure: Error | undefined
+  let safe = true
+  let activity: 'active' | 'idle' | 'unknown' = 'unknown'
+  let roleAvailability: import('../src/engine/engine.ts').SessionAvailability = 'available'
+  let judgeAvailability: import('../src/engine/engine.ts').SessionAvailability = 'available'
+  let failManagerSendAfterAccept = false
+  let actorSerial = 0
+  const send = (sessionId: string, text: string) => {
+    const messageId = `recovery-message-${messages.length + 1}`
+    messages.push({ sessionId, messageId, text })
+    return { messageId }
+  }
+  const makeEngine = () => {
+    const next = new WorkflowEngine({
+      async steerManager(_run, text) {
+        const sent = send('manager', text)
+        if (failManagerSendAfterAccept) throw new Error('Queue accepted but acknowledgement was lost')
+        return sent
+      },
+      async sendRoleActor(run, role, text) { return send(run.roleActors[role]!, text) },
+      managerSessionSeq() { return 0 },
+    }, {
+      async ensureRoleActor(_run, _role, text) {
+        const childId = actorSerial++ === 0 ? 'worker-session' : `worker-replacement-${actorSerial}`
+        ensuredActors.push(childId)
+        return { childId, ...send(childId, text) }
+      },
+      async startJudge(_run, input) {
+        judgeStarts.push(input)
+        return { judgeSessionId: input.judgeSessionId, ...send(input.judgeSessionId, 'Judge') }
+      },
+      async followupJudge(_run, judgeSessionId, input) {
+        judgeFollowups.push(input)
+        if (judgeFollowupFailure) throw judgeFollowupFailure
+        return send(judgeSessionId, 'Judge followup')
+      },
+      async judgeSessionAvailability() { return judgeAvailability },
+      async roleSessionAvailability() { return roleAvailability },
+      async retireJudge() {},
+      async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); if (drainFailure) throw drainFailure },
+      async compactRoleActor() { return { ok: true } },
+      async safeToInspect() { return safe },
+    }, { async run() { throw new Error('T7') } }, makeStateHost(store))
+    next.cwdResolver = async () => home
+    next.actorActivity = async () => activity
+    return next
+  }
+  let engine = makeEngine()
+  const caller = (dispatch: { sessionId?: string; messageId?: string }) => ({ sessionId: dispatch.sessionId!, turnUserMessageIds: new Set([dispatch.messageId!]) })
+  return {
+    home, messages, judgeStarts, judgeFollowups, ensuredActors, drains, caller,
+    get engine() { return engine },
+    get store() { return store },
+    setSafe(value: boolean) { safe = value },
+    setActivity(value: 'active' | 'idle' | 'unknown') { activity = value },
+    setRoleAvailability(value: import('../src/engine/engine.ts').SessionAvailability) { roleAvailability = value },
+    setJudgeAvailability(value: import('../src/engine/engine.ts').SessionAvailability) { judgeAvailability = value },
+    setDrainFailure(value: Error | undefined) { drainFailure = value },
+    setJudgeFollowupFailure(value: Error | undefined) { judgeFollowupFailure = value },
+    setManagerSendAfterAcceptFailure(value: boolean) { failManagerSendAfterAccept = value },
+    async row() { return (await store.get('ws'))! },
+    async start() { return engine.startRun('ws', engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, 'root request') },
+    reopen() { store.close(); store = new StateStore(home); engine = makeEngine() },
+    close() { store.close(); rmSync(home, { recursive: true, force: true }) },
+  }
+}
+
+async function acceptRecoveryCurrent(h: ReturnType<typeof recoveryHarness>, handoff: string) {
+  const actor = h.caller((await h.row()).execution.dispatch!)
+  assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff }, actor)).ok, true)
+  await h.engine.handleTurnEnded('ws', actor)
+  const checking = await h.row()
+  const judge = h.caller(checking.execution.judge!)
+  assert.equal((await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'ACCEPT', 'verified', judge)).ok, true)
+  return judge
+}
+
+// T6 seam stays the same: actual Runtime + closed/reopened SQLite + controlled Host.
+test('working without an interrupted event reopens into recoverable BLOCK and resumes through the normal driver', async () => {
+  const h = recoveryHarness()
+  try {
+    await h.start()
+    const before = await h.row()
+    const oldActor = h.caller(before.execution.dispatch!)
+    assert.equal((await h.store.events('ws', before.execution.executionId)).some(event => event.type === 'blocked'), false)
+
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.equal(blocked.execution.phase, 'working')
+    assert.equal(blocked.execution.input, 'root request')
+    assert.match(blocked.execution.blockReason!, /host restarted/)
+
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '外因已处理，先核对现场再继续。', 'manager', 'auto')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.run.status, 'running')
+    assert.notEqual(resumed.execution.dispatch?.id, before.execution.dispatch?.id)
+    assert.match(h.messages.at(-1)!.text, /之前中断，请先检查实际完成情况；已完成勿重复副作用，未完继续；不确定\/缺权限BLOCK/)
+    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'late old work' }, oldActor)).ok, false)
+
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: '现场核验后完成' }, h.caller(resumed.execution.dispatch!))
+    await h.engine.handleTurnEnded('ws', h.caller(resumed.execution.dispatch!))
+    const checking = await h.row()
+    await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'ACCEPT', '只读核验通过', h.caller(checking.execution.judge!))
+    assert.equal((await h.row()).run.status, 'completed')
+  } finally { h.close() }
+})
+
+test('a dispatch that may have been delivered without an acknowledgement gets a new qualification and recovery warning', async () => {
+  const h = recoveryHarness()
+  try {
+    h.setManagerSendAfterAcceptFailure(true)
+    await h.start()
+    const uncertain = await h.row()
+    assert.equal(uncertain.run.status, 'blocked')
+    assert.equal(uncertain.execution.phase, 'working')
+    assert.equal(uncertain.execution.dispatch?.messageId, undefined)
+    const oldDispatchId = uncertain.execution.dispatch!.id
+
+    h.setManagerSendAfterAcceptFailure(false)
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '消息可能已送达；先检查现场再提交。', 'manager', 'actor')).ok, true)
+    const resumed = await h.row()
+    assert.notEqual(resumed.execution.dispatch?.id, oldDispatchId)
+    assert.ok(resumed.execution.dispatch?.messageId)
+    assert.match(h.messages.at(-1)!.text, /已完成勿重复副作用/)
+  } finally { h.close() }
+})
+
+async function enterRecoveryWorker(h: ReturnType<typeof recoveryHarness>) {
+  await h.start()
+  const rootJudge = await acceptRecoveryCurrent(h, 'manager handoff')
+  await h.engine.handleTurnEnded('ws', rootJudge)
+  const worker = await h.row()
+  assert.equal(worker.execution.nodeId, 'work')
+  assert.equal(worker.execution.phase, 'working')
+  return worker
+}
+
+test('Manager recovery allows unknown cold Role only after explicit resume, but known unsafe idle stays BLOCKed', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    const before = await enterRecoveryWorker(h)
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    let blocked = await h.row()
+    h.setSafe(false)
+    h.setActivity('idle')
+    const denied = await h.engine.handleResume('ws', blocked.execution.nodeToken, '仍有Host可见活动，不能接手。', 'manager', 'actor')
+    assert.equal(denied.ok, false)
+    assert.match(denied.reason!, /not safely closed/)
+    assert.equal((await h.row()).execution.dispatch?.id, before.execution.dispatch?.id)
+
+    h.setActivity('unknown')
+    blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '已人工核查旧Role无冲突，可冷接手。', 'manager', 'actor')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.run.status, 'running')
+    assert.equal(resumed.execution.dispatch?.sessionId, 'worker-session')
+    assert.notEqual(resumed.execution.dispatch?.id, before.execution.dispatch?.id)
+  } finally { h.close() }
+})
+
+test('actor resume rechecks a settled Role dispatch and rejects a newly active Session', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    await enterRecoveryWorker(h)
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim awaiting a Judge' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    let row = await h.row()
+    await h.engine.handleTurnEnded('ws', h.caller(row.execution.judge!))
+    row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    assert.equal(row.execution.dispatch?.settled, true)
+    h.setSafe(false)
+    h.setActivity('active')
+    const denied = await h.engine.handleResume('ws', row.execution.nodeToken, '旧Role被其它turn重新激活，不能退回Actor。', 'manager', 'actor')
+    assert.equal(denied.ok, false)
+    assert.match(denied.reason!, /not safely closed/)
+    assert.deepEqual(await h.row(), row)
+  } finally { h.close() }
+})
+
+test('a failed Role persistence probe cannot replace a still-live unsafe Actor', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    const before = await enterRecoveryWorker(h)
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    h.setRoleAvailability('missing')
+    h.setSafe(false)
+    h.setActivity('active')
+    const blocked = await h.row()
+    const denied = await h.engine.handleResume('ws', blocked.execution.nodeToken, 'persistence读取失败但旧Actor仍active。', 'manager', 'actor')
+    assert.equal(denied.ok, false)
+    const unchanged = await h.row()
+    assert.equal(unchanged.run.roleActors.worker, 'worker-session')
+    assert.equal(unchanged.execution.dispatch?.id, before.execution.dispatch?.id)
+    assert.deepEqual(h.ensuredActors, ['worker-session'])
+  } finally { h.close() }
+})
+
+test('missing Role Session is replaced in the resume transaction and correction reuses it without compact', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    const before = await enterRecoveryWorker(h)
+    const oldActor = h.caller(before.execution.dispatch!)
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    h.setRoleAvailability('missing')
+    h.setSafe(false)
+    h.setActivity('unknown')
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '持久Session确认不存在，改由replacement核查。', 'manager', 'actor')).ok, true)
+    let row = await h.row()
+    assert.equal(row.execution.executionId, before.execution.executionId)
+    assert.equal(row.run.roleActors.worker, 'worker-replacement-2')
+    assert.equal(row.execution.dispatch?.sessionId, 'worker-replacement-2')
+    assert.equal(row.execution.roleBoundaryPrepared, true)
+    const replacementPrompt = h.messages.at(-1)!.text
+    assert.match(replacementPrompt, /manager handoff/)
+    assert.match(replacementPrompt, /\[instruction\]\nWork/)
+    assert.match(replacementPrompt, /\[criteria\]\nCorrect plan/)
+    assert.match(replacementPrompt, /持久Session确认不存在/)
+    assert.match(replacementPrompt, /已完成勿重复副作用/)
+    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'old Role late claim' }, oldActor)).ok, false)
+
+    const replacement = h.caller(row.execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'replacement candidate' }, replacement)
+    h.setSafe(true)
+    await h.engine.handleTurnEnded('ws', replacement)
+    row = await h.row()
+    await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', '需要补充核验证据', h.caller(row.execution.judge!))
+    row = await h.row()
+    assert.equal(row.execution.dispatch?.sessionId, 'worker-replacement-2')
+    assert.equal(row.execution.roleBoundaryPrepared, true)
+    assert.deepEqual(h.ensuredActors, ['worker-session', 'worker-replacement-2'])
+    assert.match(h.messages.at(-1)!.text, /replacement candidate/)
+  } finally { h.close() }
+})
+
+test('checking recovery keeps a settled claim and follows up the available unjudged Judge identity', async () => {
+  const h = recoveryHarness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'durable candidate' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    const before = await h.row()
+    const oldJudge = structuredClone(before.execution.judge)!
+
+    h.reopen()
+    h.setSafe(false)
+    h.setActivity('unknown')
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '重启后继续只读核验。', 'manager', 'auto')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.execution.claim?.id, before.execution.claim?.id)
+    assert.equal(resumed.execution.judge?.sessionId, oldJudge.sessionId)
+    assert.notEqual(resumed.execution.judge?.id, oldJudge.id)
+    assert.notEqual(resumed.execution.judge?.messageId, oldJudge.messageId)
+    assert.equal(resumed.execution.previousJudge, undefined)
+    assert.equal(h.judgeFollowups.length, 1)
+    assert.equal(h.judgeStarts.length, 1)
+    assert.equal(h.judgeFollowups.at(-1)!.input, 'root request')
+    assert.equal(h.judgeFollowups.at(-1)!.claim.handoff, 'durable candidate')
+    assert.equal(h.judgeFollowups.at(-1)!.managerContext, '重启后继续只读核验。')
+    assert.equal(h.judgeFollowups.at(-1)!.recovery, true)
+    assert.ok((await h.store.events('ws', resumed.execution.executionId)).some(event => event.type === 'judge-arranged' && event.snapshot.judge?.id === resumed.execution.judge?.id))
+    assert.equal((await h.engine.handleJudgeClaim('ws', resumed.execution.nodeToken, 'ACCEPT', 'late old turn', h.caller(oldJudge))).ok, false)
+  } finally { h.close() }
+})
+
+test('checking recovery preserves an unjudged Judge when persistence availability is unknown', async () => {
+  const h = recoveryHarness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate under uncertain persistence' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    const oldJudge = structuredClone((await h.row()).execution.judge)!
+    h.reopen()
+    h.setJudgeAvailability('unknown')
+    h.setSafe(false)
+    h.setActivity('unknown')
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '持久层不可读但无已知冲突，冷续接原Judge。', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.execution.judge?.sessionId, oldJudge.sessionId)
+    assert.notEqual(resumed.execution.judge?.id, oldJudge.id)
+    assert.equal(resumed.execution.previousJudge, undefined)
+    assert.equal(h.judgeStarts.length, 1)
+    assert.equal(h.judgeFollowups.length, 1)
+    assert.equal((await h.engine.handleJudgeClaim('ws', resumed.execution.nodeToken, 'ACCEPT', 'late old turn', h.caller(oldJudge))).ok, false)
+  } finally { h.close() }
+})
+
+test('checking recovery respawns a fresh Judge only when the durable Judge Session is missing', async () => {
+  const h = recoveryHarness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate for replacement Judge' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    const oldJudge = structuredClone((await h.row()).execution.judge)!
+
+    h.reopen()
+    h.setJudgeAvailability('missing')
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '旧Judge Session不存在，重建只读Judge。', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    assert.notEqual(resumed.execution.judge?.sessionId, oldJudge.sessionId)
+    assert.equal(h.judgeFollowups.length, 0)
+    assert.equal(h.judgeStarts.length, 2)
+    assert.equal(h.judgeStarts.at(-1)!.claim.handoff, 'candidate for replacement Judge')
+    assert.equal(h.judgeStarts.at(-1)!.recovery, true)
+  } finally { h.close() }
+})
+
+test('checking with an unsettled Actor defaults auto recovery back to Actor and keeps the old claim as previous material', async () => {
+  const h = recoveryHarness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'possibly completed before interruption' }, actor)
+    const claim = structuredClone((await h.row()).execution.claim)!
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '默认交还Actor核查并重新claim。', 'manager', 'auto')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.execution.phase, 'working')
+    assert.equal(resumed.execution.claim, undefined)
+    assert.equal(resumed.execution.previousClaim?.id, claim.id)
+    assert.match(h.messages.at(-1)!.text, /root request/)
+    assert.match(h.messages.at(-1)!.text, /\[instruction\]\nPlan/)
+    assert.match(h.messages.at(-1)!.text, /\[criteria\]\nCorrect plan/)
+    assert.match(h.messages.at(-1)!.text, /possibly completed before interruption/)
+    assert.match(h.messages.at(-1)!.text, /默认交还Actor核查并重新claim/)
+    assert.match(h.messages.at(-1)!.text, /之前中断/)
+  } finally { h.close() }
+})
+
+test('explicit Judge recovery keeps an unsettled Manager claim without treating the current Manager turn as the old turn', async () => {
+  const h = recoveryHarness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'Manager claim retained' }, actor)
+    const claimId = (await h.row()).execution.claim!.id
+    h.reopen()
+    h.setSafe(false)
+    h.setActivity('active')
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Manager确认自己的旧turn已中断，直接交Judge。', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.execution.claim?.id, claimId)
+    assert.equal(resumed.execution.dispatch?.settled, true)
+    assert.ok(resumed.execution.judge?.messageId)
+  } finally { h.close() }
+})
+
+test('explicit Judge recovery rejects known-unsafe Role activity but accepts Manager-confirmed unknown and keeps its claim', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    await enterRecoveryWorker(h)
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'Role claim retained for Judge' }, actor)
+    const claimId = (await h.row()).execution.claim!.id
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    let blocked = await h.row()
+    h.setSafe(false)
+    h.setActivity('active')
+    const denied = await h.engine.handleResume('ws', blocked.execution.nodeToken, '旧Role仍可见active，不能启动Judge。', 'manager', 'judge')
+    assert.equal(denied.ok, false)
+    assert.equal((await h.row()).execution.dispatch?.settled, false)
+
+    h.setActivity('unknown')
+    blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '已核查外因，旧Role无可见冲突，保留claim交Judge。', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.execution.claim?.id, claimId)
+    assert.equal(resumed.execution.dispatch?.settled, true)
+    assert.ok(resumed.execution.judge?.messageId)
+  } finally { h.close() }
+})
+
+async function blockRecoveryNeedContext(h: ReturnType<typeof recoveryHarness>) {
+  await h.start()
+  const actor = h.caller((await h.row()).execution.dispatch!)
+  await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim awaiting context' }, actor)
+  await h.engine.handleTurnEnded('ws', actor)
+  const checking = await h.row()
+  const oldJudge = structuredClone(checking.execution.judge)!
+  await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'NEED_CONTEXT', '需要Manager提供只读事实', h.caller(oldJudge))
+  return oldJudge
+}
+
+test('an already-BLOCKed NEED_CONTEXT run is marked across restart and cold-follows the existing Judge after Manager confirmation', async () => {
+  const h = recoveryHarness()
+  try {
+    const oldJudge = await blockRecoveryNeedContext(h)
+    const before = await h.row()
+    assert.equal(before.run.status, 'blocked')
+    h.reopen()
+    h.setSafe(false)
+    h.setActivity('unknown')
+    await h.engine.handleRestartReconcile()
+    let blocked = await h.row()
+    assert.equal(blocked.execution.restartPending, true)
+    assert.equal(blocked.execution.blockReason, before.execution.blockReason)
+    const status = await h.engine.status('ws', 'manager')
+    assert.equal(status.status.execution.restartPending, true)
+    assert.equal((await h.store.events('ws', blocked.execution.executionId)).at(-1)?.type, 'interrupted')
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '补充事实已核实，冷续接原Judge。', 'manager', 'judge')).ok, true)
+    blocked = await h.row()
+    assert.equal(blocked.execution.restartPending, false)
+    assert.equal(blocked.execution.judge?.sessionId, oldJudge.sessionId)
+    assert.equal(h.judgeFollowups.length, 1)
+    assert.equal(h.judgeFollowups[0]!.previousFeedback?.reason, '需要Manager提供只读事实')
+  } finally { h.close() }
+})
+
+test('an already-BLOCKed NEED_CONTEXT run rebuilds a missing Judge but preserves its claim and feedback', async () => {
+  const h = recoveryHarness()
+  try {
+    const oldJudge = await blockRecoveryNeedContext(h)
+    const claimId = (await h.row()).execution.claim!.id
+    h.reopen()
+    h.setJudgeAvailability('missing')
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    const startsBefore = h.judgeStarts.length
+    h.setDrainFailure(new Error('old Judge drain failed'))
+    const failed = await h.engine.handleResume('ws', blocked.execution.nodeToken, '原Judge不存在，按保存材料重建。', 'manager', 'judge')
+    assert.equal(failed.ok, false)
+    assert.deepEqual(await h.row(), blocked)
+    assert.equal(h.judgeStarts.length, startsBefore)
+    h.setDrainFailure(undefined)
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '原Judge不存在，按保存材料重建。', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    assert.deepEqual(h.drains.slice(-2), [oldJudge.sessionId, oldJudge.sessionId])
+    assert.equal(resumed.execution.claim?.id, claimId)
+    assert.notEqual(resumed.execution.judge?.sessionId, oldJudge.sessionId)
+    assert.equal(h.judgeStarts.at(-1)!.previousFeedback?.reason, '需要Manager提供只读事实')
+    assert.equal(h.judgeStarts.at(-1)!.managerContext, '原Judge不存在，按保存材料重建。')
+  } finally { h.close() }
+})
+
+test('restart after an uncertain Judge followup preserves the Session but rotates the unjudged dispatch', async () => {
+  const h = recoveryHarness()
+  try {
+    await blockRecoveryNeedContext(h)
+    let blocked = await h.row()
+    h.setJudgeFollowupFailure(new Error('Judge Queue acknowledgement lost'))
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '首次补充已保存。', 'manager', 'judge')).ok, true)
+    const uncertain = await h.row()
+    assert.equal(uncertain.run.status, 'blocked')
+    assert.ok(uncertain.execution.judge)
+    assert.equal(uncertain.execution.judge?.messageId, undefined)
+    const uncertainJudge = structuredClone(uncertain.execution.judge)!
+
+    h.setJudgeFollowupFailure(undefined)
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    blocked = await h.row()
+    const startsBefore = h.judgeStarts.length
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '确认旧turn无已知冲突，续接原Judge Session重新只读核验。', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    assert.equal(h.judgeStarts.length, startsBefore)
+    assert.equal(resumed.execution.judge?.sessionId, uncertainJudge.sessionId)
+    assert.notEqual(resumed.execution.judge?.id, uncertainJudge.id)
+    assert.equal(h.judgeFollowups.at(-1)!.previousFeedback?.reason, '需要Manager提供只读事实')
+    assert.equal(h.drains.includes(uncertainJudge.sessionId), false)
+  } finally { h.close() }
+})
+
+test('restart recovery settles only an exited ACCEPT predecessor Judge and continues the registered successor', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    await h.start()
+    const oldJudgeCaller = await acceptRecoveryCurrent(h, 'accepted predecessor handoff')
+    const successor = await h.row()
+    const predecessor = await h.store.execution('ws', successor.execution.predecessorId!)
+    assert.equal(successor.execution.phase, 'ready')
+    assert.equal(predecessor?.phase, 'exited')
+    assert.equal(predecessor?.judgment?.result, 'ACCEPT')
+    assert.equal(predecessor?.judge?.settled, false)
+
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '重启已确认只读前驱Judge撤权，继续已登记后继。', 'manager', 'auto')).ok, true)
+    const resumed = await h.row()
+    const settledPredecessor = await h.store.execution('ws', blocked.execution.predecessorId!)
+    assert.equal(resumed.execution.executionId, successor.execution.executionId)
+    assert.equal(resumed.execution.phase, 'working')
+    assert.equal(resumed.execution.input, 'accepted predecessor handoff')
+    assert.equal(settledPredecessor?.judge?.settled, true)
+    assert.equal(h.judgeStarts.length, 1, 'predecessor is not judged again')
+    await h.engine.handleTurnEnded('ws', oldJudgeCaller)
+    assert.equal((await h.row()).run.status, 'running')
+  } finally { h.close() }
+})
+
+test('restart reconciliation contains one workspace CAS failure and continues the remaining workspaces', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-t6-reconcile-'))
+  const store = new StateStore(home)
+  const base = makeStateHost(store)
+  const subagents = {
+    async ensureRoleActor() { throw new Error('unexpected Role') },
+    async startJudge(_run: never, input: import('../src/engine/engine.ts').JudgeSpawnInput) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge' } },
+    async followupJudge() { return { messageId: 'followup' } },
+    async judgeSessionAvailability() { return 'missing' as const }, async roleSessionAvailability() { return 'missing' as const },
+    async retireJudge() {}, async drainJudge() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
+  }
+  const targets = {
+    async steerManager() { return { messageId: crypto.randomUUID() } },
+    async sendRoleActor() { throw new Error('unexpected Role') }, managerSessionSeq() { return 0 },
+  }
+  const starter = new WorkflowEngine(targets, subagents, { async run() { throw new Error('T7') } }, base)
+  try {
+    await starter.startRun('ws-a', starter.buildInitialRun('manager-a', 'test', CONFIG, 'hash'), undefined, 'a')
+    await starter.startRun('ws-b', starter.buildInitialRun('manager-b', 'test', CONFIG, 'hash'), undefined, 'b')
+    let failed = false
+    const conflicted = { ...base, async put(ws: string, run: import('../src/types.ts').RunState, version: number, changes: import('../src/types.ts').ExecutionChange[]) {
+      if (ws === 'ws-a' && !failed) { failed = true; throw new Error('injected reconcile conflict') }
+      return base.put(ws, run, version, changes)
+    } }
+    const restarted = new WorkflowEngine(targets, subagents, { async run() { throw new Error('T7') } }, conflicted)
+    await restarted.handleRestartReconcile()
+    assert.equal((await store.get('ws-a'))!.run.status, 'running')
+    assert.equal((await store.get('ws-b'))!.run.status, 'blocked')
+    assert.equal((await store.get('ws-b'))!.execution.restartPending, true)
+  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
 })

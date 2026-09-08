@@ -9,7 +9,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { StateStore, workspaceKeyOf, StateConflictError } from './state/store.ts'
+import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
 import { endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
 import { WorkflowEngine } from './engine/engine.ts'
@@ -17,7 +17,7 @@ import { WorkflowError } from './types.ts'
 import type { RunState } from './types.ts'
 import { setToolHost, workflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
-import { makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
+import { isRootCommandAgent, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
 
 export const name = 'dsh-agent-team-workflow'
@@ -25,8 +25,18 @@ export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', '
 
 export function apply(ctx: Context) {
   const home = resolveDshHome()
-  const store = new StateStore(home)
-  ctx.effect(() => () => store.close())
+  const stateAccess = new StateAccess(home)
+  const store = () => stateAccess.current()
+  ctx.effect(() => () => stateAccess.close())
+  const maintenanceText = (diagnostic: StateMaintenanceDiagnostic): string => [
+    'Workflow State Store is in maintenance mode; ordinary list/start/tools are disabled.',
+    `path: ${diagnostic.path}`,
+    `user_version: ${diagnostic.userVersion ?? 'unreadable'}`,
+    `reason: ${diagnostic.reason}`,
+    'No data was migrated or replaced. Plain /dsh-flow reset cannot cut over an incompatible store.',
+    'A root user may back up and replace the ENTIRE workflow State Store with: /dsh-flow reset --incompatible-store',
+    'This does not cancel old external effects; inspect them before starting new work.',
+  ].join('\n')
 
   /** Live session → workspace key for every run participant (manager + role actors). */
   const sessionWorkspaces = new Map<string, string>()
@@ -69,7 +79,7 @@ export function apply(ctx: Context) {
    * session id matches the durable row.
    */
   async function durableJudgeWorkspace(sessionId: string): Promise<string | undefined> {
-    for (const row of await store.list()) {
+    for (const row of await store().list()) {
       if (row.execution.judge?.sessionId === sessionId) return row.workspaceKey
     }
     return undefined
@@ -87,7 +97,7 @@ export function apply(ctx: Context) {
     // Missing mapping can be a registration race (async realpath) or a host
     // restart. Fall back to the durable row in either case; a positive match
     // repairs the live mappings.
-    const row = await store.get(workspaceKey)
+    const row = await store().get(workspaceKey)
     const judgment = row?.execution.judgment
     const currentJudged = judgment !== undefined && judgment.claimId === row?.execution.claim?.id
       && judgment.inputVersion === row?.execution.inputVersion
@@ -166,6 +176,8 @@ export function apply(ctx: Context) {
 
   /** Authorize a workflow-control tool call from the calling agent (exec.agent). */
   async function authorize(caller: unknown, toolName: string): Promise<{ workspaceKey: string } | { workspaceKey: null; reason: string }> {
+    const diagnostic = stateAccess.maintenanceDiagnostic()
+    if (diagnostic) return { workspaceKey: null, reason: maintenanceText(diagnostic) }
     if (typeof caller !== 'object' || caller === null || !('session' in caller)) {
       return { workspaceKey: null, reason: 'no calling agent' }
     }
@@ -175,7 +187,7 @@ export function apply(ctx: Context) {
     // mapping for future calls, covering the Manager's new post-restart session).
     const ws = await workspaceOfSession(sessionId)
     if (ws === undefined) return { workspaceKey: null, reason: 'no workspace for this session' }
-    const row = await store.get(ws)
+    const row = await store().get(ws)
     if (row === undefined) return { workspaceKey: null, reason: 'no active run in this workspace' }
     // S1: a cold-resumed Judge is re-admitted when its id matches the durable
     // row's current judgeSessionId (host-restart repair).
@@ -201,7 +213,7 @@ export function apply(ctx: Context) {
     resume: (ws, nodeToken, resolutionContext, caller, target) => engine.handleResume(ws, nodeToken, resolutionContext, caller, target).then(outcomeOf),
     runProgram: (ws, nodeToken, parameters, caller) => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf),
     resolveProgram: (ws, nodeToken, result, reason, caller) => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf),
-    setRoleModel: (ws, roleKey, provider, modelId) => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf),
+    setRoleModel: (ws, roleKey, provider, modelId, caller) => engine.handleSetRoleModel(ws, roleKey, provider, modelId, caller).then(outcomeOf),
     judgeClaim: (ws, nodeToken, result, reason, caller) => engine.handleJudgeClaim(ws, nodeToken, result, reason, caller).then(outcomeOf),
     respawnJudge: (ws, nodeToken, reason, caller) => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf),
     status: (ws, caller, history) => engine.status(ws, caller, history),
@@ -266,6 +278,7 @@ export function apply(ctx: Context) {
   // roleKey). We learn the child id from `subagent/start` (local children) and
   // join it with the run's roleActors mapping.
   ctx.on('subagent/start', (info) => {
+    if (stateAccess.maintenanceDiagnostic()) return
     const agent = ctx.agents.get(info.id)
     if (agent === undefined) return
     const parentId = agent.session.header.parentSession
@@ -274,7 +287,7 @@ export function apply(ctx: Context) {
       const ws = sessionWorkspaces.get(parentId)
       if (ws === undefined) return
       sessionWorkspaces.set(info.id, ws)
-      const row = await store.get(ws)
+      const row = await store().get(ws)
       if (row === undefined) return
       // S1: a cold-resumed JUDGE child re-registers via the durable row.
       if (row.execution.judge?.sessionId === info.id) {
@@ -296,8 +309,14 @@ export function apply(ctx: Context) {
     currentWorkspaceKey: async (agent) => {
       return workspaceKeyOf(agent.session.header.cwd)
     },
-    list: () => scanCatalog(home),
+    async list() {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) return { ok: false, reason: maintenanceText(diagnostic), entries: [], diagnostics: [] }
+      return scanCatalog(home)
+    },
     async start(agent, workspaceKey, workflowId, extraText) {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) return { ok: false, reason: maintenanceText(diagnostic) }
       try {
         const entry = await loadCatalogEntry(home, workflowId)
         if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
@@ -311,11 +330,28 @@ export function apply(ctx: Context) {
         return { ok: false, reason: String(error) }
       }
     },
-    status: (workspaceKey, caller) => toolHost.status(workspaceKey, caller),
-    async reset(workspaceKey) {
+    status: (workspaceKey, caller) => {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) return Promise.resolve({ ok: true, status: maintenanceText(diagnostic) })
+      if (workspaceKey === undefined) return Promise.resolve({ ok: false, reason: '当前会话没有 workspace cwd' })
+      return toolHost.status(workspaceKey, caller)
+    },
+    async reset(agent, workspaceKey, mode) {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) {
+        if (mode !== 'incompatible-store') return { ok: false, reason: maintenanceText(diagnostic) }
+        if (!isRootCommandAgent(agent)) return { ok: false, reason: 'incompatible-store cutover is root-command-only; subagent/diagnostic Sessions are not authorized' }
+        try {
+          const cutover = await stateAccess.archiveIncompatible()
+          return { ok: true, message: `Entire incompatible Workflow State Store was backed up to ${cutover.backupPath} and replaced with an empty v9 Store. Original raw files: ${cutover.archivePath}. External effects were not cancelled.` }
+        } catch (error) { return { ok: false, reason: String(error) }
+        }
+      }
+      if (mode === 'incompatible-store') return { ok: false, reason: 'state store is compatible; use plain /dsh-flow reset for the current Run' }
+      if (workspaceKey === undefined) return { ok: false, reason: '当前会话没有 workspace cwd' }
       try {
-        await engine.handleReset(workspaceKey)
-        return { ok: true, message: 'run row removed' }
+        const outcome = await engine.handleReset(workspaceKey, agent.session.id)
+        return outcome.ok ? { ok: true, message: outcome.message } : { ok: false, reason: outcome.reason }
       } catch (error) {
         return { ok: false, reason: String(error) }
       }
@@ -328,7 +364,7 @@ export function apply(ctx: Context) {
 
   // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。
   ctx.on('session/event', (session, event) => {
-    if (event.type !== 'turn/end') return
+    if (stateAccess.maintenanceDiagnostic() || event.type !== 'turn/end') return
     const ids = endedTurnUserMessageIds(session.snapshotEvents(), event)
     if (ids === undefined) return
     subagentHost.observeTurnEnd(session.id)
@@ -348,7 +384,7 @@ export function apply(ctx: Context) {
   })
 
   // ---- Host restart reconciliation (design §4.2 H1) ----
-  void (async () => {
+  if (!stateAccess.maintenanceDiagnostic()) void (async () => {
     await engine.handleRestartReconcile()
   })()
 }
