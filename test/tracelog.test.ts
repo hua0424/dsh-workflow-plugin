@@ -45,12 +45,12 @@ test('appendLine: appends timestamped lines, accumulating content', () => {
     writeFileSync(configPath, '')
     const logPath = createRunLog(configPath, 'smoke-test', '9e473ab5-0000')
     assert.ok(logPath !== undefined)
-    assert.equal(appendLine(logPath, 'START workflow=smoke-test run=9e473ab5-0000 fmt=2', new Date(2026, 0, 3, 14, 15, 22)), true)
+    assert.equal(appendLine(logPath, 'START workflow=smoke-test run=9e473ab5-0000 fmt=3', new Date(2026, 0, 3, 14, 15, 22)), true)
     assert.equal(appendLine(logPath, 'ROUTE workflow=smoke-test node=hello result=PASS target=END', new Date(2026, 0, 3, 14, 16, 30)), true)
     const content = readFileSync(logPath, 'utf8')
     assert.equal(
       content,
-      '[2026-01-03 14:15:22] START workflow=smoke-test run=9e473ab5-0000 fmt=2\n' +
+      '[2026-01-03 14:15:22] START workflow=smoke-test run=9e473ab5-0000 fmt=3\n' +
         '[2026-01-03 14:16:30] ROUTE workflow=smoke-test node=hello result=PASS target=END\n',
     )
   })
@@ -76,7 +76,7 @@ test('appendLine: unwritable target is silently ignored and reports false (A3 §
   })
 })
 
-// ---- A3 fmt=2 event-line helpers ----
+// ---- A3 fmt=3 event-line helpers ----
 
 test('shortId: first 8 chars', () => {
   assert.equal(shortId('9e473ab5-1234-5678'), '9e473ab5')
@@ -100,8 +100,8 @@ test('jsonField: escapes free text onto one line; null for absent (A3 §3)', () 
 
 test('traceEvent: key=value tokens in insertion order; undefined omitted, null kept', () => {
   assert.equal(
-    traceEvent('CLAIM', { workflow: 'eng-test', node: 'plan', token: 'ab12cd34', role: 'manager', outcome: 'completed', summary: jsonField('planned', 100), handoff: jsonField(null, 100) }),
-    'CLAIM workflow=eng-test node=plan token=ab12cd34 role=manager outcome=completed summary="planned" handoff=null',
+    traceEvent('CLAIM', { workflow: 'eng-test', node: 'plan', token: 'ab12cd34', role: 'manager', outcome: 'completed', handoff: jsonField('planned', 100) }),
+    'CLAIM workflow=eng-test node=plan token=ab12cd34 role=manager outcome=completed handoff="planned"',
   )
   assert.equal(traceEvent('MODEL', { workflow: 'w', role: 'judge', provider: undefined, model: 'm1' }), 'MODEL workflow=w role=judge model=m1')
   assert.equal(traceEvent('COMPACT', { ok: true, detail: jsonField(null, 100) }), 'COMPACT ok=true detail=null')

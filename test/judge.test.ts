@@ -23,9 +23,22 @@ function makeSource(id: string, events: Array<{ time: number; seq: number; type:
   return {
     id,
     seq: events.reduce((max, e) => Math.max(max, e.seq + 1), 0),
-    events: events.map(e => ({ type: e.type, seq: e.seq, time: e.time, data: e.data, surfaceOp: e.surfaceOp ?? 'append' }) as SessionEvent),
+    snapshotEvents: () => events.map(e => ({ type: e.type, seq: e.seq, time: e.time, data: e.data, surfaceOp: e.surfaceOp ?? 'append' }) as SessionEvent),
   }
 }
+
+test('plugin-owned dispute protocol tells Actor to BLOCK disagreements and Judge not to invent criteria', () => {
+  assert.match(SUBMISSION_CONSTRAINT, /认可.*修正/)
+  assert.match(SUBMISSION_CONSTRAINT, /分歧.*证据.*Manager/)
+  assert.match(SUBMISSION_CONSTRAINT, /不伪报 failed/)
+  const prompt = renderJudgePrompt({
+    nodeToken: 'tok', nodeInstruction: 'work', criteria: 'existing criteria', workerOutcome: 'completed', workerHandoff: 'claim', workspaceCwd: '.', transcript: '',
+  })
+  assert.match(prompt, /existing criteria/)
+  assert.match(prompt, /verifiable fact/i)
+  assert.match(prompt, /NEED_CONTEXT/)
+  assert.match(prompt, /preference.*criterion/i)
+})
 
 test('parseJudgeClaim accepts ACCEPT/REJECT/NEED_CONTEXT (A1 v2)', () => {
   assert.deepEqual(parseJudgeClaim({ result: 'ACCEPT', reason: 'good' }), { result: 'ACCEPT', reason: 'good' })
@@ -45,12 +58,19 @@ test('parseJudgeClaim rejects invalid shapes', () => {
   assert.equal(parseJudgeClaim(null), undefined)
 })
 
+test('T2 Judge packet preserves the actual handoff literally, without a summary', () => {
+  const handoff = '实际交付 $& {workspaceCwd} {transcript}'
+  const text = renderJudgePrompt({ nodeToken: 'token', nodeInstruction: 'work', criteria: 'verify', workerOutcome: 'failed', workerHandoff: handoff, workspaceCwd: '.', transcript: '' })
+  assert.ok(text.includes(`Worker handoff:\n${handoff}`))
+  assert.doesNotMatch(text, /Worker summary/)
+})
+
 test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_claim protocol', () => {
   const text = renderJudgePrompt({
     nodeToken: 'tok-1',
     nodeInstruction: 'Build it',
     criteria: 'PASS when built',
-    workerSummary: 'I built it',
+    workerHandoff: 'I built it',
     workerOutcome: 'completed',
     workspaceCwd: 'C:\\ws',
     transcript: 'USER\nhello',
@@ -74,24 +94,38 @@ test('renderJudgePrompt renders the [previous rejection] evidence before the cla
     nodeToken: 'tok-1',
     nodeInstruction: 'Build it',
     criteria: 'PASS when built',
-    workerSummary: 'I built it',
+    workerHandoff: 'I built it',
     workerOutcome: 'completed',
     workspaceCwd: 'C:\\ws',
     transcript: '',
-    previousRejection: {
-      judgeReason: 'tests missing',
-      previousClaim: { outcome: 'completed', summary: 'built v1', handoffContext: 'notes' },
+    previousFeedback: {
+      result: 'REJECT', reason: 'tests missing',
+      claim: { outcome: 'completed', handoff: 'notes' },
     },
   })
-  assert.match(text, /# Previous judgment on this node \(REJECTED\)\n\[judge rejection\]\ntests missing\n\n\[previous claim\]\noutcome: completed\nsummary: built v1\nhandoffContext: notes\n/)
-  const evidenceAt = text.indexOf('[judge rejection]')
+  assert.match(text, /# Previous Judge feedback on this node \(REJECT\)\n\[judge reason\]\ntests missing\n\n\[judged claim\]\noutcome: completed\nhandoff: notes\n/)
+  const evidenceAt = text.indexOf('[judge reason]')
   const claimAt = text.indexOf('Worker claimed outcome')
   assert.ok(evidenceAt !== -1 && claimAt !== -1 && evidenceAt < claimAt, 'evidence precedes the worker claim')
 })
 
+test('fresh Judge packet preserves NEED_CONTEXT feedback and the current Manager resolution', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-1', nodeInstruction: 'Build it', criteria: 'PASS when built',
+    workerHandoff: 'candidate', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need the approved scope decision', claim: { outcome: 'completed', handoff: 'candidate' } },
+    managerContext: 'The approved scope explicitly includes this behavior.',
+  })
+  assert.match(text, /NEED_CONTEXT/)
+  assert.match(text, /need the approved scope decision/)
+  assert.match(text, /candidate/)
+  assert.match(text, /The approved scope explicitly includes this behavior/)
+  assert.match(text, /does not change frozen criteria/)
+})
+
 test('renderJudgePrompt renders an empty transcript placeholder', () => {
   const text = renderJudgePrompt({
-    nodeToken: 'tok-1', nodeInstruction: 'x', criteria: 'y', workerSummary: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+    nodeToken: 'tok-1', nodeInstruction: 'x', criteria: 'y', workerHandoff: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
   })
   assert.match(text, /no node-local conversation since dispatch/)
 })
@@ -173,6 +207,20 @@ test('ACTOR projection keeps coordinator relay dispatch text; MANAGER projection
   const actorView = projectSessionSurface(s, 0, 'ACTOR')
   assert.equal(actorView.length, 1)
   assert.match(actorView[0]!.text, /repo=acme\/server/)
+})
+
+test('target host Workflow queue provenance projects only for the Actor and only after its dispatch', () => {
+  const dispatch = createUserMessage({ content: [{ type: 'text', text: 'current work' + SUBMISSION_CONSTRAINT }], source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } })
+  const actor = makeSession([
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'old work' }], source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } }), surfaceOp: 'append' },
+    { type: 'user/message', data: dispatch, surfaceOp: 'append' },
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'unrelated notice' }], source: { kind: 'plugin', plugin: 'other-plugin' } }), surfaceOp: 'append' },
+  ])
+  const text = projectNodeLocal(makeSession([]), {
+    dispatchedAt: 0, managerFromSeq: 0, executorSessionId: actor.id, executorDispatchMessageId: dispatch.id,
+  }, actor)
+  assert.equal(text, '[ACTOR]\ncurrent work')
+  assert.deepEqual(projectSessionSurface(actor, 0, 'MANAGER'), [])
 })
 
 test('the A3 submission constraint is stripped from the projected dispatch text (A3 R1/AC6)', () => {

@@ -9,24 +9,38 @@ import { Context } from '@deepseek-ai/cordis'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { StateStore, workspaceKeyOf, StateConflictError } from './state/store.ts'
-import { topFrame } from './state/invariants.ts'
+import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
+import { endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
 import type { RunState } from './types.ts'
 import { setToolHost, workflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
-import { makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
+import { isRootCommandAgent, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
 
 export const name = 'dsh-agent-team-workflow'
-export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions'] as const
+// compaction 不可注入：dsh 0.1.1-rc.7 引入 agent presets 后，压缩后端移入每个
+// 会话 preset 的 isolate 域（web-app bundle 显式禁用宿主平面副本），宿主行
+// inject 它只会永久 `waiting for service: compaction` 并卡死整个 boot。
+// 改为运行期按目标 agent 解析（plugin/host.ts 的 compactionFor）。
+export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs'] as const
 
 export function apply(ctx: Context) {
   const home = resolveDshHome()
-  const store = new StateStore(home)
-  ctx.effect(() => () => store.close())
+  const stateAccess = new StateAccess(home)
+  const store = () => stateAccess.current()
+  ctx.effect(() => () => stateAccess.close())
+  const maintenanceText = (diagnostic: StateMaintenanceDiagnostic): string => [
+    'Workflow State Store is in maintenance mode; ordinary list/start/tools are disabled.',
+    `path: ${diagnostic.path}`,
+    `user_version: ${diagnostic.userVersion ?? 'unreadable'}`,
+    `reason: ${diagnostic.reason}`,
+    'No data was migrated or replaced. Plain /dsh-flow reset cannot cut over an incompatible store.',
+    'A root user may back up and replace the ENTIRE workflow State Store with: /dsh-flow reset --incompatible-store',
+    'This does not cancel old external effects; inspect them before starting new work.',
+  ].join('\n')
 
   /** Live session → workspace key for every run participant (manager + role actors). */
   const sessionWorkspaces = new Map<string, string>()
@@ -59,7 +73,7 @@ export function apply(ctx: Context) {
   function revokeJudgeSession(sessionId: string): void {
     judgeSessions.delete(sessionId)
     judgeWorkspaces.delete(sessionId)
-    sessionWorkspaces.delete(sessionId)
+    // 历史routing保留；授权只认当前工作单，不因撤权丢最后turn/end。
   }
 
   /**
@@ -69,8 +83,8 @@ export function apply(ctx: Context) {
    * session id matches the durable row.
    */
   async function durableJudgeWorkspace(sessionId: string): Promise<string | undefined> {
-    for (const row of await store.list()) {
-      if (row.run.judgeSessionId === sessionId) return row.workspaceKey
+    for (const row of await store().list()) {
+      if (row.execution.judge?.sessionId === sessionId) return row.workspaceKey
     }
     return undefined
   }
@@ -83,16 +97,16 @@ export function apply(ctx: Context) {
    */
   async function isJudgeSessionOf(sessionId: string, workspaceKey: string): Promise<boolean> {
     const admittedWorkspace = judgeWorkspaces.get(sessionId)
-    if (admittedWorkspace !== undefined) {
-      // A known live mapping is workspace-scoped: it cannot authorize another
-      // workspace even when the session id remains admitted.
-      return admittedWorkspace === workspaceKey
-    }
+    if (admittedWorkspace !== undefined && admittedWorkspace !== workspaceKey) return false
     // Missing mapping can be a registration race (async realpath) or a host
     // restart. Fall back to the durable row in either case; a positive match
     // repairs the live mappings.
-    const row = await store.get(workspaceKey)
-    if (row !== undefined && row.run.judgeSessionId === sessionId) {
+    const row = await store().get(workspaceKey)
+    const judgment = row?.execution.judgment
+    const currentJudged = judgment !== undefined && judgment.claimId === row?.execution.claim?.id
+      && judgment.inputVersion === row?.execution.inputVersion
+    if (row !== undefined && row.run.status === 'running' && row.execution.phase === 'checking'
+      && !currentJudged && row.execution.judge?.sessionId === sessionId) {
       judgeSessions.add(sessionId)
       judgeWorkspaces.set(sessionId, workspaceKey)
       sessionWorkspaces.set(sessionId, workspaceKey)
@@ -111,19 +125,6 @@ export function apply(ctx: Context) {
     sessionRoles.set(sessionId, roleKey)
   }
 
-  /**
-   * Per-workspace mutation serialization (design §5: one short mutation
-   * queue). Engine handlers are chained so concurrent claims/programs settle
-   * in order; the in-flight async Judge/Program phase runs OUTSIDE the queue.
-   */
-  const workspaceQueues = new Map<string, Promise<unknown>>()
-  function enqueue<T>(workspaceKey: string, fn: () => Promise<T>): Promise<T> {
-    const prev = workspaceQueues.get(workspaceKey) ?? Promise.resolve()
-    const next = prev.then(fn, fn)
-    workspaceQueues.set(workspaceKey, next.catch(() => {}))
-    return next
-  }
-
   function managerOf(run: RunState): Agent | undefined {
     return ctx.agents.get(run.managerSessionId as SessionId)
   }
@@ -140,9 +141,10 @@ export function apply(ctx: Context) {
     return ctx.agents.currentInitiator()
   }
 
+  const subagentHost = makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute)
   const engine: WorkflowEngine = new WorkflowEngine(
     makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
-    makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute),
+    subagentHost,
     makeProgramHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
     makeStateHost(store),
   )
@@ -178,6 +180,8 @@ export function apply(ctx: Context) {
 
   /** Authorize a workflow-control tool call from the calling agent (exec.agent). */
   async function authorize(caller: unknown, toolName: string): Promise<{ workspaceKey: string } | { workspaceKey: null; reason: string }> {
+    const diagnostic = stateAccess.maintenanceDiagnostic()
+    if (diagnostic) return { workspaceKey: null, reason: maintenanceText(diagnostic) }
     if (typeof caller !== 'object' || caller === null || !('session' in caller)) {
       return { workspaceKey: null, reason: 'no calling agent' }
     }
@@ -187,7 +191,7 @@ export function apply(ctx: Context) {
     // mapping for future calls, covering the Manager's new post-restart session).
     const ws = await workspaceOfSession(sessionId)
     if (ws === undefined) return { workspaceKey: null, reason: 'no workspace for this session' }
-    const row = await store.get(ws)
+    const row = await store().get(ws)
     if (row === undefined) return { workspaceKey: null, reason: 'no active run in this workspace' }
     // S1: a cold-resumed Judge is re-admitted when its id matches the durable
     // row's current judgeSessionId (host-restart repair).
@@ -208,32 +212,15 @@ export function apply(ctx: Context) {
 
   const toolHost: ToolHost = {
     authorize,
-    claim: (ws, claim, caller) => enqueue(ws, () => engine.handleClaim(ws, claim, caller).then(outcomeOf)),
-    block: (ws, nodeToken, reason, caller) => enqueue(ws, () => engine.handleBlock(ws, nodeToken, reason, caller).then(outcomeOf)),
-    resume: (ws, nodeToken, resolutionContext, caller) => enqueue(ws, () => engine.handleResume(ws, nodeToken, resolutionContext, caller).then(outcomeOf)),
-    runProgram: (ws, nodeToken, parameters, caller) => enqueue(ws, () => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf)),
-    resolveProgram: (ws, nodeToken, result, reason, caller) => enqueue(ws, () => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf)),
-    setRoleModel: (ws, roleKey, provider, modelId) => enqueue(ws, () => engine.handleSetRoleModel(ws, roleKey, provider, modelId).then(outcomeOf)),
-    judgeClaim: (ws, nodeToken, result, reason, judgeSessionId) => enqueue(ws, () => engine.handleJudgeClaim(ws, nodeToken, result, reason, judgeSessionId).then(outcomeOf)),
-    respawnJudge: (ws, nodeToken, reason, caller) => enqueue(ws, () => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf)),
-    status: async (ws) => {
-      const row = await store.get(ws)
-      if (row === undefined) return { ok: true, status: 'no active run' }
-      const run = row.run
-      return {
-        ok: true,
-        status: {
-          runId: run.runId,
-          catalogWorkflowId: run.catalogWorkflowId,
-          status: run.status,
-          callStack: run.callStack.map(f => ({ workflowId: f.workflowId, nodeId: f.nodeId, nodeToken: f.nodeToken })),
-          currentFrame: run.callStack.length > 0 ? topFrame(run) : null,
-          roleActors: run.roleActors,
-          modelOverrides: run.modelOverrides,
-          blockReason: run.blockReason,
-        },
-      }
-    },
+    claim: (ws, claim, caller) => engine.handleClaim(ws, claim, caller).then(outcomeOf),
+    block: (ws, nodeToken, reason, caller) => engine.handleBlock(ws, nodeToken, reason, caller).then(outcomeOf),
+    resume: (ws, nodeToken, resolutionContext, caller, target) => engine.handleResume(ws, nodeToken, resolutionContext, caller, target).then(outcomeOf),
+    runProgram: (ws, nodeToken, parameters, caller) => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf),
+    resolveProgram: (ws, nodeToken, result, reason, caller) => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf),
+    setRoleModel: (ws, roleKey, provider, modelId, caller) => engine.handleSetRoleModel(ws, roleKey, provider, modelId, caller).then(outcomeOf),
+    judgeClaim: (ws, nodeToken, result, reason, caller) => engine.handleJudgeClaim(ws, nodeToken, result, reason, caller).then(outcomeOf),
+    respawnJudge: (ws, nodeToken, reason, caller) => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf),
+    status: (ws, caller, history) => engine.status(ws, caller, history),
     inspectGit: async (_ws, operation) => {
       const cwd = ambientAgent()?.session.header.cwd
       if (cwd === undefined) return { ok: false, reason: 'no cwd' }
@@ -295,6 +282,7 @@ export function apply(ctx: Context) {
   // roleKey). We learn the child id from `subagent/start` (local children) and
   // join it with the run's roleActors mapping.
   ctx.on('subagent/start', (info) => {
+    if (stateAccess.maintenanceDiagnostic()) return
     const agent = ctx.agents.get(info.id)
     if (agent === undefined) return
     const parentId = agent.session.header.parentSession
@@ -303,10 +291,10 @@ export function apply(ctx: Context) {
       const ws = sessionWorkspaces.get(parentId)
       if (ws === undefined) return
       sessionWorkspaces.set(info.id, ws)
-      const row = await store.get(ws)
+      const row = await store().get(ws)
       if (row === undefined) return
       // S1: a cold-resumed JUDGE child re-registers via the durable row.
-      if (row.run.judgeSessionId === info.id) {
+      if (row.execution.judge?.sessionId === info.id) {
         judgeSessions.add(info.id)
         judgeWorkspaces.set(info.id, ws)
         return
@@ -325,34 +313,49 @@ export function apply(ctx: Context) {
     currentWorkspaceKey: async (agent) => {
       return workspaceKeyOf(agent.session.header.cwd)
     },
-    list: () => scanCatalog(home),
+    async list() {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) return { ok: false, reason: maintenanceText(diagnostic), entries: [], diagnostics: [] }
+      return scanCatalog(home)
+    },
     async start(agent, workspaceKey, workflowId, extraText) {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) return { ok: false, reason: maintenanceText(diagnostic) }
       try {
         const entry = await loadCatalogEntry(home, workflowId)
         if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
         const run = engine.buildInitialRun(agent.session.id, workflowId, entry.config, entry.definitionHash)
         sessionWorkspaces.set(agent.session.id, workspaceKey)
-        const outcome = await engine.startRun(workspaceKey, run, entry.path)
+        const outcome = await engine.startRun(workspaceKey, run, entry.path, extraText)
         if (!outcome.ok) return { ok: false, reason: outcome.reason }
-        // Design §2.6: extra text only enters the steer message to the Manager.
-        if (extraText !== '') {
-          const { createUserMessage } = await import('@deepseek-ai/dsh-llm')
-          agent.steer(createUserMessage({
-            content: [{ type: 'text', text: extraText }],
-            source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' },
-          }))
-        }
-        return { ok: true, message: `started ${workflowId} (run ${outcome.run.runId})${extraText !== '' ? `; steered: ${extraText}` : ''}` }
+        return { ok: true, message: `started ${workflowId} (run ${outcome.run.runId})` }
       } catch (error) {
         if (error instanceof StateConflictError) return { ok: false, reason: error.message }
         return { ok: false, reason: String(error) }
       }
     },
-    status: (workspaceKey) => toolHost.status(workspaceKey),
-    async reset(workspaceKey) {
+    status: (workspaceKey, caller) => {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) return Promise.resolve({ ok: true, status: maintenanceText(diagnostic) })
+      if (workspaceKey === undefined) return Promise.resolve({ ok: false, reason: '当前会话没有 workspace cwd' })
+      return toolHost.status(workspaceKey, caller)
+    },
+    async reset(agent, workspaceKey, mode) {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) {
+        if (mode !== 'incompatible-store') return { ok: false, reason: maintenanceText(diagnostic) }
+        if (!isRootCommandAgent(agent)) return { ok: false, reason: 'incompatible-store cutover is root-command-only; subagent/diagnostic Sessions are not authorized' }
+        try {
+          const cutover = await stateAccess.archiveIncompatible()
+          return { ok: true, message: `Entire incompatible Workflow State Store was backed up to ${cutover.backupPath} and replaced with an empty v9 Store. Original raw files: ${cutover.archivePath}. External effects were not cancelled.` }
+        } catch (error) { return { ok: false, reason: String(error) }
+        }
+      }
+      if (mode === 'incompatible-store') return { ok: false, reason: 'state store is compatible; use plain /dsh-flow reset for the current Run' }
+      if (workspaceKey === undefined) return { ok: false, reason: '当前会话没有 workspace cwd' }
       try {
-        await engine.handleReset(workspaceKey)
-        return { ok: true, message: 'run row removed' }
+        const outcome = await engine.handleReset(workspaceKey, agent.session.id)
+        return outcome.ok ? { ok: true, message: outcome.message } : { ok: false, reason: outcome.reason }
       } catch (error) {
         return { ok: false, reason: String(error) }
       }
@@ -363,46 +366,20 @@ export function apply(ctx: Context) {
   const disposeCommand = ctx.commands.register(makeDshFlowCommand(commandHost))
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
 
-  // ---- Turn-settlement observation (design §4.2 D6) ----
-  // MANAGER and mapped ROLE ACTOR sessions settle workflow turns. Judge
-  // sessions settle through handleJudgeTurnEnded (technical-fault detection).
+  // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。
   ctx.on('session/event', (session, event) => {
-    if (event.type !== 'turn/end') return
-    // Defer: never mutate state inside the append publication lock (design).
-    // Route through the same per-workspace mutation queue as tool-driven
-    // engine calls so a settlement never races an in-flight judge_claim.
-    void (async () => {
-      // S1: in-memory Judge sets are empty after a host restart — fall back to
-      // the durable rows so a cold-resumed Judge's turn/end still routes to
-      // handleJudgeTurnEnded (A4 R4/A1 R12).
-      const liveWs = judgeWorkspaces.get(session.id)
-      if (liveWs !== undefined) {
-        const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } })?.reason
-        const kind = reason?.kind ?? 'unknown'
-        const errorMessage = reason?.kind === 'error' && reason.error?.message !== undefined ? `: ${reason.error.message}` : ''
-        const detail = kind === 'completed'
-          ? 'judge turn ended without judge_claim'
-          : `judge turn ended (${kind})${errorMessage}`
-        await enqueue(liveWs, () => engine.handleJudgeTurnEnded(liveWs, session.id, detail).then(() => undefined))
-        return
-      }
-      const durableWs = await durableJudgeWorkspace(session.id)
-      if (durableWs !== undefined) {
-        judgeWorkspaces.set(session.id, durableWs)
-        sessionWorkspaces.set(session.id, durableWs)
-        const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } })?.reason
-        const kind = reason?.kind ?? 'unknown'
-        const errorMessage = reason?.kind === 'error' && reason.error?.message !== undefined ? `: ${reason.error.message}` : ''
-        const detail = kind === 'completed'
-          ? 'judge turn ended without judge_claim'
-          : `judge turn ended (${kind})${errorMessage}`
-        await enqueue(durableWs, () => engine.handleJudgeTurnEnded(durableWs, session.id, detail).then(() => undefined))
-        return
-      }
-      const ws = sessionWorkspaces.get(session.id)
-      if (ws === undefined) return
-      await enqueue(ws, () => engine.handleTurnEnded(ws, session.id).then(() => undefined))
-    })()
+    if (stateAccess.maintenanceDiagnostic() || event.type !== 'turn/end') return
+    const ids = endedTurnUserMessageIds(session.snapshotEvents(), event)
+    if (ids === undefined) return
+    subagentHost.observeTurnEnd(session.id)
+    const caller = { sessionId: session.id, turnUserMessageIds: ids }
+    setImmediate(() => {
+      void (async () => {
+        const ws = sessionWorkspaces.get(session.id) ?? await durableJudgeWorkspace(session.id)
+          ?? await workspaceKeyOf(session.header.cwd)
+        if (ws !== undefined) await engine.handleTurnEnded(ws, caller)
+      })().catch(error => ctx.logger.warn(`workflow turn settlement failed: ${String(error)}`))
+    })
   })
 
   ctx.effect(() => () => {
@@ -411,7 +388,7 @@ export function apply(ctx: Context) {
   })
 
   // ---- Host restart reconciliation (design §4.2 H1) ----
-  void (async () => {
+  if (!stateAccess.maintenanceDiagnostic()) void (async () => {
     await engine.handleRestartReconcile()
   })()
 }

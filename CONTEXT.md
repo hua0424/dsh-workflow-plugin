@@ -1,167 +1,109 @@
 # Domain Glossary
 
-## Agent Team Workflow
+> `refact` 当前为 T6–T9 实现与整体验收冻结、待父代理最终 Standards/Spec 审查和提交的集成态，未部署。目标架构见 `docs/design/node-execution-runtime.md`，A01–A30 证据见 `docs/testing/node-execution-runtime-acceptance.md`；不能据此操作真实 Run。
 
-在DSH主会话中，由Manager与若干固定Role Actors按预配置Workflow Definition串行协作，直到Root Workflow到达END。它只定义团队编排、Node推进、Checker判断和中断继续，不内置PRD、GitHub、测试或交付等具体业务流程。
+## Agent Team Workflow / Manager
 
-## Manager
+插件按不可变 Graph 串行组织 Manager 与固定 Role Actors。Manager 是启动 Run 的主会话，负责启动、查看状态、处理 BLOCK，也可承担 `role: manager` 的 Actor Task；即使 Manager 执行，也必须经独立 Judge 确认 claim。
 
-当前DSH主会话承担的编排者。Manager启动Run、为动态决策Node选择业务对象、把上下文交给后续Node、处理中断/BLOCK、与直接人类沟通，并可执行配置为`manager` Role的Actor Task。Manager执行Actor Task时仍不能自行判定PASS。
+一个 canonical workspace 最多一个未结束 Root Run。Manager ownership 固定，其他 Session 不能接管推进。授权使用真实调用 Agent，不信任模型自行声明 Session 身份。
 
-## Role Definition
+## Workflow Configuration / Definition Snapshot
 
-团队中一种工作职责的不可变运行定义，包括`roleKey`、persona、model route和tool restrictions。Role Definition可以由多个Node复用。Session Preset提供基础persona/tools/Skills/MCP和helper subagents；Role Actor继承Preset后再应用Workflow Role覆盖/收窄。Manager是保留roleKey且不在roles配置中。
+Catalog 位于 `${DSH_HOME:-$HOME/.dsh}/workflows/<workflow-id>.yaml`。schema 为 `agent-workflow/v2`，受限单文档 YAML 1.2，禁止 duplicate key、anchor/alias/merge、custom tag、模板插值及外部引用。文件名必须是小写 `[a-z][a-z0-9-]*.yaml` 普通文件；每次 list/start fresh 扫描，invalid 文件只阻塞自身。
 
-## Role Actor
+Run 启动校验、规范化并固定完整 Definition Snapshot 与 hash。运行中不读取新 YAML 改图。Root startNode 必须是 `actor-task role:manager`。Graph 只有 PASS/FAIL 路由，END 是终点而不是结果。
 
-某个Workflow Run中Role Definition的当前执行身份。`subagent` Role在首次使用时创建一个continuable Actor，并在整个Root/Child Run中复用（Session级复用：DSH continuable child在quiescent时Activation被自动释放，后续followup自动cold-resume）；每次派发新Node前Engine对其执行Node边界compact（A4方案A：cold Actor先经`ctx.agents.resume`无prompt物化，`ctx.compaction.compactNow`压缩后`dispose`释放，随后followup重放已压缩surface；resident窄竞态下的`busy`降级跳过），compact异常进入BLOCK；不可恢复时用replacement Actor覆盖current mapping。Manager Role由主会话直接承担，不创建Role Actor mapping，也不被compact。
+## Run
 
-## Judge Role
+`runs` 保存 Run identity、workspace、固定 Manager/Snapshot、status、`currentExecutionId`、callStack、Role mappings、modelOverrides、row CAS version 及时间。节点材料不镜像在 Run。
 
-整个Root Workflow只配置一次的独立判断职责，包括persona、model和Engine固定read-only allow-list：read/glob/grep/read_image及current workspace/repository限定的`workflow_inspect_git`、`workflow_inspect_github` wrappers；不暴露shell/SSH/mutation/MCP/subagent/Workflow control。Judge Role不承担普通工作Node，也不能修改被判断对象。
+status 为 `running|blocked|completed|terminated`。BLOCK 仍占 workspace；completed/terminated 释放新 Run 资格但不被覆盖。completed 的 `currentExecutionId` 仍指向终局工作单且 callStack 为空；terminated 保留原 callStack/current execution/phase 与全部材料，只轮换顶层 nodeToken、清 restartPending 并记录“不取消外部动作”的终止原因。最终 handoff 从终局工作单读取，无 Run.finalHandoff。
 
-## Judge Agent
+Run.blockReason 仅用于 Run 控制故障；节点暂停原因属于工作单，status 从工作单投影，不重复写两份原因。当前 Runtime 的节点 BLOCK 只写工作单原因。
 
-根据Judge Role为一次具体Checker判断创建、按Node隔离的continuable Agent。每个Node创建一个全新Judge Session；同一Node内可因信息不足被Manager followup续接；Node离开（ACCEPT推进）或REJECT重派后撤销授权（Activation由DSH settlement watcher在Judge turn结束后自动释放；**禁止从Judge自己的judge_claim turn内drain自己**），下一判定创建新Session，不复用。Parent/Child Workflow共享同一个Judge Role配置，但不复用Judge session。Engine在admission前为Judge预留并持久化`judgeSessionId`，Host必须以该预留id作为continuable `childId`；child admission后才可能发生真实判定。Judge只接收当前Node的Node-local projection（从Node实际dispatch边界起，按事件时间戳合并Manager/User/Actor消息，排除system/tool/notice/旧Node历史与引擎注入的`[提交要求]`硬约束）与`pendingCorrection`携带的`[previous rejection]`证据段（Manager路径projection不透出correction，证据走该持久化通道）；不再注入完整Manager Session投影。Judge通过专用`judge_claim({nodeToken,result,reason})`协议提交`ACCEPT|REJECT|NEED_CONTEXT`：**Judge只确认claim是否可信，不改写结果**——ACCEPT时Graph verdict由claim outcome映射（completed→PASS、failed→FAIL）；REJECT触发correction流（同Node重派原Actor）；`NEED_CONTEXT`进入可恢复BLOCK等待Manager补充。技术故障fail-closed并BLOCK；判定阶段`pendingClaim`持久化`{outcome,summary,handoffContext?}`，spawn/respawn/重建时用其`outcome/summary`（连同`pendingCorrection`证据）重投Judgment Packet，`handoffContext`保留在State，判定ACCEPT后（PASS或FAIL）交给后继Node（20260906对称化）。
+## Run Frame / 当前位置
 
-宿主实现已确认：`toolFilter.allow`过滤整个继承工具面（global+Preset ancestor层），固定allow-list对继承Preset的Judge成立，并额外授予`judge_claim`；两个`workflow_inspect_*` wrapper注册在host行，执行时由`tools.guard()`校验调用者属于当前Judge session；每次spawn后Host对Judge final visible schema做fail-closed断言。
+callStack 的 workflowId/nodeId/nodeToken/executionId 必须与各层工作单一致；顶层 executionId 等于 Run.currentExecutionId，较低层 executionId 稳定指向等待中的 Child caller。Store 在同一事务内校验更新。它不是独立推进入口。新 visit 产生新 execution ID 与 token。
 
-## Workflow Configuration
+nodeToken 是控制面过期检查，不是授权凭证。**旧 Turn 即使查到最新 token，也不能取得新 dispatch 的 claim/block/Judge 权利。**
 
-`${DSH_HOME:-$HOME/.dsh}/workflows/<workflow-id>.yaml`中的一个自包含Catalog文件。文件名stem就是Root Workflow ID；顶层`workflow`保存Root Graph，可选`childWorkflows`保存复用子流程。文件还内联全部Role Definitions和一个Judge Role。Schema精确为`agent-workflow/v2`（A1原地升级：v1文件被loader拒绝，不设双轨），使用单文档受限YAML 1.2，无duplicate key、anchor/alias/merge、custom tag或模板插值。首期不存在import、include、extends、overlay、跨文件引用或远程Registry。Catalog每次list/start fresh非递归扫描根目录，只接受lowercase`[a-z][a-z0-9-]*.yaml`普通文件，拒绝symlink/junction和`.yml`；invalid文件只阻塞自身。主入口是原生Command：`/dsh-flow list|start <workflow-id> [extra text]|status|reset`；无参数返回usage error，不做隐式status/list。
+## Node Execution（工作单）
 
-## Workflow Plugin Bundle
+`node_executions` 是一次 Graph visit 的当前事实。每次沿 Edge 进入（包括自环、回边）创建独立 execution；REJECT、补充、resume、Judge respawn、重启恢复与 Role replacement 都更新同一单，不新增 visit。
 
-插件以DSH Profile Bundle分发：package.json声明`dsh.bundle.patch`指向`cordis.patch.yml`，装入`${DSH_HOME}/profiles/<name>/`的`dsh.profile.bundles`列表，用`dsh plugin --profile <name> add <path|git>`安装。Engine、`/dsh-flow`命令、八个Workflow control tools、Judge专用`judge_claim`和两个inspection wrapper注册在bundle的host行（global层、所有Agent可见、靠guard授权；共十一个注册工具）；Role/Judge subagent由插件直接调用`ctx.subagents`（continuable/one-shot），不走Preset的subagent delegation工具。bundle成员变更需重启DSH；home/patch层修改可热载。
+工作单保存 input 快照、phase、Actor 安排与真实 Host message ID、Node-local 投影边界、当前 claim/Judge/判定、版本与暂停原因，以及前驱/后继关联。input 进入时固定，不被前驱修改或后续补充覆盖。
 
-## Workflow Definition
+phase 为 `ready|working|checking|settling|exited`：表示已登记业务事实，不表示宿主瞬时状态。working 不证明消息已送达；checking 不证明 Judge 已启动。BLOCK 保留阶段与材料。exited 材料不可变，只允许为待派发后继补记前驱 Judge 安全收口元数据。
 
-一个不可变的有向Node Graph，由`workflowId`、`startNode`和Nodes组成。Graph运行中不能修改；Node业务判断只产生`PASS|FAIL`，不支持任意表达式、脚本transition、多结果分支或并行Node。
+## Node Execution Events
 
-## Root Workflow
+`node_execution_events` 只追加关键快照：进入、Actor/Judge/Program/Child安排、claim、judgment、Program结果/人工裁决、Child返回、模型变更、离开、BLOCK。事件在同 execution 内使用稳定递增 sequence；时间仅供显示。
 
-Catalog文件名对应的入口Workflow Definition。Root startNode必须是`actor-task role:manager`，以直接利用当前主会话conversation并在主聊天开始编排；后续Node不限。Root到达END时整个Run completed。
+状态与对应事件同事务。ACCEPT 的 judgment、前驱离开、后继 input/进入事件、Run 指针同事务；失败全部回滚，同一真实提交可重试，成功后重复提交不能二次推进。
 
-## Child Workflow
+正常继续读当前工作单，历史解释读事件。不回放事件恢复；不建 attempt、outbox、effect 或 recovery-job 表。`workflow_status({executionId,after?,limit?})` 向当前 Run Manager 提供稳定 sequence 的前向分页（每页最多 50）；Role/Judge 与跨 Run execution 拒绝，默认无参仍只给当前摘要。
 
-被Parent Workflow中的`child-workflow` Node引用的可复用Workflow Definition。调用时push一个Child Run Frame；Child内部FAIL由自己的onFail循环/修复处理，BLOCK保留Child Frame，只有到达END才pop并让Parent调用Node视为PASS。首期Child不返回独立FAIL终点，Workflow引用图禁止直接或间接递归。
+## Node Claim / Handoff
 
-## Parent Workflow
+Actor 的唯一业务提交是 `node_claim({outcome: completed|failed, handoff})`。handoff opaque、trim 后 1..8000 字符，两种 outcome 完全对称，END 也必填。`normalizeNodeClaim` 同时保护工具与 Runtime；旧 summary/handoffContext 及额外业务字段明确拒绝。
 
-当前调用另一个Child Workflow的Workflow Definition或Run Frame。Parent/Child描述Graph复用与Runtime调用栈，不再固定表示GitHub Milestone/Issue等业务对象。
+handoff 说明实际结果、产物位置与核验依据、剩余问题和后续约束。Judge、Manager 预览、后继 input 与最终交付共用这一文本，不另造摘要或 fallback。额度不足/缺条件/临时无法继续应 BLOCK，不伪报 failed。
 
-## Workflow Run
+## Dispatch / Claim 身份与 CAS
 
-一次Root Workflow执行。Run保存启动时的完整immutable Definition Snapshot、当前call stack、Role Actor mappings和最小诊断状态。Run状态闭集是`running|blocked|completed`。
+execution ID 标识 visit；dispatch.id 标识一次安排；真实 Host 返回的 Session/message ID 与 caller 当前 Turn 的 user/message ID 集合共同绑定来源；claim.id 标识一次结果；Judge 安排绑定 claim.id 与 inputVersion。row revision 只仲裁竞争，不能替代任一身份。
 
-## Definition Snapshot
+安排先持久化，再调用 Host。Host 返回后重新验证当前 execution/dispatch/claim 与 CAS version，才发布实际 message ID。admission→返回窗口内无法证明来源的调用 fail-closed，可重试；不建恰好一次投递平台。
 
-Run启动时对完整Workflow Configuration严格校验、规范化后保存的不可变副本。Active Run只使用该Snapshot；外部YAML之后的修改只影响下一个Run，不热重载当前Graph或Role。
+没有内存 DispatchBook 作为独占材料或 lease 权威。Actor claim 的 phase/claim 原子写入就是消费资格；失败事务不消费，重复或旧 dispatch 提交拒绝。Manager 当前是 Actor 时同样必须绑定真实 dispatch；Manager 对 Role 节点的 BLOCK 才是无 lease 的控制面动作。
 
-## Run Frame
+## Role Definition / Role Actor
 
-Call Stack中的一个Root或Child执行帧，只包含`workflowId`、`nodeId`和current `nodeToken`。Token是每次Node进入/resume/replacement派发时更新的UUID，用于拒绝旧Turn/旧消息迟到mutation；不保存旧Token历史。Token是尽力而为的stale防护：防「凭记忆用旧token」，防不住「迟到方实时查`workflow_status`拿新token伪装」（已知限制）。Actor一律以`workflow_status`返回的当前nodeToken为准；`resolutionContext`不承载nodeToken。Runtime不保存working/checking/interrupted phase、completion claim、attempt或Node历史。
+Role Definition 定义 persona、model route 与 tool restrictions，Preset 提供基础环境。Role mappings 属于 Root Run，跨 Node 复用 continuable Session；工作单独立不意味着每 Node 创建新 Session。Manager 不建 Role mapping，不 compact。
 
-## Node
+Role 首次使用创建 Session；再次承担新 visit 前先确认无冲突活动，再执行 Node 边界 compact，之后用 exact Host queue 交付本次 input/instruction/criteria。T1 已对齐 `queueHostSubagentPrompt` 与 `snapshotEvents()`，不用 nearest-step sendMessage 替代独立派发。
 
-Workflow Definition中的最小执行单元。Node包含稳定`nodeId`、一种Execution Type、可选instruction/Checker、必填`onPass`和可选`onFail`。Node运行时不被修改。
+T5 已把 `jobs`、`compaction` 设为标准 Web composition 的 required service，并在 Host Adapter 内用正式接口完成 cold resume（无 prompt）、idle maintenance、释放和原 Session Queue 续接。成功与合法 no-range 可继续；busy、压缩/resume/dispose 失败均不伪装成功，工作单保留并 BLOCK。T6 的 Session availability 为 `available|missing|unknown`：live 或持久读取成功为 available，只有正式 `SessionPersistenceNotFoundError` 是 missing，服务缺失/损坏/读取异常保持 unknown；仅 missing 自动 fresh replacement，unknown 保留原身份并在 Manager 明确确认后尝试 cold 续接，失败继续 BLOCK。
 
-## Execution Type
+## Judge Role / Judge Agent
 
-Node如何执行的代码内置闭集：
+Judge 是独立只读检查者，不补做 Actor 工作，不改写 claim outcome。首次判断和 respawn 创建 continuable Judge；NEED_CONTEXT 补充可复用同一 Session，但每次都先登记新的 Judge dispatch，再以 Host queue 开新真实 Turn，并在真实 message ID 返回后才允许该 Turn 提交。T6 将恢复决定持久化为 `followup|fresh`：historical NEED_CONTEXT 或重启后未判定且 available/unknown 的当前 Judge 可在同 Session 预安排新 dispatch 并 followup；只有 missing 或明确 respawn 才 fresh，旧 Turn/inputVersion 均失权。
 
-- `actor-task`：由Manager或一个continuable Role Actor工作；必须配置Checker；
-- `builtin-program`：运行代码内置Program，可执行动作或读取现场，并在结果明确时直接返回PASS/FAIL；
-- `child-workflow`：调用可复用Child Workflow，Child到END后返回PASS。
+Host 用真实 tool allow-list 限制 read/glob/grep/read_image 和 workspace/repository 限定的 workflow_inspect_git/workflow_inspect_github，并授予专用 judge_claim；spawn 后检查最终工具面，异常 fail-closed。Actor/Manager 不能冒充 Judge。
 
-## Builtin Program
+Judgment Packet 来自本次工作单 input、instruction/criteria、claim.handoff 与本次 dispatch 的 Node-local projection，不从旧 Run.nodeBoundary/pendingClaim 镜像读取。投影排除旧 Node、system/tool/notice 与提交约束，不注入完整 Manager 历史。
 
-由代码注册的固定业务程序，具有稳定`programId`、config/parameter/result schema。Node保存静态config，Manager在current Node通过`node_run_program`提供不持久化的typed parameters；Host固定programId。它可以执行业务动作或纯检查。v1仅含固定当前Workspace repository的`github.initialize-milestone(title,branchName)`与`github.all-milestone-issues-complete(milestoneNumber)`；Program parameters/details不持久化。只有结果明确时返回PASS/FAIL；ERROR/INDETERMINATE不走Graph Edge，在当前Node进入BLOCK并交给Manager处理。扩展Program必须修改代码。
+`judge_claim({nodeToken,result,reason})` 的真实 caller Turn 绑定当前 Judge dispatch，且必须匹配 claim/input version。ACCEPT 后 completed→PASS、failed→FAIL；有合法出口才原子交接。REJECT 在同 execution 保存完整旧 claim 与 Judge/input 关联、使当前资格失效并重派原 Actor，不走 onFail/新 visit/compact；NEED_CONTEXT 保留当前 claim 并 BLOCK。Manager 的完整当前补充先入库/事件、递增 inputVersion，再开 Judge followup；失败仍保留材料，旧 Turn 无效。
 
-## Checker
+## 安全收口 / Host Adapter
 
-`actor-task`的实际推进门控。Node配置`checkerId`和该Checker schema允许的config；Worker只能claim completed/failed，Checker才产生PASS/FAIL。Runtime不保存Checker状态、evidence或attempt history。
+claim 入库之后先等待**对应真实 Actor Turn**安全收口，才启动 Judge。旧 Session 的其他 Turn/end 不能结算当前 visit。interrupt 回执不代表工具/后台任务已经停止。
 
-## Checker Definition
+session/event 同步回调只捕获该 turn/end 对应的精确消息集合和 Agent 生命周期引用，退出 append publication lock 后由 setImmediate 触发 Runtime。Host 使用正式 jobs、whenIdle、inbox、durable descendant 与 live registry 检查当代/observed exact Agent：durable inactive descendant 无 Activation 可通过；running 却不可观察、live 非 idle、pending inbox、非 terminal job、diagnostic 或 orphan 证据均 fail-closed。orphan 不因 job 行消失洗白，插件 effect 清理观察引用。这里只保证可观察 Host 活动，不证明未登记外部副作用停止。
 
-插件源码内部固定Catalog中的Checker实现，包括`checkerId`、evaluation mode、config/claim/parameter schema、可选Judge prompt template和evaluate逻辑。不提供运行时register API；新增ID但不改变配置结构/既有语义时仍属于当前schema版本，结构或既有语义不兼容才升级版本（A1已升`agent-workflow/v2`并更名`judge.claim-correct`）；扩展Checker必须修改插件源码、测试和版本；配置不能提供任意程序、脚本或Checker类型。
+Judge ACCEPT 工具内只提交事务和撤权，**不 await 自己 whenIdle/drain**。后继派发由该 Judge 工具返回后的精确收口事件驱动。Root END 已完成时，Actor 已在判断前安全收口，撤权后的只读 Judge 不因缺失最终 turn/end 另占 workspace 或形成新的业务锁。T6 中 live active/idle 但 `safeToInspect=false` 的旧执行仍保守拒绝；重启后无 current/observed Agent 的 unknown 只有在 Manager 提供明确 resume context 后才可 cold 接手。已 ACCEPT/exited 且后继登记的前驱只读 Judge 漏 end，可由重启恢复事务技术收口而不重判前驱。T8 Reset 仅撤销 Workflow 资格和 best-effort Judge 授权，不 drain/cancel 外部资源。
 
-## Deterministic Program Checker（未来扩展）
+SQLite 事务与状态队列不包 spawn/compact/网络/Program 长调用。index 不再把完整 Engine Promise 放进 workspace enqueue；每个外部返回后重新验证身份版本。
 
-直接根据Worker claim、Node config和live workspace/remote facts计算PASS/FAIL的Checker；当前尚无该类checkerId。
+## BLOCK / 恢复与暂未接通范围
 
-## Judge-assisted Program Checker（未来扩展）
+T4 支持显式 node_block、Actor 未提交结果、Judge 未提交结论、NEED_CONTEXT、派发/compact/安全收口故障的可见 BLOCK；材料保留。`node_resume` 是 Manager-only/current BLOCK，可选 auto/actor/judge 并拒绝已 exited、不适用阶段或可交接结论；`judge_respawn` 仅在有效 claim 下重建并撤销/收口旧 Judge。T6 的重启 reconciliation 为所有未结束 Run 记录 `restartPending`/`interrupted`，running 转可恢复 BLOCK、原 blocked 保留原因；resume 消费该标记并重入同一 driver。working/无可靠收口的 checking-auto 让 Actor 带完整材料检查现场后重新 claim；settled claim 或 Manager 显式 judge 决议走只读 Judge。派发无回执时新建 dispatch 身份，不承诺 exactly-once。Actor/Judge 争议协议仍统一注入，Manager 补充不改冻结 Snapshot/criteria。
 
-使用fresh Judge从claim/现场提取固定parameter schema，再由内置程序计算最终PASS/FAIL的Checker；v1尚无该类checkerId。Judge不能选择任意command或checkerId。
+T7 已接通 Builtin Program、嵌套 Child、FAIL 无出口重开与 model replacement。Program 参数/安排先存再执行，PASS/FAIL 无 Judge 原子路由；显式 handoff 或原 input 是唯一交接，ERROR/抛错先 BLOCK，由 Manager 显式重试或裁决。Child caller 与 frame.executionId 稳定关联，首节点继承调用 input，最终 handoff 原子逐层 pop 到父后继，Root/Child 共用 Role mappings。Actor accepted FAIL 无 onFail 保留 claim/judgment 于 settling BLOCK，Manager actor resume 在同 execution 重开新工作版本。
 
-## Judge Decision Checker
+T8 已接通 Manager-only `/dsh-flow reset`：一个短 CAS 事务把当前 active Run 标为 terminated，保留 execution/事件/Snapshot/Role mapping 并写 terminated event；重复 Reset 与非 Manager 拒绝。新 Run 前检查 terminated 当前 Role/Judge 及 ready 前驱未收口 Judge，known active/idle 拒绝，Host unknown 仅因新的显式 start 才允许，旧 Actor/Judge/Program 回调不能推进新 Run。
 
-由Judge根据Global Judge persona、内置Checker template、Node criteria、Worker claim、只读现场，以及当前Node的Node-local projection确认claim可信度的Checker。Projection从Node实际dispatch边界起按时间戳合并Manager/User/Actor消息，排除system/tool/subagent/hidden/旧Node内容且不写State。v2唯一Checker `judge.claim-correct`只允许Node配置criteria文本；Judge通过`judge_claim`协议提交`ACCEPT|REJECT|NEED_CONTEXT`：ACCEPT按claim outcome映射Graph PASS/FAIL，REJECT触发correction流（同Node重派原Actor并携带`[previous rejection]`证据），`NEED_CONTEXT`进入可恢复BLOCK，技术故障fail-closed并BLOCK。它不能替换Judge只读职责和专用协议。
+## Workflow State Store / 可观察性
 
-## ACCEPT / REJECT / NEED_CONTEXT
+使用内置 node:sqlite、WAL、单连接短事务；SQL active-workspace unique/FK 与 Run/Execution CAS 共同保护位置。T8 为 terminated 状态/事件将 State format 升为 `agent-workflow-state/v9`；旧 workflow_state、v3–v8、未知格式或坏库进入只读 maintenance 诊断，普通 start/list/tools fail-closed，插件命令仍激活。不会自动迁移或创建空库遮盖；只有 root 人类命令 `/dsh-flow reset --incompatible-store` 才对整个 Store 做唯一一致性备份（有效 SQLite 使用原生 backup，坏库保留原始 main/WAL/SHM bundle）后切换空 v9，失败保持源文件与 maintenance 状态。
 
-Judge确认协议的三值结果（v2）。ACCEPT=claim与事实/instruction/criteria一致（Graph verdict由claim outcome映射，Judge不改写结果）；REJECT=不正确或证据不足（reason必须写明如何修正，直接作为correction指令重派同Node）；NEED_CONTEXT=无法可靠判定（reason必须说明缺什么、为何影响判定、Manager应提供什么）。
+命令仍是 `/dsh-flow list|start <id> [extra text]|status|reset`，另有仅供不兼容全库维护退出的显式 `/dsh-flow reset --incompatible-store`；Root extraText 在首次派发前作为 input 保存。默认 status 只展示当前 execution/phase/角色/原因、input/handoff 有界预览与恢复方向，不暴露完整 claim、previousClaim、Manager context 或内部 dispatch；最终通知 best-effort，失败不撤销终局事务。
 
-## PASS / FAIL
+trace 是派生产物，不是业务 events。Runtime 保留 trace helper 的转义/脱敏/失败容忍，并在事实提交后 best-effort 记录 START/CLAIM/JUDGE/ROUTE/BLOCK/MODEL；不通过 trace 恢复。Program/Child/resume/respawn 等权威过程只写同事务 `node_execution_events`，不继续维护旧专属 trace 双路径。
 
-Graph的唯一业务结果，由Checker确认后的claim outcome映射（completed→PASS、failed→FAIL）或Builtin Program结果产生。PASS走`onPass`；FAIL在配置`onFail`时走该Edge，未配置onFail时当前Node进入BLOCK。
+## 测试与交付
 
-## END
+最高 controlled seam 是真实 Workflow Runtime + 临时 SQLite（恢复、Program、嵌套 Child 与 Reset/升级测试真实关闭重开）+ 受控 Host Adapter；关键来源测试使用精确派发 ID 集合。`scripts/t3-smoke.mjs` 保留 ACCEPT 基线，`scripts/e2e-smoke.mjs` 覆盖 REJECT/failed-onFail/修正闭环；二者都使用独立临时 home，不操作真实 Run。
 
-成功终点，不是Node结果。Root到END表示Run completed；Child到END表示Child成功并返回Parent PASS。
-
-Root END 时 Engine 向 Manager 主会话 steer 一条完成通知（`workflow "<id>" 已完成（run <runId>）`），用户因此在主聊天里能明确看到工作流结束；通知是 best-effort，失败不影响已持久化的 completed 状态。
-
-## BLOCK
-
-当前Node/Run的可恢复暂停状态，不是Graph Edge或业务结果。Actor可以主动报告BLOCK；Actor/Manager Turn结束但未提交Node结果、派发失败、Host重启后缺少匹配Turn、Judge技术故障、Node边界compact失败、Builtin Program ERROR/INDETERMINATE或FAIL且无onFail也进入BLOCK。BLOCK保留current Node和call stack；Manager处理后只能resume同一Node或Reset，不能跳到任意Node。技术性BLOCK（Judge故障、actor未提交结果、compact失败）主动steer Manager固定模板通知，说明原因与可选动作；actor-task派发统一注入「必须调用`node_claim`提交」硬约束。
-
-## Manager Session Context
-
-当前主会话中已有的USER/MANAGER conversation、workspace instructions、Skills和Tools。`/dsh-flow`启动后steer同一个Manager，因此Run State不复制conversation/system/Skill/MCP上下文。Role/Judge Agent由DSH按各自cwd/preset重新装配环境。
-
-## Handoff Context
-
-Actor Task在completion claim中可提供的opaque文本，**completed与failed契约完全对称**（20260906-claim-handoff-symmetry）：类型、长度（trim后1..8000）、空值处理、存储与派发规则不因outcome不同而改变，outcome只决定ACCEPT后的onPass/onFail路由。判定ACCEPT后，Engine/Manager把它原样放进发给后继Node或Child Actor的消息（`[handoff]`头+原文+`[instruction]`，PASS/FAIL同构，不标注来源节点/出口）；failed沿onFail送达返工/修复节点。它用于Agent动态选择Issue/仓库等对象，替代typed resolver、变量、output binding和data-flow DSL；deferred派发窗口由`pendingDispatchContext`镜像持久化，其余发送窗口丢失时重新询问或按真实现场重建。
-
-## Node Claim
-
-Current Actor Task Worker通过`node_claim`提交的`completed|failed`声明、summary和可选handoffContext（两种outcome对称，20260906）。**不携带nodeToken**（A1 AC2）：admission由ActorDispatchLease绑定（当前调用turn必须包含本次dispatch的message id且lease未消费）。Claim和handoff都必须经过Checker确认；claim进入判定阶段后其`{outcome,summary,handoffContext?}`作为`pendingClaim`持久化（供Judge spawn/respawn/重建重投Judgment Packet，连同`pendingCorrection`证据段；`handoffContext`对completed/failed对称、trim后非空才写入），判定结束清除。判定阶段BLOCK后Worker重新claim会整体覆盖`pendingClaim`（含handoff），`pendingCorrection`继续保留供packet引用。
-
-## ActorDispatchLease
-
-DispatchBook内的派发租约字段（`dispatchMessageId`+`leaseConsumed`，A1 R2）：本次真实dispatch的user message id，一次性可消费。准入门判据（单一真值来源）：book存在且非pendingDispatch、lease未消费、有dispatchMessageId、token/executor匹配、且dispatch message id属于caller当前turn的user/message id集合（turnbind从caller session log的`tool/call`或Code Mode的`tool/code-dispatch-start`+根`run_code`双绑定推导）。lease不持久化：host重启后running run一律BLOCK，恢复必经resume→重新dispatch→新lease。claim的lease消费时点在`state.put`成功之后（put失败可原样重试）；BLOCK随book删除一并消费。builtin-program节点不发布lease（一等无lease态）。node_block的lease绑定只适用于actor-task节点的精确executor；program/child节点与Manager对role节点的block是控制面动作。
-
-## pendingCorrection
-
-REJECT时随RunState持久化的纠正证据`{judgeReason, previousClaim{outcome,summary,handoffContext?}}`（A1 §6.4/D4）。每次REJECT覆盖写入；再次claim/NEED_CONTEXT/judge fault BLOCK/派发失败BLOCK期间保留（供packet`[previous rejection]`段与resume重建correction消息）；节点经advance离开时清除。correction重派以`nodeBoundary.executorSessionId`解析原Actor（映射漂移时先回写`roleActors`）；blocked+pendingCorrection时Manager的model override被接受并重置boundary，resume以新路由建replacement Actor、证据照常送达。
-
-## Node Block
-
-Current Actor或Manager可在Run running且token匹配时通过`node_block(nodeToken,reason)`把current Node置为BLOCK。它不运行Checker/Edge，也不自动interrupt Actor；BLOCK后迟到mutation因status不再running而拒绝。actor-task节点的精确executor（Manager-executor或role Actor）调用时须通过与claim相同的lease绑定（同一dispatch的第二个claim/block被拒，旧turn迟到block被拒）；builtin-program/child-workflow节点与Manager对role-executor节点的block为控制面动作（只校验status/token/caller）。
-
-## Node Program Run
-
-Manager在current `builtin-program` Node调用`node_run_program(nodeToken,parameters)`的动作。Engine从current Node固定programId/config，只接收其parameterSchema允许的临时参数；参数不持久化、不形成变量或handoff，中断后重新提供。
-
-## Node Resume
-
-Manager在current Role Actor无active turn时通过`node_resume(nodeToken,resolutionContext)`恢复BLOCK Node。它清除BLOCK状态，把处理结果发给当前Worker，或用于重新运行Builtin Program/Child调用；不能修改current Node。判定阶段的BLOCK：`judgeSessionId`存在时followup该Judge（followup文本显式携带轮换后的新nodeToken——A1 R10「新token必须告知Judge」），不存在时spawn重建Judge；`judge_respawn(nodeToken,reason?)`显式重建。correction派发失败的BLOCK：resume从`pendingCorrection`重建完整correction消息（`[judge rejection]`+`[previous claim]`+`[manager resolution]`+`[instruction]`），不依赖Manager从trace手工复制。resume成功后nodeToken必然轮换，Actor一律以`workflow_status`为准。ResolutionContext不承载nodeToken、不持久化，派发失败后再次resume必须重新提供。
-
-## Manual Program Resolution
-
-只要current Node是builtin-program、Run处于BLOCK且nodeToken匹配，Manager检查真实现场后可调用`node_resolve_program(nodeToken,result,reason)`确认PASS/FAIL。Host不分类BLOCK原因；Manager因此可以覆盖builtin-program的明确FAIL，但Actor Checker和Child结果仍不能override。
-
-## Workflow Visibility
-
-首期不开发自定义Workflow Web UI。Manager输出和Tool/Command Cards显示在主聊天，Role Actors显示在Child Session hierarchy，`/dsh-flow status`展示current workspace的Run status/call stack/current Node/Role/blockReason/model override；历史查看复用DSH Session log。
-
-## Workflow State Store
-
-`${DSH_HOME}/workflows/state.sqlite3`中按current Manager Session cwd的filesystem canonical realpath分Row保存current Run的最小持久化边界。一个Workspace最多一个Run并永久绑定启动managerSessionId，不同Workspace可并发；其他Session不能接管/推进，但同Workspace任意direct-human Session可用`/dsh-flow reset`只删除本地Row；一个connection/queue串行短写。State只包含catalogWorkflowId、immutable Definition Snapshot、Run identity/status、call stack、当前active Node的`NodeContextBoundary`（串行执行下top frame唯一活跃，实现为Run级单字段，离开Node即重置；FAIL且无onFail的BLOCK保留边界）、Role Actor mappings、current model overrides、blockReason、当前`judgeSessionId`映射、判定阶段`pendingClaim{outcome,summary,handoffContext?}`、纠正阶段`pendingCorrection{judgeReason,previousClaim}`（A1）、deferred派发窗口的一次性transient镜像`pendingDispatchContext{kind,text}`（20260906：仅running且已advance未派发时存在，送达/resume消费后清除；FAIL无onFail的BLOCK不携带）和可选派生元数据`traceLogPath`（A3：Run trace log文件路径，仅作日志定位用，使host重启后事件仍写同一文件；非workflow状态，缺失的旧行仅静默不记日志）；Root frame.workflowId等于catalogWorkflowId；不保存recentEvents、业务对象状态、Judge历史、Checker evidence、Task/Effect、Recovery状态、ActorDispatchLease（内存DispatchBook派生产物）或精确外部副作用历史。历史完全复用DSH Session log。
-
-宿主实现确认：Home路径用`resolveDshHome()`（显式配置>`DSH_HOME`环境变量>`~/.dsh`）；cwd取自`agent.session.header.cwd`，缺失时拒绝start；SQLite用内置`node:sqlite`的`DatabaseSync`（与DSH storage-sqlite同款），owner-only目录/文件、WAL、单连接加短mutation队列。Turn结算订阅`session/event`的durable `turn/end`；`subagent/end`是Activation-epoch级、不能用于Node结果关联。自动BLOCK写入必须defer，不能在`session/event`回调内同步append同一Session。Judge授权/turn路由在live workspace映射缺失时fallback到State行durable修复（`judgeSessionId`匹配即重新入映射，覆盖Host重启与realpath注册竞态）；Host restart reconcile用`sessionPersistence.inspect`校验持久化Judge是否存在，不存在则清除id并保留`pendingClaim`供spawn重建；每个workspace独立best-effort reconcile，版本竞争不得中止后续row。persistence读取失败fail-closed（Judge投影进入`judge fault: <detail>` BLOCK；restart existence probe则按不存在处理并安全spawn重建），服务缺失时降级（无Actor surface投影）。
-
-## External Fact
-
-Git、GitHub、文件系统、SSH环境等Node工作涉及的真实现场。插件不为外部副作用建设精准Effect recovery；系统中断后Manager/Worker重新读取External Facts，自行决定继续、重做、重新claim或BLOCK。
+T9 已按 `docs/testing/runtime-refact-test-migration.md` 删除旧 MemState/单表结构测试并以新 seam 动态证据替代，full suite 必须 0 fail/0 skip。`test/runtime-real-host.test.ts` 另以 exact DSH 0.1.2-rc.1 真实 Host 组合覆盖 A30 的 Role Activation cold continuation、真实 Basic compact、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume；它使用脚本 LLM，不冒充外部模型质量或完整进程重启。

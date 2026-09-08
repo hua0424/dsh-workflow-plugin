@@ -1,38 +1,90 @@
-/**
- * Minimal SQLite state store (design §5 C1-C4).
- * One DatabaseSync connection, one short mutation queue, STRICT table keyed by
- * the canonical workspace realpath. All mutations serialize through `enqueue`.
- */
-import { mkdirSync } from 'node:fs'
-import { dirname, join } from 'node:path'
-import { DatabaseSync } from 'node:sqlite'
-import { snapshotJsonValue, isJsonValue } from '@deepseek-ai/dsh-session'
-import { CATALOG_DIR_NAME, STATE_DB_NAME, STATE_FORMAT_VERSION, STATE_TABLE_NAME, type RunState, type StateRow } from '../types.ts'
+/** 三表唯一事实来源；短同步事务，不持有锁等待 Host。 */
+import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { basename, dirname, join } from 'node:path'
+import { backup, DatabaseSync } from 'node:sqlite'
+import { isDeepStrictEqual } from 'node:util'
+import { snapshotJsonValue, isJsonValue } from '@deepseek-ai/dsh-util-values'
+import { CATALOG_DIR_NAME, EVENT_TYPES, STATE_DB_NAME, STATE_FORMAT_VERSION, type ExecutionChange, type NodeExecution, type NodeExecutionEvent, type RunState, type StateRow } from '../types.ts'
+import { checkExecutionInvariants, checkStateInvariants } from './invariants.ts'
 
-interface RowShape {
+interface RunRow {
+  sequence: number
+  run_id: string
   workspace_key: string
   format_version: string
   state_version: number
+  status: string
+  current_execution_id: string
   snapshot_json: string
   updated_at: string
 }
-
+interface ExecutionRow {
+  execution_id: string
+  run_id: string
+  visit: number
+  revision: number
+  snapshot_json: string
+}
+export interface StateMaintenanceDiagnostic {
+  kind: 'incompatible' | 'corrupt'
+  path: string
+  userVersion: number | null
+  tables: string[]
+  reason: string
+}
+// Internal as-const literals only; no SQL input crosses a trust boundary here.
+const EVENT_TYPES_SQL = EVENT_TYPES.map(type => `'${type}'`).join(', ')
 const CREATE_SQL = `
-CREATE TABLE IF NOT EXISTS ${STATE_TABLE_NAME} (
-  workspace_key  TEXT PRIMARY KEY,
-  format_version TEXT    NOT NULL,
-  state_version  INTEGER NOT NULL,
-  snapshot_json  TEXT    NOT NULL,
-  updated_at     TEXT    NOT NULL
-) STRICT
+CREATE TABLE runs (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL UNIQUE,
+  workspace_key TEXT NOT NULL,
+  format_version TEXT NOT NULL,
+  state_version INTEGER NOT NULL CHECK(state_version > 0),
+  status TEXT NOT NULL CHECK(status IN ('running', 'blocked', 'completed', 'terminated')),
+  current_execution_id TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY(run_id, current_execution_id) REFERENCES node_executions(run_id, execution_id) DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+CREATE UNIQUE INDEX one_active_run_per_workspace ON runs(workspace_key) WHERE status IN ('running', 'blocked');
+CREATE INDEX workspace_runs ON runs(workspace_key, sequence DESC);
+CREATE TABLE node_executions (
+  execution_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES runs(run_id),
+  visit INTEGER NOT NULL CHECK(visit > 0),
+  revision INTEGER NOT NULL CHECK(revision > 0),
+  snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
+  UNIQUE(run_id, execution_id),
+  UNIQUE(run_id, visit)
+) STRICT;
+CREATE TABLE node_execution_events (
+  execution_id TEXT NOT NULL REFERENCES node_executions(execution_id),
+  sequence INTEGER NOT NULL CHECK(sequence > 0),
+  type TEXT NOT NULL CHECK(type IN (${EVENT_TYPES_SQL})),
+  at TEXT NOT NULL,
+  snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
+  PRIMARY KEY(execution_id, sequence)
+) STRICT;
+PRAGMA user_version = 9;
 `
 
-/** Absolute path of the state database under the harness home. */
-export function stateDbPath(home: string): string {
-  return join(home, CATALOG_DIR_NAME, STATE_DB_NAME)
+function json(value: unknown): string {
+  const snapshot = snapshotJsonValue(value)
+  if (snapshot === undefined) throw new Error('state is not lossless JSON')
+  return JSON.stringify(snapshot)
+}
+function parse<T>(value: string): T {
+  const parsed: unknown = JSON.parse(value)
+  if (!isJsonValue(parsed) || typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('corrupt state JSON')
+  return parsed as T
+}
+function assertValid(problems: string[]): void {
+  if (problems.length) throw new Error(`corrupt or invalid state: ${problems.join('; ')}`)
 }
 
-/** Canonical workspace key from the session cwd (design §5). */
+export function stateDbPath(home: string): string { return join(home, CATALOG_DIR_NAME, STATE_DB_NAME) }
 export async function workspaceKeyOf(cwd: string | undefined): Promise<string | undefined> {
   if (cwd === undefined || cwd.trim() === '') return undefined
   const { realpath } = await import('node:fs/promises')
@@ -46,123 +98,301 @@ export class StateStore {
 
   constructor(home: string) {
     const path = stateDbPath(home)
-    mkdirSync(dirname(path), { recursive: true })
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
     this.db = new DatabaseSync(path)
-    this.db.exec('PRAGMA journal_mode = WAL')
-    this.db.exec(CREATE_SQL)
+    try {
+      this.assertNoLegacyRows()
+      const tables = this.db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%'").all() as { name: string }[]
+      const names = tables.map(row => row.name).filter(name => name !== 'workflow_state')
+      const version = this.db.prepare('PRAGMA user_version').get() as { user_version: number }
+      if (names.length === 0 && version.user_version === 0) {
+        this.db.exec('BEGIN IMMEDIATE')
+        try { this.db.exec(CREATE_SQL); this.db.exec('COMMIT') } catch (error) { this.db.exec('ROLLBACK'); throw error }
+      } else if (version.user_version !== 9 || names.length !== 3 || !['runs', 'node_executions', 'node_execution_events'].every(name => names.includes(name))) {
+        throw new Error('incompatible state format; original data retained; authorized backup/reset required')
+      }
+      this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000')
+      // Fail closed even for an empty database with an unrecognized table layout.
+      this.db.prepare('SELECT sequence, run_id, workspace_key, format_version, state_version, status, current_execution_id, snapshot_json, updated_at FROM runs LIMIT 0').all()
+      this.db.prepare('SELECT execution_id, run_id, visit, revision, snapshot_json FROM node_executions LIMIT 0').all()
+      this.db.prepare('SELECT execution_id, sequence, type, at, snapshot_json FROM node_execution_events LIMIT 0').all()
+      const incompatible = this.db.prepare('SELECT run_id FROM runs WHERE format_version <> ? LIMIT 1').get(STATE_FORMAT_VERSION)
+      if (incompatible) throw new Error('incompatible state format; original data retained')
+    } catch (error) {
+      this.db.close()
+      throw error
+    }
   }
 
-  /** Serialize one synchronous mutation. */
-  private enqueue<T>(fn: () => T): Promise<T> {
+  static probe(home: string): StateMaintenanceDiagnostic | undefined {
+    const path = stateDbPath(home)
+    if (!existsSync(path)) return undefined
+    let db: DatabaseSync | undefined
+    try {
+      db = new DatabaseSync(path, { readOnly: true })
+      const userVersion = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
+      const tables = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map(row => row.name)
+      const expected = ['node_execution_events', 'node_executions', 'runs']
+      if (userVersion === 9 && isDeepStrictEqual(tables, expected)) return undefined
+      return { kind: 'incompatible', path, userVersion, tables, reason: `incompatible state format (user_version=${userVersion}); original data retained` }
+    } catch (error) {
+      return { kind: 'corrupt', path, userVersion: null, tables: [], reason: `state database is unreadable: ${error instanceof Error ? error.message : String(error)}; original bytes retained` }
+    } finally { db?.close() }
+  }
+
+  private assertNoLegacyRows(): void {
+    if (this.db.prepare("SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'workflow_state'").get() && this.db.prepare('SELECT 1 FROM workflow_state LIMIT 1').get()) {
+      throw new Error('incompatible legacy workflow_state contains data; original data retained; authorized backup/reset required')
+    }
+  }
+
+  /** ponytail: one short connection queue; split by workspace only if contention warrants it. */
+  private enqueue<T>(fn: () => T, write = false): Promise<T> {
     if (this.closed) return Promise.reject(new Error('state store is closed'))
-    const next = this.queue.then(() => fn())
+    const next = this.queue.then(() => {
+      if (this.closed) throw new Error('state store is closed')
+      this.db.exec(write ? 'BEGIN IMMEDIATE' : 'BEGIN')
+      try {
+        this.assertNoLegacyRows()
+        const result = fn()
+        this.db.exec('COMMIT')
+        return result
+      } catch (error) {
+        this.db.exec('ROLLBACK')
+        throw error
+      }
+    })
     this.queue = next.catch(() => {})
     return next
   }
 
-  /** Read one row by workspace key. */
+  private latest(workspaceKey: string): RunRow | undefined {
+    return this.db.prepare('SELECT * FROM runs WHERE workspace_key = ? ORDER BY sequence DESC LIMIT 1').get(workspaceKey) as RunRow | undefined
+  }
+
+  private runRowForExecution(workspaceKey: string, executionId: string): RunRow | undefined {
+    return this.db.prepare('SELECT r.* FROM runs r JOIN node_executions e ON e.run_id = r.run_id WHERE r.workspace_key = ? AND e.execution_id = ?').get(workspaceKey, executionId) as RunRow | undefined
+  }
+
+  private readExecution(run: RunState, executionId: string): NodeExecution | undefined {
+    const row = this.db.prepare('SELECT * FROM node_executions WHERE run_id = ? AND execution_id = ?').get(run.runId, executionId) as ExecutionRow | undefined
+    if (!row) return undefined
+    const execution = parse<NodeExecution>(row.snapshot_json)
+    assertValid(checkExecutionInvariants(run, execution))
+    if (execution.executionId !== row.execution_id || execution.runId !== row.run_id || execution.visit !== row.visit || execution.revision !== row.revision) throw new Error('corrupt execution columns/snapshot mismatch')
+    return execution
+  }
+
+  private decode(row: RunRow): StateRow {
+    if (row.format_version !== STATE_FORMAT_VERSION) throw new Error('incompatible state format; original data retained')
+    const run = parse<RunState>(row.snapshot_json)
+    assertValid(checkStateInvariants(run))
+    if (run.runId !== row.run_id || run.status !== row.status || run.currentExecutionId !== row.current_execution_id || !Number.isSafeInteger(row.state_version) || row.state_version < 1) throw new Error('corrupt run columns/snapshot mismatch')
+    const execution = this.readExecution(run, run.currentExecutionId)
+    if (!execution) throw new Error('corrupt run: current execution is missing')
+    assertValid(checkStateInvariants(run, execution))
+    return { workspaceKey: row.workspace_key, formatVersion: STATE_FORMAT_VERSION, stateVersion: row.state_version, run, execution, updatedAt: row.updated_at }
+  }
+
   get(workspaceKey: string): Promise<StateRow | undefined> {
+    return this.enqueue(() => { const row = this.latest(workspaceKey); return row ? this.decode(row) : undefined })
+  }
+
+  /** Each workspace's newest Run; completed history remains in runs. */
+  list(): Promise<StateRow[]> {
+    return this.enqueue(() => (this.db.prepare('SELECT * FROM runs WHERE sequence IN (SELECT MAX(sequence) FROM runs GROUP BY workspace_key) ORDER BY sequence').all() as unknown as RunRow[]).map(row => this.decode(row)))
+  }
+
+  execution(workspaceKey: string, executionId: string): Promise<NodeExecution | undefined> {
     return this.enqueue(() => {
-      const row = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).get(workspaceKey) as RowShape | undefined
-      if (row === undefined) return undefined
-      const parsed: unknown = JSON.parse(row.snapshot_json)
-      if (!isJsonValue(parsed) || typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
-        throw new Error(`state row for ${workspaceKey} is corrupt`)
-      }
-      return {
-        workspaceKey: row.workspace_key,
-        formatVersion: row.format_version as typeof STATE_FORMAT_VERSION,
-        stateVersion: row.state_version,
-        run: (parsed as { run: RunState }).run,
-        updatedAt: row.updated_at,
-      }
+      const row = this.runRowForExecution(workspaceKey, executionId)
+      if (!row) return undefined
+      return this.readExecution(this.decode(row).run, executionId)
     })
   }
 
-  /** All rows (status/reset diagnostics). */
-  list(): Promise<StateRow[]> {
+  historyOwner(workspaceKey: string, executionId: string): Promise<{ runId: string; managerSessionId: string } | undefined> {
     return this.enqueue(() => {
-      const rows = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME}`).all() as unknown as RowShape[]
-      return rows.map(row => {
-        const parsed = JSON.parse(row.snapshot_json) as { run: RunState }
-        return {
-          workspaceKey: row.workspace_key,
-          formatVersion: row.format_version as typeof STATE_FORMAT_VERSION,
-          stateVersion: row.state_version,
-          run: parsed.run,
-          updatedAt: row.updated_at,
-        }
+      const row = this.runRowForExecution(workspaceKey, executionId)
+      if (!row) return undefined
+      const run = this.decode(row).run
+      return { runId: run.runId, managerSessionId: run.managerSessionId }
+    })
+  }
+
+  /** Stable per-execution sequence, exclusive after; next cursor is last sequence. */
+  events(workspaceKey: string, executionId: string, after = 0, limit = 50): Promise<NodeExecutionEvent[]> {
+    return this.enqueue(() => {
+      if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error('events requires after >= 0 and limit 1..50')
+      const row = this.runRowForExecution(workspaceKey, executionId)
+      if (!row) throw new Error('execution is not in the current run or workspace history')
+      const run = this.decode(row).run
+      const execution = this.readExecution(run, executionId)
+      if (!execution) throw new Error('execution is not in this workspace history')
+      const rows = this.db.prepare('SELECT * FROM node_execution_events WHERE execution_id = ? AND sequence > ? ORDER BY sequence LIMIT ?').all(executionId, after, limit) as { execution_id: string; sequence: number; type: NodeExecutionEvent['type']; at: string; snapshot_json: string }[]
+      return rows.map(event => {
+        const snapshot = parse<NodeExecution>(event.snapshot_json)
+        assertValid(checkExecutionInvariants(run, snapshot))
+        if (snapshot.executionId !== executionId || snapshot.input !== execution.input || snapshot.visit !== execution.visit || snapshot.revision < 1 || snapshot.revision > execution.revision || !EVENT_TYPES.includes(event.type) || !Number.isSafeInteger(event.sequence) || event.sequence <= after) throw new Error('corrupt execution event snapshot')
+        return { executionId, sequence: event.sequence, type: event.type, at: event.at, snapshot }
       })
     })
   }
 
-  /**
-   * Insert a fresh row (start). Fails when the key already exists and its run
-   * is not completed (design A2).
-   */
-  createRow(workspaceKey: string, run: RunState): Promise<StateRow> {
+  createRow(workspaceKey: string, run: RunState, execution: NodeExecution): Promise<StateRow> {
+    // Detach before queueing: caller mutations cannot change pending transaction inputs.
+    const savedRun = parse<RunState>(json(run))
+    const savedExecution = parse<NodeExecution>(json(execution))
     return this.enqueue(() => {
-      const existing = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).get(workspaceKey) as RowShape | undefined
-      if (existing !== undefined) {
-        const parsed = JSON.parse(existing.snapshot_json) as { run: RunState }
-        if (parsed.run.status !== 'completed') {
-          throw new StateConflictError(workspaceKey, parsed.run.status)
-        }
+      if (!workspaceKey.trim()) throw new Error('workspace key is required')
+      const existing = this.latest(workspaceKey)
+      if (existing) {
+        const current = this.decode(existing)
+        if (current.run.status !== 'completed' && current.run.status !== 'terminated') throw new StateConflictError(workspaceKey, current.run.status)
       }
-      return this.writeRow(workspaceKey, run, existing?.state_version ?? 0)
-    })
+      assertValid(checkStateInvariants(savedRun, savedExecution))
+      if (savedExecution.revision !== 0 || savedExecution.phase !== 'ready' || savedExecution.predecessorId || savedRun.status !== 'running') throw new Error('new run requires a ready revision-0 initial execution')
+      const at = new Date().toISOString()
+      this.db.prepare('INSERT INTO runs (run_id, workspace_key, format_version, state_version, status, current_execution_id, snapshot_json, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?)').run(savedRun.runId, workspaceKey, STATE_FORMAT_VERSION, savedRun.status, savedRun.currentExecutionId, json(savedRun), at)
+      this.writeExecution(savedRun, { execution: savedExecution, expectedRevision: null, events: ['entered'] }, at)
+      return this.decode(this.latest(workspaceKey)!)
+    }, true)
   }
 
-  /**
-   * Overwrite an existing row with the next state version. The caller must
-   * pass the expected current stateVersion; mismatch throws (stale writer).
-   */
-  updateRow(workspaceKey: string, run: RunState, expectedVersion: number): Promise<StateRow> {
+  updateRow(workspaceKey: string, run: RunState, expectedVersion: number, changes: ExecutionChange[]): Promise<StateRow> {
+    const savedRun = parse<RunState>(json(run))
+    const savedChanges = JSON.parse(json(changes)) as ExecutionChange[]
     return this.enqueue(() => {
-      const existing = this.db.prepare(`SELECT * FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).get(workspaceKey) as RowShape | undefined
-      if (existing === undefined) throw new StateGoneError(workspaceKey)
-      if (existing.state_version !== expectedVersion) {
-        throw new StateVersionError(workspaceKey, existing.state_version, expectedVersion)
+      const row = this.latest(workspaceKey)
+      if (!row) throw new StateGoneError(workspaceKey)
+      const current = this.decode(row)
+      if (row.state_version !== expectedVersion) throw new StateVersionError(workspaceKey, row.state_version, expectedVersion)
+      if (current.run.status === 'completed' || current.run.status === 'terminated') throw new Error(`${current.run.status} run is immutable`)
+      for (const key of ['runId', 'managerSessionId', 'catalogWorkflowId', 'definitionHash', 'definitionSnapshot'] as const) {
+        if (!isDeepStrictEqual(current.run[key], savedRun[key])) throw new Error(`${key} is immutable`)
       }
-      return this.writeRow(workspaceKey, run, existing.state_version)
-    })
+      assertValid(checkStateInvariants(savedRun))
+      if (new Set(savedChanges.map(change => change.execution.executionId)).size !== savedChanges.length) throw new Error('duplicate execution change')
+      const at = new Date().toISOString()
+      for (const change of savedChanges) this.writeExecution(savedRun, change, at)
+      const execution = this.readExecution(savedRun, savedRun.currentExecutionId)
+      if (!execution) throw new Error('current execution is missing')
+      assertValid(checkStateInvariants(savedRun, execution))
+      const result = this.db.prepare('UPDATE runs SET state_version = state_version + 1, status = ?, current_execution_id = ?, snapshot_json = ?, updated_at = ? WHERE run_id = ? AND state_version = ?').run(savedRun.status, savedRun.currentExecutionId, json(savedRun), at, savedRun.runId, expectedVersion)
+      if (result.changes !== 1) throw new StateVersionError(workspaceKey, row.state_version, expectedVersion)
+      return this.decode(this.latest(workspaceKey)!)
+    }, true)
   }
 
-  /** Delete one row (reset). Idempotent. */
-  deleteRow(workspaceKey: string): Promise<void> {
-    return this.enqueue(() => {
-      this.db.prepare(`DELETE FROM ${STATE_TABLE_NAME} WHERE workspace_key = ?`).run(workspaceKey)
-    })
+  private writeExecution(run: RunState, change: ExecutionChange, at: string): void {
+    const { execution, expectedRevision, events } = change
+    assertValid(checkExecutionInvariants(run, execution))
+    if (!Array.isArray(events) || events.some(type => !EVENT_TYPES.includes(type))) throw new Error('invalid execution events')
+    const existing = this.readExecution(run, execution.executionId)
+    if (expectedRevision === null) {
+      if (existing || execution.revision !== 0 || !events.includes('entered')) throw new Error('new execution requires revision 0 and entered event')
+    } else {
+      if (!Number.isSafeInteger(expectedRevision) || !existing || existing.revision !== expectedRevision || execution.revision !== expectedRevision) throw new StateVersionError(execution.executionId, existing?.revision ?? 0, expectedRevision)
+      if (existing.phase === 'exited') {
+        // 离开后只允许真实 Judge 收口回执；不重开或改写终局材料。
+        const settled = structuredClone(existing)
+        if (settled.judge) settled.judge.settled = true
+        if (!isDeepStrictEqual(settled, execution) || events.length) throw new Error('exited execution materials are immutable')
+      }
+      for (const key of ['executionId', 'runId', 'workflowId', 'nodeId', 'visit', 'input', 'enteredAt', 'predecessorId'] as const) {
+        if (!isDeepStrictEqual(existing[key], execution[key])) throw new Error(`execution ${key} is immutable`)
+      }
+      if (events.includes('entered')) throw new Error('entered event is only valid for new execution')
+    }
+    const saved = { ...execution, revision: (expectedRevision ?? 0) + 1 }
+    if (expectedRevision === null) {
+      this.db.prepare('INSERT INTO node_executions (execution_id, run_id, visit, revision, snapshot_json) VALUES (?, ?, ?, ?, ?)').run(saved.executionId, saved.runId, saved.visit, saved.revision, json(saved))
+    } else {
+      const result = this.db.prepare('UPDATE node_executions SET revision = ?, snapshot_json = ? WHERE execution_id = ? AND run_id = ? AND revision = ?').run(saved.revision, json(saved), saved.executionId, saved.runId, expectedRevision)
+      if (result.changes !== 1) throw new StateVersionError(saved.executionId, existing!.revision, expectedRevision)
+    }
+    const last = this.db.prepare('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM node_execution_events WHERE execution_id = ?').get(saved.executionId) as { sequence: number }
+    let sequence = last.sequence
+    for (const type of events) this.db.prepare('INSERT INTO node_execution_events (execution_id, sequence, type, at, snapshot_json) VALUES (?, ?, ?, ?, ?)').run(saved.executionId, ++sequence, type, at, json(saved))
   }
 
-  private writeRow(workspaceKey: string, run: RunState, previousVersion: number): StateRow {
-    const snapshot = snapshotJsonValue({ run })
-    if (snapshot === undefined) throw new Error('run state is not lossless JSON')
-    const nextVersion = previousVersion + 1
-    const updatedAt = new Date().toISOString()
-    this.db.prepare(`
-      INSERT INTO ${STATE_TABLE_NAME} (workspace_key, format_version, state_version, snapshot_json, updated_at)
-      VALUES (?, ?, ?, ?, ?)
-      ON CONFLICT(workspace_key) DO UPDATE SET
-        format_version = excluded.format_version,
-        state_version = excluded.state_version,
-        snapshot_json = excluded.snapshot_json,
-        updated_at = excluded.updated_at
-    `).run(workspaceKey, STATE_FORMAT_VERSION, nextVersion, JSON.stringify(snapshot), updatedAt)
-    return {
-      workspaceKey,
-      formatVersion: STATE_FORMAT_VERSION,
-      stateVersion: nextVersion,
-      run,
-      updatedAt,
+  close(): void { if (!this.closed) { this.closed = true; this.db.close() } }
+}
+
+/** One mutable store holder: maintenance diagnostics or exactly one healthy v9 Store. */
+export class StateAccess {
+  private store: StateStore | undefined
+  private diagnostic: StateMaintenanceDiagnostic | undefined
+  private queue: Promise<unknown> = Promise.resolve()
+  private readonly home: string
+  constructor(home: string) {
+    this.home = home
+    const diagnostic = StateStore.probe(home)
+    if (diagnostic) { this.diagnostic = diagnostic; return }
+    try { this.store = new StateStore(home) }
+    catch (error) {
+      const reason = error instanceof Error ? error.message : String(error)
+      this.diagnostic = { kind: /incompatible/.test(reason) ? 'incompatible' : 'corrupt', path: stateDbPath(home), userVersion: null, tables: [], reason }
     }
   }
-
-  close(): void {
-    if (this.closed) return
-    this.closed = true
-    this.db.close()
+  current(): StateStore {
+    if (!this.store) throw new Error(`workflow state is in maintenance mode: ${this.diagnostic?.reason ?? 'unavailable'}`)
+    return this.store
   }
+  maintenanceDiagnostic(): StateMaintenanceDiagnostic | undefined {
+    return this.diagnostic ? structuredClone(this.diagnostic) : undefined
+  }
+  archiveIncompatible(backupDatabase: typeof backup = backup): Promise<{ backupPath: string; archivePath: string }> {
+    const next = this.queue.then(async () => {
+      const diagnostic = this.diagnostic
+      if (!diagnostic || this.store) throw new Error('state store is compatible; incompatible-store cutover is not applicable')
+      const path = diagnostic.path
+      const suffix = `${new Date().toISOString().replace(/[-:.]/g, '')}-${randomUUID()}`
+      const backupPath = `${path}.backup-${suffix}.sqlite3`
+      const archivePath = `${path}.archive-${suffix}`
+      if (diagnostic.kind === 'incompatible') {
+        let source: DatabaseSync | undefined
+        try {
+          source = new DatabaseSync(path, { readOnly: true })
+          await backupDatabase(source, backupPath)
+        } catch (error) {
+          rmSync(backupPath, { force: true })
+          throw new Error(`state backup failed; original store unchanged: ${error instanceof Error ? error.message : String(error)}`)
+        } finally { source?.close() }
+      }
+
+      mkdirSync(archivePath, { mode: 0o700 })
+      const moved: Array<{ from: string; to: string }> = []
+      const restore = () => {
+        for (const entry of moved.reverse()) if (existsSync(entry.to)) renameSync(entry.to, entry.from)
+        rmSync(archivePath, { recursive: true, force: true })
+      }
+      try {
+        for (const from of [path, `${path}-wal`, `${path}-shm`]) {
+          if (!existsSync(from)) continue
+          const to = join(archivePath, basename(from))
+          renameSync(from, to)
+          moved.push({ from, to })
+        }
+      } catch (error) {
+        restore()
+        throw new Error(`state archive failed; original store restored: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      try {
+        const fresh = new StateStore(this.home)
+        this.store = fresh
+        this.diagnostic = undefined
+      } catch (error) {
+        for (const file of [path, `${path}-wal`, `${path}-shm`]) rmSync(file, { force: true })
+        restore()
+        throw new Error(`new state initialization failed; original store restored: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return { backupPath: diagnostic.kind === 'corrupt' ? archivePath : backupPath, archivePath }
+    })
+    this.queue = next.catch(() => {})
+    return next
+  }
+  close(): void { this.store?.close() }
 }
 
 export class StateConflictError extends Error {
@@ -173,17 +403,12 @@ export class StateConflictError extends Error {
     this.status = status
   }
 }
-
 export class StateVersionError extends Error {
   constructor(workspaceKey: string, actual: number, expected: number) {
     super(`state version mismatch for ${workspaceKey}: actual ${actual}, expected ${expected}`)
     this.name = 'StateVersionError'
   }
 }
-
 export class StateGoneError extends Error {
-  constructor(workspaceKey: string) {
-    super(`no state row for ${workspaceKey}`)
-    this.name = 'StateGoneError'
-  }
+  constructor(workspaceKey: string) { super(`no state row for ${workspaceKey}`); this.name = 'StateGoneError' }
 }

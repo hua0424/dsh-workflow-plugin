@@ -3,6 +3,8 @@ import assert from 'node:assert/strict'
 import { workflowTools, setToolHost, type ToolHost } from '../src/tools/tools.ts'
 import { makeDshFlowCommand, type CommandHost } from '../src/commands/dsh-flow.ts'
 import { randomUUID } from 'node:crypto'
+import { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 
 /** Find a registered tool by name. */
 function findTool(name: string) {
@@ -21,11 +23,11 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
     },
     claim: async (ws, claim, caller) => { calls.push({ name: 'claim', args: { ws, claim, caller } }); return { ok: true, message: 'claimed' } },
     block: async (ws, nodeToken, reason) => { calls.push({ name: 'block', args: { ws, nodeToken, reason } }); return { ok: true, message: 'blocked' } },
-    resume: async (ws, nodeToken, resolutionContext) => { calls.push({ name: 'resume', args: { ws, nodeToken, resolutionContext } }); return { ok: true, message: 'resumed' } },
+    resume: async (ws, nodeToken, resolutionContext, _caller, target) => { calls.push({ name: 'resume', args: { ws, nodeToken, resolutionContext, target } }); return { ok: true, message: 'resumed' } },
     runProgram: async (ws, nodeToken, parameters) => { calls.push({ name: 'runProgram', args: { ws, nodeToken, parameters } }); return { ok: true, message: 'ran' } },
     resolveProgram: async (ws, nodeToken, result, reason) => { calls.push({ name: 'resolveProgram', args: { ws, nodeToken, result, reason } }); return { ok: true, message: 'resolved' } },
     setRoleModel: async (ws, roleKey, provider, modelId) => { calls.push({ name: 'setRoleModel', args: { ws, roleKey, provider, modelId } }); return { ok: true, message: 'set' } },
-    judgeClaim: async (ws, nodeToken, result, reason, judgeSessionId) => { calls.push({ name: 'judgeClaim', args: { ws, nodeToken, result, reason, judgeSessionId } }); return { ok: true, message: 'claimed' } },
+    judgeClaim: async (ws, nodeToken, result, reason, caller) => { calls.push({ name: 'judgeClaim', args: { ws, nodeToken, result, reason, caller } }); return { ok: true, message: 'claimed' } },
     respawnJudge: async (ws, nodeToken, reason, caller) => { calls.push({ name: 'respawnJudge', args: { ws, nodeToken, reason, caller } }); return { ok: true, message: 'respawned' } },
     status: async () => ({ ok: true, status: { runId: 'r1', status: 'running' } }),
     inspectGit: async (_ws, operation) => ({ ok: true, value: `git:${operation}` }),
@@ -70,13 +72,13 @@ test('node_claim routes to host.claim and concludes the turn on success', async 
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
   const result = await tool.execute(
-    { outcome: 'completed', summary: 'did it', handoffContext: 'next: X' },
+    { outcome: 'completed', handoff: 'did it; next: X' },
     exec as never,
   )
   assert.equal(result, 'claimed')
   // A1 AC2: no nodeToken — only the payload plus the lease caller snapshot
   // (EXEC has no agent → fail-closed empty id set, sessionId '').
-  assert.deepEqual(host.calls[0], { name: 'claim', args: { ws: 'ws-1', claim: { outcome: 'completed', summary: 'did it', handoffContext: 'next: X' }, caller: { sessionId: '', turnUserMessageIds: new Set<string>() } } })
+  assert.deepEqual(host.calls[0], { name: 'claim', args: { ws: 'ws-1', claim: { outcome: 'completed', handoff: 'did it; next: X' }, caller: { sessionId: '', turnUserMessageIds: new Set<string>() } } })
   assert.equal(concluded, true)
 })
 
@@ -95,8 +97,9 @@ test('node_resume routes to host.resume', async () => {
   const host = makeToolHost()
   const tool = findTool('node_resume')
   const token = randomUUID()
-  await tool.execute({ nodeToken: token, resolutionContext: 'fixed it' }, EXEC as never)
-  assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'fixed it' } })
+  await tool.execute({ nodeToken: token, resolutionContext: 'fixed it', target: 'judge' }, EXEC as never)
+  assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'fixed it', target: 'judge' } })
+  await assert.rejects(() => tool.execute({ nodeToken: token, resolutionContext: 'fixed', surprise: true }, EXEC as never), /unsupported node_resume property/)
 })
 
 test('node_run_program routes to host.runProgram', async () => {
@@ -130,15 +133,30 @@ test('workflow_status renders host status', async () => {
   assert.ok(host.calls.length === 0)
 })
 
+test('workflow_status forwards explicit history paging and rejects open-root extras or invalid combinations', async () => {
+  const calls: unknown[] = []
+  makeToolHost({ status: async (...args: unknown[]) => { calls.push(args); return { ok: true, status: { history: [] } } } })
+  const tool = findTool('workflow_status')
+  const agent = { session: { id: 'manager' } }
+  await tool.execute({ executionId: 'execution-1', after: 4, limit: 10 }, { ...EXEC, agent } as never)
+  assert.deepEqual(calls, [['ws-1', 'manager', { executionId: 'execution-1', after: 4, limit: 10 }]])
+  await assert.rejects(() => tool.execute({ after: 1 }, { ...EXEC, agent } as never), /executionId/)
+  await assert.rejects(() => tool.execute({ executionId: 'execution-1', limit: 51 }, { ...EXEC, agent } as never), /limit/)
+  await assert.rejects(() => tool.execute({ executionId: 'execution-1', surprise: true }, { ...EXEC, agent } as never), /unsupported workflow_status property/)
+})
+
 test('judge_claim routes to host.judgeClaim and concludes the turn on success', async () => {
   const host = makeToolHost()
   const tool = findTool('judge_claim')
+  assert.match(tool.description, /REJECT 仅用于 claim 与既有 criteria 或可验证事实冲突/)
+  const resultDescription = (tool.parameters as { properties: { result: { description: string } } }).properties.result.description
+  assert.match(resultDescription, /NEED_CONTEXT=信息不足或要求不清/)
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
   const token = randomUUID()
   const result = await tool.execute({ nodeToken: token, result: 'ACCEPT', reason: 'verified' }, exec as never)
   assert.equal(result, 'claimed')
-  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'ACCEPT', reason: 'verified', judgeSessionId: '' } })
+  assert.deepEqual(host.calls[0], { name: 'judgeClaim', args: { ws: 'ws-1', nodeToken: token, result: 'ACCEPT', reason: 'verified', caller: { sessionId: '', turnUserMessageIds: new Set<string>() } } })
   assert.equal(concluded, true)
 })
 
@@ -148,44 +166,34 @@ test('trim-bounded payloads reach the host trimmed — a whitespace bomb never l
   const judgeClaim = findTool('judge_claim')
   const nodeBlock = findTool('node_block')
   const padded = ' '.repeat(10_000) + 'x'
-  await nodeClaim.execute({ outcome: 'completed', summary: padded, handoffContext: '  h  ' }, EXEC as never)
+  await nodeClaim.execute({ outcome: 'completed', handoff: padded }, EXEC as never)
   await judgeClaim.execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: padded }, EXEC as never)
   await nodeBlock.execute({ nodeToken: randomUUID(), reason: padded }, EXEC as never)
-  assert.deepEqual((host.calls[0]!.args as { claim: { summary: string; handoffContext: string } }).claim, { outcome: 'completed', summary: 'x', handoffContext: 'h' })
+  assert.deepEqual((host.calls[0]!.args as { claim: { handoff: string } }).claim, { outcome: 'completed', handoff: 'x' })
   assert.equal((host.calls[1]!.args as { reason: string }).reason, 'x')
   assert.equal((host.calls[2]!.args as { reason: string }).reason, 'x')
 })
 
-test('node_claim accepts handoffContext for failed with the SAME contract as completed (20260906 AC1)', async () => {
+test('T2 public schema rejects legacy fields and invalid handoff symmetrically', async () => {
   const host = makeToolHost()
-  const nodeClaim = findTool('node_claim')
-  // failed + handoff passes the tool layer exactly like completed.
-  const okFailed = await nodeClaim.execute({ outcome: 'failed', summary: 'review blocked', handoffContext: 'fix=X' }, EXEC as never)
-  assert.equal(okFailed, 'claimed')
-  assert.deepEqual(
-    (host.calls[0]!.args as { claim: { outcome: string; summary: string; handoffContext: string } }).claim,
-    { outcome: 'failed', summary: 'review blocked', handoffContext: 'fix=X' },
-  )
-  // Omitting handoffContext stays valid for BOTH outcomes (no auto-context).
-  const okNoHandoff = await nodeClaim.execute({ outcome: 'failed', summary: 'rework' }, EXEC as never)
-  assert.equal(okNoHandoff, 'claimed')
-  // Identical boundary rules for both outcomes: overlong and whitespace-only
-  // handoffs are rejected with the SAME message.
-  const long = 'x'.repeat(8001)
-  const rejectCompleted = await nodeClaim.execute({ outcome: 'completed', summary: 's', handoffContext: long }, EXEC as never)
-  const rejectFailed = await nodeClaim.execute({ outcome: 'failed', summary: 's', handoffContext: long }, EXEC as never)
-  assert.equal(rejectCompleted, rejectFailed)
-  assert.match(rejectCompleted as string, /handoffContext must be at most 8000 characters after trim/)
-  const blankCompleted = await nodeClaim.execute({ outcome: 'completed', summary: 's', handoffContext: '   ' }, EXEC as never)
-  const blankFailed = await nodeClaim.execute({ outcome: 'failed', summary: 's', handoffContext: '   ' }, EXEC as never)
-  assert.equal(blankCompleted, blankFailed)
-  assert.match(blankFailed as string, /handoffContext must be at least 1 characters after trim/)
-  // Trim normalization is outcome-neutral too.
-  await nodeClaim.execute({ outcome: 'failed', summary: 's', handoffContext: '  h  ' }, EXEC as never)
-  assert.deepEqual(
-    (host.calls.at(-1)!.args as { claim: { handoffContext: string } }).claim.handoffContext,
-    'h',
-  )
+  const tool = findTool('node_claim')
+  for (const outcome of ['completed', 'failed']) {
+    for (const args of [
+      { outcome }, { outcome, handoff: 42 },
+      { outcome, summary: 'old' }, { outcome, handoffContext: 'old' },
+      { outcome, handoff: 'valid', summary: 'old' },
+      { outcome, handoff: 'valid', handoffContext: 'old' },
+    ]) {
+      await assert.rejects(() => tool.execute(args, EXEC as never), /invalid arguments/)
+    }
+    for (const handoff of ['', '   ', 'x'.repeat(8001)]) {
+      assert.match(await tool.execute({ outcome, handoff }, EXEC as never) as string, /拒绝：handoff/)
+    }
+    const handoff = 'x'.repeat(8000)
+    assert.equal(await tool.execute({ outcome, handoff: `  ${handoff}  ` }, EXEC as never), 'claimed')
+    assert.deepEqual((host.calls.at(-1)!.args as { claim: unknown }).claim, { outcome, handoff })
+  }
+  assert.equal(host.calls.length, 2)
 })
 
 test('judge_respawn routes to host.respawnJudge', async () => {
@@ -194,6 +202,7 @@ test('judge_respawn routes to host.respawnJudge', async () => {
   const token = randomUUID()
   await tool.execute({ nodeToken: token, reason: 'model swap' }, EXEC as never)
   assert.deepEqual(host.calls[0], { name: 'respawnJudge', args: { ws: 'ws-1', nodeToken: token, reason: 'model swap', caller: '' } })
+  await assert.rejects(() => tool.execute({ nodeToken: token, extra: true }, EXEC as never), /unsupported judge_respawn property/)
 })
 
 test('inspection wrappers reject when authorize fails', async () => {
@@ -210,8 +219,58 @@ test('authorize denial surfaces in control tools', async () => {
     authorize: async () => ({ workspaceKey: null, reason: 'only manager' }),
   })
   const tool = findTool('node_claim')
-  const result = await tool.execute({ outcome: 'completed', summary: 's' }, EXEC as never)
+  const result = await tool.execute({ outcome: 'completed', handoff: 's' }, EXEC as never)
   assert.match(result as string, /拒绝：only manager/)
+})
+
+test('target host Session snapshot binds native claim to its dispatch, excluding later turns', async () => {
+  const host = makeToolHost()
+  const session = Session.create(SessionId('native-caller'))
+  session.append('turn/start', { turn: 1 } as never)
+  const dispatch = createUserMessage({ content: [{ type: 'text', text: 'work' }], source: { kind: 'user' } })
+  session.append('user/message', dispatch, { surfaceOp: 'append' })
+  session.append('tool/call', { turn: 1, step: 1, callId: 'native-claim', name: 'node_claim', arguments: '{}' } as never)
+  session.append('tool/call', { turn: 1, step: 1, callId: 'judge-call', name: 'judge_claim', arguments: '{}' } as never)
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } } as never)
+  session.append('turn/start', { turn: 2 } as never)
+  session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'new work' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
+  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'done' }, {
+    ...EXEC, agent: { session }, callId: 'native-claim', rootCallId: 'native-claim',
+  } as never)
+  assert.deepEqual((host.calls[0]!.args as { caller: unknown }).caller, {
+    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
+  })
+  await findTool('judge_claim').execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: 'verified' }, {
+    ...EXEC, agent: { session }, callId: 'judge-call', rootCallId: 'judge-call',
+  } as never)
+  assert.deepEqual((host.calls[1]!.args as { caller: unknown }).caller, {
+    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
+  })
+})
+
+test('target host Code Mode snapshot binds claim/block only with the real root and subcall', async () => {
+  const session = Session.create(SessionId('code-caller'))
+  session.append('turn/start', { turn: 1 } as never)
+  const dispatch = createUserMessage({ content: [{ type: 'text', text: 'work' }], source: { kind: 'user' } })
+  session.append('user/message', dispatch, { surfaceOp: 'append' })
+  session.append('tool/call', { turn: 1, step: 1, callId: 'root', name: 'run_code', arguments: '{}' } as never)
+  session.append('tool/code-dispatch-start', { rootCallId: 'root', parentCallId: 'root', subCallId: 'root:code:1', name: 'node_claim', arguments: {} } as never)
+  const callers: unknown[] = []
+  makeToolHost({
+    claim: async (_ws, _claim, caller) => { callers.push(caller); return { ok: true } },
+    block: async (_ws, _token, _reason, caller) => { callers.push(caller); return { ok: true } },
+  })
+  const exec = { ...EXEC, agent: { session }, callId: 'root:code:1', rootCallId: 'root' }
+  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'done' }, exec as never)
+  await findTool('node_block').execute({ nodeToken: randomUUID(), reason: 'pause' }, exec as never)
+  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'forged root' }, { ...exec, rootCallId: 'other-root' } as never)
+  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'forged subcall' }, { ...exec, callId: 'root:code:2' } as never)
+  assert.deepEqual(callers, [
+    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set() },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set() },
+  ])
 })
 
 // ---- command tests ----
@@ -266,7 +325,7 @@ test('dsh-flow start rejects invalid workflow ids', async () => {
 
 test('dsh-flow status renders host status', async () => {
   const cmd = makeDshFlowCommand(makeCommandHost())
-  const result = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'status', attachments: [], signal: new AbortController().signal })
+  const result = await cmd.handler({ commandId: 'x' as never, agent: { session: { id: 'manager' } } as never, rawInput: 'status', attachments: [], signal: new AbortController().signal })
   assert.equal(result.kind, 'success')
   assert.match(result.text ?? '', /running/)
 })

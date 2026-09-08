@@ -5,8 +5,8 @@
  */
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v1' as const
-export const STATE_TABLE_NAME = 'workflow_state' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v9' as const
+export const STATE_TABLE_NAME = 'runs' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
 
@@ -22,8 +22,6 @@ export const LIMITS = {
   criteriaMax: 8000,
   reasonMin: 1,
   reasonMax: 2000,
-  summaryMin: 1,
-  summaryMax: 4000,
   handoffMax: 8000,
   resolutionMin: 1,
   resolutionMax: 8000,
@@ -31,6 +29,7 @@ export const LIMITS = {
   /** A1 D3: model-route component caps (characters, after trim). */
   providerMax: 64,
   modelIdMax: 128,
+  programParametersMax: 8000,
 } as const
 
 export interface RoleModel {
@@ -126,7 +125,7 @@ export interface WorkflowConfig {
   childWorkflows?: Record<string, WorkflowDef>
 }
 
-export type RunStatus = 'running' | 'blocked' | 'completed'
+export type RunStatus = 'running' | 'blocked' | 'completed' | 'terminated'
 
 /**
  * The precise local cursor for one Node's context isolation (A1 R2). Built when
@@ -155,6 +154,7 @@ export interface CallFrame {
   workflowId: string
   nodeId: string
   nodeToken: string
+  executionId: string
 }
 
 export interface ModelOverride {
@@ -162,10 +162,7 @@ export interface ModelOverride {
   modelId: string
 }
 
-/**
- * The minimal persistent runtime state (design §5). Serialized as
- * `snapshot_json.definitionSnapshot`-sibling fields on the state row.
- */
+/** Run只管位置/控制/固定Snapshot/Role映射；节点材料属于NodeExecution。 */
 export interface RunState {
   runId: string
   managerSessionId: string
@@ -177,40 +174,8 @@ export interface RunState {
   roleActors: Record<string, string>
   modelOverrides: Record<string, ModelOverride>
   blockReason: string | null
-  /** Current Node's precise context boundary (A1 R2/R4). */
-  nodeBoundary: NodeContextBoundary
-  /** Current active/pending Judge session id for this Node (A1/A4). */
-  judgeSessionId?: string
-  /**
-   * Worker claim held during the judgment phase (A4 R9). The optional
-   * `handoffContext` is persisted together with the claim for BOTH outcomes
-   * (20260902-fixbug review resolution "方案2"; 20260906-claim-handoff-symmetry
-   * extends it to failed) so a host restart during judgment cannot silently
-   * drop the handoff; it is cleared together with the claim when the verdict
-   * lands.
-   */
-  pendingClaim?: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
-  /**
-   * A1 §6.4 (D4): the durable REJECT evidence for the current node — the
-   * Judge's rejection reason plus a snapshot of the claim it rejected.
-   * Written on every REJECT (overwriting), retained through re-claims /
-   * NEED_CONTEXT / judge-fault BLOCKs / correction-dispatch-failure BLOCKs
-   * (resume rebuilds the correction message from it), and cleared by
-   * `advance()` when the node finally leaves.
-   */
-  pendingCorrection?: PendingCorrection
-  /**
-   * 20260906-claim-handoff-symmetry: the one-shot transient context of a
-   * DEFERRED dispatch, persisted with the advanced run by `persistDeferred`
-   * so the window between the accepted claim (PASS/FAIL) and the deferred
-   * dispatch cannot lose the handoff on a host restart — the in-memory
-   * DispatchBook dies with the process, this field does not. Consumed by
-   * exactly one successful dispatch (`dispatchNow` clears it) or by a resume
-   * (the actor-path resume re-delivers it alongside the Manager's resolution).
-   * Only set while `status === 'running'`: a FAIL without onFail BLOCKs with
-   * the claim consumed, so it never carries a pending dispatch.
-   */
-  pendingDispatchContext?: TransientDispatch
+  /** 当前 visit；completed 时仍指向终局工作单，最终交付从该工作单读取。 */
+  currentExecutionId: string
   /**
    * Absolute path of this run's trace log file (A3). Persisted so events
    * after a host restart (restart-reconcile BLOCK, post-restart resume)
@@ -221,11 +186,121 @@ export interface RunState {
   traceLogPath?: string
 }
 
+/** 派发意图先存；messageId 只由真实 Host 返回，不能由模型填写。 */
+export interface ExecutionDispatch {
+  id: string
+  sessionId?: string
+  messageId?: string
+  settled: boolean
+}
+
+export interface ExecutionClaim extends NodeClaim {
+  id: string
+  dispatchId: string
+}
+
+export interface ExecutionJudge extends ExecutionDispatch {
+  sessionId: string
+  claimId: string
+  inputVersion: number
+}
+
+/** 最新 Judge 判定/反馈；保留 claim/Judge/input 关联，只有 ACCEPT 可交接。 */
+export interface ExecutionJudgment extends JudgeResult {
+  claimId: string
+  judgeDispatchId: string
+  judgeSessionId: string
+  inputVersion: number
+}
+
+export type ResumeTarget = 'auto' | 'actor' | 'judge'
+
+/** 当前完整补充/恢复材料；后续补充替换它，旧值由 events 保留。 */
+export interface ExecutionResolution {
+  target: Exclude<ResumeTarget, 'auto'> | 'child'
+  /** 每次 node_resume 提供的完整当前补充；respawn 不伪造补充。 */
+  context?: string
+  /** 最近一次 Manager 恢复/重建决定，供事件解释，不作为新 criteria。 */
+  decision?: string
+  /** Judge 恢复沿普通 driver 续接持久 Session 或重新创建。 */
+  judgeMode?: 'followup' | 'fresh'
+  judgeSessionId?: string
+  inputVersion: number
+}
+
+export interface ExecutionProgram {
+  id: string
+  parameters: Record<string, unknown>
+  result?:
+    | { kind: 'PASS' | 'FAIL'; handoff: string; reason?: string }
+    | { kind: 'ERROR'; reason: string }
+}
+
+export interface ExecutionChild {
+  workflowId: string
+  executionId: string
+  result?: { terminalExecutionId: string; handoff: string }
+}
+
+/** 一次 Graph visit 的唯一当前材料。revision 与派发/claim/Program 身份互不替代。 */
+export interface NodeExecution {
+  executionId: string
+  runId: string
+  workflowId: string
+  nodeId: string
+  nodeToken: string
+  visit: number
+  revision: number
+  input: string
+  phase: 'ready' | 'working' | 'checking' | 'settling' | 'exited'
+  /** 当前 visit 的 Role 边界 compact 已完成或无需执行；Host Queue 前持久化。 */
+  roleBoundaryPrepared: boolean
+  /** Host 重启已观察到；Manager resume 消费该标记，不依赖中断事件是否存在。 */
+  restartPending: boolean
+  predecessorId?: string
+  successorId?: string
+  boundary?: NodeContextBoundary
+  dispatch?: ExecutionDispatch
+  claim?: ExecutionClaim
+  /** REJECT/显式退回后保留的已失效旧 claim；不授予当前提交资格。 */
+  previousClaim?: ExecutionClaim
+  judge?: ExecutionJudge
+  /** 最近被替换的 Judge 身份；只保留一代，完整历史由 events 保存。 */
+  previousJudge?: ExecutionJudge
+  judgment?: ExecutionJudgment
+  resolution?: ExecutionResolution
+  program?: ExecutionProgram
+  child?: ExecutionChild
+  inputVersion: number
+  blockReason: string | null
+  enteredAt: string
+  exitedAt?: string
+}
+
+export const EVENT_TYPES = ['entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited', 'blocked', 'manager-context', 'resumed', 'judge-respawned', 'interrupted', 'program-ready', 'program-arranged', 'program-result', 'program-resolved', 'child-entered', 'child-returned', 'model-changed', 'terminated'] as const
+export type NodeExecutionEventType = typeof EVENT_TYPES[number]
+
+export interface NodeExecutionEvent {
+  executionId: string
+  sequence: number
+  type: NodeExecutionEventType
+  at: string
+  snapshot: NodeExecution
+}
+
+/** 一个短事务可同时保存前驱、后继及所有对应关键快照。 */
+export interface ExecutionChange {
+  execution: NodeExecution
+  expectedRevision: number | null
+  events: NodeExecutionEventType[]
+}
+
 export interface StateRow {
   workspaceKey: string
   formatVersion: typeof STATE_FORMAT_VERSION
   stateVersion: number
   run: RunState
+  execution: NodeExecution
   updatedAt: string
 }
 
@@ -243,33 +318,23 @@ export interface ClaimCaller {
   turnUserMessageIds: ReadonlySet<string>
 }
 
-/**
- * A1 §3 + 20260906-claim-handoff-symmetry: one-shot transient context for the
- * next dispatch — `handoff` (an accepted PASS/FAIL edge / resolution) or
- * `correction` (a REJECTed claim re-dispatched to the same node). Identical
- * rules for completed and failed: the outcome only picks the onPass/onFail
- * edge, never the framing. Threading the kind through DispatchBook /
- * persistDeferred / dispatchNow keeps the delayed correction's header
- * distinct from `[handoff]`.
- */
-export type TransientDispatch =
-  | { kind: 'handoff'; text: string }
-  | { kind: 'correction'; text: string }
-
 /** A worker's completion claim. No nodeToken (A1 AC2): admission binds the
  * claim to the current dispatch lease, so the claim carries only its payload. */
 export interface NodeClaim {
   outcome: ClaimOutcome
-  summary: string
-  handoffContext?: string
+  handoff: string
 }
 
-/** A1 §6.4: persisted REJECT evidence for the current node's correction cycle. */
-export interface PendingCorrection {
-  /** The Judge's REJECT reason (≤ reasonMax) — reused verbatim as the correction instruction. */
-  judgeReason: string
-  /** Snapshot of the claim the Judge rejected. */
-  previousClaim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }
+/** 工具与 Runtime 共用同一交付合同；失败不产生部分 claim。 */
+export function normalizeNodeClaim(claim: NodeClaim): NodeClaim {
+  if (Object.keys(claim).some(key => key !== 'outcome' && key !== 'handoff')) {
+    throw new WorkflowError('node_claim only accepts outcome and handoff; summary/handoffContext are not supported')
+  }
+  if (claim.outcome !== 'completed' && claim.outcome !== 'failed') throw new WorkflowError('invalid claim outcome')
+  if (typeof claim.handoff !== 'string' || claim.handoff.trim() === '') throw new WorkflowError('handoff is required')
+  const handoff = claim.handoff.trim()
+  if (handoff.length > LIMITS.handoffMax) throw new WorkflowError(`handoff must be at most ${LIMITS.handoffMax} characters after trim`)
+  return { outcome: claim.outcome, handoff }
 }
 
 /** Judge decision submitted through the `judge_claim` protocol (A1 R9). */
@@ -280,9 +345,9 @@ export interface JudgeResult {
 
 /** Builtin program terminal outcome. */
 export type ProgramResult =
-  | { kind: 'PASS'; details?: unknown }
-  | { kind: 'FAIL'; reason?: string }
-  | { kind: 'ERROR'; reason: string }
+  | { kind: 'PASS'; handoff?: string; details?: unknown }
+  | { kind: 'FAIL'; reason?: string; handoff?: string; details?: unknown }
+  | { kind: 'ERROR'; reason: string; details?: unknown }
 
 /** Tool-facing result codes surfaced as tool error text. */
 export class WorkflowError extends Error {

@@ -1,244 +1,97 @@
-/**
- * Host interaction surfaces the engine needs, declared as narrow interfaces so
- * the whole engine is testable without a live DSH host. The plugin's `apply()`
- * wires real DSH services into these.
- */
-import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimOutcome, ClaimCaller, TransientDispatch, PendingCorrection } from '../types.ts'
-import { WorkflowError, LIMITS, normalizeModelRoute } from '../types.ts'
+/** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
+import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
+import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
-import { createRunLog, appendLine, jsonField, redact, shortId, traceEvent } from './tracelog.ts'
-import { SUBMISSION_CONSTRAINT } from './texts.ts'
+import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
+import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
+import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
+import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
-/** A2 R4: marker prefix compactBeforeDispatch throws with (for clean BLOCK routing). */
-const COMPACT_FAIL_PREFIX = 'node-boundary compact failed: '
-
-/** A4 R2: fixed template for a judge technical fault (steered to the Manager). */
-function judgeFaultNotice(run: RunState, nodeId: string, detail: string): string {
-  const resumeAction = run.judgeSessionId !== undefined
-    ? '你的补充/指示交给当前 Judge 继续（followup）'
-    : '没有可 followup 的 Judge；从 pendingClaim 重建新 Judge'
-  const respawnAction = run.judgeSessionId !== undefined
-    ? '放弃当前 Judge，重建新 Judge 重来一次判定'
-    : '显式重建新 Judge，重来一次判定'
-  return `⚠️ Judge 判定故障（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— ${resumeAction}；\n  2. judge_respawn({nodeToken}) —— ${respawnAction}；\n  3. workflow_set_role_model({roleKey:'judge', ...}) 换模型后再 resume/respawn；\n  4. node_block 保留现场等待人工。`
-}
-
-/** A1 R10: fixed template for a NEED_CONTEXT judgment (steered to the Manager). */
-function needContextNotice(run: RunState, nodeId: string, reason: string): string {
-  return `⚠️ Judge 需要补充信息（workflow ${run.runId} / node ${nodeId}）\n原因：${reason}\n\n当前 Node 已 BLOCK，未推进 PASS/FAIL。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 你的补充交给当前 Judge 继续；\n  2. node_block 保留现场等待人工。`
-}
-
-/** A3 R3: fixed template for an actor-turn-without-result BLOCK (steered to the Manager). */
-function actorNoResultNotice(run: RunState, nodeId: string): string {
-  return `⚠️ Actor 未提交结果（workflow ${run.runId} / node ${nodeId}）\n当前 Actor 结束回合但未调用 node_claim。\n当前 Node 已 BLOCK，未推进。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 将你的指示交给当前 Actor 继续并提交；\n  2. node_block 保留现场等待人工。`
-}
-
-/** A2 R4: fixed template for a node-boundary compact failure (steered to the Manager). */
-function compactFaultNotice(run: RunState, nodeId: string, detail: string): string {
-  return `⚠️ Node 边界 compact 失败（workflow ${run.runId} / node ${nodeId}）\n诊断：${detail}\n\n当前 Node 已 BLOCK，未派发。\n可选动作：\n  1. node_resume({nodeToken, resolutionContext}) —— 重试派发（compact 会再次尝试）；\n  2. workflow_set_role_model 换 summarization 模型后 resume；\n  3. node_block 保留现场等待人工。`
-}
-
-/**
- * A1 R7/§6.3: the correction message's evidence sections — `[judge rejection]`
- * + `[previous claim]`. The dispatch wrapper prepends `[correction]` and
- * appends `[instruction]`; a resume rebuild additionally appends
- * `[manager resolution]`. Lengths are bounded by the entry LIMITS chain.
- */
-export function correctionEvidence(pc: { judgeReason: string; previousClaim: { outcome: ClaimOutcome; summary: string; handoffContext?: string } }): string {
-  const claim = `[previous claim]\noutcome: ${pc.previousClaim.outcome}\nsummary: ${pc.previousClaim.summary}`
-    + (pc.previousClaim.handoffContext !== undefined ? `\nhandoffContext: ${pc.previousClaim.handoffContext}` : '')
-  return `[judge rejection]\n${pc.judgeReason}\n\n${claim}`
-}
-
-/** Deliverable messages to Manager / Role Actors. */
 export interface DispatchTargets {
-  /**
-   * Steer the Manager session. Returns the user message id assigned by
-   * `createUserMessage` (synchronously allocated before the steer) — the
-   * Manager-dispatch lease identity (A1 R2/R3).
-   */
   steerManager(run: RunState, text: string): Promise<{ messageId: string }>
-  /** Deliver to an EXISTING mapped role actor (followup); returns the message id (A1 R2). */
   sendRoleActor(run: RunState, roleKey: string, text: string): Promise<{ messageId: string }>
-  /** The Manager session's current next-seq, captured at dispatch (A1 R2). */
   managerSessionSeq(run: RunState): number
 }
-
-/** Judge spawn input the host needs to build the Judgment Packet. */
 export interface JudgeSpawnInput {
   nodeToken: string
   instruction: string
   criteria: string
-  /** A1 R7: the Judge sees only the worker's claim outcome/summary. */
-  claim: { outcome: ClaimOutcome; summary: string }
-  /** A1 §7.1: REJECT evidence from a previous correction round on this node, when present. */
-  previousRejection?: PendingCorrection
+  input: string
+  boundary: NodeContextBoundary
+  claim: NodeClaim
+  previousFeedback?: { result: 'REJECT' | 'NEED_CONTEXT'; reason: string; claim: NodeClaim }
+  managerContext?: string
   cwd: string
-  /**
-   * Engine-reserved Judge session id. The Host must use it as the continuable
-   * child's caller-reserved `childId`, because the child may start its first
-   * turn before this adapter returns and State has already been updated.
-   */
   judgeSessionId: string
+  recovery?: boolean
 }
-
-/** Subagent lifecycle used by roles/judge. */
+export type SessionAvailability = 'available' | 'missing' | 'unknown'
 export interface SubagentHost {
-  /**
-   * Create a continuable role actor for roleKey and deliver `initialText` as
-   * its first prompt. Returns the durable child id + the dispatch message id.
-   */
   ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<{ childId: string; messageId: string }>
-  /** Start a fresh continuable Judge and deliver its Judgment Packet (A1 R8). The reserved input.judgeSessionId must become the child id. */
   startJudge(run: RunState, input: JudgeSpawnInput): Promise<{ judgeSessionId: string; messageId: string }>
-  /** Followup an existing Judge session with supplemental context (A1 R10). */
-  followupJudge(run: RunState, judgeSessionId: string, text: string): Promise<void>
-  /** Whether the durable Judge Session exists and can be cold-resumed after a host restart. */
-  judgeSessionExists(judgeSessionId: string): Promise<boolean>
-  /**
-   * Retire a Judge after its PASS/FAIL verdict (A1 R11): revoke its
-   * authorization only. The resident Activation is released by DSH's own
-   * settlement watcher once the Judge's turn ends — an explicit drain from
-   * inside the Judge's own `judge_claim` tool call would cancel the very turn
-   * executing the call and deadlock on its quiescence.
-   */
+  followupJudge(run: RunState, judgeSessionId: string, input: JudgeSpawnInput): Promise<{ messageId: string }>
+  judgeSessionAvailability(judgeSessionId: string): Promise<SessionAvailability>
+  roleSessionAvailability(roleSessionId: string): Promise<SessionAvailability>
   retireJudge(run: RunState, judgeSessionId: string): Promise<void>
-  /**
-   * Drain a Judge's resident Activation (revoke + explicit drain). Only safe
-   * from a turn OTHER than the Judge's own (judge_respawn); an absent target
-   * is an accepted no-op.
-   */
   drainJudge(run: RunState, judgeSessionId: string): Promise<void>
-  /**
-   * Node-boundary compact of a role actor (A2; A4 plan A). A cold actor is
-   * materialized without a prompt, compacted while idle, and released before
-   * the dispatch followup cold-resumes the compacted surface. Failure returns
-   * ok:false so the caller BLOCKs with a clean reason (A2 R4).
-   */
   compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
+  /** 必须覆盖普通工具 tail、已知后台写任务及未收口后代；unknown=false。 */
+  safeToInspect(sessionId: string): Promise<boolean>
 }
-
-/** Program executor used by builtin-program nodes. */
 export interface ProgramHost {
-  run(run: RunState, programId: string, parameters: Record<string, unknown>, cwd: string): Promise<{ kind: 'PASS' | 'FAIL' | 'ERROR'; reason?: string; details?: unknown }>
+  run(run: RunState, programId: string, parameters: Record<string, unknown>, cwd: string): Promise<ProgramResult>
 }
-
-/** Persistence boundary (state store wrapper). */
+export interface RuntimeRow { run: RunState; execution: NodeExecution; version: number }
 export interface StateHost {
-  get(workspaceKey: string): Promise<{ run: RunState; version: number } | undefined>
-  put(workspaceKey: string, run: RunState, expectedVersion: number): Promise<void>
-  /** Insert/overwrite the row; resolves with the row's new state version. */
-  create(workspaceKey: string, run: RunState): Promise<number>
-  remove(workspaceKey: string): Promise<void>
-  listRuns(): Promise<Array<{ workspaceKey: string; run: RunState; version: number }>>
+  get(workspaceKey: string): Promise<RuntimeRow | undefined>
+  put(workspaceKey: string, run: RunState, expectedVersion: number, changes: ExecutionChange[]): Promise<void>
+  create(workspaceKey: string, run: RunState, execution: NodeExecution): Promise<number>
+  listRuns(): Promise<Array<RuntimeRow & { workspaceKey: string }>>
+  execution(workspaceKey: string, executionId: string): Promise<NodeExecution | undefined>
+  events(workspaceKey: string, executionId: string, after?: number, limit?: number): Promise<NodeExecutionEvent[]>
+  historyOwner(workspaceKey: string, executionId: string): Promise<{ runId: string; managerSessionId: string } | undefined>
 }
-
-export type EngineOutcome =
-  | { ok: true; run: RunState; message: string }
-  | { ok: false; reason: string }
-
+export type EngineOutcome = { ok: true; run: RunState; message: string } | { ok: false; reason: string }
 export interface NodeView {
-  execution: {
-    type: 'actor-task' | 'builtin-program' | 'child-workflow'
-    role?: string
-    instruction?: string
-    programId?: string
-    workflowId?: string
-    config?: Record<string, unknown>
-  }
+  execution: { type: 'actor-task' | 'builtin-program' | 'child-workflow'; role?: string; instruction?: string; programId?: string; workflowId?: string; config?: Record<string, unknown> }
   checker?: { checkerId: string; config: Record<string, unknown> }
   onPass: string
   onFail?: string
 }
-
-/**
- * Per-workspace dispatch bookkeeping (in-memory, design §4.2):
- * - dispatchedToken: token the last dispatched turn was running under.
- * - executorSessionId: the exact session that was dispatched for the current
- *   node (manager session id or role-actor child id). Only that session's
- *   turn settlement drives auto-BLOCK / deferred dispatch (design §4.2).
- * - pendingDispatch: the node advanced via an accepted claim/verdict, and the
- *   NEXT node dispatch is deferred until the old turn settles (design §4.2:
- *   "dispatch next Node only after old Turn settles").
- * - transientContext: one-shot context to prepend to the next dispatch
- *   message (handoff on an accepted PASS/FAIL / resolution on resume /
- *   correction evidence on REJECT). In-memory only — the DEFERRED variant is
- *   mirrored into `run.pendingDispatchContext` so a host restart cannot lose
- *   it (20260906); consumed by exactly one dispatch (design §2.6/§5.2 G4).
- * - workerSettled: the dispatched executor's turn already ended while a
- *   judgment was pending (the async-Judge era: the worker's `node_claim` ends
- *   its turn long before the verdict). When true, a later PASS/FAIL verdict
- *   dispatches the next node immediately instead of deferring to a turn/end
- *   that already fired (A1 R9–R11).
- * - dispatchMessageId + leaseConsumed: the ActorDispatchLease (A1 R2). The
- *   user message id of THIS node's actual dispatch, consumable exactly once
- *   by a node_claim/node_block whose calling turn contains that id.
- */
-interface DispatchBook {
-  dispatchedToken: string
-  executorSessionId: string
-  pendingDispatch: boolean
-  transientContext: TransientDispatch | null
-  workerSettled: boolean
-  /** A1 R2: the dispatch's user message id — the lease principal. `undefined` for lease-less nodes (builtin-program). */
-  dispatchMessageId?: string
-  /** Whether the lease has been consumed by one admitted claim/block. */
-  leaseConsumed: boolean
-}
-
-/**
- * A1 §3.1: the identity of one real dispatch, returned by `dispatchCurrent`
- * so `dispatchNow` can publish the lease at its single convergence point.
- * `undefined` means the node publishes no lease (builtin-program).
- */
-interface DispatchIdentity {
-  executorSessionId: string
-  /** The steer/followup/startContinuable user message id. */
-  dispatchMessageId: string
-}
-
-/** The current node's precise executor session (design §4 seriality). */
 export function executorSessionOf(run: RunState): string {
   const frame = topFrame(run)
-  const def = frame.workflowId === run.catalogWorkflowId
-    ? run.definitionSnapshot.workflow
-    : run.definitionSnapshot.childWorkflows?.[frame.workflowId]
-  const node = def?.nodes[frame.nodeId]
-  if (node !== undefined && node.execution.type === 'actor-task' && node.execution.role === 'manager') {
-    return run.managerSessionId
-  }
-  if (node !== undefined && node.execution.type === 'actor-task' && node.execution.role !== undefined) {
-    return run.roleActors[node.execution.role] ?? ''
-  }
-  // builtin-program / child-workflow are Manager-driven (program parameters /
-  // child admission come from the Manager).
-  return run.managerSessionId
+  const def = frame.workflowId === run.catalogWorkflowId ? run.definitionSnapshot.workflow : run.definitionSnapshot.childWorkflows?.[frame.workflowId]
+  const execution = def?.nodes[frame.nodeId]?.execution
+  return execution?.type === 'actor-task' && execution.role !== 'manager' ? run.roleActors[execution.role] ?? '' : run.managerSessionId
 }
+const rejected = (reason: string): EngineOutcome => ({ ok: false, reason })
+const matches = (dispatch: ExecutionDispatch | undefined, caller: ClaimCaller): boolean =>
+  dispatch?.sessionId === caller.sessionId && dispatch.messageId !== undefined && caller.turnUserMessageIds.has(dispatch.messageId)
+const executionHandoff = (execution: NodeExecution): string | undefined => execution.claim?.handoff
+  ?? (execution.program?.result?.kind === 'PASS' || execution.program?.result?.kind === 'FAIL' ? execution.program.result.handoff : undefined)
+  ?? execution.child?.result?.handoff
+const change = (execution: NodeExecution, ...events: NodeExecutionEvent['type'][]): ExecutionChange => ({ execution, expectedRevision: execution.revision, events })
+export const TERMINATED_REASON = 'terminated; external effects not cancelled'
 
 export class WorkflowEngine {
-  /** Bound cwd resolver (wired by the plugin; throws until then). */
   cwdResolver: (run: RunState) => Promise<string> = async () => { throw new WorkflowError('cwd resolver is not wired') }
-
-  /** Optional actor-activity oracle (wired by the plugin when available). */
-  actorActivity: (actorSessionId: string) => Promise<'active' | 'idle' | 'unknown'> = async () => 'unknown'
-
-  /** Optional model-route resolver for the Manager at Run start (F22). */
-  managerRoute: (managerSessionId: string) => Promise<{ provider?: string; model?: string }> = async () => ({})
-
-  private readonly dispatchBook = new Map<string, DispatchBook>()
-  private readonly inFlight = new Map<string, string>() // workspaceKey → operation kind
-  /**
-   * A3 §10: ONE warning per run on the first trace-log failure, so
-   * best-effort still has a diagnosis without a warning loop. Wired to the
-   * Host logger by the plugin; absent in tests.
-   */
+  actorActivity: (sessionId: string) => Promise<'active' | 'idle' | 'unknown'> = async () => 'unknown'
+  managerRoute: (sessionId: string) => Promise<{ provider?: string; model?: string }> = async () => ({})
+  frozenRoute: { provider?: string; model?: string } = {}
   traceWarn: ((message: string) => void) | undefined
-  private readonly traceWarnedRuns = new Set<string>()
   private readonly targets: DispatchTargets
   private readonly subagents: SubagentHost
   private readonly programs: ProgramHost
   private readonly state: StateHost
-
+  private readonly traceWarned = new Set<string>()
+  private trace(run: RunState, event: string, fields: Parameters<typeof traceEvent>[1]): void {
+    if (run.traceLogPath && !appendLine(run.traceLogPath, traceEvent(event, fields))) this.warnTrace(run)
+  }
+  private warnTrace(run: RunState): void {
+    if (this.traceWarned.has(run.runId)) return
+    this.traceWarned.add(run.runId)
+    try { this.traceWarn?.(`workflow trace unavailable for run ${run.runId}; SQLite remains authoritative`) } catch {}
+  }
   constructor(targets: DispatchTargets, subagents: SubagentHost, programs: ProgramHost, state: StateHost) {
     this.targets = targets
     this.subagents = subagents
@@ -246,1374 +99,839 @@ export class WorkflowEngine {
     this.state = state
   }
 
-  buildInitialRun(managerSessionId: string, workflowId: string, config: WorkflowConfig, definitionHash: string): RunState {
-    return {
-      runId: crypto.randomUUID(),
-      managerSessionId,
-      catalogWorkflowId: workflowId,
-      definitionHash,
-      definitionSnapshot: config,
-      status: 'running',
-      callStack: [{ workflowId, nodeId: config.workflow.startNode, nodeToken: newNodeToken() }],
-      roleActors: {},
-      modelOverrides: {},
-      blockReason: null,
-      nodeBoundary: { dispatchedAt: 0, managerFromSeq: 0 },
-    }
-  }
-
-  /** F22: the Manager's route frozen at Run start (empty = inherit per-spawn). */
-  frozenRoute: { provider?: string; model?: string } = {}
-
-  /** Start a run: persist the initial row, then dispatch the root start node immediately. */
-  async startRun(workspaceKey: string, run: RunState, configPath?: string): Promise<EngineOutcome> {
-    // A3 review round 2: the workspace-uniqueness check is atomic with the
-    // row creation (state.create). Pre-check it so the COMMON conflict (user
-    // error, not a crash) rejects cleanly BEFORE any trace artifact exists —
-    // only a genuine race between this check and create can leave an orphan
-    // START line + file (declared at-least-once semantics).
-    const existing = await this.state.get(workspaceKey)
-    if (existing !== undefined && existing.run.status !== 'completed') {
-      return { ok: false, reason: `workspace already has a ${existing.run.status} run (key: ${workspaceKey})` }
-    }
-    // A3: create the trace log BEFORE the state row and persist its path on
-    // the row, so every later event (including after a host restart) appends
-    // to the same file. Best-effort — tracelog never throws, so logging can
-    // never block run startup (R4); a create failure leaves traceLogPath
-    // unset and the run simply runs unlogged.
-    if (configPath !== undefined) {
-      const logPath = createRunLog(configPath, run.catalogWorkflowId, run.runId)
-      if (logPath !== undefined) {
-        run.traceLogPath = logPath
-      } else {
-        this.warnTraceOnce(run.runId, `workflow trace log creation failed for run ${shortId(run.runId)}; the run continues without a trace log`)
-      }
-    }
-    // R1/R2: the START line announces the event-line format version (A3 §3).
-    // Written BEFORE the row creation per the §10 order (validate → trace →
-    // persist): a crash between leaves an orphan START in an orphan file
-    // (at-least-once); the reverse gap (row without START) does not exist.
-    this.logLine(run, traceEvent('START', { workflow: run.catalogWorkflowId, run: run.runId, fmt: 2 }))
-    let version: number
-    try {
-      version = await this.state.create(workspaceKey, run)
-    } catch (error) {
-      // A3 review S4: a failed start leaves no run to clean the marker later.
-      this.traceWarnedRuns.delete(run.runId)
-      if (error instanceof Error && error.name === 'StateConflictError') {
-        return { ok: false, reason: error.message }
-      }
-      throw error
-    }
-    // F22: freeze the Manager's current route as the inherited fallback at Run
-    // start, so later Manager UI model switches do not change first-time
-    // Worker/Judge spawns.
-    this.frozenRoute = await this.managerRoute(run.managerSessionId)
-    await this.dispatchNow(workspaceKey, run, version)
-    return { ok: true, run, message: run.blockReason ?? `dispatched ${topFrame(run).nodeId}` }
-  }
-
-  /**
-   * Append one line to this run's trace log (best-effort, R4). No-op when the
-   * run has no trace-log path (no configPath at start, log creation failed,
-   * or a pre-A3 durable row). The path travels ON the durable row, so events
-   * after a host restart reach the same file (A3 R5 restart coverage).
-   */
-  private logLine(run: RunState, line: string): void {
-    const logPath = run.traceLogPath
-    if (logPath === undefined) return
-    if (!appendLine(logPath, line)) {
-      this.warnTraceOnce(run.runId, `workflow trace log append failed for run ${shortId(run.runId)} (path: ${logPath}); further trace failures for this run stay silent`)
-    }
-  }
-
-  /** A3 §10: surface the FIRST trace failure of a run once, never in a loop. */
-  private warnTraceOnce(runId: string, message: string): void {
-    if (this.traceWarnedRuns.has(runId)) return
-    this.traceWarnedRuns.add(runId)
-    try {
-      this.traceWarn?.(message)
-    } catch {
-      // even the warning is best-effort
-    }
-  }
-
-  // ---- A3 trace events (fmt=2). Free-text fields go through `jsonField`
-  // at their protocol bounds (§4); ids use short prefixes (§5/§10). ----
-
-  /** A3 R1: an accepted Actor claim, logged after admission, before Judge spawn. */
-  private logClaim(run: RunState, frame: CallFrame, role: string, outcome: ClaimOutcome, summary: string, handoff: string | null): void {
-    this.logLine(run, traceEvent('CLAIM', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      role,
-      outcome,
-      summary: jsonField(summary, LIMITS.summaryMax),
-      handoff: jsonField(handoff, LIMITS.handoffMax),
-    }))
-  }
-
-  /** A1 v2: the Judge's confirmation (ACCEPT/REJECT/NEED_CONTEXT), recorded before any state transition. */
-  private logJudge(run: RunState, frame: CallFrame, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): void {
-    this.logLine(run, traceEvent('JUDGE', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      result,
-      reason: jsonField(reason, LIMITS.reasonMax),
-      judge: shortId(judgeSessionId),
-    }))
-  }
-
-  /** A1 §7.2: the REJECT re-dispatch boundary — same node, rotated token,
-   * retired judge. Marks where a correction cycle began (never a ROUTE: no
-   * Edge was read). */
-  private logCorrect(run: RunState, frame: CallFrame, role: string, oldJudgeId: string, detail: string): void {
-    this.logLine(run, traceEvent('CORRECT', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      role,
-      judge: shortId(oldJudgeId),
-      detail: jsonField(detail, LIMITS.reasonMax),
-    }))
-  }
-
-  /** A3 §3: the finally-adopted Graph edge direction (verdict synthesis, not the verdict itself). */
-  private logRoute(run: RunState, frame: CallFrame, result: 'PASS' | 'FAIL', target: string): void {
-    this.logLine(run, traceEvent('ROUTE', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      result,
-      target,
-    }))
-  }
-
-  /** A3 R5: every BLOCK entrance with its source and normalized reason. */
-  private logBlock(run: RunState, frame: CallFrame, source: 'actor' | 'judge' | 'program' | 'dispatch' | 'compact' | 'restart' | 'manager', reason: string): void {
-    this.logLine(run, traceEvent('BLOCK', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      source,
-      reason: jsonField(reason, LIMITS.blockReasonMax),
-    }))
-  }
-
-  /** A3 R6: node_resume — target=judge in the judgment phase, else target=actor. */
-  private logResume(run: RunState, frame: CallFrame, oldToken: string, target: 'judge' | 'actor', resolutionContext: string): void {
-    this.logLine(run, traceEvent('RESUME', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      oldToken: shortId(oldToken),
-      newToken: shortId(frame.nodeToken),
-      target,
-      context: jsonField(resolutionContext, LIMITS.resolutionMax),
-    }))
-  }
-
-  /** A3 R6: judge_respawn — the fresh Judge id prefix links back to its JUDGE line. */
-  private logRespawn(run: RunState, frame: CallFrame, judgeSessionId: string, reason: string | null): void {
-    this.logLine(run, traceEvent('RESPAWN', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      judge: shortId(judgeSessionId),
-      reason: jsonField(reason, LIMITS.reasonMax),
-    }))
-  }
-
-  /** A3 R6: node_resolve_program — the Manager's manual verdict on a blocked program node. */
-  private logResolve(run: RunState, frame: CallFrame, result: 'PASS' | 'FAIL', reason: string): void {
-    this.logLine(run, traceEvent('RESOLVE', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      result,
-      reason: jsonField(reason, LIMITS.blockReasonMax),
-    }))
-  }
-
-  /** A3 §9: builtin program outcome. Parameters are never logged (§9 privacy). */
-  private logProgram(run: RunState, frame: CallFrame, programId: string, result: 'PASS' | 'FAIL' | 'ERROR', reason: string | null): void {
-    this.logLine(run, traceEvent('PROGRAM', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      program: programId,
-      result,
-      reason: jsonField(reason, LIMITS.reasonMax),
-    }))
-  }
-
-  /** A3 R6: model override — ids only, never credentials. provider/modelId
-   * are untrusted Manager tool input: redact credential shapes pointwise
-   * (other raw identifiers are catalog-validated and intentionally exempt,
-   * A3 review round 3 S1). */
-  private logModel(run: RunState, roleKey: string, provider: string, modelId: string): void {
-    this.logLine(run, traceEvent('MODEL', {
-      workflow: run.catalogWorkflowId,
-      role: roleKey,
-      provider: redact(provider),
-      model: redact(modelId),
-    }))
-  }
-
-  /** A3 §8: child-workflow entry (push). Token pairs with the POP of the same node. */
-  private logPush(run: RunState, frame: CallFrame, childWorkflowId: string): void {
-    this.logLine(run, traceEvent('PUSH', {
-      parent: `${frame.workflowId}/${frame.nodeId}`,
-      token: shortId(frame.nodeToken),
-      child: childWorkflowId,
-    }))
-  }
-
-  /** A3 §8: child-workflow return (pop) — explicit, not inferred from the parent PASS. */
-  private logPop(run: RunState, childWorkflowId: string, result: 'PASS' | 'FAIL', parentFrame: CallFrame): void {
-    this.logLine(run, traceEvent('POP', {
-      child: childWorkflowId,
-      result,
-      parent: `${parentFrame.workflowId}/${parentFrame.nodeId}`,
-      token: shortId(parentFrame.nodeToken),
-    }))
-  }
-
-  /** A2 R7: node-boundary compact outcome. */
-  private logCompact(run: RunState, frame: CallFrame, roleKey: string, ok: boolean, detail: string | null): void {
-    this.logLine(run, traceEvent('COMPACT', {
-      workflow: frame.workflowId,
-      node: frame.nodeId,
-      token: shortId(frame.nodeToken),
-      role: roleKey,
-      ok,
-      detail: jsonField(detail, LIMITS.blockReasonMax),
-    }))
-  }
-
   nodeAt(run: RunState, frame: CallFrame): NodeView | undefined {
-    const def = frame.workflowId === run.catalogWorkflowId
-      ? run.definitionSnapshot.workflow
-      : run.definitionSnapshot.childWorkflows?.[frame.workflowId]
-    if (def === undefined) return undefined
-    return def.nodes[frame.nodeId] as NodeView | undefined
+    const def = frame.workflowId === run.catalogWorkflowId ? run.definitionSnapshot.workflow : run.definitionSnapshot.childWorkflows?.[frame.workflowId]
+    return def?.nodes[frame.nodeId]
   }
-
   currentNodeKind(run: RunState): NodeView['execution']['type'] {
     const node = this.nodeAt(run, topFrame(run))
-    if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
+    if (!node) throw new WorkflowError('current node is missing from snapshot')
     return node.execution.type
   }
-
-  /**
-   * Deliver the current node's prompt to its executor (design §4.1).
-   * A one-shot transientContext (handoff / resolution / correction) is
-   * prepended to the message and consumed. Establishes the NodeContextBoundary
-   * at actual dispatch (A1 R1), performs node-boundary compaction (A2), and
-   * injects the submission hard constraint for actor-tasks (A3 R1). Mutates
-   * the run in memory only (role mapping + child frames + boundary). Throws
-   * on dispatch failure so callers can BLOCK.
-   *
-   * Returns the dispatch identity (A1 §3.1) — the executor session plus the
-   * dispatch message id — for lease publication; `undefined` for lease-less
-   * nodes (builtin-program: they accept no claims).
-   */
-  async dispatchCurrent(run: RunState, transientContext: TransientDispatch | null): Promise<DispatchIdentity | undefined> {
+  buildInitialRun(managerSessionId: string, workflowId: string, config: WorkflowConfig, _definitionHash: string): RunState {
+    const snapshot = validateAndNormalize(structuredClone(config), { workflowId })
+    const currentExecutionId = newNodeToken()
+    return {
+      runId: newNodeToken(), managerSessionId, catalogWorkflowId: workflowId,
+      definitionHash: computeDefinitionHash(snapshot), definitionSnapshot: snapshot,
+      status: 'running', callStack: [{ workflowId, nodeId: snapshot.workflow.startNode, nodeToken: newNodeToken(), executionId: currentExecutionId }],
+      currentExecutionId, roleActors: {}, modelOverrides: {}, blockReason: null,
+    }
+  }
+  private newExecution(run: RunState, input: string, visit: number, predecessorId?: string): NodeExecution {
     const frame = topFrame(run)
-    const node = this.nodeAt(run, frame)
-    if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
-    const execution = node.execution
-    const text = transientContext !== null && transientContext.text !== ''
-      ? `[${transientContext.kind}]\n${transientContext.text}\n\n[instruction]\n${execution.instruction ?? ''}`
-      : (execution.instruction ?? '')
-
-    if (execution.type === 'actor-task') {
-      // A3 R1: append the submission hard constraint (never replace the original).
-      const dispatchText = text + SUBMISSION_CONSTRAINT
-      if (execution.role === 'manager') {
-        // A2 R2: the Manager (user main session) is never compacted.
-        const freshBoundary = run.nodeBoundary.dispatchedAt === 0
-        this.establishManagerBoundary(run)
-        const { messageId } = await this.targets.steerManager(run, dispatchText)
-        // A1 R2: record the Manager dispatch's message id on the boundary too
-        // (the field existed but was previously only written on role paths).
-        if (freshBoundary) run.nodeBoundary.executorDispatchMessageId = messageId
-        return { executorSessionId: run.managerSessionId, dispatchMessageId: messageId }
-      }
-      const roleKey = execution.role!
-      // A1 §6.5: a correction re-dispatch targets the ORIGINAL actor — the
-      // retained boundary names this node's executor truth, so repair a
-      // drifted/missing mapping before the followup decision. A mapping loss
-      // must never silently redirect a correction to a replacement actor.
-      if (transientContext?.kind === 'correction'
-        && run.nodeBoundary.dispatchedAt !== 0
-        && run.nodeBoundary.executorSessionId !== undefined) {
-        run.roleActors[roleKey] = run.nodeBoundary.executorSessionId
-      }
-      const existing = run.roleActors[roleKey]
-      // A2 R6 / A1 R4: compact only on fresh node entry — a retained
-      // boundary for the SAME executor means this is a same-node resume.
-      const isSameNodeResume = run.nodeBoundary.dispatchedAt !== 0
-        && run.nodeBoundary.executorSessionId === existing
-      if (existing !== undefined) {
-        if (!isSameNodeResume) {
-          await this.compactBeforeDispatch(run, roleKey)
-        }
-        // A1 R2: capture the boundary cursors BEFORE the followup await — a
-        // manager message landing during the send belongs to this node's
-        // projection window, exactly like the first-creation path.
-        const dispatchedAt = Date.now()
-        const managerFromSeq = this.targets.managerSessionSeq(run)
-        const { messageId } = await this.targets.sendRoleActor(run, roleKey, dispatchText)
-        if (!isSameNodeResume) {
-          run.nodeBoundary = {
-            dispatchedAt,
-            managerFromSeq,
-            executorSessionId: existing,
-            executorDispatchMessageId: messageId,
-          }
-        }
-        // Same-node resume: RETAIN the original boundary (A1 R4/AC5) so the
-        // Judge projection keeps this node's pre-resume local history; the
-        // resume dispatch itself still projects (it follows the boundary seq).
-        return { executorSessionId: existing, dispatchMessageId: messageId }
-      }
-      // A2 R3: first creation has no history — create directly, no compact.
-      const dispatchedAt = Date.now()
-      const managerFromSeq = this.targets.managerSessionSeq(run)
-      const { childId, messageId } = await this.subagents.ensureRoleActor(run, roleKey, dispatchText)
-      run.roleActors[roleKey] = childId
-      run.nodeBoundary = { dispatchedAt, managerFromSeq, executorSessionId: childId, executorDispatchMessageId: messageId }
-      return { executorSessionId: childId, dispatchMessageId: messageId }
+    const execution = this.nodeAt(run, frame)?.execution
+    const role = execution?.type === 'actor-task' ? execution.role : undefined
+    const roleBoundaryPrepared = role === undefined || role === 'manager' || run.roleActors[role] === undefined
+    return { runId: run.runId, ...frame, visit, revision: 0,
+      input, phase: 'ready', roleBoundaryPrepared, restartPending: false, inputVersion: 1, blockReason: null, enteredAt: new Date().toISOString(),
+      ...(predecessorId === undefined ? {} : { predecessorId }) }
+  }
+  private judgePacket(run: RunState, e: NodeExecution, cwd: string): JudgeSpawnInput {
+    const node = this.nodeAt(run, topFrame(run))!
+    const feedback = e.judgment?.result === 'REJECT' && e.previousClaim
+      ? { result: e.judgment.result, reason: e.judgment.reason, claim: { outcome: e.previousClaim.outcome, handoff: e.previousClaim.handoff } }
+      : e.judgment?.result === 'NEED_CONTEXT' && e.claim
+        ? { result: e.judgment.result, reason: e.judgment.reason, claim: { outcome: e.claim.outcome, handoff: e.claim.handoff } }
+        : undefined
+    return {
+      nodeToken: e.nodeToken, instruction: node.execution.instruction ?? '', criteria: String(node.checker?.config.criteria ?? ''),
+      input: e.input, boundary: e.boundary!, claim: { outcome: e.claim!.outcome, handoff: e.claim!.handoff }, cwd, judgeSessionId: e.judge!.sessionId!,
+      ...(feedback ? { previousFeedback: feedback } : {}),
+      ...(e.resolution?.context ? { managerContext: e.resolution.context } : {}),
+      ...(e.resolution?.target === 'judge' ? { recovery: true } : {}),
     }
-    if (execution.type === 'builtin-program') {
-      // A3 R1: builtin-program dispatch is NOT injected with the constraint,
-      // and publishes NO lease (program nodes accept no claims — A1 §5.2).
-      this.establishManagerBoundary(run)
-      const programText = text !== ''
-        ? text
-        : 'Run the current builtin program via node_run_program.'
-      await this.targets.steerManager(run, programText)
-      return undefined
+  }
+  async status(ws: string, caller = '', history?: { executionId: string; after?: number; limit?: number }) {
+    const row = await this.state.get(ws)
+    if (!row) return { ok: true, status: 'no active run' }
+    const { run, execution } = row
+    if (history) {
+      const after = history.after ?? 0
+      const limit = history.limit ?? 50
+      if (!history.executionId.trim() || !Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
+        return { ok: false, reason: 'history requires executionId, after >= 0, and limit 1..50' }
+      }
+      try {
+        const owner = await this.state.historyOwner(ws, history.executionId)
+        if (!owner || owner.runId !== run.runId) return { ok: false, reason: 'workflow history execution is not in the current Run' }
+        if (caller !== owner.managerSessionId) return { ok: false, reason: 'workflow history is Manager-only' }
+        const events = await this.state.events(ws, history.executionId, after, limit)
+        return { ok: true, status: { runId: owner.runId, history: { executionId: history.executionId, after, limit, events, nextAfter: events.length === limit ? events.at(-1)!.sequence : null } } }
+      } catch (error) { return { ok: false, reason: error instanceof Error ? error.message : String(error) }
+      }
     }
-    const childId = execution.workflowId!
-    const childDef = run.definitionSnapshot.childWorkflows?.[childId]
-    if (childDef === undefined) throw new WorkflowError(`child workflow "${childId}" is missing from the snapshot`)
-    run.callStack.push({ workflowId: childId, nodeId: childDef.startNode, nodeToken: newNodeToken() })
-    // A3 §8: child-workflow entry (push); the return is logged by advance()'s POP.
-    this.logPush(run, frame, childId)
-    // The handoff reaches the Child's start node (design §2.6). The lease
-    // belongs to the innermost real actor-task dispatch — propagate it.
-    return await this.dispatchCurrent(run, transientContext)
+    const node = run.status === 'completed' ? undefined : this.nodeAt(run, topFrame(run))
+    const handoffPreview = executionHandoff(execution)?.slice(0, 500) ?? null
+    return { ok: true, status: {
+      runId: run.runId, catalogWorkflowId: run.catalogWorkflowId, status: run.status,
+      currentFrame: run.callStack.at(-1) ?? null,
+      handler: node?.execution.type === 'actor-task' ? node.execution.role : node?.execution.type ?? null,
+      execution: {
+        executionId: execution.executionId, workflowId: execution.workflowId, nodeId: execution.nodeId,
+        nodeToken: execution.nodeToken, visit: execution.visit, phase: execution.phase,
+        hasClaim: execution.claim !== undefined, claimOutcome: execution.claim?.outcome ?? null,
+        judgment: execution.judgment ? { result: execution.judgment.result, reasonPreview: execution.judgment.reason.slice(0, 500) } : null,
+        inputPreview: execution.input.slice(0, 500), handoffPreview,
+        blockReason: execution.blockReason ?? run.blockReason, recoveryTarget: execution.resolution?.target ?? null,
+        restartPending: execution.restartPending,
+      },
+      blockReason: execution.blockReason ?? run.blockReason,
+      handoffPreview,
+      finalHandoffPreview: run.status === 'completed' ? handoffPreview : null,
+    } }
+  }
+  async startRun(ws: string, run: RunState, configPath?: string, extraText = ''): Promise<EngineOutcome> {
+    if (extraText.length > LIMITS.handoffMax) return rejected(`root input exceeds ${LIMITS.handoffMax} characters`)
+    const previous = await this.state.get(ws)
+    if (previous && previous.run.status !== 'completed' && previous.run.status !== 'terminated') return rejected(`workspace already has a ${previous.run.status} run`)
+    if (previous?.run.status === 'terminated') {
+      const previousNode = this.nodeAt(previous.run, topFrame(previous.run))
+      const knownSessions = new Set<string>()
+      if (previousNode?.execution.type === 'actor-task' && previousNode.execution.role !== 'manager') {
+        const actorSessionId = previous.execution.dispatch?.sessionId ?? previous.run.roleActors[previousNode.execution.role!]
+        if (actorSessionId) knownSessions.add(actorSessionId)
+      }
+      if (previous.execution.judge?.sessionId) knownSessions.add(previous.execution.judge.sessionId)
+      if (previous.execution.predecessorId) {
+        const predecessor = await this.state.execution(ws, previous.execution.predecessorId)
+        if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated predecessor inspection')
+        if (predecessor?.judge && !predecessor.judge.settled) knownSessions.add(predecessor.judge.sessionId)
+      }
+      for (const sessionId of knownSessions) {
+        const safe = await this.subagents.safeToInspect(sessionId)
+        if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run safety inspection')
+        if (!safe) {
+          const activity = await this.actorActivity(sessionId)
+          if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run activity inspection')
+          if (activity !== 'unknown') return rejected(`terminated Run session ${sessionId} is not safely closed`)
+        }
+      }
+    }
+    this.frozenRoute = await this.managerRoute(run.managerSessionId)
+    if (configPath) {
+      const path = createRunLog(configPath, run.catalogWorkflowId, run.runId)
+      if (path) run.traceLogPath = path
+      else this.warnTrace(run)
+    }
+    try { await this.state.create(ws, run, this.newExecution(run, extraText, 1)) }
+    catch (error) {
+      if (error instanceof Error && error.name === 'StateConflictError') return rejected(error.message)
+      throw error
+    }
+    this.trace(run, 'START', { workflow: run.catalogWorkflowId, run: run.runId, fmt: 3 })
+    await this.drive(ws)
+    const row = (await this.state.get(ws))!
+    return { ok: true, run: row.run, message: row.execution.blockReason ?? 'work order started' }
   }
 
-  /** Establish the boundary for a Manager-driven node (no executor session). */
-  private establishManagerBoundary(run: RunState): void {
-    // A1 R4: on resume the boundary is retained; on fresh node entry it is
-    // (re)established from the current manager session cursor.
-    if (run.nodeBoundary.dispatchedAt !== 0) return
-    run.nodeBoundary = { dispatchedAt: Date.now(), managerFromSeq: this.targets.managerSessionSeq(run) }
-  }
-
-  /** A2: node-boundary compact of a resident role actor (best-effort trace log). */
-  private async compactBeforeDispatch(run: RunState, roleKey: string): Promise<void> {
-    // Fresh-node-entry decision is the caller's (dispatchCurrent): same-node
-    // resume and first creation never reach here (A2 R3/R6).
-    const frame = topFrame(run)
-    const result = await this.subagents.compactRoleActor(run, roleKey)
-    if (!result.ok) {
-      const detail = result.detail ?? 'unknown compaction failure'
-      this.logCompact(run, frame, roleKey, false, detail)
-      throw new WorkflowError(`${COMPACT_FAIL_PREFIX}${detail}`)
-    }
-    this.logCompact(run, frame, roleKey, true, result.detail ?? null)
-  }
-
-  /**
-   * Mutate the run along a PASS/FAIL edge (no persistence). Emits ROUTE (the
-   * finally-adopted edge direction, A3 §3), POP on a child-workflow return
-   * (§8), and BLOCK when a FAIL finds no onFail edge (R5) — `blockSource`
-   * names the component whose verdict ran out of edges.
-   */
-  private advance(run: RunState, verdict: 'PASS' | 'FAIL', reason: string, blockSource: 'judge' | 'program' | 'manager'): void {
-    const frame = topFrame(run)
-    const node = this.nodeAt(run, frame)
-    if (node === undefined) throw new WorkflowError('current node is missing from the snapshot')
-    // The verdict always ends the judgment phase — and any correction cycle:
-    // an accepted conclusion supersedes the previous rejection evidence.
-    delete run.judgeSessionId
-    delete run.pendingClaim
-    delete run.pendingCorrection
-    if (verdict === 'PASS') {
-      const target = node.onPass
-      if (target === 'END') {
-        this.logRoute(run, frame, 'PASS', 'END')
-        if (run.callStack.length === 1) {
-          run.status = 'completed'
-          run.callStack = []
-          run.blockReason = null
-          // A1 R4: the node has left; the boundary is invalid.
-          run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
-          return
-        }
-        const childWorkflowId = frame.workflowId
-        run.callStack.pop()
-        // A3 §8: the child's return is explicit, not inferred from the
-        // parent's next PASS line.
-        this.logPop(run, childWorkflowId, 'PASS', topFrame(run))
-        this.advance(run, 'PASS', '', blockSource)
+  /** 一次触发只登记当前需要的一个安排。并发触发由数据库 CAS 仲裁，非整Promise锁。 */
+  async drive(ws: string): Promise<void> {
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'running') return
+    const { run, execution: e, version } = row
+    if (e.phase === 'ready') {
+      if (e.predecessorId) {
+        const predecessor = await this.state.execution(ws, e.predecessorId)
+        if (!predecessor) return
+        const predecessorNode = this.nodeAt(run, { workflowId: predecessor.workflowId, nodeId: predecessor.nodeId, nodeToken: predecessor.nodeToken, executionId: predecessor.executionId })
+        const settled = predecessorNode?.execution.type === 'actor-task'
+          ? predecessor.judge?.settled === true
+          : predecessor.phase === 'exited' && predecessor.successorId === e.executionId
+        if (!settled) return
+      }
+      const node = this.nodeAt(run, topFrame(run))!
+      if (node.execution.type === 'builtin-program') {
+        await this.state.put(ws, run, version, [change(e, 'program-ready')])
+        await this.targets.steerManager(run, `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[program]\n${node.execution.programId}\n请调用 node_run_program 提供当前参数；Program 结果由 Runtime 直接结算，不使用 Judge。`).catch(async error => {
+          const current = await this.state.get(ws)
+          if (current?.version === version + 1 && current.execution.executionId === e.executionId) await this.blockRow(ws, current, `dispatch fault: ${error instanceof Error ? error.message : String(error)}`)
+        })
         return
       }
-      this.logRoute(run, frame, 'PASS', target)
-      frame.nodeId = target
-      frame.nodeToken = newNodeToken()
-      // A1 R4: the node has left; the next dispatch establishes a fresh boundary.
-      run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
-      return
-    }
-    const target = node.onFail
-    if (target === undefined || target === 'END') {
-      const blockReason = `checker FAIL${reason.trim() !== '' ? `: ${reason.trim()}` : ''} and no onFail edge`
-      this.logRoute(run, frame, 'FAIL', 'BLOCK')
-      this.logBlock(run, frame, blockSource, blockReason)
-      run.status = 'blocked'
-      run.blockReason = blockReason
-      // A1 R4: FAIL with no onFail keeps the node — the boundary is RETAINED so
-      // a resume preserves this node's local history (and A2 R6 skips compact).
-      return
-    }
-    this.logRoute(run, frame, 'FAIL', target)
-    frame.nodeId = target
-    frame.nodeToken = newNodeToken()
-    // A1 R4: the node has left via the onFail edge.
-    run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
-  }
-
-  /** Dispatch the current node NOW (start/resume), then persist. */
-  private async dispatchNow(workspaceKey: string, run: RunState, expectedVersion: number, transientContext: TransientDispatch | null = null): Promise<void> {
-    let identity: DispatchIdentity | undefined
-    if (run.status === 'running') {
-      try {
-        identity = await this.dispatchCurrent(run, transientContext)
-        // 20260906: the dispatch delivered the (possibly deferred) transient —
-        // its durable mirror is consumed. A dispatch FAILURE keeps the mirror
-        // so the resume re-delivers the handoff with the resolution context.
-        delete run.pendingDispatchContext
-      } catch (error) {
-        run.status = 'blocked'
-        // A2 R4/AC5: a node-boundary compact failure gets its own clean
-        // reason (no double wrapping) and an active Manager notification,
-        // reusing the A4 BLOCK-steer framework.
-        if (error instanceof WorkflowError && error.message.startsWith(COMPACT_FAIL_PREFIX)) {
-          run.blockReason = error.message.slice(0, LIMITS.blockReasonMax)
-          // A3 R5: compact-failure BLOCK (before persistence, per §10 order).
-          this.logBlock(run, topFrame(run), 'compact', run.blockReason)
-          await this.state.put(workspaceKey, run, expectedVersion)
-          this.dispatchBook.delete(workspaceKey)
-          await this.targets.steerManager(run, compactFaultNotice(run, topFrame(run).nodeId, error.message.slice(COMPACT_FAIL_PREFIX.length))).catch(() => {})
-          return
-        }
-        run.blockReason = `dispatch-failed: ${String(error)}`.slice(0, LIMITS.blockReasonMax)
-        // A3 R5: dispatch-failure BLOCK.
-        this.logBlock(run, topFrame(run), 'dispatch', run.blockReason)
+      if (node.execution.type === 'child-workflow') {
+        const child = run.definitionSnapshot.childWorkflows?.[node.execution.workflowId!]
+        if (!child) { await this.blockRow(ws, row, 'Child workflow is missing from the frozen snapshot'); return }
+        const executionId = newNodeToken()
+        e.phase = 'working'
+        e.child = { workflowId: node.execution.workflowId!, executionId }
+        run.currentExecutionId = executionId
+        run.callStack.push({ workflowId: node.execution.workflowId!, nodeId: child.startNode, nodeToken: newNodeToken(), executionId })
+        const first = this.newExecution(run, e.input, e.visit + 1)
+        await this.state.put(ws, run, version, [change(e, 'child-entered'), { execution: first, expectedRevision: null, events: ['entered'] }])
+        await this.drive(ws)
+        return
       }
+      const role = node.execution.role!
+      const previousDispatchSettled = e.dispatch?.settled === true
+      let committedVersion = version
+      try {
+        e.phase = 'working'
+        e.dispatch = { id: newNodeToken(), settled: false, ...(role === 'manager' ? { sessionId: run.managerSessionId } : run.roleActors[role] ? { sessionId: run.roleActors[role] } : {}) }
+        e.boundary = { dispatchedAt: Date.now(), managerFromSeq: this.targets.managerSessionSeq(run), ...(role === 'manager' ? {} : e.dispatch.sessionId ? { executorSessionId: e.dispatch.sessionId } : {}) }
+        await this.state.put(ws, run, version, [change(e, 'actor-arranged')])
+        committedVersion = version + 1
+        let arrangedVersion = committedVersion
+        if (role !== 'manager' && run.roleActors[role]) {
+          if (!previousDispatchSettled) {
+            const sessionId = run.roleActors[role]
+            const safe = await this.subagents.safeToInspect(sessionId)
+            if (!await this.stillCurrent(ws, e, arrangedVersion)) return
+            if (!safe) {
+              const activity = await this.actorActivity(sessionId)
+              if (!await this.stillCurrent(ws, e, arrangedVersion)) return
+              if (e.resolution?.target !== 'actor' || activity !== 'unknown') throw new WorkflowError('previous Role execution is not safely closed')
+            }
+          }
+          if (!e.roleBoundaryPrepared) {
+            const compact = await this.subagents.compactRoleActor(run, role)
+            if (!compact.ok) throw new WorkflowError(`node-boundary compact failed: ${compact.detail ?? 'unknown'}`)
+            const current = await this.stillCurrent(ws, e, arrangedVersion)
+            if (!current) return
+            current.execution.roleBoundaryPrepared = true
+            await this.state.put(ws, current.run, current.version, [change(current.execution)])
+            e.roleBoundaryPrepared = true
+            arrangedVersion = current.version + 1
+            committedVersion = arrangedVersion
+            if (!await this.stillCurrent(ws, e, arrangedVersion)) return
+          }
+        }
+        const correction = e.previousClaim
+          ? e.judgment && e.judgment.result !== 'ACCEPT' && e.judgment.claimId === e.previousClaim.id
+            ? `\n\n[最近 Judge ${e.judgment.result} 与旧 claim]\n[judge feedback]\n${e.judgment.reason}\n\n[previous claim]\noutcome: ${e.previousClaim.outcome}\nhandoff: ${e.previousClaim.handoff}`
+            : `\n\n[Manager 退回的旧 claim；无当前 Judge 反馈]\n[previous claim]\noutcome: ${e.previousClaim.outcome}\nhandoff: ${e.previousClaim.handoff}`
+          : ''
+        const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
+        const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
+        const text = `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[criteria]\n${String(node.checker?.config.criteria ?? '')}${correction}${resolution}${recovery}${SUBMISSION_CONSTRAINT}`
+        const sent = role === 'manager'
+          ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
+          : run.roleActors[role]
+            ? { ...await this.targets.sendRoleActor(run, role, text), childId: run.roleActors[role] }
+            : await this.subagents.ensureRoleActor(run, role, text)
+        const fresh = await this.stillCurrent(ws, e, arrangedVersion)
+        if (!fresh) return // 撤权不是停止；旧已知执行保留在工作单，不给它新权利。
+        if (!sent.messageId || !sent.childId) throw new WorkflowError('Host returned no real dispatch identity')
+        fresh.execution.dispatch!.sessionId = sent.childId
+        fresh.execution.dispatch!.messageId = sent.messageId
+        fresh.execution.boundary!.executorDispatchMessageId = sent.messageId
+        if (role !== 'manager') {
+          fresh.run.roleActors[role] = sent.childId
+          fresh.execution.boundary!.executorSessionId = sent.childId
+        }
+        await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
+      } catch (error) { await this.dispatchFault(ws, e, error, committedVersion) }
+      return
     }
-    await this.state.put(workspaceKey, run, expectedVersion)
-    if (run.status === 'running') {
-      // A1 §3.1: publish the dispatch lease at the single convergence point —
-      // every real dispatch funnels through dispatchNow. A failed send throws
-      // out of dispatchCurrent above, so no claimable lease can exist for a
-      // dispatch that did not happen. A lease-less node (builtin-program)
-      // initializes EXPLICITLY: "no lease" is a first-class state, never a
-      // missing field read as "not yet published".
-      this.dispatchBook.set(workspaceKey, {
-        dispatchedToken: topFrame(run).nodeToken,
-        executorSessionId: identity?.executorSessionId ?? executorSessionOf(run),
-        pendingDispatch: false,
-        transientContext: null,
-        workerSettled: false,
-        dispatchMessageId: identity?.dispatchMessageId,
-        leaseConsumed: identity === undefined,
-      })
-    } else {
-      this.dispatchBook.delete(workspaceKey)
-      await this.notifyCompletion(run)
-    }
-  }
-
-  /** Persist an advanced run WITHOUT dispatching (deferred until turn settlement). */
-  private async persistDeferred(workspaceKey: string, run: RunState, version: number, transientContext: TransientDispatch | null = null): Promise<void> {
-    // 20260906-claim-handoff-symmetry: mirror the deferred transient into the
-    // durable snapshot. The in-memory book dies with the process, but the
-    // deferred dispatch (and its handoff, for BOTH the PASS and FAIL edges)
-    // must survive a host restart until the old turn settles. Only a running
-    // advancement carries one — a FAIL-without-onFail BLOCK keeps the node
-    // with the claim consumed, and a completed run has no next dispatch.
-    if (run.status === 'running' && transientContext !== null) {
-      run.pendingDispatchContext = transientContext
-    } else {
-      delete run.pendingDispatchContext
-    }
-    await this.state.put(workspaceKey, run, version)
-    if (run.status === 'running') {
-      const previous = this.dispatchBook.get(workspaceKey)
-      this.dispatchBook.set(workspaceKey, {
-        dispatchedToken: previous?.dispatchedToken ?? topFrame(run).nodeToken,
-        executorSessionId: previous?.executorSessionId ?? '',
-        pendingDispatch: true,
-        transientContext,
-        workerSettled: false,
-        // A1 §3: the deferred book carries NO lease — the node advanced and
-        // its token rotated, so the old dispatch's claimability is dead by
-        // construction (the admission predicate is the defensive backstop).
-        dispatchMessageId: undefined,
-        leaseConsumed: true,
-      })
-    } else {
-      this.dispatchBook.delete(workspaceKey)
-      await this.notifyCompletion(run)
-    }
-  }
-
-  /** When a run reaches Root END, notify the Manager (the user's main session). */
-  private async notifyCompletion(run: RunState): Promise<void> {
-    if (run.status !== 'completed') return
-    // A3 review S3: release the one-warning marker — a completed run's log is final.
-    this.traceWarnedRuns.delete(run.runId)
+    if (e.phase !== 'checking' || !e.claim || !e.dispatch?.settled || e.judge?.messageId) return
+    // checking 不等于Judge已经运行：只有精确 Actor 收口入口能置settled。
+    let committedVersion = version
     try {
-      await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。`)
-    } catch {
-      // Completion notification is best-effort: the completed state is durable.
-    }
-  }
-
-  /**
-   * A1 R2/§3: the dispatch-lease admission predicate. The DispatchBook is
-   * the single source of truth — a claim is admissible only when the current
-   * node has a REAL (not deferred, not consumed) dispatch whose executor is
-   * the caller and whose dispatch message id belongs to the caller's CURRENT
-   * turn. Fail-closed on every mismatch.
-   */
-  private admitLease(workspaceKey: string, run: RunState, caller: ClaimCaller): { ok: true; book: DispatchBook } | { ok: false } {
-    const book = this.dispatchBook.get(workspaceKey)
-    if (book === undefined) return { ok: false }
-    if (book.pendingDispatch) return { ok: false }
-    if (book.leaseConsumed) return { ok: false }
-    if (book.dispatchMessageId === undefined) return { ok: false }
-    if (book.dispatchedToken !== topFrame(run).nodeToken) return { ok: false }
-    if (book.executorSessionId !== caller.sessionId) return { ok: false }
-    if (!caller.turnUserMessageIds.has(book.dispatchMessageId)) return { ok: false }
-    return { ok: true, book }
-  }
-
-  /**
-   * Handle a worker node_claim (design §5.2 G2): enter the judgment phase by
-   * spawning a fresh continuable Judge with the Node-local Judgment Packet (A1
-   * R7/R8) and persist the `pendingClaim` for respawn rebuild (A4 R9). The
-   * verdict arrives later via `judge_claim` (handleJudgeClaim) or, on a
-   * technical fault, via handleJudgeTurnEnded.
-   */
-  async handleClaim(workspaceKey: string, claim: NodeClaim, caller: ClaimCaller): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run, version } = row
-    if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}; claims are rejected` }
-    const frame = topFrame(run)
-    if (this.currentNodeKind(run) !== 'actor-task') {
-      return { ok: false, reason: `current node is ${this.currentNodeKind(run)}; only actor-task accepts claims` }
-    }
-    const node = this.nodeAt(run, frame)!
-    const checker = node.checker
-    if (checker === undefined) return { ok: false, reason: 'actor-task node has no checker' }
-    if (checker.checkerId !== 'judge.claim-correct') {
-      return { ok: false, reason: `unknown checker ${checker.checkerId}` }
-    }
-    // A1 R2/§5.1: dispatch-lease admission. This also subsumes the old
-    // precise-executor check (book.executorSessionId IS the dispatch target)
-    // and rejects the PRD's core failure mode: State advanced but the next
-    // Node never dispatched → book is pendingDispatch / id-less → reject
-    // WITHOUT touching State or spawning a Judge (AC1). The claim carries NO
-    // nodeToken (AC2) — the book's dispatchedToken is the token truth.
-    const lease = this.admitLease(workspaceKey, run, caller)
-    if (!lease.ok) {
-      return { ok: false, reason: '当前调用无法绑定到一个已 dispatch 的 Node' }
-    }
-    const book = lease.book
-    // A1 R9 / single-flight: a node already in judgment phase rejects new claims.
-    if (run.pendingClaim !== undefined) {
-      return { ok: false, reason: 'a judgment is already pending for this node' }
-    }
-    // F14: single-flight per node token — one in-flight Judge per claim.
-    const flightKey = `${workspaceKey}:${book.dispatchedToken}`
-    if (this.inFlight.has(flightKey)) {
-      return { ok: false, reason: 'a judge evaluation is already in flight for this node' }
-    }
-    this.inFlight.set(flightKey, 'judge')
-    try {
-      // A1 review fix: the tool layer validates trim-based lengths, so the
-      // payloads persisted/traced here are trimmed defensively too — a
-      // whitespace-padded summary can never bloat State or the correction
-      // message regardless of how the caller reached the engine.
-      const summary = claim.summary.trim()
-      const handoff = claim.handoffContext?.trim()
-      // Prepare every fallible packet input BEFORE publishing the reserved id.
-      const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
+      const node = this.nodeAt(run, topFrame(run))!
       const cwd = await this.cwdResolver(run)
-
-      // A4 R9: persist pendingClaim AND the reserved Judge id BEFORE the
-      // child admission. A freshly materialized child can run immediately, so
-      // State must name the Judge before its first judge_claim is possible.
-      const entered = await this.state.get(workspaceKey)
-      if (entered === undefined) return { ok: false, reason: 'state row vanished during claim' }
-      if (entered.run.status !== 'running' || topFrame(entered.run).nodeToken !== book.dispatchedToken) {
-        return { ok: false, reason: 'stale claim discarded: the node moved or blocked meanwhile' }
-      }
-      const reservedJudgeSessionId = newNodeToken()
-      entered.run.pendingClaim = { outcome: claim.outcome, summary }
-      // 20260906-claim-handoff-symmetry R2: the handoff persists for BOTH
-      // outcomes — completed and failed differ only in the edge their ACCEPT
-      // takes (onPass/onFail), never in information capacity. The Judge packet
-      // below still receives only outcome/summary (A1 R7).
-      if (handoff !== undefined && handoff !== '') {
-        entered.run.pendingClaim.handoffContext = handoff
-      }
-      entered.run.judgeSessionId = reservedJudgeSessionId
-      // A3 R1 + §10 crash-seam order: validate → trace → persist. The CLAIM
-      // line is written BEFORE the durable acceptance (at-least-once: a
-      // crash between leaves an orphan CLAIM whose token prefix is
-      // distinguishable; State remains authoritative). Logging here also
-      // guarantees the line survives a Judge spawn fault (§5 R1 reason).
-      this.logClaim(
-        entered.run,
-        topFrame(entered.run),
-        node.execution.role ?? 'manager',
-        claim.outcome,
-        summary,
-        entered.run.pendingClaim.handoffContext ?? null,
-      )
-      await this.state.put(workspaceKey, entered.run, entered.version)
-      // A1 §3.2 acceptance boundary: consume the lease only AFTER the durable
-      // put succeeded — a put failure leaves State un-accepted and the lease
-      // unconsumed, so the same Actor can retry verbatim. Workspace
-      // mutations are enqueue-serialized, so no early consumption is needed
-      // against concurrency. A second claim on the same lease is rejected
-      // from here on (AC4).
-      book.leaseConsumed = true
-
-      // A4 R1: spawn failure becomes a judge technical fault → BLOCK with detail.
-      try {
-        await this.subagents.startJudge(entered.run, {
-          nodeToken: frame.nodeToken,
-          instruction: node.execution.instruction ?? '',
-          criteria,
-          claim: { outcome: claim.outcome, summary },
-          // A1 §7.1: a re-claim after a REJECT carries the prior evidence.
-          previousRejection: entered.run.pendingCorrection,
-          cwd,
-          judgeSessionId: reservedJudgeSessionId,
-        })
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error)
-        const fresh = await this.state.get(workspaceKey)
-        if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge spawn' }
-        if (fresh.run.runId !== entered.run.runId
-          || fresh.run.judgeSessionId !== reservedJudgeSessionId
-          || fresh.run.status !== 'running'
-          || topFrame(fresh.run).nodeToken !== book.dispatchedToken) {
-          await this.subagents.drainJudge(entered.run, reservedJudgeSessionId).catch(() => {})
-          return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
-        }
-        // The child was never successfully admitted. Clear the reserved id so
-        // node_resume takes A4 R4's spawn-rebuild branch instead of attempting
-        // to followup a Judge that does not exist.
-        delete fresh.run.judgeSessionId
-        await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
-        return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
-      }
-
-      // A1 R11 spawn-cleanup path: reset/start or another non-queued command may
-      // invalidate the row while the child is being materialized. Re-read after
-      // admission and drain the stale Judge if the run moved on.
-      const fresh = await this.state.get(workspaceKey)
-      if (fresh === undefined
-        || fresh.run.runId !== entered.run.runId
-        || fresh.run.judgeSessionId !== reservedJudgeSessionId
-        || fresh.run.status !== 'running'
-        || topFrame(fresh.run).nodeToken !== book.dispatchedToken) {
-        await this.subagents.drainJudge(entered.run, reservedJudgeSessionId).catch(() => {})
-        return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
-      }
-      return { ok: true, run: fresh.run, message: `judge spawned for node ${frame.nodeId}` }
-    } finally {
-      this.inFlight.delete(flightKey)
-    }
+      if (!await this.stillCurrent(ws, e, version)) return
+      const continuationSessionId = e.resolution?.target === 'judge' && e.resolution.judgeMode === 'followup'
+        ? e.resolution.judgeSessionId : undefined
+      if (!await this.stillCurrent(ws, e, version)) return
+      if (!e.judge) {
+        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+        await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
+        committedVersion = version + 1
+      } else if (e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion
+        || (continuationSessionId !== undefined && e.judge.sessionId !== continuationSessionId)) return
+      const packet = this.judgePacket(run, e, cwd)
+      const sent = continuationSessionId
+        ? { ...await this.subagents.followupJudge(run, continuationSessionId, packet), judgeSessionId: continuationSessionId }
+        : await this.subagents.startJudge(run, packet)
+      const fresh = await this.stillCurrent(ws, e, committedVersion)
+      if (!fresh) { await this.subagents.retireJudge(run, e.judge.sessionId!).catch(() => {}); return }
+      if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
+      fresh.execution.judge!.messageId = sent.messageId
+      await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
+    } catch (error) { await this.dispatchFault(ws, e, error, committedVersion) }
   }
-
-  /**
-   * A4 R1/R2: fail-closed BLOCK on a judge technical fault, with steer.
-   * Spawn/admission failure callers must first clear the never-admitted
-   * reserved id so node_resume can spawn-rebuild (A4 R4/R8). Failures of an
-   * admitted Judge keep judgeSessionId for the Manager's followup/respawn
-   * decision (A4 R5); pendingClaim always survives for packet rebuild.
-   */
-  private async blockOnJudgeFault(workspaceKey: string, run: RunState, version: number, detail: string): Promise<void> {
-    const frame = topFrame(run)
-    const reason = `judge fault: ${detail}`.slice(0, LIMITS.blockReasonMax)
-    run.status = 'blocked'
-    run.blockReason = reason
-    // A3 R4/R5: judge technical fault → BLOCK with source=judge (before the
-    // persistence, per §10 order). The reason mirrors the durable blockReason.
-    this.logBlock(run, frame, 'judge', reason)
-    await this.state.put(workspaceKey, run, version)
-    this.dispatchBook.delete(workspaceKey)
-    await this.targets.steerManager(run, judgeFaultNotice(run, frame.nodeId, detail)).catch(() => {})
+  private async stillCurrent(ws: string, e: NodeExecution, version: number): Promise<RuntimeRow | undefined> {
+    const row = await this.state.get(ws)
+    return row?.run.status === 'running' && row.version === version && row.execution.executionId === e.executionId
+      && row.execution.dispatch?.id === e.dispatch?.id && row.execution.claim?.id === e.claim?.id
+      && row.execution.judge?.id === e.judge?.id ? row : undefined
   }
-
-  /**
-   * Handle the Judge's `judge_claim` tool call (A1 v2 truth table):
-   * - ACCEPT → advance with the ACTOR's claimed outcome (completed→PASS,
-   *   failed→FAIL); the Judge confirms, it never rewrites the result.
-   * - REJECT → correction flow: retire the Judge, persist the rejection
-   *   evidence, rotate the token, re-dispatch the SAME node to the ORIGINAL
-   *   actor with the evidence (§6.2).
-   * - NEED_CONTEXT → BLOCK and keep the judge session for a followup.
-   */
-  async handleJudgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run, version } = row
-    if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}; judge claims are rejected` }
-    const frame = topFrame(run)
-    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
-    // A1 review fix: the stored/traced reason is the trim result — a
-    // whitespace-padded reason must not bloat State or the correction message
-    // (design §6.3/§6.4 bound the LIMITS at their trim semantics).
-    reason = reason.trim()
-    // A1 R9 / AC9: only the current node's mapped judge session may claim.
-    if (run.judgeSessionId === undefined || run.judgeSessionId !== judgeSessionId) {
-      return { ok: false, reason: 'judge session is not the current node judge' }
+  private async sameRow(ws: string, row: RuntimeRow): Promise<boolean> {
+    const current = await this.state.get(ws)
+    return current?.version === row.version && current.run.runId === row.run.runId
+      && current.execution.executionId === row.execution.executionId
+  }
+  /** Manager-side destructive Judge handoff: drain first, then prove the same work is still current. */
+  private async drainJudgeAndRevalidate(ws: string, row: RuntimeRow, judgeToDrain: ExecutionJudge | undefined): Promise<boolean> {
+    if (judgeToDrain) await this.subagents.drainJudge(row.run, judgeToDrain.sessionId)
+    const current = await this.state.get(ws)
+    return current?.version === row.version && current.run.runId === row.run.runId
+      && current.execution.executionId === row.execution.executionId
+  }
+  private async dispatchFault(ws: string, e: NodeExecution, error: unknown, committedVersion: number): Promise<void> {
+    const row = await this.state.get(ws)
+    // 本地候选安排可能尚未提交；只认最后成功提交的Run/visit/CAS版本。
+    if (row?.run.status !== 'running' || row.run.runId !== e.runId || row.execution.executionId !== e.executionId || row.version !== committedVersion) return
+    await this.blockRow(ws, row, `dispatch fault: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  private async blockRow(ws: string, row: RuntimeRow, reason: string, ...beforeBlock: NodeExecutionEvent['type'][]): Promise<void> {
+    row.run.status = 'blocked'
+    row.execution.blockReason = reason.slice(0, LIMITS.blockReasonMax)
+    await this.state.put(ws, row.run, row.version, [change(row.execution, ...beforeBlock, 'blocked')])
+    this.trace(row.run, 'BLOCK', { workflow: row.execution.workflowId, node: row.execution.nodeId, reason: jsonField(row.execution.blockReason, LIMITS.blockReasonMax) })
+    await this.targets.steerManager(row.run, `Workflow BLOCK: ${row.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`).catch(() => {})
+  }
+  private programParameters(node: NodeView, supplied: Record<string, unknown>): Record<string, unknown> {
+    if (typeof supplied !== 'object' || supplied === null || Array.isArray(supplied)) throw new WorkflowError('program parameters must be an object')
+    const definition = BUILTIN_PROGRAMS[node.execution.programId!]
+    if (!definition) throw new WorkflowError(`unknown program ${node.execution.programId}`)
+    const parameters = { ...(node.execution.config ?? {}), ...supplied }
+    const unknown = Object.keys(parameters).filter(key => !(key in definition.parameters))
+    if (unknown.length) throw new WorkflowError(`unknown program parameter: ${unknown.join(', ')}`)
+    for (const [key, spec] of Object.entries(definition.parameters)) {
+      const value = parameters[key]
+      if (value === undefined) {
+        if (spec.required) throw new WorkflowError(`program parameter ${key} is required`)
+      } else if (spec.type === 'string' ? typeof value !== 'string' || value.trim() === '' : typeof value !== 'number' || !Number.isFinite(value)) {
+        throw new WorkflowError(`program parameter ${key} must be a ${spec.type}`)
+      }
     }
-    if (run.pendingClaim === undefined) {
-      return { ok: false, reason: 'no pending judgment for this node' }
+    const encoded = JSON.stringify(parameters)
+    if (encoded.length > LIMITS.programParametersMax) throw new WorkflowError(`program parameters must be at most ${LIMITS.programParametersMax} characters`)
+    return structuredClone(parameters)
+  }
+  private effectiveProgramResult(result: ProgramResult, input: string): NonNullable<NonNullable<NodeExecution['program']>['result']> {
+    if (result.kind === 'ERROR') {
+      const reason = result.reason.trim()
+      if (!reason || reason.length > LIMITS.blockReasonMax) throw new WorkflowError('Program ERROR requires a bounded reason')
+      return { kind: 'ERROR', reason }
     }
-    // A3 R3: the verdict is validated against the pending claim — record it
-    // before any state transition (§10 order).
-    this.logJudge(run, frame, result, reason, judgeSessionId)
-    if (result === 'NEED_CONTEXT') {
-      // A1 R10: BLOCK, keep the judge session + pendingClaim + boundary.
-      // A1 §6.4: pendingCorrection is RETAINED through the BLOCK so the
-      // respawn/spawn-rebuild packet still carries the previous rejection.
+    const handoff = result.handoff === undefined ? input : result.handoff.trim()
+    if (!handoff || handoff.length > LIMITS.handoffMax) throw new WorkflowError(`Program handoff must be 1..${LIMITS.handoffMax} characters`)
+    const reason = result.kind === 'FAIL' && result.reason?.trim() ? result.reason.trim().slice(0, LIMITS.blockReasonMax) : undefined
+    return { kind: result.kind, handoff, ...(reason ? { reason } : {}) }
+  }
+  private async advanceKnownResult(ws: string, row: RuntimeRow, result: 'PASS' | 'FAIL', handoff: string, ...events: NodeExecutionEvent['type'][]): Promise<EngineOutcome> {
+    const { run, execution: e, version } = row
+    const node = this.nodeAt(run, topFrame(run))!
+    const target = result === 'PASS' ? node.onPass : node.onFail
+    if (!target) {
+      e.phase = 'settling'
+      e.blockReason = `${result} has no configured Graph edge`.slice(0, LIMITS.blockReasonMax)
       run.status = 'blocked'
-      run.blockReason = reason.slice(0, LIMITS.blockReasonMax)
-      this.logBlock(run, frame, 'judge', reason)
-      await this.state.put(workspaceKey, run, version)
-      this.dispatchBook.delete(workspaceKey)
-      await this.targets.steerManager(run, needContextNotice(run, frame.nodeId, reason)).catch(() => {})
-      return { ok: true, run, message: run.blockReason }
+      await this.state.put(ws, run, version, [change(e, ...events, 'blocked')])
+      await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n材料已保存；Manager 核查后可显式恢复。`).catch(() => {})
+      return { ok: true, run, message: e.blockReason }
+    }
+    e.phase = 'exited'
+    e.exitedAt = new Date().toISOString()
+    const changes = [change(e, ...events, 'exited')]
+    const exitedChain = [e]
+    let nextTarget = target
+    let terminalVisit = e.visit
+    while (nextTarget === 'END' && run.callStack.length > 1) {
+      run.callStack.pop()
+      const parentFrame = topFrame(run)
+      const parent = await this.state.execution(ws, parentFrame.executionId)
+      const parentNode = this.nodeAt(run, parentFrame)
+      if (!parent || parentNode?.execution.type !== 'child-workflow' || parent.phase !== 'working'
+        || !parent.child || parent.child.result) throw new WorkflowError('stale or corrupt Child return')
+      parent.child.result = { terminalExecutionId: e.executionId, handoff }
+      parent.phase = 'exited'
+      parent.exitedAt = new Date().toISOString()
+      terminalVisit = Math.max(terminalVisit, parent.visit)
+      exitedChain.push(parent)
+      changes.push(change(parent, 'child-returned', 'exited'))
+      nextTarget = parentNode.onPass
+    }
+    if (nextTarget === 'END') {
+      run.status = 'completed'
+      run.currentExecutionId = exitedChain.at(-1)!.executionId
+      run.callStack = []
+    } else {
+      run.currentExecutionId = newNodeToken()
+      const frame = topFrame(run)
+      frame.nodeId = nextTarget
+      frame.nodeToken = newNodeToken()
+      frame.executionId = run.currentExecutionId
+      const successor = this.newExecution(run, handoff, terminalVisit + 1, e.executionId)
+      for (const exited of exitedChain) exited.successorId = successor.executionId
+      changes.push({ execution: successor, expectedRevision: null, events: ['entered'] })
+    }
+    await this.state.put(ws, run, version, changes)
+    this.trace(run, 'ROUTE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, target })
+    if (run.status === 'completed') {
+      this.traceWarned.delete(run.runId)
+      await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。\n\n[handoff]\n${handoff}`).catch(() => {})
+    }
+    return { ok: true, run, message: `${result} committed` }
+  }
+  async handleClaim(ws: string, claim: NodeClaim, caller: ClaimCaller): Promise<EngineOutcome> {
+    try { claim = normalizeNodeClaim(claim) } catch (error) { return rejected(String(error)) }
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'running') return rejected('no running work order')
+    const e = row.execution
+    if (e.phase !== 'working' || e.claim || !matches(e.dispatch, caller)) return rejected('当前调用无法绑定到一个已 dispatch 的 Node')
+    e.claim = { ...claim, id: newNodeToken(), dispatchId: e.dispatch!.id }
+    e.phase = 'checking'
+    // lease消费就是该事务中的phase/claim更新；失败不改内存权威，没有第二本lease book。
+    await this.state.put(ws, row.run, row.version, [change(e, 'claim')])
+    this.trace(row.run, 'CLAIM', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), outcome: claim.outcome, handoff: jsonField(claim.handoff, LIMITS.handoffMax) })
+    return { ok: true, run: row.run, message: 'claim saved; waiting for Actor safe settlement' }
+  }
+  async handleJudgeClaim(ws: string, token: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
+    reason = reason.trim()
+    if (!['ACCEPT', 'REJECT', 'NEED_CONTEXT'].includes(result) || !reason || reason.length > LIMITS.reasonMax) return rejected('invalid Judge result/reason')
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'running') return rejected('no running work order')
+    const { run, execution: e, version } = row
+    const alreadyJudged = e.judgment !== undefined && e.judgment.claimId === e.claim?.id && e.judgment.inputVersion === e.inputVersion
+    if (e.nodeToken !== token || e.phase !== 'checking' || !e.claim || !e.judge || alreadyJudged
+      || e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion || !matches(e.judge, caller)) return rejected('stale or unbound Judge submission')
+    if (e.resolution?.target === 'judge') {
+      delete e.resolution.judgeMode
+      delete e.resolution.judgeSessionId
     }
     if (result === 'REJECT') {
-      // A1 §6.2 correction flow — no Edge is read, no ROUTE is logged (R6.6).
-      const node = this.nodeAt(run, frame)!
-      const role = node.execution.type === 'actor-task' ? (node.execution.role ?? 'manager') : 'manager'
-      // 2. Snapshot BEFORE clearing (the packet and the correction message
-      //    both quote the rejected claim).
-      const previousClaim = { ...run.pendingClaim }
-      const oldJudgeId = judgeSessionId
-      // 3. Retire the Judge (revoke authorization; DSH's settlement watcher
-      //    releases the Activation) and end the judgment phase.
-      await this.subagents.retireJudge(run, oldJudgeId).catch(() => {})
-      delete run.judgeSessionId
-      delete run.pendingClaim
-      // 4. Persist the durable REJECT evidence (D4): feeds the next
-      //    Judgment Packet's [previous rejection] section and survives a
-      //    correction-dispatch failure + resume rebuild.
-      run.pendingCorrection = { judgeReason: reason, previousClaim }
-      // 5. Same node, fresh token (D2: rotation retires the stale-judge
-      //    rejection path; workflowId/nodeId unchanged — R6.3).
-      frame.nodeToken = newNodeToken()
-      // 6. nodeBoundary is RETAINED (R8): the correction re-dispatch resolves
-      //    the ORIGINAL actor through nodeBoundary.executorSessionId (§6.5),
-      //    isSameNodeResume skips compaction, and the projection window
-      //    keeps this node's local history.
-      // 7. Trace the re-dispatch boundary BEFORE persistence (§10 order).
-      this.logCorrect(run, frame, role, oldJudgeId, reason)
-      // 8–9. Correction message + dispatch decision, exactly like a PASS's
-      // next-node dispatch: defer while the executor's turn is still open,
-      // dispatch now when it already settled.
-      const correction = { kind: 'correction' as const, text: correctionEvidence(run.pendingCorrection) }
-      const book = this.dispatchBook.get(workspaceKey)
-      const workerStillActive = await this.executorActive(run)
-      if (workerStillActive || (book !== undefined && !book.workerSettled)) {
-        await this.persistDeferred(workspaceKey, run, version, correction)
-      } else {
-        await this.dispatchNow(workspaceKey, run, version, correction)
+      const rejectedClaim = e.claim
+      const rejectedJudge = e.judge
+      e.previousClaim = rejectedClaim
+      e.previousJudge = rejectedJudge
+      e.judgment = {
+        result, reason, claimId: rejectedClaim.id, judgeDispatchId: rejectedJudge.id,
+        judgeSessionId: rejectedJudge.sessionId!, inputVersion: rejectedJudge.inputVersion,
       }
-      return { ok: true, run, message: 'checker REJECT; correction dispatched' }
+      delete e.claim
+      delete e.judge
+      e.phase = 'ready'
+      e.inputVersion++
+      if (e.resolution?.context) e.resolution = { target: 'actor', context: e.resolution.context, inputVersion: e.inputVersion }
+      else delete e.resolution
+      await this.state.put(ws, run, version, [change(e, 'judgment')])
+      this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(rejectedJudge.sessionId!) })
+      await this.subagents.retireJudge(run, rejectedJudge.sessionId!).catch(() => {})
+      await this.drive(ws)
+      return { ok: true, run, message: 'REJECT committed; Actor correction prepared' }
     }
-    // ACCEPT: the Graph verdict is the ACTOR's claimed outcome (AC5/AC6) —
-    // the Judge confirmed, it did not rewrite the result.
-    const verdict = run.pendingClaim.outcome === 'completed' ? 'PASS' : 'FAIL'
-    // PASS/FAIL: apply the edge and retire the judge.
-    const handoff = run.pendingClaim?.handoffContext
-    this.advance(run, verdict, reason, 'judge')
-    // A1 R11: retire the judge (revoke authorization; the resident Activation
-    // is released by DSH's settlement watcher once its turn ends). Never drain
-    // from inside the judge's own tool call — see SubagentHost.retireJudge.
+    if (result === 'NEED_CONTEXT') {
+      const judge = e.judge
+      delete e.previousJudge
+      delete e.previousClaim
+      e.judgment = {
+        result, reason, claimId: e.claim.id, judgeDispatchId: judge.id,
+        judgeSessionId: judge.sessionId!, inputVersion: judge.inputVersion,
+      }
+      e.blockReason = `Judge NEED_CONTEXT: ${reason}`.slice(0, LIMITS.blockReasonMax)
+      run.status = 'blocked'
+      await this.state.put(ws, run, version, [change(e, 'judgment', 'blocked')])
+      this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(judge.sessionId!) })
+      await this.subagents.retireJudge(run, judge.sessionId!).catch(() => {})
+      await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n请用 node_resume target=judge 提供完整当前补充；已保存 claim 不会丢失。`).catch(() => {})
+      return { ok: true, run, message: 'NEED_CONTEXT committed; Manager context required' }
+    }
+    delete e.previousJudge
+    delete e.previousClaim
+    const judgeSessionId = e.judge.sessionId
+    e.judgment = {
+      result, reason, claimId: e.claim.id, judgeDispatchId: e.judge.id,
+      judgeSessionId, inputVersion: e.judge.inputVersion,
+    }
+    const graphResult = e.claim.outcome === 'completed' ? 'PASS' : 'FAIL'
+    const advanced = await this.advanceKnownResult(ws, row, graphResult, e.claim.handoff, 'judgment')
+    this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(judgeSessionId) })
     await this.subagents.retireJudge(run, judgeSessionId).catch(() => {})
-    // Dispatch the next node. If the worker's turn already settled (the common
-    // async-Judge ordering), no future turn/end will arrive — dispatch now.
-    // Otherwise defer to that settlement (handleTurnEnded's pendingDispatch
-    // branch) so we never dispatch into a still-open executor turn.
-    const book = this.dispatchBook.get(workspaceKey)
-    const workerStillActive = await this.executorActive(run)
-    const handoffTransient = handoff !== undefined ? { kind: 'handoff' as const, text: handoff } : null
-    if (workerStillActive || (book !== undefined && !book.workerSettled)) {
-      await this.persistDeferred(workspaceKey, run, version, handoffTransient)
-    } else {
-      await this.dispatchNow(workspaceKey, run, version, handoffTransient)
-    }
-    return { ok: true, run, message: `checker ${result}` }
+    // 后继只由Judge的精确、安全turn settlement驱动，绝不在自身提交Turn里drain。
+    return advanced
   }
 
-  /**
-   * Whether the run's current executor still has an active (unsettled) turn.
-   * Manager sessions are never treated as active here — the Manager can always
-   * be steered; only role actors need the F13 wait. Used after judgment-phase
-   * BLOCKs, where the dispatch book is gone (S9 hardening).
-   */
-  private async executorActive(run: RunState): Promise<boolean> {
-    if (run.status !== 'running' || run.callStack.length === 0) return false
-    const executor = executorSessionOf(run)
-    if (executor === '' || executor === run.managerSessionId) return false
-    return await this.actorActivity(executor) === 'active'
+  /** Host 必须退出append回调再调用；caller只带该turn/end对应Turn的消息ID。 */
+  async handleTurnEnded(ws: string, caller: ClaimCaller): Promise<EngineOutcome | undefined> {
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'running') return
+    let e = row.execution
+    if (e.phase === 'ready' && e.predecessorId) {
+      const predecessor = await this.state.execution(ws, e.predecessorId)
+      if (!predecessor || !matches(predecessor.judge, caller) || predecessor.judge!.settled) return
+      if (!await this.subagents.safeToInspect(caller.sessionId)) { await this.blockRow(ws, row, 'Judge/known tools not safely closed'); return }
+      const fresh = await this.state.get(ws)
+      if (!fresh || fresh.version !== row.version || fresh.execution.executionId !== e.executionId) return
+      predecessor.judge!.settled = true
+      await this.state.put(ws, fresh.run, fresh.version, [change(predecessor)])
+      await this.drive(ws)
+      return
+    }
+    const actor = matches(e.dispatch, caller) && !e.dispatch!.settled
+    const judge = matches(e.judge, caller) && !e.judge!.settled
+    if (!actor && !judge) return
+    const safe = await this.subagents.safeToInspect(caller.sessionId)
+    const fresh = await this.stillCurrent(ws, e, row.version)
+    if (!fresh) return
+    e = fresh.execution
+    if (!safe) { await this.blockRow(ws, fresh, 'Actor/Judge or known tools not safely closed'); return }
+    if (actor && e.phase === 'checking') {
+      e.dispatch!.settled = true
+      await this.state.put(ws, fresh.run, fresh.version, [change(e)])
+      await this.drive(ws)
+    } else if (actor && e.phase === 'working') await this.blockRow(ws, fresh, 'actor-turn-ended-without-result')
+    else if (judge && e.phase === 'checking') await this.blockRow(ws, fresh, 'judge turn ended without judge_claim')
   }
-
-  /**
-   * A4 R4/R5: judge turn ended without a `judge_claim` → technical fault →
-   * BLOCK with detail. The engine does NOT auto-retry or auto-respawn.
-   */
-  async handleJudgeTurnEnded(workspaceKey: string, judgeSessionId: string, detail?: string): Promise<EngineOutcome | undefined> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return undefined
-    const { run, version } = row
-    if (run.status !== 'running') return undefined
-    if (run.judgeSessionId !== judgeSessionId) return undefined
-    const frame = topFrame(run)
-    const reason = detail ?? 'judge turn ended without judge_claim'
-    await this.blockOnJudgeFault(workspaceKey, run, version, reason)
-    return { ok: true, run, message: run.blockReason ?? '' }
+  async handleBlock(ws: string, token: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'running' || row.execution.nodeToken !== token) return rejected('no current running Node/token')
+    reason = reason.trim()
+    if (!reason || reason.length > LIMITS.blockReasonMax) return rejected('invalid block reason')
+    const control = row.run.managerSessionId === caller.sessionId && this.nodeAt(row.run, topFrame(row.run))?.execution.role !== 'manager'
+    if (!control && (row.execution.phase !== 'working' || !matches(row.execution.dispatch, caller))) return rejected('unbound dispatch')
+    await this.blockRow(ws, row, reason)
+    return { ok: true, run: row.run, message: 'blocked' }
   }
-
-  /** A4 R6: Manager-only explicit judge rebuild (clear + spawn + re-deliver packet). */
-  async handleRespawnJudge(workspaceKey: string, nodeToken: string, reason?: string, callerSessionId?: string): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run, version } = row
-    if (run.status !== 'blocked') return { ok: false, reason: `run is ${run.status}; respawn requires blocked` }
-    if (run.managerSessionId !== callerSessionId) {
-      return { ok: false, reason: 'only the Manager may respawn the judge' }
+  async handleRestartReconcile(): Promise<void> {
+    for (const row of await this.state.listRuns()) {
+      if (row.run.status === 'completed' || row.run.status === 'terminated' || row.execution.restartPending) continue
+      try {
+        row.execution.restartPending = true
+        if (row.run.status === 'running') await this.blockRow(row.workspaceKey, row, 'host restarted; saved work retained; Manager resume must confirm the recovery target', 'interrupted')
+        else await this.state.put(row.workspaceKey, row.run, row.version, [change(row.execution, 'interrupted')])
+      } catch (error) { this.traceWarn?.(`restart reconciliation failed: ${String(error)}`) }
     }
-    const frame = topFrame(run)
-    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
-    if (run.pendingClaim === undefined) {
-      return { ok: false, reason: 'no pending judgment to respawn' }
-    }
-    // Prepare every fallible packet input before draining the existing Judge or
-    // publishing a replacement id. A preparation fault leaves the blocked run
-    // and its current Judge mapping untouched, so Manager may retry safely.
-    const node = this.nodeAt(run, frame)!
-    const checker = node.checker!
-    const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
-    const cwd = await this.cwdResolver(run)
-    // Drain the old judge (if any) and clear the mapping + revoke authz.
-    const oldJudge = run.judgeSessionId
-    delete run.judgeSessionId
-    if (oldJudge !== undefined) {
-      await this.subagents.drainJudge(run, oldJudge).catch(() => {})
-    }
-    // Rebuild: reserve and persist the fresh Judge id before child admission,
-    // so the Judge can submit judge_claim as soon as DSH accepts its first
-    // prompt (P1).
-    const reservedJudgeSessionId = newNodeToken()
-    run.judgeSessionId = reservedJudgeSessionId
-    run.status = 'running'
-    run.blockReason = null
-    // A3 R6 + review round 2: record the rebuild BEFORE persistence (§10
-    // validate → trace → persist; at-least-once). A spawn failure afterwards
-    // is covered by the following judge-fault BLOCK line.
-    this.logRespawn(run, frame, reservedJudgeSessionId, reason ?? null)
-    await this.state.put(workspaceKey, run, version)
-    try {
-      await this.subagents.startJudge(run, {
-        nodeToken: frame.nodeToken,
-        instruction: node.execution.instruction ?? '',
-        criteria,
-        // A1 R7: the Judgment Packet receives only outcome/summary; handoff
-        // remains persisted in pendingClaim for the successor node after an
-        // accepted PASS or FAIL (20260906: both outcomes).
-        claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
-        // A1 §6.4: judge-fault/NEED_CONTEXT BLOCKs keep the correction
-        // evidence — the rebuilt packet still sees what was rejected.
-        previousRejection: run.pendingCorrection,
-        cwd,
-        judgeSessionId: reservedJudgeSessionId,
-      })
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error)
-      const fresh = await this.state.get(workspaceKey)
-      if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge respawn' }
-      // reset/start can replace the row during spawn; never mutate a run that
-      // is not this respawn's original run/token.
-      if (fresh.run.runId !== run.runId
-        || fresh.run.judgeSessionId !== reservedJudgeSessionId
-        || fresh.run.status !== 'running'
-        || topFrame(fresh.run).nodeToken !== nodeToken) {
-        await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
-        return { ok: false, reason: 'stale judge respawn discarded: the run changed while the judge was materializing' }
-      }
-      delete fresh.run.judgeSessionId
-      await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
-      return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
-    }
-
-    // A1 R11 spawn-cleanup path: validate the post-admission row before the
-    // respawn is allowed to claim success.
-    const fresh = await this.state.get(workspaceKey)
-    if (fresh === undefined
-      || fresh.run.runId !== run.runId
-      || fresh.run.judgeSessionId !== reservedJudgeSessionId
-      || fresh.run.status !== 'running'
-      || topFrame(fresh.run).nodeToken !== nodeToken) {
-      await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
-      return { ok: false, reason: 'stale judge respawn discarded: the run changed while the judge was materializing' }
-    }
-    return { ok: true, run: fresh.run, message: `judge respawned for node ${frame.nodeId}` }
   }
-
-  /** Handle node_block (design §5.2 G3 / A1 §5.2 lease classification). */
-  async handleBlock(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run, version } = row
-    if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}` }
-    const frame = topFrame(run)
-    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
-    const isManager = run.managerSessionId === caller.sessionId
-    // A1 §5.2, review fix: classify by NODE ROLE — never by the drift-prone
-    // roleActors mapping. executorSessionOf() returning '' for a missing
-    // mapping must not fail OPEN: a sibling role actor that keeps its own
-    // authorization (live session-role mapping) could otherwise block a node
-    // whose executor mapping drifted, with no dispatch lease at all.
-    const kind = this.currentNodeKind(run)
-    if (kind !== 'actor-task') {
-      // builtin-program / child-workflow nodes are Manager-driven control
-      // plane and publish no lease; the Manager keeps its control-plane block.
-      if (!isManager) {
-        return { ok: false, reason: 'only the current node executor or the Manager may block' }
-      }
-    } else {
-      const roleOfNode = this.nodeAt(run, frame)!.execution.role!
-      // Manager on a role-executor node: control plane (node_resume's
-      // sibling) — the status/token/caller checks above suffice, no lease.
-      const managerControlPlane = isManager && roleOfNode !== 'manager'
-      if (!managerControlPlane) {
-        // Non-Manager on a Manager-executor node is not the executor at all.
-        if (!isManager && roleOfNode === 'manager') {
-          return { ok: false, reason: 'only the current node executor or the Manager may block' }
-        }
-        // Everyone else here IS the precise executor of this dispatch (the
-        // Manager-executor, or the role Actor bound by the book's executor
-        // truth) — the claim/block pair shares one dispatch lease, so a
-        // second claim/block and a stale-turn block are both rejected.
-        const lease = this.admitLease(workspaceKey, run, caller)
-        if (!lease.ok) {
-          return { ok: false, reason: '当前调用无法绑定到一个已 dispatch 的 Node' }
-        }
+  async handleResume(ws: string, token: string, context: string, caller: string, target: ResumeTarget = 'auto'): Promise<EngineOutcome> {
+    context = context.trim()
+    if (!context || context.length > LIMITS.resolutionMax || !['auto', 'actor', 'judge'].includes(target)) return rejected('invalid resolution context/target')
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'blocked' || row.execution.nodeToken !== token) return rejected('node_resume requires the current BLOCK/token')
+    const { run, execution: e, version } = row
+    if (caller !== run.managerSessionId) return rejected('node_resume is Manager-only')
+    const node = this.nodeAt(run, topFrame(run))
+    if (!node || e.phase === 'exited') return rejected('resume target is not applicable to this execution')
+    let recoveredPredecessor: NodeExecution | undefined
+    if (e.phase === 'ready' && e.predecessorId) {
+      const predecessor = await this.state.execution(ws, e.predecessorId)
+      if (!await this.sameRow(ws, row)) return rejected('stale resume request after predecessor inspection')
+      if (!predecessor?.judge?.settled) {
+        const terminalAccepted = predecessor?.phase === 'exited' && predecessor.successorId === e.executionId
+          && predecessor.judgment?.result === 'ACCEPT' && predecessor.judgment.claimId === predecessor.claim?.id
+          && predecessor.judgment.judgeDispatchId === predecessor.judge?.id
+        if (!e.restartPending || !terminalAccepted) return rejected('predecessor Judge is not safely settled; keep BLOCK until its activity is resolved')
+        predecessor.judge!.settled = true
+        recoveredPredecessor = predecessor
       }
     }
-    run.status = 'blocked'
-    // A1 review fix: the tool layer's bound is trim-based — persist the trim
-    // result so a whitespace bomb never inflates the durable row.
-    run.blockReason = reason.trim()
-    // A3 R5: explicit node_block — source reflects who called (Manager vs the
-    // node's own Actor).
-    this.logBlock(run, frame, isManager ? 'manager' : 'actor', run.blockReason)
-    await this.state.put(workspaceKey, run, version)
-    // A1 §3.2: BLOCK consumes the lease WITH the book (no consumed residue);
-    // a put failure above leaves the book intact for a verbatim retry.
-    this.dispatchBook.delete(workspaceKey)
-    return { ok: true, run, message: `blocked: ${reason}` }
-  }
-
-  /** Handle node_resume (design §5.2 G4 / A1 R10 / A4 R4): rotate token, dispatch or followup. */
-  async handleResume(workspaceKey: string, nodeToken: string, resolutionContext: string, callerSessionId: string): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run, version } = row
-    if (run.status !== 'blocked') return { ok: false, reason: `run is ${run.status}; resume requires blocked` }
-    if (run.managerSessionId !== callerSessionId) {
-      return { ok: false, reason: 'only the Manager may resume a blocked node' }
-    }
-    const frame = topFrame(run)
-    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
-    // A1 review fix: trim the resolution context once — it feeds followups,
-    // the resume log and the correction rebuild, all under trim-based bounds.
-    resolutionContext = resolutionContext.trim()
-
-    // A4 R4: in the judgment phase, the sole control signal is judgeSessionId.
-    if (run.pendingClaim !== undefined) {
+    if (node.execution.type === 'child-workflow') {
+      if (target !== 'auto' || e.phase !== 'ready' || e.child) return rejected('Child resume requires an unentered ready caller and target=auto')
+      e.inputVersion++
+      e.resolution = { target: 'child', context, inputVersion: e.inputVersion }
+      e.restartPending = false
+      e.blockReason = null
+      e.nodeToken = newNodeToken()
+      topFrame(run).nodeToken = e.nodeToken
       run.status = 'running'
       run.blockReason = null
-      frame.nodeToken = newNodeToken()
-      // A3 R6: judgment-phase resume always targets the judge (followup the
-      // live session, or rebuild from pendingClaim below).
-      this.logResume(run, frame, nodeToken, 'judge', resolutionContext)
-      if (run.judgeSessionId !== undefined) {
-        // followup the SAME judge (A1 R10 / A4 R3); do not re-dispatch the actor.
-        const followup = `[manager resolution]\n${resolutionContext}\n\n请用新的 nodeToken "${frame.nodeToken}" 继续判定，并再次调用 judge_claim 提交。`
+      await this.state.put(ws, run, version, [change(e, 'manager-context', 'resumed'), ...(recoveredPredecessor ? [change(recoveredPredecessor)] : [])])
+      await this.drive(ws)
+      return { ok: true, run, message: 'Child caller resume committed; driver invoked' }
+    }
+    if (node.execution.type !== 'actor-task') return rejected('Program recovery requires node_run_program or node_resolve_program')
+    const resolvedTarget: Exclude<ResumeTarget, 'auto'> = target === 'auto'
+      ? e.phase === 'checking' && e.claim && e.dispatch?.settled && e.judgment?.result !== 'ACCEPT' ? 'judge' : 'actor'
+      : target
+    const role = node.execution.role!
+    let replaceRole = false
+    if (role !== 'manager' && run.roleActors[role] && (resolvedTarget === 'actor' || !e.dispatch?.settled)) {
+      const sessionId = run.roleActors[role]
+      const safe = await this.subagents.safeToInspect(sessionId)
+      if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role safety inspection')
+      if (!safe) {
+        const activity = await this.actorActivity(sessionId)
+        if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role activity inspection')
+        if (activity !== 'unknown') return rejected('previous Role execution is not safely closed')
+        if (resolvedTarget === 'actor') {
+          const availability = await this.subagents.roleSessionAvailability(sessionId)
+          if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role Session inspection')
+          replaceRole = availability === 'missing'
+        }
+      }
+    }
+    const oldJudge = e.judge
+    const oldJudgeSessionId = oldJudge?.sessionId
+    let judgeMode: 'followup' | 'fresh' | undefined
+    let judgeSessionId: string | undefined
+    if (resolvedTarget === 'judge') {
+      if (e.phase !== 'checking' || !e.claim || !e.dispatch || e.judgment?.result === 'ACCEPT') return rejected('judge resume requires an effective claim without a business conclusion')
+      // auto never takes this branch while unsettled; explicit target=judge is the Manager's takeover decision.
+      if (!e.dispatch.settled) e.dispatch.settled = true
+      const sameJudgeNeedContext = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
+        && e.judgment.claimId === e.claim.id && e.judgment.inputVersion === e.inputVersion
+        && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
+      const restartRecovery = e.restartPending
+      const historicalNeedContext = e.judgment?.result === 'NEED_CONTEXT' && e.previousJudge?.claimId === e.claim.id
+        && e.judgment.judgeDispatchId === e.previousJudge.id && e.judgment.judgeSessionId === e.previousJudge.sessionId
+      const unjudgedCurrent = oldJudge !== undefined && (e.judgment === undefined
+        || e.judgment.claimId !== e.claim.id || e.judgment.inputVersion !== e.inputVersion)
+      const judgeToContinue = sameJudgeNeedContext ? oldJudge
+        : historicalNeedContext && !oldJudge ? e.previousJudge
+          : restartRecovery && unjudgedCurrent ? oldJudge : undefined
+      if ((restartRecovery || sameJudgeNeedContext) && judgeToContinue) {
+        const availability = await this.subagents.judgeSessionAvailability(judgeToContinue.sessionId)
+        if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge Session inspection')
+        if (availability !== 'missing') {
+          const safe = await this.subagents.safeToInspect(judgeToContinue.sessionId)
+          if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge safety inspection')
+          if (!safe) {
+            const activity = await this.actorActivity(judgeToContinue.sessionId)
+            if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge activity inspection')
+            if (!restartRecovery || activity !== 'unknown') return rejected('previous Judge turn is not safely closed')
+          }
+          judgeMode = 'followup'
+          judgeSessionId = judgeToContinue.sessionId
+        } else {
+          try {
+            if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')
+          } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+          judgeMode = 'fresh'
+        }
+      } else {
+        const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
+        if (judgeToDrain) {
+          try {
+            if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale judge resume request after Judge drain')
+          } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+        }
+        judgeMode = 'fresh'
+      }
+      if (sameJudgeNeedContext && oldJudge) e.previousJudge = oldJudge
+      delete e.judge
+    } else {
+      const acceptedFailureWithoutEdge = e.phase === 'settling' && e.claim?.outcome === 'failed'
+        && e.judgment?.result === 'ACCEPT' && node.onFail === undefined
+      const canReturnActor = e.phase === 'ready' || (e.phase === 'working' && !e.claim)
+        || (e.phase === 'checking' && !!e.claim && e.judgment?.result !== 'ACCEPT') || acceptedFailureWithoutEdge
+      if (!canReturnActor) return rejected('actor resume would overwrite a transferable conclusion')
+      const relatedClaimId = e.claim?.id ?? e.previousClaim?.id
+      const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === relatedClaimId ? e.previousJudge : undefined)
+      if (judgeToDrain) {
         try {
-          await this.subagents.followupJudge(run, run.judgeSessionId, followup)
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : String(error)
-          await this.blockOnJudgeFault(workspaceKey, run, version, detail)
-          return { ok: true, run, message: run.blockReason ?? '' }
-        }
-        await this.state.put(workspaceKey, run, version)
-        return { ok: true, run, message: `followup judge ${run.judgeSessionId}` }
+          if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale actor resume request after Judge drain')
+        } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
       }
-      // Prepare every fallible packet input BEFORE publishing the reserved id.
-      const node = this.nodeAt(run, frame)!
-      const checker = node.checker!
-      const criteria = typeof checker.config['criteria'] === 'string' ? checker.config['criteria'] : ''
-      const cwd = await this.cwdResolver(run)
-      // No judge session: reserve and persist the fresh Judge id before child
-      // admission, so the child can judge_claim immediately after DSH accepts
-      // its first prompt.
-      const reservedJudgeSessionId = newNodeToken()
-      run.judgeSessionId = reservedJudgeSessionId
-      await this.state.put(workspaceKey, run, version)
-      try {
-        await this.subagents.startJudge(run, {
-          nodeToken: frame.nodeToken,
-          instruction: node.execution.instruction ?? '',
-          criteria,
-          // A1 R7: only outcome/summary enter the rebuilt Judgment Packet;
-          // handoff stays in pendingClaim for delivery after an accepted
-          // PASS or FAIL (20260906: both outcomes).
-          claim: { outcome: run.pendingClaim.outcome, summary: run.pendingClaim.summary },
-          // A1 §6.4: the spawn-rebuild keeps the prior rejection evidence.
-          previousRejection: run.pendingCorrection,
-          cwd,
-          judgeSessionId: reservedJudgeSessionId,
-        })
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error)
-        const fresh = await this.state.get(workspaceKey)
-        if (fresh === undefined) return { ok: false, reason: 'state row vanished during judge spawn recovery' }
-        if (fresh.run.runId !== run.runId
-          || fresh.run.judgeSessionId !== reservedJudgeSessionId
-          || fresh.run.status !== 'running'
-          || topFrame(fresh.run).nodeToken !== frame.nodeToken) {
-          await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
-          return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
-        }
-        delete fresh.run.judgeSessionId
-        await this.blockOnJudgeFault(workspaceKey, fresh.run, fresh.version, detail)
-        return { ok: true, run: fresh.run, message: fresh.run.blockReason ?? '' }
+      if (e.claim) {
+        const returnedClaim = e.claim
+        const currentFeedback = e.judgment?.result === 'NEED_CONTEXT' && e.judgment.claimId === returnedClaim.id && e.judgment.inputVersion === e.inputVersion
+          && oldJudge !== undefined && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
+        const historicalFeedback = e.judgment?.claimId === returnedClaim.id && e.judgment.inputVersion < e.inputVersion
+          && e.previousJudge !== undefined && e.judgment.judgeDispatchId === e.previousJudge.id
+          && e.judgment.judgeSessionId === e.previousJudge.sessionId
+        e.previousClaim = returnedClaim
+        if (currentFeedback && oldJudge) e.previousJudge = oldJudge
+        else if (!historicalFeedback) { delete e.judgment; delete e.previousJudge }
       }
-
-      // A1 R11 spawn-cleanup path: validate the post-admission row before the
-      // recovery is allowed to claim success.
-      const fresh = await this.state.get(workspaceKey)
-      if (fresh === undefined
-        || fresh.run.runId !== run.runId
-        || fresh.run.judgeSessionId !== reservedJudgeSessionId
-        || fresh.run.status !== 'running'
-        || topFrame(fresh.run).nodeToken !== frame.nodeToken) {
-        await this.subagents.drainJudge(run, reservedJudgeSessionId).catch(() => {})
-        return { ok: false, reason: 'stale judge spawn discarded: the run changed while the judge was materializing' }
-      }
-      return { ok: true, run: fresh.run, message: `judge respawned for node ${frame.nodeId}` }
+      delete e.claim
+      delete e.judge
+      e.phase = 'ready'
     }
-
-    // F13: never dispatch while the current node's actor has an active turn.
-    const currentExecutor = executorSessionOf(run)
-    if (currentExecutor !== run.managerSessionId && currentExecutor !== '') {
-      const activity = await this.actorActivity(currentExecutor)
-      if (activity === 'active') {
-        return { ok: false, reason: 'the current role actor still has an active turn; wait for it to settle' }
+    if (replaceRole) {
+      delete run.roleActors[role]
+      // Fresh replacement has no prior cross-Node context to compact; same-execution correction must not compact it later.
+      e.roleBoundaryPrepared = true
+    }
+    e.inputVersion++
+    e.resolution = {
+      target: resolvedTarget, context, inputVersion: e.inputVersion,
+      ...(resolvedTarget === 'judge' ? { judgeMode: judgeMode!, ...(judgeSessionId ? { judgeSessionId } : {}) } : {}),
+    }
+    if (resolvedTarget === 'judge') {
+      e.judge = {
+        id: newNodeToken(), sessionId: judgeSessionId ?? newNodeToken(), claimId: e.claim!.id,
+        inputVersion: e.inputVersion, settled: false,
       }
     }
+    e.restartPending = false
+    e.blockReason = null
+    e.nodeToken = newNodeToken()
+    topFrame(run).nodeToken = e.nodeToken
     run.status = 'running'
     run.blockReason = null
-    frame.nodeToken = newNodeToken()
-    // A3 R6: actor-path resume (re-dispatch with the resolution context).
-    this.logResume(run, frame, nodeToken, 'actor', resolutionContext)
-    // A1 §6.4: resuming a correction-dispatch failure (pendingCorrection set,
-    // no pendingClaim) rebuilds the FULL R7 evidence so the Actor receives
-    // [judge rejection] + [previous claim] + [manager resolution] + the
-    // [instruction] wrapper — independent of the Manager copying from trace.
-    // 20260906: a resume in the deferred-dispatch crash window (e.g. after a
-    // restart-reconcile BLOCK) re-delivers the persisted handoff mirror
-    // alongside the Manager's resolution — the advanced node's context must
-    // not depend on the in-memory book having survived.
-    const carriedHandoff = run.pendingDispatchContext?.kind === 'handoff' && run.pendingDispatchContext.text !== ''
-      ? `${run.pendingDispatchContext.text}\n\n[manager resolution]\n${resolutionContext}`
-      : resolutionContext
-    const transient: TransientDispatch = run.pendingCorrection !== undefined && run.pendingClaim === undefined
-      ? { kind: 'correction', text: `${correctionEvidence(run.pendingCorrection)}\n\n[manager resolution]\n${resolutionContext}` }
-      : { kind: 'handoff', text: carriedHandoff }
-    await this.dispatchNow(workspaceKey, run, version, transient)
-    return { ok: true, run, message: run.blockReason ?? `resumed: ${resolutionContext.slice(0, 120)}` }
+    await this.state.put(ws, run, version, [
+      change(e, 'manager-context', 'resumed', ...(resolvedTarget === 'judge' ? ['judge-arranged' as const] : [])),
+      ...(recoveredPredecessor ? [change(recoveredPredecessor)] : []),
+    ])
+    if (oldJudgeSessionId) await this.subagents.retireJudge(run, oldJudgeSessionId).catch(() => {})
+    await this.drive(ws)
+    return { ok: true, run, message: `resume ${resolvedTarget} committed; driver invoked` }
   }
-
-  /** Handle node_run_program (design §5.2 G5). */
-  async handleRunProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, callerSessionId: string): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run } = row
-    if (run.status !== 'running') return { ok: false, reason: `run is ${run.status}` }
-    if (run.managerSessionId !== callerSessionId) {
-      return { ok: false, reason: 'only the Manager may run a builtin program' }
-    }
-    const frame = topFrame(run)
-    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
-    const kind = this.currentNodeKind(run)
-    if (kind !== 'builtin-program') return { ok: false, reason: `current node is ${kind}; only builtin-program accepts node_run_program` }
-    const node = this.nodeAt(run, frame)!
-    const programId = node.execution.programId!
-    // F14: single-flight per node token — one program run at a time.
-    const flightKey = `${workspaceKey}:${nodeToken}`
-    if (this.inFlight.has(flightKey)) {
-      return { ok: false, reason: 'a program run is already in flight for this node' }
-    }
-    this.inFlight.set(flightKey, 'program')
-    try {
-      const cwd = await this.cwdResolver(run)
-
-      // Async program run — the mutation queue is NOT held.
-      const result = await this.programs.run(run, programId, parameters, cwd)
-
-      // Fresh re-read + token revalidation before applying (design §4).
-      const fresh = await this.state.get(workspaceKey)
-      if (fresh === undefined) return { ok: false, reason: 'state row vanished during the program run' }
-      if (fresh.run.status !== 'running' || topFrame(fresh.run).nodeToken !== nodeToken) {
-        return { ok: false, reason: 'stale program result discarded: the node moved or blocked meanwhile' }
-      }
-      // A3 §9: program outcome (parameters never logged). Recorded after the
-      // stale-result revalidation and before the state transition (§10 order).
-      this.logProgram(fresh.run, topFrame(fresh.run), programId, result.kind, result.kind === 'PASS' ? null : result.reason ?? null)
-      if (result.kind === 'ERROR') {
-        fresh.run.status = 'blocked'
-        fresh.run.blockReason = `program ${programId} ERROR: ${result.reason ?? ''}`
-        this.logBlock(fresh.run, topFrame(fresh.run), 'program', fresh.run.blockReason)
-        await this.state.put(workspaceKey, fresh.run, fresh.version)
-        this.dispatchBook.delete(workspaceKey)
-        return { ok: true, run: fresh.run, message: fresh.run.blockReason }
-      }
-      this.advance(fresh.run, result.kind, result.reason ?? '', 'program')
-      await this.persistDeferred(workspaceKey, fresh.run, fresh.version)
-      return { ok: true, run: fresh.run, message: `program ${result.kind}` }
-    } finally {
-      this.inFlight.delete(flightKey)
-    }
-  }
-
-  /** Handle node_resolve_program (design §5.2 G6). */
-  async handleResolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, callerSessionId: string): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run, version } = row
-    if (run.status !== 'blocked') return { ok: false, reason: `run is ${run.status}; resolve_program requires blocked` }
-    if (run.managerSessionId !== callerSessionId) {
-      return { ok: false, reason: 'only the Manager may resolve a blocked program' }
-    }
-    const frame = topFrame(run)
-    if (frame.nodeToken !== nodeToken) return { ok: false, reason: 'nodeToken is stale' }
-    if (this.currentNodeKind(run) !== 'builtin-program') {
-      return { ok: false, reason: `current node is ${this.currentNodeKind(run)}; only builtin-program accepts node_resolve_program` }
-    }
-    // A1 review fix: same defensive trim as the judge/block/resume reasons —
-    // the resolve reason flows into the trace line and any FAIL BLOCK reason.
+  async handleRespawnJudge(ws: string, token: string, reason = '', caller = ''): Promise<EngineOutcome> {
     reason = reason.trim()
-    // Clear the BLOCK before advancing; advance() re-BLOCKs on a FAIL without
-    // an onFail edge (design §5.2 G6 / acceptance G6).
+    if (reason.length > LIMITS.reasonMax) return rejected(`reason exceeds ${LIMITS.reasonMax} characters`)
+    const row = await this.state.get(ws)
+    if (!row || !['running', 'blocked'].includes(row.run.status) || row.execution.nodeToken !== token) return rejected('judge_respawn requires the current Node/token')
+    const { run, execution: e, version } = row
+    if (caller !== run.managerSessionId) return rejected('judge_respawn is Manager-only')
+    if (this.nodeAt(run, topFrame(run))?.execution.type !== 'actor-task' || e.phase !== 'checking' || !e.claim
+      || !e.dispatch?.settled || e.judgment?.result === 'ACCEPT') return rejected('judge_respawn requires an effective settled claim without a business conclusion')
+    const oldJudge = e.judge
+    let committedVersion = version
+    try {
+      const cwd = await this.cwdResolver(run)
+      const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
+      if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale respawn request after Judge drain')
+      const currentFeedback = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
+        && e.judgment.claimId === e.claim.id && e.judgment.inputVersion === e.inputVersion
+        && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
+      e.inputVersion++
+      if (currentFeedback && oldJudge) e.previousJudge = oldJudge
+      e.resolution = {
+        target: 'judge', inputVersion: e.inputVersion, judgeMode: 'fresh',
+        ...(e.resolution?.context ? { context: e.resolution.context } : {}),
+        decision: reason || 'Manager requested Judge respawn',
+      }
+      e.restartPending = false
+      e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+      e.blockReason = null
+      run.status = 'running'
+      run.blockReason = null
+      await this.state.put(ws, run, version, [change(e, 'judge-respawned', 'judge-arranged')])
+      committedVersion = version + 1
+      if (!await this.stillCurrent(ws, e, committedVersion)) return rejected('stale respawn request')
+      const sent = await this.subagents.startJudge(run, this.judgePacket(run, e, cwd))
+      const fresh = await this.stillCurrent(ws, e, committedVersion)
+      if (!fresh) { await this.subagents.retireJudge(run, sent.judgeSessionId).catch(() => {}); return rejected('stale respawn result') }
+      if (fresh.execution.judge?.id !== e.judge.id || sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
+      fresh.execution.judge.messageId = sent.messageId
+      await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
+      return { ok: true, run: fresh.run, message: `Judge respawn committed${reason ? `: ${reason}` : ''}` }
+    } catch (error) {
+      await this.dispatchFault(ws, e, error, committedVersion)
+      return rejected(`Judge respawn failed: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+  async handleRunProgram(ws: string, token: string, supplied: Record<string, unknown>, caller: string): Promise<EngineOutcome> {
+    const row = await this.state.get(ws)
+    if (!row || !['running', 'blocked'].includes(row.run.status) || row.execution.nodeToken !== token) return rejected('node_run_program requires the current Node/token')
+    const { run, execution: e } = row
+    if (caller !== run.managerSessionId) return rejected('node_run_program is Manager-only')
+    const node = this.nodeAt(run, topFrame(run))
+    if (!node || node.execution.type !== 'builtin-program' || !['ready', 'working', 'settling'].includes(e.phase)) return rejected('current execution is not a runnable Program')
+    if (run.status === 'running' && e.program && !e.program.result) return rejected('Program invocation is already in progress')
+    let parameters: Record<string, unknown>
+    try { parameters = this.programParameters(node, supplied) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
+    if (run.status === 'blocked') {
+      e.nodeToken = newNodeToken()
+      topFrame(run).nodeToken = e.nodeToken
+    }
+    e.program = { id: newNodeToken(), parameters }
+    e.phase = 'working'
+    e.restartPending = false
+    e.blockReason = null
     run.status = 'running'
     run.blockReason = null
-    // A3 R6: the Manager's manual resolution, recorded before routing.
-    this.logResolve(run, frame, result, reason)
-    this.advance(run, result, reason, 'manager')
-    await this.persistDeferred(workspaceKey, run, version)
-    return { ok: true, run, message: `resolved ${result}` }
-  }
-
-  /** Handle workflow_set_role_model (design §5.2 G7 / review F12 / A1 §6.5). */
-  async handleSetRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<EngineOutcome> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return { ok: false, reason: 'no active run' }
-    const { run, version } = row
-    if (roleKey !== 'judge' && !Object.prototype.hasOwnProperty.call(run.definitionSnapshot.roles, roleKey)) {
-      return { ok: false, reason: `unknown role key "${roleKey}"` }
-    }
-    if (roleKey !== 'judge') {
-      // A1 §6.5 guard (main): while the CURRENT node's actor awaits a
-      // judgment or a correction re-dispatch, an override would delete the
-      // mapping and silently redirect the correction to a replacement — the
-      // REJECT flow would then resurrect the OLD actor mapping. Judged by
-      // Node role + boundary (NOT the roleActors mapping): a drifted/missing
-      // mapping must still trip the guard.
-      // Review fix: a completed run has NO top frame (callStack=[]) — read
-      // the node only when one exists; completed runs take the plain
-      // override path exactly as before A1 (no throw).
-      const node = run.callStack.length > 0 ? this.nodeAt(run, topFrame(run)) : undefined
-      if (run.status === 'running'
-        && node !== undefined && node.execution.type === 'actor-task' && node.execution.role === roleKey
-        && run.nodeBoundary.dispatchedAt !== 0 && run.nodeBoundary.executorSessionId !== undefined
-        && (run.pendingClaim !== undefined || run.pendingCorrection !== undefined)) {
-        return { ok: false, reason: `role "${roleKey}" 的 actor 正在等待判定/修正；override 被拒绝` }
-      }
-      // Reject only while the mapped actor has a live ACTIVE turn; an idle actor
-      // is replaceable (design §5.2: "目标 Worker active 时拒绝").
-      const actorId = run.roleActors[roleKey]
-      if (actorId !== undefined) {
-        const activity = await this.actorActivity(actorId)
-        if (activity === 'active') {
-          return { ok: false, reason: `role "${roleKey}" has an active actor turn; override is rejected` }
-        }
-        // Remove the idle mapping so the next dispatch creates a replacement
-        // with the new route (design §5.2).
-        delete run.roleActors[roleKey]
-      }
-      // A1 §6.5 blocked escape hatch: a correction-dispatch failure BLOCK is
-      // the Manager's disposal point — an override here is ACCEPTED and the
-      // boundary is reset so the resume's correction re-dispatch takes the
-      // ensureRoleActor path (replacement with the new route) while the
-      // correction evidence still reaches it. The MODEL trace line plus the
-      // boundary reset are the durable record of the explicit replacement.
-      if (run.status === 'blocked' && run.pendingCorrection !== undefined && run.pendingClaim === undefined
-        && node !== undefined && node.execution.type === 'actor-task' && node.execution.role === roleKey
-        && run.nodeBoundary.dispatchedAt !== 0) {
-        run.nodeBoundary = { dispatchedAt: 0, managerFromSeq: 0 }
-      }
-    }
-    // A1 D3: one trim-then-normalize rule for both entry points (catalog zod
-    // caps + here). A blank/over-limit route is rejected with the limit.
-    let route: { provider: string; modelId: string }
+    await this.state.put(ws, run, row.version, [change(e, 'program-arranged')])
+    const arrangedVersion = row.version + 1
+    const invocationId = e.program.id
+    let result: ProgramResult
     try {
-      route = normalizeModelRoute(provider, modelId)
+      const cwd = await this.cwdResolver(run)
+      const current = await this.state.get(ws)
+      if (!current || current.version !== arrangedVersion || current.run.status !== 'running'
+        || current.execution.executionId !== e.executionId || current.execution.program?.id !== invocationId) return rejected('stale Program invocation before effect')
+      result = await this.programs.run(run, node.execution.programId!, parameters, cwd)
     } catch (error) {
-      return { ok: false, reason: error instanceof WorkflowError ? error.message : String(error) }
+      const current = await this.state.get(ws)
+      if (current?.version === arrangedVersion && current.run.status === 'running'
+        && current.execution.executionId === e.executionId && current.execution.program?.id === invocationId) {
+        await this.blockRow(ws, current, `Program result unknown; inspect before retry or resolution: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return rejected('Program result is unknown; Manager inspection required')
     }
-    run.modelOverrides[roleKey] = route
-    // A3 R6: model override — ids only, never credentials (already normalized).
-    this.logModel(run, roleKey, route.provider, route.modelId)
-    await this.state.put(workspaceKey, run, version)
-    return { ok: true, run, message: `model override set for ${roleKey}` }
+    const current = await this.state.get(ws)
+    if (!current || current.version !== arrangedVersion || current.run.status !== 'running'
+      || current.execution.executionId !== e.executionId || current.execution.program?.id !== invocationId) return rejected('stale Program result ignored')
+    let normalized: NonNullable<NonNullable<NodeExecution['program']>['result']>
+    try { normalized = this.effectiveProgramResult(result, current.execution.input) } catch (error) {
+      await this.blockRow(ws, current, `Program result unknown; inspect before retry or resolution: ${error instanceof Error ? error.message : String(error)}`)
+      return rejected('invalid Program result; Manager inspection required')
+    }
+    current.execution.program!.result = normalized
+    if (normalized.kind === 'ERROR') {
+      current.execution.phase = 'settling'
+      await this.blockRow(ws, current, `Program ERROR: ${normalized.reason}`, 'program-result')
+      return { ok: true, run: current.run, message: current.execution.blockReason! }
+    }
+    try {
+      const advanced = await this.advanceKnownResult(ws, current, normalized.kind, normalized.handoff, 'program-result')
+      if (advanced.ok && advanced.run.status === 'running') await this.drive(ws)
+      return advanced
+    } catch (error) {
+      const after = await this.state.get(ws)
+      if (after?.version === arrangedVersion && after.run.status === 'running'
+        && after.execution.executionId === e.executionId && after.execution.program?.id === invocationId) {
+        delete after.execution.program.result
+        await this.blockRow(ws, after, `Program result commit unknown; inspect before retry or resolution: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return rejected('Program result commit failed; Manager inspection required')
+    }
   }
-
-  /**
-   * Turn settlement for one executor session (design §4.2):
-   * - ONLY the current node's precise executor session can settle workflow
-   *   turns (Manager/Role Actor/helper interleaving is ignored).
-   * - pendingDispatch && running → dispatch the advanced node now.
-   * - running && dispatchedToken still current → no accepted result → BLOCK.
-   * Called by the plugin on `turn/end` of the manager or a mapped role actor.
-   */
-  async handleTurnEnded(workspaceKey: string, sessionId: string): Promise<EngineOutcome | undefined> {
-    const row = await this.state.get(workspaceKey)
-    if (row === undefined) return undefined
-    const { run } = row
-    if (run.status !== 'running') {
-      this.dispatchBook.delete(workspaceKey)
-      return undefined
-    }
-    const book = this.dispatchBook.get(workspaceKey)
-    if (book === undefined) return undefined
-    // Only the dispatched executor's own settlement counts (design §4.2:
-    // "only status=running && dispatchedToken==current top-frame nodeToken").
-    const currentExecutor = executorSessionOf(run)
-    const isDispatchedExecutor = book.executorSessionId === sessionId
-      // A pending (not-yet-dispatched) advancement is settled by the OLD
-      // turn's executor — the executor recorded at deferral time.
-      || (book.pendingDispatch && (book.executorSessionId === '' || book.executorSessionId === sessionId))
-    if (!isDispatchedExecutor) return undefined
-    if (book.pendingDispatch) {
-      const context = book.transientContext
-      await this.dispatchNow(workspaceKey, run, row.version, context)
-      return { ok: true, run, message: run.blockReason ?? `dispatched ${topFrame(run).nodeId}` }
-    }
-    // A judgment is in flight for this node: the worker's accepted claim ends
-    // its turn BEFORE the async Judge verdict arrives. That turn-end is the
-    // expected conclusion of a claiming turn, not a no-result turn (A3 R2
-    // scopes the BLOCK to turns without node_claim/node_block). Record the
-    // settlement so the later PASS/FAIL dispatches immediately (A1 R9–R11).
-    if (run.pendingClaim !== undefined) {
-      book.workerSettled = true
-      return undefined
-    }
-    if (topFrame(run).nodeToken === book.dispatchedToken && currentExecutor === sessionId) {
-      run.status = 'blocked'
-      run.blockReason = 'actor-turn-ended-without-result'
-      // A3 R5: the turn ended without node_claim/node_block — this BLOCK is
-      // what fills the former 52-minute trace silence.
-      this.logBlock(run, topFrame(run), 'actor', run.blockReason)
-      await this.state.put(workspaceKey, run, row.version)
-      this.dispatchBook.delete(workspaceKey)
-      // A3 R3: actively notify the Manager.
-      await this.targets.steerManager(run, actorNoResultNotice(run, topFrame(run).nodeId)).catch(() => {})
-      return { ok: true, run, message: run.blockReason }
-    }
-    // Token changed without pendingDispatch: the old turn settled after an
-    // edge advancement that was already dispatched — nothing to do.
-    return undefined
+  async handleResolveProgram(ws: string, token: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<EngineOutcome> {
+    reason = reason.trim()
+    if (!reason || reason.length > LIMITS.blockReasonMax || !['PASS', 'FAIL'].includes(result)) return rejected('invalid Program resolution')
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'blocked' || row.execution.nodeToken !== token) return rejected('node_resolve_program requires the current BLOCK/token')
+    if (caller !== row.run.managerSessionId) return rejected('node_resolve_program is Manager-only')
+    const node = this.nodeAt(row.run, topFrame(row.run))
+    if (node?.execution.type !== 'builtin-program' || !row.execution.program || !['working', 'settling'].includes(row.execution.phase)) return rejected('current execution has no Program result to resolve')
+    const prior = row.execution.program.result
+    const handoff = prior && prior.kind !== 'ERROR' ? prior.handoff : row.execution.input
+    row.execution.program.result = { kind: result, handoff, reason }
+    row.execution.blockReason = null
+    row.execution.restartPending = false
+    row.run.status = 'running'
+    row.run.blockReason = null
+    const advanced = await this.advanceKnownResult(ws, row, result, handoff, 'program-resolved')
+    if (advanced.ok && advanced.run.status === 'running') await this.drive(ws)
+    return advanced
   }
-
-  /** Host-restart reconciliation (design §4.2 H1): every pre-existing running row BLOCKs. */
-  async handleRestartReconcile(): Promise<void> {
-    this.dispatchBook.clear()
-    for (const listed of await this.state.listRuns()) {
-      if (listed.run.status !== 'running') continue
-      try {
-        // The Session probe performs persistence I/O. Re-read afterwards and
-        // mutate only the same pre-restart run/id; a concurrent post-restart
-        // mutation or replacement owns the newer row and must not be clobbered.
-        const listedJudgeId = listed.run.judgeSessionId
-        const judgeExists = listedJudgeId === undefined
-          ? true
-          : await this.subagents.judgeSessionExists(listedJudgeId).catch(() => false)
-        const fresh = await this.state.get(listed.workspaceKey)
-        if (fresh === undefined
-          || fresh.run.runId !== listed.run.runId
-          || fresh.run.status !== 'running'
-          || fresh.run.judgeSessionId !== listedJudgeId) {
-          continue
-        }
-        fresh.run.status = 'blocked'
-        fresh.run.blockReason = 'host-restarted-before-node-result'
-        // A3 R5: restart-reconcile BLOCK. Reaches the ORIGINAL run log via the
-        // durable traceLogPath persisted at Run start.
-        this.logBlock(fresh.run, topFrame(fresh.run), 'restart', fresh.run.blockReason)
-        // A reserved Judge id may be durable while its Session is not (the host
-        // can crash between the pre-admission write and materialization). Clear
-        // it so node_resume takes A4 R4's spawn-rebuild branch; pendingClaim
-        // stays for the packet.
-        if (!judgeExists) delete fresh.run.judgeSessionId
-        await this.state.put(listed.workspaceKey, fresh.run, fresh.version)
-      } catch {
-        // Reconciliation is best-effort per workspace. A concurrent writer may
-        // win the final optimistic put; never abort reconciliation of all
-        // remaining rows or overwrite the newer state.
+  async handleSetRoleModel(ws: string, role: string, provider: string, model: string, caller: string): Promise<EngineOutcome> {
+    const row = await this.state.get(ws)
+    if (!row || row.run.status === 'completed' || row.run.status === 'terminated') return rejected('workflow_set_role_model requires the current active Run')
+    if (caller !== row.run.managerSessionId) return rejected('workflow_set_role_model is Manager-only')
+    if (role !== 'judge' && !(role in row.run.definitionSnapshot.roles)) return rejected(`unknown role "${role}"`)
+    let route
+    try { route = normalizeModelRoute(provider, model) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
+    const existing = row.run.modelOverrides[role]
+    if (existing?.provider === route.provider && existing.modelId === route.modelId) return { ok: true, run: row.run, message: 'model override already applied' }
+    const mapped = role === 'judge' ? undefined : row.run.roleActors[role]
+    const currentNode = this.nodeAt(row.run, topFrame(row.run))
+    const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
+    if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')
+    if (mapped) {
+      const safe = await this.subagents.safeToInspect(mapped)
+      if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role safety inspection')
+      if (!safe) {
+        const activity = await this.actorActivity(mapped)
+        if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role activity inspection')
+        if (activity !== 'unknown') return rejected('active actor cannot be replaced')
       }
     }
+    row.run.modelOverrides[role] = route
+    if (mapped) delete row.run.roleActors[role]
+    if (replacesCurrentRole) row.execution.roleBoundaryPrepared = true
+    await this.state.put(ws, row.run, row.version, [change(row.execution, 'model-changed')])
+    this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax) })
+    return { ok: true, run: row.run, message: `model override saved for ${role}` }
   }
-
-  /** Reset: remove the workspace row (design A5). */
-  async handleReset(workspaceKey: string): Promise<void> {
-    const row = await this.state.get(workspaceKey)
-    // A3 review S3: release the one-warning marker for the removed run.
-    if (row !== undefined) this.traceWarnedRuns.delete(row.run.runId)
-    await this.state.remove(workspaceKey)
-    this.dispatchBook.delete(workspaceKey)
+  async handleReset(ws: string, caller: string): Promise<EngineOutcome> {
+    const row = await this.state.get(ws)
+    if (!row || (row.run.status !== 'running' && row.run.status !== 'blocked')) return rejected('reset requires the current active Run')
+    if (caller !== row.run.managerSessionId) return rejected('reset is Manager-only')
+    const judgeSessionId = row.execution.judge?.sessionId
+    row.run.status = 'terminated'
+    row.run.blockReason = TERMINATED_REASON
+    row.execution.restartPending = false
+    row.execution.blockReason = TERMINATED_REASON
+    row.execution.nodeToken = newNodeToken()
+    topFrame(row.run).nodeToken = row.execution.nodeToken
+    await this.state.put(ws, row.run, row.version, [change(row.execution, 'terminated')])
+    if (judgeSessionId) await this.subagents.retireJudge(row.run, judgeSessionId).catch(() => {})
+    this.traceWarned.delete(row.run.runId)
+    return { ok: true, run: row.run, message: `${TERMINATED_REASON}; saved Run history retained` }
   }
 }

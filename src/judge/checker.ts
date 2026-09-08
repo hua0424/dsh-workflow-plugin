@@ -9,7 +9,7 @@
  * Judge. This module owns only the packet text; the persona is delivered via
  * the spawn's `persona` option.
  */
-import type { JudgeResult, PendingCorrection } from '../types.ts'
+import type { JudgeResult, NodeClaim } from '../types.ts'
 import { LIMITS } from '../types.ts'
 
 /** Validate a parsed judge_claim argument into a JudgeResult (A1 v2). */
@@ -28,17 +28,15 @@ export interface JudgePromptInput {
   nodeInstruction: string
   criteria: string
   workerOutcome: 'completed' | 'failed'
-  workerSummary: string
+  workerHandoff: string
   workspaceCwd: string
   transcript: string
-  /**
-   * A1 R7/R8: REJECT evidence from a previous correction round on this same
-   * node, when present — the Judge sees what was already rejected and why.
-   */
-  previousRejection?: PendingCorrection
+  /** 最近 REJECT/NEED_CONTEXT 反馈；fresh/followup Judge 读取同一材料。 */
+  previousFeedback?: { result: 'REJECT' | 'NEED_CONTEXT'; reason: string; claim: NodeClaim }
+  managerContext?: string
 }
 
-const PROMPT_TEMPLATE = `You are an independent workflow judge evaluating ONE completed worker claim against the real workspace/remote facts.
+const PROMPT_TEMPLATE = `You are an independent workflow judge evaluating ONE submitted worker claim against the real workspace/remote facts.
 
 # Judgment duty
 - Inspect the actual workspace and repositories; never trust the worker's self-report alone.
@@ -52,20 +50,20 @@ Submit your verdict ONLY through the \`judge_claim\` tool, exactly once, with:
 - "reason": 1..2000 characters explaining the judgment
 
 - ACCEPT: the worker's claim is consistent with the facts, the node instruction, and the goal criteria. The node then concludes exactly as the worker claimed (completed → PASS edge, failed → FAIL edge).
-- REJECT: the claim is incorrect or the evidence is insufficient. Your reason MUST state concretely WHAT is wrong and HOW the work should be corrected — the worker receives it verbatim as the correction instruction for another attempt at the SAME node.
-- Use NEED_CONTEXT only when you genuinely cannot judge reliably from this packet and the read-only workspace. The reason MUST state: what information is missing, why it affects the judgment, and what the Manager should provide — never just "cannot judge".
+- REJECT: the claim conflicts with an existing criterion or a verifiable fact. Your reason MUST identify that criterion, cite the factual basis, and state concretely HOW to correct the work — the worker receives it verbatim for another attempt at the SAME node.
+- Use NEED_CONTEXT when information is insufficient or an existing requirement is unclear. State what is missing, why it affects judgment, and what the Manager should provide — never turn a personal preference into a new criterion and never just say "cannot judge".
 
 # Current judgment
 Node instruction:
 {nodeInstruction}
 
-Goal criteria (authoritative):
+Goal criteria (authoritative and frozen for this execution):
 {criteria}
-{previousRejection}
+{previousFeedback}{managerContext}
 Worker claimed outcome: {workerOutcome}
 
-Worker summary:
-{workerSummary}
+Worker handoff:
+{workerHandoff}
 
 # Workspace
 cwd: {workspaceCwd}
@@ -73,24 +71,24 @@ cwd: {workspaceCwd}
 # Node-local context (user/manager/actor-visible only, since this node dispatched)
 {transcript}`
 
-/** Render the [previous rejection]/[previous claim] evidence block (A1 §7.1). */
-function renderPreviousRejection(pc: PendingCorrection | undefined): string {
-  if (pc === undefined) return ''
-  const handoff = pc.previousClaim.handoffContext !== undefined
-    ? `\nhandoffContext: ${pc.previousClaim.handoffContext}`
-    : ''
-  return `\n# Previous judgment on this node (REJECTED)\n[judge rejection]\n${pc.judgeReason}\n\n[previous claim]\noutcome: ${pc.previousClaim.outcome}\nsummary: ${pc.previousClaim.summary}${handoff}\n`
+/** Render the latest non-terminal Judge feedback with its exact claim. */
+function renderPreviousFeedback(feedback: JudgePromptInput['previousFeedback']): string {
+  if (feedback === undefined) return ''
+  return `\n# Previous Judge feedback on this node (${feedback.result})\n[judge reason]\n${feedback.reason}\n\n[judged claim]\noutcome: ${feedback.claim.outcome}\nhandoff: ${feedback.claim.handoff}\n`
+}
+
+function renderManagerContext(context: string | undefined): string {
+  return context === undefined ? '' : `\n# Manager context (clarifies existing inputs; does not change frozen criteria)\n${context}\n`
 }
 
 /** Render the Judgment Packet sent as the Judge's initial user message (A1 R7). */
 export function renderJudgePrompt(input: JudgePromptInput): string {
-  return PROMPT_TEMPLATE
-    .replaceAll('{nodeToken}', input.nodeToken)
-    .replace('{nodeInstruction}', input.nodeInstruction)
-    .replace('{criteria}', input.criteria)
-    .replace('{previousRejection}', renderPreviousRejection(input.previousRejection))
-    .replace('{workerOutcome}', input.workerOutcome)
-    .replace('{workerSummary}', input.workerSummary)
-    .replace('{workspaceCwd}', input.workspaceCwd)
-    .replace('{transcript}', input.transcript === '' ? '(no node-local conversation since dispatch)' : input.transcript)
+  const fields: Record<string, string> = {
+    ...input,
+    previousFeedback: renderPreviousFeedback(input.previousFeedback),
+    managerContext: renderManagerContext(input.managerContext),
+    transcript: input.transcript === '' ? '(no node-local conversation since dispatch)' : input.transcript,
+  }
+  // 单次替换：交付文本中的占位符和 $& 是原文，不再次解释。
+  return PROMPT_TEMPLATE.replace(/\{(\w+)\}/g, (placeholder, key: string) => fields[key] ?? placeholder)
 }

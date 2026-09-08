@@ -25,7 +25,7 @@ export const PROJECTION_MAX_CHARS = 120_000
  */
 export interface ProjectionSource {
   id: string
-  events: readonly SessionEvent[]
+  snapshotEvents(): readonly SessionEvent[]
   /** Next unallocated seq (one past the last event). */
   seq: number
 }
@@ -61,21 +61,21 @@ export interface ProjectedMessage {
  * A1 R5 vs R6 source policy:
  * - MANAGER/USER sessions keep only `source.kind === 'user'` user messages
  *   (plugin/coordinator notices are excluded per R5);
- * - ACTOR sessions ALSO keep `source.kind === 'coordinator'` relayed user
- *   messages — within the boundary seq those relays ARE this node's
- *   dispatch/handoff/resolution text (R6), delivered by the engine via
- *   `followup`. The initial `startContinuable` prompt is `{kind:'user'}`.
+ * - ACTOR 也保留本插件的 host Queue 派发来源；旧 coordinator 仅供历史读取。
+ *   dispatch/handoff/resolution 仍受 message-id 边界约束（R6）。
+ *   首次 `startContinuable` prompt 的来源仍是 `{kind:'user'}`。
  */
 export function projectSessionSurface(session: ProjectionSource, fromSeq: number, role: 'USER' | 'MANAGER' | 'ACTOR'): ProjectedMessage[] {
   const out: ProjectedMessage[] = []
-  for (const event of session.events) {
+  for (const event of session.snapshotEvents()) {
     if (event.seq < fromSeq) continue
     if (!isAppendSurfaceEvent(event)) continue
     let message: ReturnType<typeof deriveEventMessage>
     let entryRole = role
     if (event.type === 'user/message') {
-      const source = (event.data as { source?: { kind?: string } }).source
-      if (source?.kind !== 'user' && !(role === 'ACTOR' && source?.kind === 'coordinator')) continue
+      const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
+      if (source?.kind !== 'user' && !(role === 'ACTOR' && (source?.kind === 'coordinator'
+        || (source?.kind === 'plugin' && source.plugin === 'dsh-agent-team-workflow')))) continue
       // A1 R3: keep the three-way attribution — a real human user message in
       // the Manager session projects as USER, assistant output as MANAGER.
       if (role === 'MANAGER' && source?.kind === 'user') entryRole = 'USER'
@@ -113,7 +113,7 @@ function stripSubmissionConstraint(text: string): string {
 function executorFromSeq(session: ProjectionSource, boundary: NodeContextBoundary): number {
   const id = boundary.executorDispatchMessageId
   if (id !== undefined) {
-    for (const event of session.events) {
+    for (const event of session.snapshotEvents()) {
       const message = deriveEventMessage(event)
       if (message !== null && message.id === id) return event.seq
     }
@@ -143,8 +143,8 @@ export function projectNodeLocal(
 
   // Executing Actor session: its own Node-scoped visible assistant + dispatch
   // text (the dispatch message itself is a user/message with source.kind ===
-  // 'user' on first creation, or a coordinator relay on followup — both are
-  // kept for the ACTOR role per A1 R6).
+  // 'user' on first creation, or this Workflow plugin on host Queue continuation
+  // (legacy coordinator history is also kept for the ACTOR role per A1 R6).
   if (actorSession !== undefined && boundary.executorSessionId !== undefined) {
     const from = executorFromSeq(actorSession, boundary)
     parts.push(...projectSessionSurface(actorSession, from, 'ACTOR'))

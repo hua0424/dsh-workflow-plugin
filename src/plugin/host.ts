@@ -2,11 +2,18 @@
  * Host adapters: wire the real DSH services into the engine's narrow
  * interfaces (design §2.3 deployment / §4 runtime).
  */
-import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import type {} from '@deepseek-ai/dsh-subagent'
+import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-compaction'
+// Type-only：让 ctx.get('agentPresets') 解析到 preset 服务类型。运行期该服务
+// 经 DSH 安装解析；roster 缺席（base-only profile / 旧版 dsh）时 get 返回
+// undefined，走宿主平面回退——与 dsh-subagent/child-agent.ts 的用法一致。
+import type {} from '@deepseek-ai/dsh-agent-presets'
+import type { JobStatus } from '@deepseek-ai/dsh-jobs'
+import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
+import { SessionPersistenceNotFoundError, type SessionInspection, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { StateStore } from '../state/store.ts'
 import type { RunState } from '../types.ts'
 import { WorkflowError } from '../types.ts'
@@ -16,25 +23,35 @@ import { judgeLabel, judgeSpawnPlan, JUDGE_ALLOW, JUDGE_MACHINERY_EXEMPT, resolv
 import { topFrame } from '../state/invariants.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
+import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
 
-/** Narrow shape of the `ctx.compaction` service (`@deepseek-ai/dsh-compaction`). */
-interface CompactionService {
-  compactNow(agent: Agent, signal: AbortSignal): Promise<{ shadowedSeqs: number[]; shadowedTokenCount: number } | null>
+const TERMINAL_JOB_STATUSES = new Set<JobStatus>(['completed', 'failed', 'killed'])
+
+/** 从 durable 根集合按 parentSession 线性补齐 live 后代。 */
+function liveDescendantIds(seedIds: Iterable<string>, agents: readonly Agent[]): Set<string> {
+  const ids = new Set(seedIds)
+  const childrenByParent = new Map<string, Agent[]>()
+  for (const agent of agents) {
+    const parent = agent.session.header.parentSession
+    if (!parent) continue
+    const children = childrenByParent.get(parent) ?? []
+    children.push(agent)
+    childrenByParent.set(parent, children)
+  }
+  const queue = [...ids]
+  for (let index = 0; index < queue.length; index++) {
+    for (const child of childrenByParent.get(queue[index]!) ?? []) {
+      if (ids.has(child.id)) continue
+      ids.add(child.id)
+      queue.push(child.id)
+    }
+  }
+  return ids
 }
 
-/** Duck-typed ManualCompactionError (`@deepseek-ai/dsh-compaction`). */
-function isManualCompactionError(error: unknown): error is Error & { code: string } {
-  return error instanceof Error && error.name === 'ManualCompactionError'
-}
-
-/**
- * Narrow shape of the optional `sessionPersistence` service
- * (`@deepseek-ai/dsh-session-persistence`, ctx key `sessionPersistence`) — the
- * same `inspect()` the subagent continuation manager uses for cold resume.
- * Duck-typed because the package is not a dependency of this plugin.
- */
-interface SessionPersistenceLike {
-  inspect(id: string, signal?: AbortSignal): Promise<{ meta: { id: string }; events: ReadonlyArray<import('@deepseek-ai/dsh-session').SessionEvent> }>
+/** Optional Host service used by the continuation manager for cold Session reads. */
+function sessionPersistence(ctx: Context): SessionPersistence | undefined {
+  return ctx.get('sessionPersistence') as SessionPersistence | undefined
 }
 
 /**
@@ -46,12 +63,13 @@ interface SessionPersistenceLike {
  * packet.
  */
 async function inspectPersistedSession(ctx: Context, sessionId: string): Promise<ProjectionSource | undefined> {
-  const persistence = ctx.get('sessionPersistence') as SessionPersistenceLike | undefined
-  if (persistence === undefined || typeof persistence.inspect !== 'function') return undefined
-  let inspection: Awaited<ReturnType<SessionPersistenceLike['inspect']>>
+  const persistence = sessionPersistence(ctx)
+  if (persistence === undefined) return undefined
+  let inspection: SessionInspection
   try {
-    inspection = await persistence.inspect(sessionId, new AbortController().signal)
+    inspection = await persistence.inspect(SessionId(sessionId), new AbortController().signal)
   } catch (error) {
+    if (error instanceof SessionPersistenceNotFoundError) throw error
     const detail = error instanceof Error ? error.message : String(error)
     throw new WorkflowError(`actor session projection failed: ${detail}`)
   }
@@ -61,20 +79,21 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   const events = inspection.events.slice()
   return {
     id: inspection.meta.id,
-    events,
+    snapshotEvents: () => events,
     seq: events.length > 0 ? events[events.length - 1]!.seq + 1 : 0,
   }
 }
 
-/** Best-effort durable existence probe for a reserved Judge Session id. */
-async function judgeSessionExistsInPersistence(ctx: Context, sessionId: string): Promise<boolean> {
+/** Only a typed NotFound proves absence; all other persistence uncertainty preserves identity. */
+async function sessionAvailability(ctx: Context, sessionId: string): Promise<import('../engine/engine.ts').SessionAvailability> {
+  if (ctx.agents.get(SessionId(sessionId)) !== undefined) return 'available'
+  const persistence = sessionPersistence(ctx)
+  if (persistence === undefined) return 'unknown'
   try {
     const source = await inspectPersistedSession(ctx, sessionId)
-    return source !== undefined && source.id === sessionId
-  } catch {
-    // A persistence fault is not proof of existence. Fail closed toward
-    // spawn-rebuild, which rebuilds the Judge packet from pendingClaim.
-    return false
+    return source?.id === sessionId ? 'available' : 'unknown'
+  } catch (error) {
+    return error instanceof SessionPersistenceNotFoundError ? 'missing' : 'unknown'
   }
 }
 
@@ -106,30 +125,53 @@ function errorDetail(error: unknown): string {
 
 /** ManualCompactionError detail (`compaction <code>: <message>`), else the plain message. */
 function compactErrorDetail(error: unknown): string {
-  if (isManualCompactionError(error)) return `compaction ${error.code}: ${error.message}`
+  if (error instanceof ManualCompactionError) return `compaction ${error.code}: ${error.message}`
   return errorDetail(error)
 }
 
-export function makeStateHost(store: StateStore): StateHost {
+/**
+ * 该 agent 会话平面所拥有的压缩后端。
+ *
+ * dsh 0.1.1-rc.7 引入 agent presets 后，`compaction` 不再挂载在宿主平面
+ * （web-app bundle 显式禁用宿主平面副本），而是由每个会话的 preset 在自己
+ * 的 isolate 域挂载；宿主插件行 inject 它只会永久 `waiting for service` 并
+ * 卡死 boot。按目标 agent 解析：先经 `agentPresets.serviceFor` 取该 agent
+ * 自己的 preset 实例（"请求来自会话外部、操作目标是某个会话"的规范读法），
+ * preset 未挂或 roster 缺席再回退宿主平面挂载（base-only profile / 旧版
+ * dsh）；两者都无 → undefined，调用方按良性跳过处理并告警。
+ */
+function compactionFor(ctx: Context, agent: Agent): CompactionEngine | undefined {
+  const presets = ctx.get('agentPresets')
+  return presets?.serviceFor(agent, 'compaction') ?? ctx.get('compaction')
+}
+
+/** 无任何压缩后端时的良性跳过（与 "no actor mapped" 同级），附 host 侧告警。 */
+function noCompactionBackend(ctx: Context, sessionId: string): { ok: true; detail: string } {
+  ctx.logger.warn(`workflow boundary compact skipped: session ${sessionId} has no compaction backend (neither its agent preset nor the host plane mounts one)`)
+  return { ok: true, detail: 'no compaction backend; boundary compact skipped' }
+}
+
+export function makeStateHost(source: StateStore | (() => StateStore)): StateHost {
+  const store = (): StateStore => typeof source === 'function' ? source() : source
   return {
     async get(workspaceKey) {
-      const row = await store.get(workspaceKey)
+      const row = await store().get(workspaceKey)
       if (row === undefined) return undefined
-      return { run: row.run, version: row.stateVersion }
+      return { run: row.run, execution: row.execution, version: row.stateVersion }
     },
-    async put(workspaceKey, run, expectedVersion) {
-      await store.updateRow(workspaceKey, run, expectedVersion)
+    async put(workspaceKey, run, expectedVersion, changes) {
+      await store().updateRow(workspaceKey, run, expectedVersion, changes)
     },
-    async create(workspaceKey, run) {
-      const row = await store.createRow(workspaceKey, run)
+    async create(workspaceKey, run, execution) {
+      const row = await store().createRow(workspaceKey, run, execution)
       return row.stateVersion
     },
-    async remove(workspaceKey) {
-      await store.deleteRow(workspaceKey)
-    },
+    execution: (workspaceKey, executionId) => store().execution(workspaceKey, executionId),
+    events: (workspaceKey, executionId, after, limit) => store().events(workspaceKey, executionId, after, limit),
+    historyOwner: (workspaceKey, executionId) => store().historyOwner(workspaceKey, executionId),
     async listRuns() {
-      const rows = await store.list()
-      return rows.map(row => ({ workspaceKey: row.workspaceKey, run: row.run, version: row.stateVersion }))
+      const rows = await store().list()
+      return rows.map(row => ({ workspaceKey: row.workspaceKey, run: row.run, execution: row.execution, version: row.stateVersion }))
     },
   }
 }
@@ -165,10 +207,9 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const childId = run.roleActors[roleKey]
       if (childId === undefined) throw new WorkflowError(`no actor mapped for role "${roleKey}"`)
-      const messageId = await adapters.ctx.subagents.followup(manager, childId as SessionId, textBlocks(text), {
-        source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
-        signal: new AbortController().signal,
-      })
+      // Workflow 派发必须是独立 child turn，不可用 nearest-step sendMessage。
+      const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(childId), textBlocks(text),
+        { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
       return { messageId }
     },
     managerSessionSeq(run) {
@@ -179,8 +220,109 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
   }
 }
 
-export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { provider?: string; model?: string }): SubagentHost {
+export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { provider?: string; model?: string }): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+  // ponytail: plugin-lifetime保留当代Agent/祖先/unsafe证据；若长期进程的Session churn实测成问题，再随Run完成/Reset显式清理。
+  const observed = new Map<string, Agent>()
+  const parents = new Map<string, string>()
+  const unsafe = new Set<string>()
+  const recordParentSession = (agent: Agent): void => {
+    const parentId = agent.session.header.parentSession
+    if (parentId !== undefined) parents.set(agent.id, parentId)
+  }
+  const stopObservingJobs = adapters.ctx.jobs.onJobDone((job, owner) => {
+    if (!owner || !job.detail?.includes('work may be orphaned')) return
+    recordParentSession(owner)
+    // 保留 exact owner 与当时已知祖先；descriptor 消失不能洗白父 Role。
+    const seen = new Set<string>()
+    for (let id: string | undefined = owner.id; id !== undefined && !seen.has(id); id = parents.get(id)) {
+      seen.add(id)
+      unsafe.add(id)
+      const agent = observed.get(id) ?? adapters.ctx.agents.get(SessionId(id))
+      if (agent !== undefined) recordParentSession(agent)
+    }
+  })
+  adapters.ctx.effect(() => () => {
+    stopObservingJobs()
+    observed.clear()
+    parents.clear()
+    unsafe.clear()
+  })
+  async function judgePrompt(run: RunState, input: import('../engine/engine.ts').JudgeSpawnInput): Promise<string> {
+    const manager = adapters.managerAgentOf(run)
+    if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+    const executorSessionId = input.boundary.executorSessionId
+    let actorSession: ProjectionSource | undefined
+    if (executorSessionId !== undefined) {
+      const actorAgent = adapters.ctx.agents.get(SessionId(executorSessionId))
+      actorSession = actorAgent?.session ?? await inspectPersistedSession(adapters.ctx, executorSessionId)
+    }
+    return renderJudgePrompt({
+      nodeToken: input.nodeToken,
+      nodeInstruction: `[当前工作单 input]\n${input.input}\n\n[instruction]\n${input.instruction}${input.recovery ? JUDGE_RECOVERY_INSTRUCTION : ''}`,
+      criteria: input.criteria,
+      workerOutcome: input.claim.outcome,
+      workerHandoff: input.claim.handoff,
+      workspaceCwd: input.cwd,
+      transcript: projectNodeLocal(manager.session, input.boundary, actorSession),
+      previousFeedback: input.previousFeedback,
+      managerContext: input.managerContext,
+    })
+  }
   return {
+    observeTurnEnd(sessionId) {
+      const agent = adapters.ctx.agents.get(SessionId(sessionId))
+      if (agent) {
+        observed.set(sessionId, agent)
+        recordParentSession(agent)
+      }
+    },
+    async safeToInspect(sessionId) {
+      const agent = observed.get(sessionId) ?? adapters.ctx.agents.get(SessionId(sessionId))
+      if (!agent || unsafe.has(sessionId)) return false
+      try {
+        await agent.whenIdle()
+        const descendants = await adapters.ctx.subagents.listDescendants(SessionId(sessionId))
+        if (descendants.some(child => child.kind === 'diagnostic')) return false
+        for (const child of descendants) parents.set(String(child.id), String(child.parentId))
+        const durableIds = new Set([sessionId, ...descendants.map(child => String(child.id))])
+        if ([...durableIds].some(id => unsafe.has(id))) return false
+        const requiredIds = new Set([sessionId, ...descendants
+          .filter(child => child.kind === 'child' && child.activity === 'running')
+          .map(child => String(child.id))])
+        for (const id of durableIds) if (observed.has(id)) requiredIds.add(id)
+
+        // Durable inactive 后代没有 Activation；registry 补齐 descriptor
+        // 发布窗口中的 live 后代，以及 cold parent 之下的 live 后代。
+        const live = adapters.ctx.agents.list()
+        for (const candidate of live) recordParentSession(candidate)
+        const treeIds = liveDescendantIds(durableIds, live)
+        for (const child of live) if (treeIds.has(child.id)) requiredIds.add(child.id)
+
+        const agents: Agent[] = []
+        for (const id of requiredIds) {
+          const candidate = observed.get(id) ?? adapters.ctx.agents.get(SessionId(id))
+          if (!candidate || candidate.status !== 'idle' || candidate.inbox.hasPending || unsafe.has(id)) return false
+          agents.push(candidate)
+        }
+        await Promise.all(agents.map(candidate => candidate.whenIdle()))
+
+        const currentDescendants = await adapters.ctx.subagents.listDescendants(SessionId(sessionId))
+        for (const child of currentDescendants) parents.set(String(child.id), String(child.parentId))
+        if (currentDescendants.some(child => child.kind === 'diagnostic'
+          || unsafe.has(String(child.id))
+          || (child.activity === 'running' && !requiredIds.has(String(child.id))))) return false
+        const currentLive = adapters.ctx.agents.list()
+        for (const candidate of currentLive) recordParentSession(candidate)
+        const currentTreeIds = liveDescendantIds([sessionId, ...currentDescendants.map(child => String(child.id))], currentLive)
+        if (currentLive.some(child => currentTreeIds.has(child.id) && !requiredIds.has(child.id))) return false
+        return agents.every(candidate => {
+          const current = adapters.ctx.agents.get(candidate.id)
+          return (current === undefined || current === candidate) && candidate.status === 'idle' && !candidate.inbox.hasPending && !unsafe.has(candidate.id)
+            && adapters.ctx.jobs.list(candidate).filter(job => job.ownerSession === candidate.id)
+              .every(job => TERMINAL_JOB_STATUSES.has(job.status) && !job.detail?.includes('work may be orphaned'))
+        })
+      } catch { return false }
+    },
     async ensureRoleActor(run, roleKey, initialText) {
       const existing = run.roleActors[roleKey]
       if (existing !== undefined) {
@@ -188,10 +330,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         // correct continuation for an existing mapping.
         const manager = adapters.managerAgentOf(run)
         if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-        const messageId = await adapters.ctx.subagents.followup(manager, existing as SessionId, textBlocks(initialText), {
-          source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
-          signal: new AbortController().signal,
-        })
+        const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(existing), textBlocks(initialText),
+          { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
         return { childId: existing, messageId }
       }
       const manager = adapters.managerAgentOf(run)
@@ -226,35 +366,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const plan = judgeSpawnPlan(run, frozenRoute())
 
-      // A1 R5–R7: Node-local projection (no full manager transcript).
-      // F9: read the actor's events resident-first, then through session
-      // persistence — a Judge packet rebuilt for respawn/spawn-recovery runs
-      // long after the actor's Activation auto-settled (DSH releases continuable
-      // children when quiescent), and the durable Session log still holds the
-      // node's actor history either way.
-      const executorSessionId = run.nodeBoundary.executorSessionId
-      let actorSession: ProjectionSource | undefined
-      if (executorSessionId !== undefined) {
-        const actorAgent = adapters.ctx.agents.get(SessionId(executorSessionId))
-        if (actorAgent !== undefined) {
-          actorSession = actorAgent.session
-        } else {
-          actorSession = await inspectPersistedSession(adapters.ctx, executorSessionId)
-        }
-      }
-      const transcript = projectNodeLocal(manager.session, run.nodeBoundary, actorSession)
-
-      const prompt = renderJudgePrompt({
-        nodeToken: input.nodeToken,
-        nodeInstruction: input.instruction,
-        criteria: input.criteria,
-        workerOutcome: input.claim.outcome,
-        workerSummary: input.claim.summary,
-        workspaceCwd: input.cwd,
-        transcript,
-        // A1 §7.1: prior REJECT evidence for this same node, when present.
-        previousRejection: input.previousRejection,
-      })
+      // 首次、followup 与 respawn 都从同一当前工作单材料重建完整 packet。
+      const prompt = await judgePrompt(run, input)
 
       const started = await adapters.ctx.subagents.startContinuable({
         provider: 'spawn',
@@ -295,17 +408,21 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       return { judgeSessionId: started.childId, messageId: started.messageId }
     },
 
-    async judgeSessionExists(judgeSessionId) {
-      return judgeSessionExistsInPersistence(adapters.ctx, judgeSessionId)
+    async judgeSessionAvailability(judgeSessionId) {
+      return sessionAvailability(adapters.ctx, judgeSessionId)
     },
 
-    async followupJudge(run, judgeSessionId, text) {
+    async roleSessionAvailability(roleSessionId) {
+      return sessionAvailability(adapters.ctx, roleSessionId)
+    },
+
+    async followupJudge(run, judgeSessionId, input) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      await adapters.ctx.subagents.followup(manager, SessionId(judgeSessionId), textBlocks(text), {
-        source: { kind: 'coordinator', form: 'relay', senderSessionId: manager.session.id },
-        signal: new AbortController().signal,
-      })
+      const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(judgeSessionId), textBlocks(await judgePrompt(run, input)),
+        { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
+      adapters.registerJudgeSession(judgeSessionId, input.cwd)
+      return { messageId }
     },
 
     async retireJudge(run, judgeSessionId) {
@@ -320,17 +437,13 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async drainJudge(run, judgeSessionId) {
       const manager = adapters.managerAgentOf(run)
       adapters.revokeJudgeSession(judgeSessionId)
-      if (manager === undefined) return
-      await adapters.ctx.subagents.drainContinuableChildren(manager, [SessionId(judgeSessionId)]).catch(() => {})
+      if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+      await adapters.ctx.subagents.drainContinuableChildren(manager, [SessionId(judgeSessionId)])
     },
 
     async compactRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
-      const compaction = adapters.ctx.get('compaction') as CompactionService | undefined
-      if (compaction === undefined || typeof compaction.compactNow !== 'function') {
-        return { ok: true, detail: 'no compaction service' }
-      }
       const signal = new AbortController().signal
       // A4 plan A (docs/prd/20260903-workflow-hardening/a4-code-findings.md §3):
       // the settlement watcher releases the actor's Activation right after its
@@ -342,22 +455,22 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // cold-resumes the compacted surface.
       const resident = adapters.ctx.agents.get(childId as SessionId)
       if (resident !== undefined) {
-        // Rare race (findings §1): the Judge finished while the actor's own
-        // turn is still draining. Compact in place; a busy actor degrades to a
-        // skip — the dispatch message queues FIFO behind the running turn
-        // exactly as it did before plan A.
+        const compaction = compactionFor(adapters.ctx, resident)
+        if (compaction === undefined) return noCompactionBackend(adapters.ctx, childId)
+        // 收口后仍可能被外部唤醒；busy 必须拒绝，不能以FIFO排队冒充compact通过。
         try {
           const result = await compaction.compactNow(resident, signal)
           if (result === null) return { ok: true, detail: 'no compactable range' }
           return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
         } catch (error) {
-          if (isManualCompactionError(error) && error.code === 'busy') {
-            return { ok: true, detail: 'resident actor busy; skipped' }
+          if (error instanceof ManualCompactionError && error.code === 'busy') {
+            return { ok: false, detail: 'resident actor busy' }
           }
           return { ok: false, detail: compactErrorDetail(error) }
         }
       }
       const route = resolveRoleModel(run, roleKey, frozenRoute())
+      const manager = adapters.managerAgentOf(run)
       let handle: AgentHandle
       try {
         handle = await adapters.ctx.agents.resume({
@@ -368,16 +481,38 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
           // latest routed request), so the summary model may differ from the
           // actor's model.
           agentOptions: route.provider !== undefined || route.model !== undefined ? route : undefined,
+          // Maintenance materialization must join the parent preset too: the
+          // compaction backend (and every model-facing row) lives in the
+          // preset's isolate domain, and an unjoined agent resolves no backend
+          // via serviceFor (dsh also warns about publishing unjoined agents).
+          // Mirrors applyChildComposition's join step only — persona/tool
+          // filter are turn-facing and irrelevant to a compact-only surface.
+          // Join failure degrades to the host-plane fallback / skip below, so
+          // it is logged rather than failing the resume.
+          ...(manager === undefined ? {} : {
+            setup: ((agentCtx: Context) => {
+              try {
+                agentCtx.get('agentPresets')?.composeFrom(agentCtx, manager.ctx)
+              } catch (error) {
+                agentCtx.logger.warn(`workflow maintenance preset join skipped: ${errorDetail(error)}`)
+              }
+            }) satisfies AgentSetup,
+          }),
         })
       } catch (error) {
         return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
       }
       let outcome: { ok: boolean; detail: string }
       try {
-        const result = await compaction.compactNow(handle.agent, signal)
-        outcome = result === null
-          ? { ok: true, detail: 'cold: no compactable range' }
-          : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+        const compaction = compactionFor(adapters.ctx, handle.agent)
+        if (compaction === undefined) {
+          outcome = noCompactionBackend(adapters.ctx, childId)
+        } else {
+          const result = await compaction.compactNow(handle.agent, signal)
+          outcome = result === null
+            ? { ok: true, detail: 'cold: no compactable range' }
+            : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+        }
       } catch (error) {
         outcome = { ok: false, detail: compactErrorDetail(error) }
       }

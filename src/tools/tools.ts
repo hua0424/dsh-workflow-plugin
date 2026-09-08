@@ -3,9 +3,9 @@
  * wrappers. Pure definitions + execute closures over a ToolHost interface, so
  * the whole tool layer is unit-testable without the host.
  */
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { defineTool, ToolArgsError } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { LIMITS, type ClaimOutcome, type ClaimCaller } from '../types.ts'
+import { LIMITS, normalizeNodeClaim, type ClaimOutcome, type ClaimCaller } from '../types.ts'
 import { callerTurnUserMessageIds } from '../plugin/turnbind.ts'
 
 /** Length-check a tool text argument per the design bounds. */
@@ -19,7 +19,7 @@ function lengthError(field: string, value: string | undefined, min: number, max:
 
 /** Minimal shape of the exec's caller agent the binding needs. */
 interface CallerAgentLike {
-  session: { id: string; events?: unknown }
+  session: { id: string; snapshotEvents?: () => unknown }
 }
 
 /**
@@ -33,7 +33,7 @@ function claimCallerOf(exec: { agent?: unknown; callId?: string; rootCallId?: st
     ? (exec.agent as CallerAgentLike)
     : undefined
   const sessionId = agent?.session.id ?? ''
-  const events = agent?.session.events
+  const events = typeof agent?.session.snapshotEvents === 'function' ? agent.session.snapshotEvents() : undefined
   const callId = typeof exec.callId === 'string' ? exec.callId : ''
   const rootCallId = typeof exec.rootCallId === 'string' ? exec.rootCallId : callId
   const ids = Array.isArray(events) && callId !== ''
@@ -54,14 +54,14 @@ export interface ToolHost {
   // Engine mutations (callers already passed authorize; `caller` identifies
   // the calling agent's session — for claim/block it also carries the calling
   // turn's user-message id snapshot for dispatch-lease admission, A1 R2/R3).
-  claim(workspaceKey: string, claim: { outcome: ClaimOutcome; summary: string; handoffContext?: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
+  claim(workspaceKey: string, claim: { outcome: ClaimOutcome; handoff: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   block(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
-  resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string, target?: 'auto' | 'actor' | 'judge'): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
-  setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
-  status(workspaceKey: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
-  judgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, judgeSessionId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  status(workspaceKey: string, caller: string, history?: { executionId: string; after?: number; limit?: number }): Promise<{ ok: boolean; reason?: string; status?: unknown }>
+  judgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   respawnJudge(workspaceKey: string, nodeToken: string, reason: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
 
   // Inspection wrappers (read-only, enum operations)
@@ -71,6 +71,11 @@ export interface ToolHost {
 
 function text(v: string): Array<{ type: 'text'; text: string }> {
   return [{ type: 'text', text: v }]
+}
+
+function rejectUnknown(args: Record<string, unknown>, allowed: readonly string[], toolName: string): void {
+  const unknown = Object.keys(args).filter(key => !allowed.includes(key))
+  if (unknown.length) throw new ToolArgsError(unknown.map(key => `unsupported ${toolName} property "${key}"`))
 }
 
 function fmtResult(outcome: { ok: boolean; reason?: string; message?: string; status?: unknown; value?: unknown }): string {
@@ -98,13 +103,25 @@ async function controlWorkspace(agent: unknown, toolName: string): Promise<{ wor
 export const workflowTools: ToolDefinition[] = [
   defineTool({
     name: 'workflow_status',
-    description: '查看当前 workspace 的 Workflow Run 状态（只读；Manager 与 Role Actor 可用）。',
-    parameters: {},
+    description: '默认查看当前 Run 摘要；Manager 可显式指定 executionId/after/limit 分页查看关键历史（最多 50 条）。',
+    parameters: {
+      executionId: { type: 'string', description: '本 Run 的 execution ID；提供后进入 Manager-only 历史模式' },
+      after: { type: 'integer', description: '稳定事件 sequence 游标（exclusive，默认 0）' },
+      limit: { type: 'integer', description: '每页 1..50 条（默认 50）' },
+    },
     output: stringOut,
-    async execute(_args, exec) {
+    async execute(args, exec) {
       const auth = await controlWorkspace(exec.agent, 'workflow_status')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
-      return fmtResult(await thisHost().status(auth.workspaceKey))
+      rejectUnknown(args, ['executionId', 'after', 'limit'], 'workflow_status')
+      const historyRequested = args.executionId !== undefined || args.after !== undefined || args.limit !== undefined
+      if (!historyRequested) return fmtResult(await thisHost().status(auth.workspaceKey, auth.caller))
+      if (typeof args.executionId !== 'string' || !args.executionId.trim()) throw new ToolArgsError(['workflow_status history requires executionId'])
+      if (args.after !== undefined && (!Number.isSafeInteger(args.after) || args.after < 0)) throw new ToolArgsError(['workflow_status after must be a non-negative integer'])
+      if (args.limit !== undefined && (!Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 50)) throw new ToolArgsError(['workflow_status limit must be an integer from 1 to 50'])
+      return fmtResult(await thisHost().status(auth.workspaceKey, auth.caller, {
+        executionId: args.executionId.trim(), ...(args.after === undefined ? {} : { after: args.after }), ...(args.limit === undefined ? {} : { limit: args.limit }),
+      }))
     },
   }),
 
@@ -113,29 +130,23 @@ export const workflowTools: ToolDefinition[] = [
     description: '提交当前 Node 的工作结果声明（candidate result）。由 Checker 独立确认 ACCEPT/REJECT。无需任何 token——绑定由派发 lease 自动完成。这必须是当前 Turn 的最后一个动作。',
     parameters: {
       outcome: { type: 'string', required: true, enum: ['completed', 'failed'], description: 'completed | failed' },
-      summary: { type: 'string', required: true, description: '工作摘要（1..4000 字符）' },
-      handoffContext: { type: 'string', description: '交给下一 Node 的上下文（completed 与 failed 均可携带，1..8000 字符；failed 时用于向后继返工/修复节点传递完整业务上下文）' },
+      handoff: { type: 'string', required: true, description: '唯一结果与交接说明（trim 后 1..8000 字符，completed/failed 对称，END 也必填）：实际结果、产物位置与核验依据、剩余问题和后续约束。Judge、Manager、后继读取同一文本；不接受旧 summary/handoffContext。' },
     },
     output: stringOut,
     async execute(args, exec) {
       const auth = await controlWorkspace(exec.agent, 'node_claim')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
+      // 宿主 defineTool 的参数根是 open object；显式拒绝旧字段及其它业务入口。
+      const unknown = Object.keys(args).filter(key => key !== 'outcome' && key !== 'handoff')
+      if (unknown.length > 0) throw new ToolArgsError(unknown.map(key => `unsupported node_claim property "${key}"; use outcome and handoff`))
       const host = thisHost()
-      const summaryError = lengthError('summary', args.summary, LIMITS.summaryMin, LIMITS.summaryMax, true)
-      if (summaryError !== undefined) return `拒绝：${summaryError}`
-      // 20260906-claim-handoff-symmetry R1: handoffContext accepts the SAME
-      // contract for completed and failed — the outcome only picks the edge.
-      if (args.handoffContext !== undefined) {
-        const handoffError = lengthError('handoffContext', args.handoffContext, 1, LIMITS.handoffMax, false)
-        if (handoffError !== undefined) return `拒绝：${handoffError}`
+      let claim
+      try {
+        claim = normalizeNodeClaim(args)
+      } catch (error) {
+        return `拒绝：${error instanceof Error ? error.message : String(error)}`
       }
-      const outcome = await host.claim(auth.workspaceKey, {
-        outcome: args.outcome,
-        // Review fix: length checks are trim-based, so the STORED payloads are
-        // the trim results — a whitespace bomb must never reach State.
-        summary: args.summary.trim(),
-        handoffContext: args.handoffContext !== undefined ? args.handoffContext.trim() : undefined,
-      }, claimCallerOf(exec))
+      const outcome = await host.claim(auth.workspaceKey, claim, claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },
@@ -162,18 +173,20 @@ export const workflowTools: ToolDefinition[] = [
 
   defineTool({
     name: 'node_resume',
-    description: 'Manager 恢复 BLOCK 的当前 Node（生成新 token 并重新派发）。',
+    description: 'Manager 恢复 BLOCK 的当前 Node；target=auto|actor|judge，生成新 token 并按当前材料继续。',
     parameters: {
       nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
-      resolutionContext: { type: 'string', required: true, description: '处理结果上下文（1..8000 字符）' },
+      resolutionContext: { type: 'string', required: true, description: '完整当前补充/处理上下文（1..8000 字符；替换上次当前补充，旧值保留在 events）' },
+      target: { type: 'string', enum: ['auto', 'actor', 'judge'], description: '恢复目标；默认 auto' },
     },
     output: stringOut,
     async execute(args, exec) {
       const auth = await controlWorkspace(exec.agent, 'node_resume')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
+      rejectUnknown(args, ['nodeToken', 'resolutionContext', 'target'], 'node_resume')
       const ctxError = lengthError('resolutionContext', args.resolutionContext, LIMITS.resolutionMin, LIMITS.resolutionMax, true)
       if (ctxError !== undefined) return `拒绝：${ctxError}`
-      return fmtResult(await thisHost().resume(auth.workspaceKey, args.nodeToken, args.resolutionContext.trim(), auth.caller))
+      return fmtResult(await thisHost().resume(auth.workspaceKey, args.nodeToken, args.resolutionContext.trim(), auth.caller, args.target ?? 'auto'))
     },
   }),
 
@@ -222,7 +235,7 @@ export const workflowTools: ToolDefinition[] = [
     async execute(args, exec) {
       const auth = await controlWorkspace(exec.agent, 'workflow_set_role_model')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
-      return fmtResult(await thisHost().setRoleModel(auth.workspaceKey, args.roleKey, args.provider, args.modelId))
+      return fmtResult(await thisHost().setRoleModel(auth.workspaceKey, args.roleKey, args.provider, args.modelId, auth.caller))
     },
   }),
 
@@ -231,22 +244,27 @@ export const workflowTools: ToolDefinition[] = [
     description: 'Manager 显式重建当前 Node 的 Judge（清映射 + drain 旧 Judge + spawn 新 Judge 重投判定）。',
     parameters: {
       nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
-      reason: { type: 'string', description: '可选，写入 trace log 说明为何重建' },
+      reason: { type: 'string', description: '可选，作为有界 Manager 重建决定写入当前工作单与关键 events' },
     },
     output: stringOut,
     async execute(args, exec) {
       const auth = await controlWorkspace(exec.agent, 'judge_respawn')
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
-      return fmtResult(await thisHost().respawnJudge(auth.workspaceKey, args.nodeToken, args.reason, auth.caller))
+      rejectUnknown(args, ['nodeToken', 'reason'], 'judge_respawn')
+      if (args.reason !== undefined) {
+        const reasonError = lengthError('reason', args.reason, 1, LIMITS.reasonMax, true)
+        if (reasonError !== undefined) return `拒绝：${reasonError}`
+      }
+      return fmtResult(await thisHost().respawnJudge(auth.workspaceKey, args.nodeToken, args.reason?.trim(), auth.caller))
     },
   }),
 
   defineTool({
     name: 'judge_claim',
-    description: 'Judge 确认当前 Node 的 Actor 声明是否可信（ACCEPT | REJECT | NEED_CONTEXT）。ACCEPT = 声明与事实/instruction/criteria 一致；REJECT = 不正确或证据不足，reason 必须写明如何修正。这必须是当前 Turn 的最后一个动作。',
+    description: 'Judge 确认当前 Node 的 Actor 声明是否可信。REJECT 仅用于 claim 与既有 criteria 或可验证事实冲突，reason 必须指出依据和修法；信息不足或要求不清必须 NEED_CONTEXT，并说明 Manager 需补什么。这必须是当前 Turn 的最后一个动作。',
     parameters: {
       nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
-      result: { type: 'string', required: true, enum: ['ACCEPT', 'REJECT', 'NEED_CONTEXT'], description: 'ACCEPT | REJECT | NEED_CONTEXT' },
+      result: { type: 'string', required: true, enum: ['ACCEPT', 'REJECT', 'NEED_CONTEXT'], description: 'ACCEPT=符合事实与既有要求；REJECT=与既有criteria/可验证事实冲突；NEED_CONTEXT=信息不足或要求不清' },
       reason: { type: 'string', required: true, description: '判定理由（1..2000 字符）' },
     },
     output: stringOut,
@@ -255,7 +273,7 @@ export const workflowTools: ToolDefinition[] = [
       if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
       const reasonError = lengthError('reason', args.reason, LIMITS.reasonMin, LIMITS.reasonMax, true)
       if (reasonError !== undefined) return `拒绝：${reasonError}`
-      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason.trim(), auth.caller)
+      const outcome = await thisHost().judgeClaim(auth.workspaceKey, args.nodeToken, args.result, args.reason.trim(), claimCallerOf(exec))
       if (outcome.ok) exec.concludeTurn()
       return fmtResult(outcome)
     },

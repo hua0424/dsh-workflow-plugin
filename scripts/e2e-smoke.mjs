@@ -1,321 +1,149 @@
 /**
- * Real-code-path e2e smoke: runs the smoke-test workflow through the actual
- * engine + real SQLite store + real catalog loader, with ONLY the model
- * dispatch layer stubbed (steer/sendRoleActor = scripted log, judge =
- * scripted file inspection).
- *
- * ISOLATION (issue #3): the harness NEVER touches the real ~/.dsh home or the
- * repo workspace's real state row. It writes an embedded smoke-test.yaml into
- * a fresh temporary DSH home (hermetic — the real home's catalog may lag the
- * plugin version) and uses a synthetic workspace directory inside it; all
- * state rows and trace logs live under that temp home, which is removed at
- * the end. If a real state row exists for the repo workspace it is left
- * strictly untouched.
- *
- * A1 v2 coverage: the full start → (wrong work → claim → async REJECT →
- * correction re-dispatch → correct work → re-claim → async ACCEPT) → END loop
- * on production code paths for BOTH a Manager node and a Role node —
- * token-less claims bound by the dispatch lease, and the CORRECT trace event.
- *
- * 20260906-claim-handoff-symmetry coverage: an honest FAILED claim with
- * handoffContext → ACCEPT → FAIL edge → deferred re-dispatch of the SAME node
- * carrying the [handoff] text, with the durable pendingDispatchContext mirror
- * visible in the REAL SQLite row before the turn settles.
+ * T4 isolated smoke: real Catalog + WorkflowEngine + SQLite, controlled Host only.
+ * It never reads or writes the real DSH home/workspace and is not a real-host Run.
  */
+import assert from 'node:assert/strict'
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSync } from 'node:fs'
 import { StateStore, workspaceKeyOf } from '../src/state/store.ts'
+import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { loadCatalogEntry } from '../src/catalog/loader.ts'
-import { topFrame } from '../src/state/invariants.ts'
 
-// ---- Isolated environment (temp DSH home + synthetic workspace) ----
-const home = mkdtempSync(join(tmpdir(), 'dsh-e2e-home-'))
-const ws = join(home, 'workspace')
-mkdirSync(ws, { recursive: true })
-const workspaceKey = await workspaceKeyOf(ws)
-if (workspaceKey === undefined) throw new Error('no workspace key')
-
-// Embedded v2 catalog: hermetic against the real home's catalog version.
-const SMOKE_YAML = `schemaVersion: agent-workflow/v2
+const home = mkdtempSync(join(tmpdir(), 'dsh-t4-e2e-'))
+const cwd = join(home, 'workspace')
+mkdirSync(cwd)
+mkdirSync(join(home, 'workflows'))
+writeFileSync(join(home, 'workflows', 'smoke-test.yaml'), `schemaVersion: agent-workflow/v2
 roles:
-  worker: { persona: Echo worker. }
-judgeRole: { persona: Judge. }
+  worker: { persona: Work only in the isolated workspace. }
+judgeRole: { persona: Read-only verification. }
 workflow:
   startNode: hello
   nodes:
     hello:
-      execution: { type: actor-task, role: manager, instruction: Write the single line "smoke ok" into smoke/result.txt. }
-      checker: { checkerId: judge.claim-correct, config: { criteria: smoke/result.txt holds exactly the single line "smoke ok". } }
+      execution: { type: actor-task, role: manager, instruction: Write the single line "smoke ok" into result.txt. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: result.txt holds exactly the single line "smoke ok". } }
       onPass: worker-echo
     worker-echo:
-      execution: { type: actor-task, role: worker, instruction: Append the single line "worker ok" to smoke/result.txt. }
-      checker: { checkerId: judge.claim-correct, config: { criteria: smoke/result.txt holds "smoke ok" then "worker ok", exactly two lines. } }
+      execution: { type: actor-task, role: worker, instruction: Append the single line "worker ok" to result.txt. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: result.txt holds "smoke ok" then "worker ok", exactly two lines. } }
       onPass: END
       onFail: worker-echo
-`
-mkdirSync(join(home, 'workflows'), { recursive: true })
-const catalogPath = join(home, 'workflows', 'smoke-test.yaml')
-writeFileSync(catalogPath, SMOKE_YAML, 'utf8')
+`)
 
-const store = new StateStore(home)
+let store = new StateStore(home)
 try {
-  // The temp home is fresh, so no state row exists; never delete rows from
-  // any home we do not own.
+  const ws = await workspaceKeyOf(cwd)
+  assert.ok(ws)
   const entry = await loadCatalogEntry(home, 'smoke-test')
-  if (entry === undefined) throw new Error('smoke-test not found in the isolated catalog')
+  assert.ok(entry)
 
-  const stateHost = {
-    async get(key) {
-      const row = await store.get(key)
-      return row === undefined ? undefined : { run: row.run, version: row.stateVersion }
-    },
-    async put(key, run, expectedVersion) { await store.updateRow(key, run, expectedVersion) },
-    async create(key, run) { const row = await store.createRow(key, run); return row.stateVersion },
-    async remove(key) { await store.deleteRow(key) },
-    async listRuns() { return (await store.list()).map(r => ({ workspaceKey: r.workspaceKey, run: r.run, version: r.stateVersion })) },
+  let sequence = 0
+  const actorPrompts = []
+  const judgePackets = []
+  const compacts = []
+  const send = (sessionId, text) => {
+    const messageId = `message-${++sequence}`
+    actorPrompts.push({ sessionId, messageId, text })
+    return { messageId }
   }
-
-  const dispatchLog = []
-  /** Dispatch message ids per session kind — the lease truth for token-less claims. */
-  const managerMsgIds = []
-  const actorMsgIds = []
-  /** Per-verdict settlement: each scripted judge verdict resolves its own waiter. */
-  let verdictsApplied = 0
-  const verdictWaiters = []
-  function waitVerdict() {
-    if (verdictsApplied > 0) {
-      verdictsApplied -= 1
-      return Promise.resolve()
-    }
-    return new Promise(resolve => verdictWaiters.push(resolve))
-  }
-  function noteVerdict() {
-    const waiter = verdictWaiters.shift()
-    if (waiter !== undefined) waiter()
-    else verdictsApplied += 1
-  }
-  const subagents = {
-    async ensureRoleActor(_run, role, initialText) {
-      dispatchLog.push(`role[${role}](create): ${initialText.split('\n')[0]}`)
-      const messageId = `actor-msg-${actorMsgIds.length + 1}`
-      actorMsgIds.push(messageId)
-      return { childId: 'actor-session-1', messageId }
-    },
-    async startJudge(_run, input) {
-      // Scripted judge: inspect the synthetic workspace and submit the
-      // confirmation via the engine's judge_claim path (the same code path a
-      // real Judge's `judge_claim` tool call drives). A1 v2: the verdict is
-      // ACCEPT (claim trustworthy) or REJECT (evidence insufficient) — the
-      // Graph PASS comes from the claim outcome, never from this result.
-      const path = join(ws, 'smoke', 'result.txt')
-      let content = ''
-      if (existsSync(path)) content = readFileSync(path, 'utf8')
-      const lines = content.split('\n').map(l => l.trim()).filter(l => l !== '')
-      const isHello = input.instruction.includes('Write the single line')
-      const ok = isHello
-        ? lines.length === 1 && lines[0] === 'smoke ok'
-        : lines.length === 2 && lines[0] === 'smoke ok' && lines[1] === 'worker ok'
-      // 20260906 symmetry: the Judge confirms whether the CLAIM is
-      // trustworthy — a failed claim over genuinely unmet criteria is honest
-      // and ACCEPTs (the Graph FAIL then comes from the claim outcome).
-      const honest = input.claim.outcome === 'completed' ? ok : !ok
-      const verdict = honest ? 'ACCEPT' : 'REJECT'
-      const reason = honest
-        ? (ok ? 'content matches criteria' : 'genuine failure: criteria not met')
-        : `content does not match criteria yet: ${JSON.stringify(content)}`
-      // Defer to a macrotask so the verdict lands AFTER handleClaim persists the
-      // judgment phase (await continuations are microtasks; setTimeout(0) runs
-      // after them), mirroring a real async judge turn. The Judge must use the
-      // engine-reserved id already persisted before this child existed (P1).
-      setTimeout(() => {
-        void engine.handleJudgeClaim(workspaceKey, input.nodeToken, verdict, reason, input.judgeSessionId)
-          .then(outcome => { if (outcome.ok) noteVerdict() })
-      }, 0)
-      return { judgeSessionId: input.judgeSessionId, messageId: 'judge-msg-1' }
-    },
-    async followupJudge() {},
-    async judgeSessionExists() { return true },
-    async retireJudge() {},
-    async drainJudge() {},
-    async compactRoleActor() { return { ok: true, detail: 'no compactable range' } },
-  }
-  const programs = {
-    async run() { return { kind: 'ERROR', reason: 'no programs in smoke-test' } },
-  }
-  const targets = {
-    async steerManager(_run, text) {
-      dispatchLog.push(`steer: ${text.split('\n')[0]}`)
-      const messageId = `steer-msg-${managerMsgIds.length + 1}`
-      managerMsgIds.push(messageId)
-      return { messageId }
-    },
-    async sendRoleActor(_run, role, text) {
-      dispatchLog.push(`role[${role}]: ${text.split('\n')[0]}`)
-      const messageId = `actor-msg-${actorMsgIds.length + 1}`
-      actorMsgIds.push(messageId)
-      return { messageId }
-    },
+  const engine = new WorkflowEngine({
+    async steerManager(_run, text) { return send('manager', text) },
+    async sendRoleActor(_run, _role, text) { return send('worker', text) },
     managerSessionSeq() { return 0 },
+  }, {
+    async ensureRoleActor(_run, _role, text) { return { ...send('worker', text), childId: 'worker' } },
+    async startJudge(_run, input) {
+      judgePackets.push(structuredClone(input))
+      return { judgeSessionId: input.judgeSessionId, messageId: `judge-message-${++sequence}` }
+    },
+    async followupJudge(_run, sessionId, input) {
+      judgePackets.push(structuredClone(input))
+      return { messageId: `judge-followup-${sessionId}-${++sequence}` }
+    },
+    async safeToInspect() { return true },
+    async retireJudge() {}, async drainJudge() {}, async judgeSessionExists() { return true },
+    async compactRoleActor(_run, role) { compacts.push(role); return { ok: true, detail: 'controlled no-op' } },
+  }, { async run() { throw new Error('no Program in this smoke') } }, makeStateHost(store))
+  engine.cwdResolver = async () => cwd
+  const caller = dispatch => ({ sessionId: dispatch.sessionId, turnUserMessageIds: new Set([dispatch.messageId]) })
+  const row = () => store.get(ws)
+  async function settleActorAndJudge(result, reason) {
+    const claimed = await row()
+    const actor = caller(claimed.execution.dispatch)
+    await engine.handleTurnEnded(ws, actor)
+    const checking = await row()
+    const judge = caller(checking.execution.judge)
+    assert.equal((await engine.handleJudgeClaim(ws, checking.execution.nodeToken, result, reason, judge)).ok, true)
+    return judge
   }
 
-  const engine = new WorkflowEngine(targets, subagents, programs, stateHost)
-  engine.cwdResolver = async () => ws
+  const run = engine.buildInitialRun('manager', 'smoke-test', entry.config, entry.definitionHash)
+  assert.equal((await engine.startRun(ws, run, entry.path, 'isolated request')).ok, true)
+  const firstExecutionId = (await row()).execution.executionId
 
-  const managerCaller = () => ({ sessionId: 'manager-session-e2e', turnUserMessageIds: new Set(managerMsgIds) })
-  const actorCaller = () => ({ sessionId: 'actor-session-1', turnUserMessageIds: new Set(actorMsgIds) })
+  writeFileSync(join(cwd, 'result.txt'), 'wrong\n')
+  let current = await row()
+  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'wrote wrong result' }, caller(current.execution.dispatch))).ok, true)
+  const firstJudge = await settleActorAndJudge('REJECT', 'existing criteria requires exactly smoke ok')
+  current = await row()
+  assert.equal(current.execution.executionId, firstExecutionId)
+  assert.match(actorPrompts.at(-1).text, /existing criteria requires exactly smoke ok/)
+  assert.match(actorPrompts.at(-1).text, /wrote wrong result/)
+  assert.equal((await engine.handleJudgeClaim(ws, current.execution.nodeToken, 'ACCEPT', 'late old verdict', firstJudge)).ok, false)
 
-  // 1. start (configPath feeds the run trace log directory)
-  const run = engine.buildInitialRun('manager-session-e2e', 'smoke-test', entry.config, entry.definitionHash)
-  const started = await engine.startRun(workspaceKey, run, entry.path)
-  console.log('1. start:', started.ok, started.message, '| frame:', topFrame(started.run).nodeId, '|', started.run.status)
-  console.log('   dispatch:', dispatchLog.at(-1))
+  writeFileSync(join(cwd, 'result.txt'), 'smoke ok\n')
+  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'wrote smoke ok' }, caller(current.execution.dispatch))).ok, true)
+  const helloAccepted = await settleActorAndJudge('ACCEPT', 'content matches criteria')
+  await engine.handleTurnEnded(ws, helloAccepted)
+  current = await row()
+  assert.equal(current.execution.nodeId, 'worker-echo')
+  assert.equal(current.execution.input, 'wrote smoke ok')
 
-  // 2. Manager does WRONG work first: the judge must REJECT, and the SAME
-  //    node re-dispatches to the Manager with the correction evidence.
-  mkdirSync(join(ws, 'smoke'), { recursive: true })
-  writeFileSync(join(ws, 'smoke', 'result.txt'), 'wrong content\n', 'utf8')
-  const claim1 = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'wrote smoke/result.txt (wrong)' }, managerCaller())
-  console.log('2. claim hello (wrong work):', claim1.ok, claim1.message)
-  // PRODUCTION ORDERING (F1/F2 regression): the worker's own turn ends
-  // IMMEDIATELY after node_claim, while the async Judge is still evaluating.
-  const settle1 = await engine.handleTurnEnded(workspaceKey, 'manager-session-e2e')
-  if (settle1 !== undefined) throw new Error(`unexpected turn settlement result: ${JSON.stringify(settle1)}`)
-  {
-    const row = await stateHost.get(workspaceKey)
-    if (row === undefined) throw new Error('row vanished after turn end')
-    if (row.run.status !== 'running') throw new Error(`false BLOCK after a claiming turn: ${row.run.status} / ${row.run.blockReason}`)
-    console.log('   turn settled mid-judgment: no false BLOCK ✓')
-  }
-  await waitVerdict()
-  {
-    const row = await stateHost.get(workspaceKey)
-    if (row === undefined) throw new Error('row vanished after REJECT')
-    if (topFrame(row.run).nodeId !== 'hello') throw new Error(`REJECT moved the node: ${topFrame(row.run).nodeId}`)
-    if (row.run.pendingCorrection === undefined) throw new Error('REJECT persisted no pendingCorrection')
-    console.log('   REJECT → correction pending | dispatch:', dispatchLog.at(-1))
-    if (!(dispatchLog.at(-1) ?? '').includes('[correction]')) throw new Error('correction message missing the [correction] header')
-  }
-  // The corrected Manager turn does the work correctly and re-claims (the
-  // re-claim binds to the CORRECTION dispatch's lease).
-  writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\n', 'utf8')
-  const claim1b = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'wrote smoke/result.txt' }, managerCaller())
-  console.log('3. re-claim hello (corrected):', claim1b.ok, claim1b.message)
-  await engine.handleTurnEnded(workspaceKey, 'manager-session-e2e')
-  await waitVerdict()
-  let current = await stateHost.get(workspaceKey)
-  if (current === undefined) throw new Error('row vanished after verdict')
-  console.log('   frame after ACCEPT:', topFrame(current.run).nodeId, '| dispatch:', dispatchLog.at(-1))
-  if (topFrame(current.run).nodeId !== 'worker-echo') throw new Error(`verdict did not advance/dispatch: ${topFrame(current.run).nodeId}`)
+  const failedHandoff = 'rework: append the exact line worker ok'
+  assert.equal((await engine.handleClaim(ws, { outcome: 'failed', handoff: failedHandoff }, caller(current.execution.dispatch))).ok, true)
+  const failureAccepted = await settleActorAndJudge('ACCEPT', 'honest failure; worker line is absent')
+  await engine.handleTurnEnded(ws, failureAccepted)
+  current = await row()
+  assert.equal(current.execution.nodeId, 'worker-echo')
+  assert.equal(current.execution.input, failedHandoff)
+  assert.deepEqual(compacts, ['worker'])
 
-  // 4. 20260906-claim-handoff-symmetry: the worker honestly reports the work
-  //    NOT done as a FAILED claim with handoffContext → ACCEPT → FAIL edge
-  //    (self-loop rework) → deferred re-dispatch carrying the [handoff] text.
-  const REWORK = 'rework: append the exact line "worker ok"'
-  const claimFail = await engine.handleClaim(workspaceKey, {
-    outcome: 'failed', summary: 'criteria not met yet', handoffContext: REWORK,
-  }, actorCaller())
-  console.log('4. claim worker-echo (honest failed + handoff):', claimFail.ok, claimFail.message)
-  // NO turn settlement yet → the ACCEPT takes the DEFERRED dispatch path and
-  // the durable handoff mirror is visible in the REAL SQLite row.
-  await waitVerdict()
-  {
-    const row = await stateHost.get(workspaceKey)
-    if (row === undefined) throw new Error('row vanished after failed ACCEPT')
-    if (topFrame(row.run).nodeId !== 'worker-echo') throw new Error(`FAIL edge moved the node: ${topFrame(row.run).nodeId}`)
-    if (row.run.pendingDispatchContext?.kind !== 'handoff' || row.run.pendingDispatchContext.text !== REWORK) {
-      throw new Error(`durable handoff mirror missing in the real store: ${JSON.stringify(row.run.pendingDispatchContext)}`)
-    }
-    if ((dispatchLog.at(-1) ?? '').includes('[handoff]')) throw new Error('deferred dispatch fired before turn settlement')
-    console.log('   FAIL edge deferred | durable mirror:', JSON.stringify(row.run.pendingDispatchContext))
-  }
-  await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
-  {
-    const row = await stateHost.get(workspaceKey)
-    // The dispatch log records only the first line — the [handoff] header.
-    // (The full text is asserted by the unit tests; here the durable mirror
-    // above proved what the header wraps.)
-    const sent = dispatchLog.at(-1) ?? ''
-    if (!sent.includes('role[worker]: [handoff]')) {
-      throw new Error(`rework handoff did not reach the re-dispatch: ${sent}`)
-    }
-    if (row.run.pendingDispatchContext !== undefined) throw new Error('dispatched mirror not consumed')
-    console.log('   rework re-dispatch carries the handoff ✓ | dispatch:', sent)
-  }
+  writeFileSync(join(cwd, 'result.txt'), 'smoke ok\nwrong worker\n')
+  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'appended wrong worker line' }, caller(current.execution.dispatch))).ok, true)
+  await settleActorAndJudge('REJECT', 'existing criteria requires the exact worker ok line')
+  current = await row()
+  assert.match(actorPrompts.at(-1).text, /appended wrong worker line/)
+  assert.deepEqual(compacts, ['worker'], 'same-execution correction must not compact')
 
-  // 5. The worker actor does WRONG work and claims completed: REJECT
-  //    re-dispatches the correction to the ORIGINAL actor session.
-  writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\nwrong worker\n', 'utf8')
-  const claim2 = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'appended worker ok (wrong)' }, actorCaller())
-  console.log('5. claim worker-echo (wrong work):', claim2.ok, claim2.message)
-  await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
-  await waitVerdict()
-  {
-    const row = await stateHost.get(workspaceKey)
-    if (row === undefined) throw new Error('row vanished after worker REJECT')
-    if (topFrame(row.run).nodeId !== 'worker-echo') throw new Error(`worker REJECT moved the node: ${topFrame(row.run).nodeId}`)
-    console.log('   REJECT → correction to the original actor | dispatch:', dispatchLog.at(-1))
-    if (!(dispatchLog.at(-1) ?? '').includes('[correction]')) throw new Error('actor correction message missing the [correction] header')
-  }
-  // Corrected actor work → re-claim → ACCEPT → END.
-  writeFileSync(join(ws, 'smoke', 'result.txt'), 'smoke ok\nworker ok\n', 'utf8')
-  const claim2b = await engine.handleClaim(workspaceKey, { outcome: 'completed', summary: 'appended worker ok' }, actorCaller())
-  console.log('6. re-claim worker-echo (corrected):', claim2b.ok, claim2b.message)
-  await engine.handleTurnEnded(workspaceKey, 'actor-session-1')
-  await waitVerdict()
-  const final = await stateHost.get(workspaceKey)
-  if (final === undefined) throw new Error('row vanished at the end')
-  console.log('7. FINAL:', final.run.status, '| callStack:', JSON.stringify(final.run.callStack))
+  writeFileSync(join(cwd, 'result.txt'), 'smoke ok\nworker ok\n')
+  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'final verified result.txt' }, caller(current.execution.dispatch))).ok, true)
+  await settleActorAndJudge('ACCEPT', 'content matches criteria')
+  current = await row()
+  assert.equal(current.run.status, 'completed')
+  assert.equal(current.execution.claim.handoff, 'final verified result.txt')
 
-  let pass = final.run.status === 'completed' && final.run.callStack.length === 0
+  const firstHistory = await store.events(ws, firstExecutionId)
+  assert.equal(firstHistory.filter(event => event.type === 'claim').length, 2)
+  assert.equal(firstHistory.filter(event => event.type === 'judgment').length, 2)
+  const rejected = firstHistory.find(event => event.type === 'judgment' && event.snapshot.judgment?.result === 'REJECT')
+  assert.equal(rejected.snapshot.previousClaim.handoff, 'wrote wrong result')
 
-  // 8. run trace log assertions (workflow-run-logging AC1/AC2 + A3 fmt=2 events + A1 CORRECT)
-  const TS = '\\[\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}\\]'
-  const TOK = '[0-9a-f]{8}'
+  const finalExecutionId = current.execution.executionId
+  store.close(); store = new StateStore(home)
+  assert.equal((await store.get(ws)).execution.claim.handoff, 'final verified result.txt')
+  assert.ok((await store.events(ws, finalExecutionId)).some(event => event.type === 'judgment'))
+
   const logDir = join(dirname(entry.path), 'smoke-test')
-  const logFiles = existsSync(logDir) ? readdirSync(logDir).filter(f => f.endsWith('.txt')) : []
-  if (logFiles.length !== 1 || !/^\d{8}-\d{6}-[0-9a-f-]{8}\.txt$/.test(logFiles[0])) {
-    console.log('8. trace log FAIL: expected one yyyyMMdd-HHmmss-<runId8>.txt in', logDir, '| got:', JSON.stringify(logFiles))
-    pass = false
-  } else {
-    const log = readFileSync(join(logDir, logFiles[0]), 'utf8')
-    // The REJECT reasons carry escaped quotes/newlines through jsonField's
-    // double JSON-escaping — build those fragments with JSON.stringify +
-    // re-escape instead of hand-counting backslashes.
-    const reEscape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-    const wrongReason = JSON.stringify('content does not match criteria yet: ' + JSON.stringify('wrong content\n'))
-    const reworkHandoff = JSON.stringify('rework: append the exact line "worker ok"')
-    const expectations = [
-      new RegExp(`${TS} START workflow=smoke-test run=${run.runId} fmt=2\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt \\(wrong\\)" handoff=null\\n`),
-      new RegExp(`${TS} JUDGE workflow=smoke-test node=hello token=${TOK} result=REJECT reason=${reEscape(wrongReason)} judge=${TOK}\\n`),
-      new RegExp(`${TS} CORRECT workflow=smoke-test node=hello token=${TOK} role=manager judge=${TOK} detail=${reEscape(wrongReason)}\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=hello token=${TOK} role=manager outcome=completed summary="wrote smoke/result.txt" handoff=null\\n`),
-      new RegExp(`${TS} JUDGE workflow=smoke-test node=hello token=${TOK} result=ACCEPT reason="content matches criteria" judge=${TOK}\\n`),
-      new RegExp(`${TS} ROUTE workflow=smoke-test node=hello token=${TOK} result=PASS target=worker-echo\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=failed summary="criteria not met yet" handoff=${reEscape(reworkHandoff)}\\n`),
-      new RegExp(`${TS} JUDGE workflow=smoke-test node=worker-echo token=${TOK} result=ACCEPT reason="genuine failure: criteria not met" judge=${TOK}\\n`),
-      new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo token=${TOK} result=FAIL target=worker-echo\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok \\(wrong\\)" handoff=null\\n`),
-      new RegExp(`${TS} CORRECT workflow=smoke-test node=worker-echo token=${TOK} role=worker judge=${TOK} detail=.+\\n`),
-      new RegExp(`${TS} CLAIM workflow=smoke-test node=worker-echo token=${TOK} role=worker outcome=completed summary="appended worker ok" handoff=null\\n`),
-      new RegExp(`${TS} JUDGE workflow=smoke-test node=worker-echo token=${TOK} result=ACCEPT reason="content matches criteria" judge=${TOK}\\n`),
-      new RegExp(`${TS} ROUTE workflow=smoke-test node=worker-echo token=${TOK} result=PASS target=END\\n`),
-    ]
-    for (const [i, re] of expectations.entries()) {
-      const ok = re.test(log)
-      console.log(`8.${i + 1} trace log line ${ok ? 'OK' : 'MISSING'}: ${re.source}`)
-      if (!ok) pass = false
-    }
-    if (pass) console.log('   trace log:', join(logDir, logFiles[0]))
-  }
+  const logs = readdirSync(logDir).filter(name => name.endsWith('.txt'))
+  assert.equal(logs.length, 1)
+  const trace = readFileSync(join(logDir, logs[0]), 'utf8')
+  for (const marker of [' START ', ' CLAIM ', ' JUDGE ', ' result=REJECT ', ' result=ACCEPT ', ' ROUTE ']) assert.match(trace, new RegExp(marker))
 
-  console.log(pass ? 'E2E SMOKE PASS' : 'E2E SMOKE FAIL')
-  if (!pass) process.exitCode = 1
+  console.log('E2E SMOKE PASS: REJECT correction + failed onFail self-loop + Role reuse/compact + final ACCEPT + SQLite reopen')
 } finally {
   store.close()
-  // Remove ONLY the isolated temp home (state db + catalog copy + trace logs
-  // + synthetic workspace). The real ~/.dsh home is never modified.
   rmSync(home, { recursive: true, force: true })
 }
