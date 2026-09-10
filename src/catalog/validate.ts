@@ -198,9 +198,7 @@ function validateTargets(label: string, node: NodeDef, def: WorkflowDef, problem
     problems.push(`${label} onPass target "${node.onPass}" does not exist`)
   }
   if ('onFail' in node && node.onFail !== undefined) {
-    if (isEnd(node.onFail)) {
-      problems.push(`${label} onFail cannot target END (FAIL without onFail means BLOCK)`)
-    } else if (!validNodeTarget(node.onFail, def)) {
+    if (!validNodeTarget(node.onFail, def)) {
       problems.push(`${label} onFail target "${node.onFail}" does not exist`)
     }
   }
@@ -211,7 +209,7 @@ function hasEndPath(def: WorkflowDef, nodeId: string, seen: Set<string>): boolea
   seen.add(nodeId)
   const node = def.nodes[nodeId]
   if (node === undefined) return false
-  if (node.onPass === 'END') return true
+  if (node.onPass === 'END' || ('onFail' in node && node.onFail === 'END')) return true
   const next: string[] = []
   if (!isEnd(node.onPass)) next.push(node.onPass)
   if ('onFail' in node && node.onFail !== undefined && !isEnd(node.onFail)) next.push(node.onFail)
