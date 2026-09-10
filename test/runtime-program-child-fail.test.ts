@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine, type ProgramHost } from '../src/engine/engine.ts'
+import { validateAndNormalize } from '../src/catalog/validate.ts'
 import type { ClaimCaller, ProgramResult, WorkflowConfig } from '../src/types.ts'
 
 const CHECKER = { checkerId: 'judge.claim-correct', config: { criteria: 'existing criteria' } }
@@ -463,6 +464,93 @@ test('Program FAIL without onFail retains its result in settling BLOCK', async (
     assert.equal(blocked.execution.phase, 'settling')
     assert.deepEqual(blocked.execution.program?.result, { kind: 'FAIL', reason: 'milestone is closed', handoff: 'repair milestone #7' })
     assert.equal(blocked.execution.successorId, undefined)
+  } finally { h.close() }
+})
+
+test('accepted Actor failed→END completes the root with failed-terminal wording (#17)', async () => {
+  const h = harness({
+    schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
+    workflow: { startNode: 'plan', nodes: {
+      plan: { execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' }, checker: CHECKER, onPass: 'END', onFail: 'END' },
+    } },
+  }, { async run() { throw new Error('unexpected Program') } })
+  try {
+    await h.start()
+    await acceptActor(h, 'user cancelled after review', 'failed')
+    const row = await h.row()
+    assert.equal(row.run.status, 'completed')
+    assert.deepEqual(row.run.callStack, [])
+    assert.equal(row.execution.claim?.handoff, 'user cancelled after review')
+    assert.equal(row.execution.judgment?.result, 'ACCEPT')
+    const terminal = h.messages.at(-1)!.text
+    assert.match(terminal, /以失败结果结束/)
+    assert.match(terminal, /FAIL→END/)
+    assert.match(terminal, /user cancelled after review/)
+    assert.doesNotMatch(terminal, /已完成（run/)
+  } finally { h.close() }
+})
+
+test('builtin FAIL→END completes the root without a Judge (#17)', async () => {
+  const config = programConfig()
+  config.workflow.nodes.program!.onFail = 'END'
+  delete config.workflow.nodes.repair
+  const h = harness(config, { async run() { return { kind: 'FAIL', reason: 'milestone is closed', handoff: 'cancelled: no work to do' } } })
+  try {
+    await h.start()
+    await acceptActor(h, 'approved plan')
+    const program = await h.row()
+    const judgesBefore = h.messages.filter(message => message.text === 'judge').length
+    assert.equal((await h.engine.handleRunProgram('ws', program.execution.nodeToken, { title: 'M7', branchName: 'feature/t7' }, 'manager')).ok, true)
+    const row = await h.row()
+    assert.equal(row.run.status, 'completed')
+    assert.deepEqual(row.run.callStack, [])
+    assert.equal(h.messages.filter(message => message.text === 'judge').length, judgesBefore)
+    const terminal = h.messages.at(-1)!.text
+    assert.match(terminal, /以失败结果结束/)
+    assert.match(terminal, /cancelled: no work to do/)
+    const status = await h.engine.status('ws', 'manager')
+    assert.equal(status.status.finalHandoffPreview, 'cancelled: no work to do')
+  } finally { h.close() }
+})
+
+test('nested Child failed→END returns to the parent onPass with the child handoff (#17)', async () => {
+  const config = childConfig()
+  config.childWorkflows!['child-a'] = { startNode: 'work', nodes: {
+    work: { execution: { type: 'actor-task', role: 'worker', instruction: 'Child work' }, checker: CHECKER, onPass: 'nowhere', onFail: 'END' },
+  } }
+  // 子图自带一条悬空 onPass 目标时校验仍应拒绝：未知目标不可用 END 绕过。
+  assert.throws(() => validateAndNormalize(structuredClone(config), { workflowId: 'test' }), /does not exist/)
+  config.childWorkflows!['child-a'] = { startNode: 'work', nodes: {
+    work: { execution: { type: 'actor-task', role: 'worker', instruction: 'Child work' }, checker: CHECKER, onPass: 'END', onFail: 'END' },
+  } }
+  const h = harness(config, { async run() { throw new Error('unexpected Program') } })
+  try {
+    await h.start()
+    await acceptActor(h, 'parent input')
+    let row = await h.row()
+    assert.equal(row.execution.workflowId, 'child-a')
+    assert.equal(row.run.callStack.length, 2)
+    const parentExecutionId = row.run.callStack[0]!.executionId
+    // 子流程内 FAIL 被 ACCEPT 后走 onFail→END：pop 回父 onPass，不把 failed 传播成父失败。
+    // 注：acceptActor 内已含 handleTurnEnded（与既有单层 Child 测试一致），后继已派发为 working。
+    let childRow = await h.row()
+    const childActor = h.caller(childRow.execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'failed', handoff: 'no deliverable issues remain' }, childActor)
+    await h.engine.handleTurnEnded('ws', childActor)
+    childRow = await h.row()
+    const childJudge = h.caller(childRow.execution.judge!)
+    assert.equal((await h.engine.handleJudgeClaim('ws', childRow.execution.nodeToken, 'ACCEPT', 'honest failure', childJudge)).ok, true)
+    const returned = await h.row()
+    assert.equal(returned.run.callStack.length, 1)
+    assert.equal(returned.execution.nodeId, 'after')
+    assert.equal(returned.execution.input, 'no deliverable issues remain')
+    assert.equal(returned.execution.phase, 'ready')
+    assert.equal(returned.run.status, 'running')
+    const parent = (await h.store.execution('ws', parentExecutionId))!
+    assert.equal(parent.phase, 'exited')
+    assert.equal(parent.child?.result?.handoff, 'no deliverable issues remain')
+    await h.engine.handleTurnEnded('ws', childJudge)
+    assert.equal((await h.row()).execution.phase, 'working')
   } finally { h.close() }
 })
 

@@ -28,7 +28,7 @@
 - B2 `list` 对 invalid 文件显示 diagnostics 且仅阻塞该文件自身；其他文件正常。
 - B3 Root `startNode` 必须是 `actor-task role:manager`；缺失/类型错误 → 拒绝。
 - B4 引用完整性：role/childWorkflowId/edge target 存在；Child 引用图 DAG（直接/间接递归拒绝）；
-  每个 Workflow 至少一条可达 END；`onFail:END` 拒绝；Root 不被 Child 引用。
+  每个 Workflow 至少一条可达 END（含经 `onFail: END` 的路径，#17 起允许）；Root 不被 Child 引用。
 - B5 actor-task 必有合法 checkerId；builtin-program 禁 role/checker；child-workflow 只允许 onPass。
 - B6 拒绝并行、表达式、脚本 transition、动态改图、运行时注册 Program/Checker。
 

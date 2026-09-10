@@ -99,7 +99,11 @@ Role 定义：
 
 - `checker`：目前仅 `judge.claim-correct`，`config.criteria` 为 trim 后
   1..8000 字符，是 Judge 判定的权威标准。
-- `onPass` 必填，指向节点 id 或 `END`；`onFail` 可选，**不能指向 `END`**。
+- `onPass` 必填，指向节点 id 或 `END`；`onFail` 可选，可指向节点 id
+  或 `END`（#17 起允许，FAIL→END 为业务终局：根 Run 状态沿用 `completed`
+  表示执行结束，终局业务结果由终局 claim outcome + handoff 表达；终局通知
+  按 PASS/FAIL 区分措辞，不把取消/失败报成“已完成”。子流程 FAIL→END
+  pop 回父节点 `onPass`，对父读作 PASS，父只能经 handoff 文本感知失败）。
 - FAIL 且未配置 `onFail` → 进入 BLOCK（Manager 处理后 resume 同一节点），
   这不是一种边。
 

@@ -462,7 +462,10 @@ export class WorkflowEngine {
     this.trace(run, 'ROUTE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, target })
     if (run.status === 'completed') {
       this.traceWarned.delete(run.runId)
-      await this.targets.steerManager(run, `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。\n\n[handoff]\n${handoff}`).catch(() => {})
+      const terminal = result === 'FAIL'
+        ? `workflow "${run.catalogWorkflowId}" 以失败结果结束（run ${run.runId}，FAIL→END）。Run 状态沿用 completed 表示执行结束，终局业务结果见 handoff。\n\n[handoff]\n${handoff}`
+        : `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。\n\n[handoff]\n${handoff}`
+      await this.targets.steerManager(run, terminal).catch(() => {})
     }
     return { ok: true, run, message: `${result} committed` }
   }

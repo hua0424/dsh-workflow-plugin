@@ -105,7 +105,7 @@ workflow:
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /startNode/)
 })
 
-test('onFail END is rejected', () => {
+test('onFail END is accepted (#17); unknown target and truly endless graphs still rejected', () => {
   const config = parseCatalogConfig(`
 schemaVersion: agent-workflow/v2
 roles: { developer: { persona: D } }
@@ -123,7 +123,63 @@ workflow:
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       onPass: END
 `)
-  assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /onFail/)
+  const normalized = validateAndNormalize(config, { workflowId: 'w' })
+  assert.equal(normalized.workflow.nodes.plan.onFail, 'END')
+
+  // 仅 onFail 可到 END 的图可通过校验。
+  const onlyFailToEnd = parseCatalogConfig(`
+schemaVersion: agent-workflow/v2
+roles: { developer: { persona: D } }
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      onPass: build
+      onFail: END
+    build:
+      execution: { type: actor-task, role: developer, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      onPass: plan
+`)
+  validateAndNormalize(onlyFailToEnd, { workflowId: 'w2' })
+
+  // 未知目标仍拒绝。
+  const unknown = parseCatalogConfig(`
+schemaVersion: agent-workflow/v2
+roles: { developer: { persona: D } }
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      onPass: END
+      onFail: ghost
+`)
+  assert.throws(() => validateAndNormalize(unknown, { workflowId: 'w3' }), CatalogValidationError, /onFail target/)
+
+  // 真正无终点图仍拒绝（onPass/onFail 均不成环到 END）。
+  const endless = parseCatalogConfig(`
+schemaVersion: agent-workflow/v2
+roles: { developer: { persona: D } }
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      onPass: build
+    build:
+      execution: { type: actor-task, role: developer, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      onPass: plan
+`)
+  assert.throws(() => validateAndNormalize(endless, { workflowId: 'w4' }), CatalogValidationError, /no path.*END/)
 })
 
 test('unknown role is rejected', () => {

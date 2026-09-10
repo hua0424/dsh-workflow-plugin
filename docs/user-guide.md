@@ -80,7 +80,11 @@ nodeToken 为准，不要缓存旧 token。
 
 - 节点推进：Manager 派发 → Actor 工作 → `node_claim` → Judge 核验 →
   通过走 `onPass`，REJECT 以 reason 作为纠正指令重派同节点，NEED_CONTEXT
-  由 Manager 补充材料后重判。
+  由 Manager 补充材料后重判。`onFail` 可指向节点 id 或 `END`（#17 起）：
+  FAIL→END 为业务终局——根 Run 状态沿用 `completed` 表示执行结束，终局
+  业务结果由终局 claim outcome + handoff 表达（`workflow_status` 的
+  `claimOutcome` / `finalHandoffPreview` 可见）；子流程 FAIL→END 返回父
+  节点 `onPass`（对父读作 PASS，父只能经 handoff 文本感知失败）。
 - Role Actor 是 continuable 子会话，跨节点复用；**节点边界**会对其做一次
   压缩（cold materialize → compactNow → dispose），token 得以受控。
 - BLOCK：Actor 主动 `node_block`，或技术故障（Judge fault 等）自动进入；
