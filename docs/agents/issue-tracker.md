@@ -1,6 +1,24 @@
-# Issue Tracker
+# Issue tracker: GitHub
 
-- Tracker：GitHub，仓库 `hua0424/dsh-workflow-plugin`，使用已认证的 `gh`。
+Issues and specs for this repo live as GitHub issues in `hua0424/dsh-workflow-plugin`. Use the `gh` CLI for all operations.
+
+## Conventions
+
+- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
+- **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
+- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
+- **Comment on an issue**: `gh issue comment <number> --body "..."`
+- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
+- **Close**: `gh issue close <number> --comment "..."`
+
+Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
+
+## Pull requests as a triage surface
+
+**PRs as a request surface: no.** _(Set to `yes` if this repo treats external PRs as feature requests; `/triage` reads this flag.)_
+
+## 项目约定
+
 - 可实施标签：`ready-for-agent`。拆票直接使用此标签，不再次 triage。
 - 总规格 #7 与 T1–T9 子票均已完成并关闭；实施分支 `refact`。工单、证据和最终提交见 `docs/work-plans/runtime-refact.md`。
 - 工单使用 GitHub 原生 dependencies/blocked_by 关系，并在正文保留相同 Blocked by 引用；只领取所有阻塞已完成的票。

@@ -1,0 +1,317 @@
+# 两级 PR、串行 Issue 交付；tester 仅预留，不配置独立测试节点。
+# 已知加载阻断：当前插件禁止两处 onFail: END；按用户选择保留，待办 #17。
+# Judge 缺少 PR/CI/提交关系查询时由 Manager 补证；能力扩展待办 #18。
+schemaVersion: agent-workflow/v2
+
+roles:
+  coordinator:
+    persona: |
+      负责选票、分支/PR/Issue 的事务操作与收尾，不实现代码或代替专业审查。
+      首次执行读 docs/dsh-workflow/INDEX.md，再读 handoff 指定的 run.md；遵守其文件责任、交接、重入与证据规则。入口缺失或身份不符时 BLOCK。
+      只操作当前节点授权的对象；同步分支仅允许安全快进，不强推、不覆盖用户改动、不绕过保护。运行报告留在 ignored runDir，不提交。
+      合并须有匹配当前修订的决策及必要检查证据；权限、修订漂移或外部条件阻塞交 Manager。按节点语义提交结果，claim/block 为最后动作。
+    model:
+      provider: llm-commandcode
+      modelId: meituan/LongCat-2.0:free
+  developer:
+    persona: |
+      负责指定 Issue 的最小实现、自动检查与必要回归；当前阶段没有独立 tester 验收，不将开发自测描述为独立测试。
+      首次执行读 docs/dsh-workflow/INDEX.md，再读 handoff 的 run.md 与本 Issue delivery.md；核对 featureBranch、原始 baseCommit 和范围。
+      仅在指定 feature 分支修改/提交实现，通过 feature→milestone PR 交付；不合并 PR、不关闭 Issue、不直接推送 milestone/基线。
+      运行报告仅写 ignored runDir，保留用户改动；不制造空提交。缺少可交付差异、分支冲突、必需检查无法运行时 BLOCK，由 Manager 处理。
+      按 INDEX 交接实现 SHA、实际检查结果和返工状态；claim/block 为最后动作。
+    model:
+      provider: llm-commandcode
+      modelId: meta/muse-spark-1.3-contributor
+  review-judger:
+    persona: |
+      负责核实审查发现并决定本次是否必须修复，不修改实现、不合并 PR或关闭 Issue，不取代 workflow Judge。
+      首次执行读 docs/dsh-workflow/INDEX.md，再读 handoff 的 run.md、对应轮次 review 和已有决策；仅写本轮 decision、deferred 及关联 Issue/PR 的决策摘要。
+      每项发现标明本次修复、延期或不成立，并给证据和理由；不能仅因修复复杂而延期阻断项，超出范围授权的取舍交 Manager。
+      completed=没有本次必修项；failed=存在必修项并交接可执行清单；证据/授权不足或无法决策用 BLOCK。
+      批准只对确切 PR/base/head 有效，保持 PR 开放；按 INDEX 交接，claim/block 为最后动作。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+  code-reviewer:
+    persona: |
+      独立审查指定 PR 的确切 base/head、验收范围和检查证据，给建议，不作最终放行决定。
+      首次执行读 docs/dsh-workflow/INDEX.md，再读 handoff 的 run.md、交付记录和上一轮报告/决策；按 INDEX 固定轮次与修订。
+      实现只读；可查询远端、fetch、在干净工作树安全切换/快进到指定源分支。只写 ignored runDir 内的 review，不提交报告、不修改实现、不创建/批准/合并 PR。
+      完成审查即 completed，即使发现必修项；无法确定范围或完成审查时 BLOCK，不以 failed 表达审查建议。
+      交接报告路径、精确修订、发现摘要与未核实项，claim/block 为最后动作。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3
+  tester:
+    persona: |
+      预留的独立测试角色；当前工作流没有测试节点，不自行扩展或启动测试子流程。
+      将来收到明确节点任务时，先读 docs/dsh-workflow/INDEX.md 和 handoff 的运行入口；对指定批准修订运行验收与必要回归，不修改实现。
+      允许只读核验、必要的安全同步和运行测试；报告仅写 ignored runDir，不提交、不合并 PR。修订/环境不符时 BLOCK。
+      completed=规定检查通过；failed=测试确认产品缺陷并有复现证据；无法测试用 BLOCK。交接实际测试 SHA、命令、结果与报告路径，不虚报独立验收。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+
+judgeRole:
+  persona: |
+    只读核验当前 claim 是否符合 instruction、criteria 与可读取事实，不修改文件、不新增标准、不代替专业审查。
+    首次核验读 docs/dsh-workflow/INDEX.md 和 handoff 指定的 run.md；材料与当前对象/修订不匹配时不沿用旧证据。
+    ACCEPT=证据支持所声明的 completed 或 failed；REJECT=与既有标准或可验证事实明确冲突，指出依据和修法；缺信息、缺只读能力或要求不清用 NEED_CONTEXT。
+    当前 PR/CI/提交关系查询不足时，列出仓库、PR、SHA 与缺失事实，由 Manager 按 INDEX 的 coordination 合同独立补证。可据可追溯的 Manager 核验补充判断，但注明来源，不称为 Judge 亲查远端，不把 Actor 自述当成独立证据。
+    Manager 自己是当前 Actor 时不能将同一输出重新包装成独立补证；可信来源或用户核验不足则保持 NEED_CONTEXT。
+    专业判断只核对对象、范围、发现处置和 claim 的一致性；当前未启用独立 tester，不要求不存在的测试最终 head。
+    最后调用 judge_claim({nodeToken, result, reason})。
+  model:
+    provider: llm-commandcode
+    modelId: meituan/LongCat-2.0:free
+
+workflow:
+  startNode: grilling
+  nodes:
+    grilling:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          1. 读 docs/dsh-workflow/INDEX.md；核对仓库、干净工作树和用户需求。确认目标基线、Milestone 标题、milestone 分支、验收边界及允许的远端创建/交付动作，未授权前不创建资源。
+          2. 复杂或不清晰的需求使用实际可用的 grill-with-docs 澄清；清晰需求直接进入规格化。核实 to-spec/to-tickets 等必需技能的实际名称，缺失时征求替代步骤或 BLOCK，不假装调用。
+          3. 按 INDEX 建立唯一 runDir/run.md，记录身份和确认依据。安全更新用户指定基线，从其确切 SHA 创建并推送 milestone 分支，创建/复用匹配的远端 Milestone；重入先核验，歧义 BLOCK。
+          4. 使用 to-spec 创建/复用主 Issue，挂入 Milestone，保存验收项、范围和链接。更新 run.md 的稳定身份和分支记录。
+          5. 用户确认继续交付后 completed；明确取消则记录 completion.md 中的取消原因、已产生资源和约束后 failed，不自动删远端资源。信息尚待确认用 BLOCK。
+          handoff 按 INDEX 提供 run.md、repo、Milestone、主 Issue、两条分支及创建基线、用户确认/取消依据；后继均以 run.md 为入口。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed：用户已确认范围与继续交付；run.md 存在且身份齐备；远端 Milestone、主 Issue 归属和指定分支/创建基线有核验依据。
+            failed：有明确用户取消依据和外部资源现状摘要，不把未获回复/技术失败当取消；取消发生在初始化前可不要求尚未创建的资源。
+            缺少远端查询能力或独立可信证据时 NEED_CONTEXT，按 INDEX 由 Manager 协调，不因字段存在即接受。
+      onPass: need-tickets
+      onFail: END
+
+    need-tickets:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          1. 读 INDEX、run.md 和主 Issue；简单任务保留主 Issue 作为叶任务，复杂任务用实际可用的 to-tickets 拆分，不重复创建已有票。
+          2. 明确每票验收项、父子关系与 Blocked by；子票属于同一 Milestone，当前可实施票标为 ready-for-agent。标明主 Issue 是否仅为聚合父任务，有独立验收则不能自动随子票关闭。
+          3. 更新 run.md 任务表，检查无依赖环、遗漏或未经授权的范围变更；无法形成可执行任务时 BLOCK。
+          completed handoff 提供 run.md、repo/Milestone、主 Issue/叶任务列表、依赖与拆分或不拆分依据。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed：任务清单覆盖主 Issue 验收范围，归属/依赖和聚合父任务标记明确，存在可执行叶任务；handoff 保留运行入口和任务列表。
+            无法核验范围、标签或依赖时 NEED_CONTEXT；不采用“其他 outcome 直接接受”。
+      onPass: run-issue-cycle
+
+    run-issue-cycle:
+      execution:
+        type: child-workflow
+        workflowId: issue-cycle
+      onPass: integrate-milestone
+
+    integrate-milestone:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 按 run.md 分页核对 Milestone 的全部 Issue（排除 PR 记录）均关闭、清单无未解释的移出；Milestone 应仍 open，否则 BLOCK。
+          2. fetch 并安全切回/快进 milestone 分支，确认工作树干净、已推送且无未解释的本地提交。创建/复用指定 milestone→基线开放 PR；同源目标有歧义、PR 已关闭/合并或无交付差异时 BLOCK，不造空提交。
+          3. 更新 integration/delivery.md 与 run.md，记录 PR URL、base/head 分支及 SHA、范围和关联主 Issue；PR 描述保留原文并补交付摘要，不合并。
+          completed handoff 提供运行入口、Milestone、集成 PR、确切 base/head 和 delivery 路径。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed：完整任务清单已关闭；开放 PR 的源/目标为指定 milestone/基线，推送状态与交接 SHA 一致；运行入口与 integration/delivery.md 可读。
+            PR 或列表完整性缺独立证据时 NEED_CONTEXT，由 Manager 补证。
+      onPass: final-review
+
+    final-review:
+      execution:
+        type: actor-task
+        role: code-reviewer
+        instruction: |
+          1. 读 run.md、integration/delivery.md、主 Issue 验收及历史 review/decision。查询指定集成 PR，固定当前 base/head 与 mergeBase；按 INDEX 先读上一轮再建立本轮记录。
+          2. 审查 milestone→基线的完整 PR diff 和集成边界；仅满足 INDEX 的增量条件时审增量，仍复核旧必修项。简单纯文档/注释修改可直接审查，其余调用 code-review 技能；缺必需能力时 BLOCK。
+          3. 核对开发自测与已有 CI/必要集成回归证据；发现缺陷或验证缺口写入发现列表，不冒充独立测试，不代替开发修改。
+          4. 写 integration/rNNN-review.md；结束前复核 PR 修订未变，漂移时 BLOCK。报告完成 completed，不论建议放行或返工。
+          handoff 提供运行入口、集成 PR、轮次、reviewedBase/reviewedHead、报告路径、发现及未核实项摘要。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed：报告对应指定集成 PR 的确切 base/head，含验收范围、方法、发现/无发现、旧必修项状态和验证边界；交接有运行入口、轮次及可读报告。
+            发现必修项不等于审查动作失败；修订或证据不足时 NEED_CONTEXT。
+      onPass: decide-pr
+
+    decide-pr:
+      execution:
+        type: actor-task
+        role: review-judger
+        instruction: |
+          1. 核对集成 PR 当前 base/head 与本轮 review 一致，逐项核实发现，结合主 Issue 验收和授权范围作处置；修订漂移或范围争议 BLOCK。
+          2. 写 integration/rNNN-decision.md，对每项给出本次修复/延期/不成立及证据。延期项登记 deferred.md；本次必修项给出可执行修复清单和验收要求。
+          3. 将决策摘要及确切修订同步至集成 PR 和主 Issue，保留原文与历史。无必修项才记录 approvedBase/approvedHead，PR 保持开放。
+          无本次必修项 completed→合并收尾；有必修项 failed→Manager 规划修复 Issue，不进入独立测试节点。
+          handoff 提供运行入口、Milestone/集成 PR、本轮 base/head、review/decision 路径、远端摘要链接及批准修订或必修清单。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            两种 outcome 均需匹配当前集成 PR/base/head 的报告和逐项决策，交接有运行入口、决策路径与摘要链接。
+            completed：无未解决的本次必修项，批准修订明确；failed：存在有依据的必修清单与验收要求，不把环境/权限问题伪装成产品返工。
+            关键依据或 PR 事实不足时 NEED_CONTEXT，由 Manager 按 INDEX 补证。
+      onPass: close-milestone
+      onFail: plan-remediation
+
+    close-milestone:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 读取集成 decision，核对完整 Issue 清单已关闭。开放 PR 的 base/head 必须与批准修订一致，所需 CI/保护检查通过；无适用检查须有明确依据。当前无独立 tester，不要求不存在的测试 SHA。
+          2. 合并前发现修订漂移、缺验证或保护/权限不满足时 BLOCK，由 Manager 安排新修订审查/补证；不得绕过保护或以复杂性为由放行。
+          3. 以 merge commit 将指定 milestone PR 合入指定基线；仅允许 squash 时 BLOCK。已合并则核对目标、合并时源 head 和 merge SHA 后只补收尾；不匹配 BLOCK。
+          4. fetch 核验远端基线包含批准 head/merge SHA，更新 integration/delivery.md；关闭 GitHub Milestone，已关闭则核对本次收尾归属。安全切回更新后的基线，保持工作树干净。
+          5. 写 completion.md：交付范围、集成 PR/merge SHA、实际验证、独立测试未启用和延期事项；同步摘要至主 Issue，更新 run.md。权限/网络失败用 BLOCK，不新建产品修复票。
+          completed handoff 提供运行入口、Milestone closed 状态、集成 PR/批准 head/merge SHA、完成文档和远端摘要链接。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed：指定集成 PR 已合并至指定基线，源 head 匹配批准修订，合并时保护检查满足；远端目标包含批准提交，任务全部关闭且 Milestone 已关闭。
+            completion.md 和远端摘要明确实际验证/延期边界；工作树干净并位于基线。不要求独立 tester 证据，不以本地记录存在替代远端事实。
+            PR/CI/祖先关系缺查询能力时 NEED_CONTEXT，由 Manager 补充对应修订的核验依据。
+      onPass: END
+
+    plan-remediation:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          1. 读 INDEX、run.md 及本轮集成 decision，核对 Milestone 仍 open；外部关闭时 BLOCK，不擅自重开。
+          2. 仅为本次必修项创建/复用修复 Issue；按发现 ID/决策轮次核对已有映射，避免重入重复建票。复杂任务用实际可用的 to-tickets 拆分，记录验收、依赖和 ready-for-agent 标签。
+          3. 更新 run.md 任务表，记录“decision/发现 ID→Issue URL”；已关闭主 Issue 可继续用作历史入口，不因追加修复票擅自重开。非阻断优化须另有范围授权。
+          4. 缺明确修复目标、反复返工无新证据或无法形成可执行票时 BLOCK，由用户澄清。
+          completed handoff 提供运行入口、Milestone、决策路径、修复 Issue 列表、依赖和映射。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed：同一开放 Milestone 中存在对应本轮必修项的未完成修复票，验收/依赖/标签明确，无未解释的重复或范围扩张；交接含运行入口、决策→Issue 映射。
+            无法核验任务归属、修复依据或完整性时 NEED_CONTEXT。
+      onPass: run-issue-cycle
+
+childWorkflows:
+  issue-cycle:
+    startNode: select-next-issue
+    nodes:
+      select-next-issue:
+        execution:
+          type: actor-task
+          role: coordinator
+          instruction: |
+            1. 读 run.md，分页读取 Milestone 全部记录，排除 PR 后核对任务表。空 Issue 集、未解释移出/取消、查询不完整或 API 总记录超过 100 时 BLOCK，由 Manager 核验完整性与授权后再恢复。
+            2. 仅对 run.md 标记为纯聚合的父 Issue，在全部子票关闭且无独立验收项后评论并关闭；其他父票不自动关闭。
+            3. 选择 open、非父级、ready-for-agent 且全部 Blocked by 已关闭/为空的叶 Issue；多条可选按明确依赖优先级，再按编号升序，串行处理。
+            4. 有候选时，安全更新 milestone，从其确切 SHA 创建 feat/<issue-number>-<slug> 并推送 upstream，保存原始 baseCommit。分支已存在则按 Issue/delivery 记录核对归属、原始基线及祖先关系后复用；记录缺失/分歧 BLOCK，不把当前 tip 当原始基线。
+            5. 更新 issues/<number>/delivery.md 和 Issue 交付区，保留原文；记录 featureBranch/baseCommit/milestoneBranch。completed handoff 提供运行入口、Milestone/Issue、交付路径、分支和原始基线。
+            6. 无候选且全部 Issue 确已关闭时 failed，交接完整性依据、运行入口和里程碑汇总，结束本子流程；仍有 open 但无候选时 BLOCK，在 reason 列出每票阻塞原因，不以 failed 跳过任务。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              completed：候选归属正确、open、非父级、标签/依赖满足；分支及原始 baseCommit 有可复核记录，handoff 有运行入口和 Issue 交付路径。
+              failed：非空且完整的任务清单全部关闭、无未解释移出/取消，handoff 保留运行入口和完成依据；不是查询失败或无可执行票。
+              列表截断、分支关系或远端事实不足时 NEED_CONTEXT，由 Manager 补证。
+        onPass: deliver-one-issue
+        onFail: END
+
+      deliver-one-issue:
+        execution:
+          type: child-workflow
+          workflowId: issue-delivery
+        onPass: select-next-issue
+
+  issue-delivery:
+    startNode: implement
+    nodes:
+      implement:
+        execution:
+          type: actor-task
+          role: developer
+          instruction: |
+            1. 读本 Issue、delivery.md 与返工 decision（如有），核对工作树、featureBranch/原始 baseCommit 和目标 milestone。简单文档任务直接实现，复杂编码用实际可用的 implement 技能；缺技能或范围不清 BLOCK。
+            2. 实现当前验收项/必修清单，优先复用现有代码和测试；运行适用自测与必要回归。运行环境部署须已有明确授权，不擅自部署生产或改共享环境。
+            3. 检查通过后只提交本任务实现，不含 ignored 运行材料；记录实现 SHA 和实际命令/结果。无法运行必需检查时 BLOCK；纯文档无适用测试需写明依据。
+            4. 推送 feature，创建/复用 feature→milestone 开放 PR。返工复用同一开放 PR；已关闭/合并、无可交付差异或身份冲突时 BLOCK，不造空提交。
+            5. 更新 delivery.md、Issue 和 PR 的交付上下文：实现 SHA、当前 PR base/head、验收和检查摘要，保留原文。
+            completed handoff 提供运行入口、Milestone/Issue、featureBranch/baseCommit、PR URL、implementationCommit、base/head SHA、交付路径和自测证据。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              completed：指定 Issue 的开放 PR 源/目标分支正确，实现已推送且 head 与交接一致；有对应修订的适用自测/回归结果或不适用依据，交付记录和运行入口可读。
+              未启用独立 tester；不把开发自测称为独立验收。PR/远端提交缺独立证据时 NEED_CONTEXT，由 Manager 补证。
+        onPass: review
+
+      review:
+        execution:
+          type: actor-task
+          role: code-reviewer
+          instruction: |
+            1. 读 Issue 验收、delivery.md、历史 review/decision；固定指定 PR 的当前 base/head/mergeBase，按 INDEX 确定本轮和完整/增量范围。
+            2. 纯文档/注释的简单修改直接审查，其余调用 code-review 技能，对精确 diff、验收项、自测与必要回归证据独立检查；记录发现和未核实项，不修改实现。
+            3. 写 issues/<number>/rNNN-review.md，包含旧必修项复核和建议结论；结束前复核修订未漂移。报告完成 completed，即使建议返工；无法完成 BLOCK。
+            handoff 提供运行入口、Milestone/Issue、PR/分支、implementationCommit、reviewedBase/reviewedHead、轮次、报告路径与发现摘要。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              completed：报告绑定指定 Issue/PR/base/head，覆盖验收范围、检查证据、发现或无发现、旧必修项状态；运行入口、轮次、报告路径及修订交接齐备。
+              建议返工不等于动作 failed；范围/修订或材料不足时 NEED_CONTEXT。
+        onPass: decide-pr
+
+      decide-pr:
+        execution:
+          type: actor-task
+          role: review-judger
+          instruction: |
+            1. 核对当前 Issue PR/base/head 与本轮 review，逐项核实发现并按授权范围判断本次修复/延期/不成立；修订变化或证据不足 BLOCK。
+            2. 写 issues/<number>/rNNN-decision.md；必修项列具体问题、依据和验收要求，延期项写 deferred.md 并给后续入口，不因修复复杂跳过阻断项。
+            3. 将决策摘要与本轮修订补到 PR 交付区，保留历史；无必修项才记录 approvedBase/approvedHead，保持 PR 开放、Issue 未关闭。
+            无必修项 completed→合并收尾；存在必修项 failed→implement；当前不进入独立测试节点。
+            handoff 提供运行入口、Milestone/Issue、PR/分支、implementationCommit、base/head、review/decision 路径、远端摘要链接及批准修订或返工清单。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              两种 outcome 均有对应当前 Issue/PR/base/head 的逐项决策和运行入口、报告/决策路径。
+              completed：无本次必修项且批准修订明确；failed：存在有依据的必修清单和可执行验收要求。
+              PR 或关键事实缺独立证据时 NEED_CONTEXT，由 Manager 按 INDEX 补证。
+        onPass: complete-issue
+        onFail: implement
+
+      complete-issue:
+        execution:
+          type: actor-task
+          role: coordinator
+          instruction: |
+            1. 读本轮 decision/delivery，核对开放 PR 的源/目标、base/head 与批准修订一致，开发自测及所需 CI/保护检查满足。没有独立 tester，不要求测试最终 head；同账号不能自批 GitHub PR，保护规则要求他人 approval 时 BLOCK。
+            2. 以 merge commit 合入指定 milestone；仅允许 squash、修订漂移、保护/权限不满足时 BLOCK，由 Manager 协调，不直接推 milestone/基线、不绕过保护。
+            3. 已合并时核验目标、合并时源 head 与本次批准修订匹配后只补收尾，不重复合并；不匹配 BLOCK。fetch 验证远端 milestone 包含 implementationCommit/批准 head 和 merge SHA。
+            4. 更新 delivery.md 和 Issue 交付区，保留 PR、实现/批准修订、检查摘要、review/decision 路径及 merge SHA/核验依据；本地报告无报告提交 SHA。验证成功再关闭 Issue，已关闭则核验复用。
+            5. 安全切回更新后的 milestone，保持工作树干净，更新 run.md 进度。网络/外部条件阻塞用 BLOCK，不回已合并 PR 开发。
+            completed handoff 提供运行入口、Milestone/Issue closed 状态、PR、实现/批准 head/merge SHA、交付记录和远端摘要链接。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              completed：指定 PR 已合入指定 milestone，合并源 head 匹配批准修订且当时保护检查满足；远端 milestone 包含实现/批准提交和 merge SHA。
+              Issue 已关闭、交付记录完整；工作树干净并位于 milestone。证据为开发自测/现有 CI，不要求独立 tester 或报告提交 SHA。
+              PR/CI/祖先关系缺独立核验能力时 NEED_CONTEXT，由 Manager 补证，不以 Actor 自述替代事实。
+        onPass: END

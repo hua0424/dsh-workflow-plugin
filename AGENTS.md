@@ -44,6 +44,7 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 
 - 当前运行版本：`0.1.2-rc.1`；对应源码：`D:\project\github\deepseek-harness`。分析宿主兼容性、continuable Actor、compact 或 Session 行为时，查询此版本源码。
 - 该仓库已用 codebase-memory 索引，project：`D-project-github-deepseek-harness`；优先图查询，引用前检查 coverage，必要时读取源文件核实。源码仓库与已安装运行产物是不同路径。
+- 本仓库的默认远端是github，相关操作可使用gh命令行工具。
 
 ## Commands
 
@@ -78,6 +79,7 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 - 工单实施/审查先读 `docs/agents/issue-tracker.md` 和 `docs/work-plans/runtime-refact.md`，获取实际工单依赖、完成状态与用户改动保护范围。
 - `refact` 分支的重构开发/评审先读 `docs/design/node-execution-runtime.md` 与 `docs/specs/node-execution-runtime.md`：三表工作单、outcome+handoff 单文本、Role 复用/compact、BLOCK 争议处理的目标基线；旧 PRD/Issue #6 已被替代。未实现前，以下领域文档仍用于理解当前代码。
 - `CONTEXT.md` — 领域术语表（Manager、Role Actor、Judge、Run Frame、nodeToken、BLOCK、pendingClaim、Handoff Context 等含义精确，代码/文档中使用原词）.
+- `docs/user-guide.md` — 面向使用者/运维者的操作手册（命令、工具、部署、故障排查）.
 - `docs/design/configurable-agent-workflow-graph.md` — v1 权威设计.
 - `docs/testing/acceptance-test-plan.md` / `acceptance-report.md` — 冻结的验收标准与现状.
 - `docs/prd/<YYYYMMDD-topic>/` — 每轮修复/加固的 PRD；`docs/test-reports/` — 每个_issue 的测试报告；`docs/pending-discussions/` — 已记录的前提结论.
@@ -95,3 +97,17 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 - Catalog YAML 是受限单文档 YAML 1.2：禁止 duplicate key、anchor/alias/merge、custom tag、模板插值；文件名必须是小写 `[a-z][a-z0-9-]*.yaml`（拒绝 `.yml`）；invalid 文件只阻塞自身.
 - Trace log 是 best-effort 派生产物，写在 catalog 配置旁 `<catalogDir>/<workflowId>/`，失败静默、绝不阻断 Run；日志**内容**不进 SQLite，仅文件路径以可选 `traceLogPath` 元数据随行持久化（host 重启后事件仍写同一文件）.
 - 新增 Checker id 或 builtin program = 修改插件源码 + 测试 + 版本说明；配置不能注册任意程序/脚本/Checker 类型.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as GitHub issues in `hua0424/dsh-workflow-plugin`; managed via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles, label strings equal to role names: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.

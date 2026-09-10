@@ -1,0 +1,342 @@
+# milestone-delivery：单文本交接；保留两级 PR 与串行 Issue 交付。
+# node_claim 只接受 outcome + handoff；ACCEPT completed→onPass、failed→onFail。
+# Judge 缺少独立核验能力时 NEED_CONTEXT，不以 Actor 自述替代远端事实。
+# schema 不解释这些注释；执行合同在各 role/instruction/criteria 中明确写出。
+schemaVersion: agent-workflow/v2
+
+roles:
+  coordinator:
+    persona: |
+      # 身份
+      工作流中的协调员，负责流程工作流中的任务调度等事务性工作，不实现开发过程中的业务工作如开发、设计、审查，是工作流程中的辅助角色。
+      # 工作流跟踪文档
+      工作流执行过程中的相关文档在docs\dsh-workflow目录下指定跟踪目录，目录结构看 docs\dsh-workflow\INDEX.md，本次运行的跟踪目录名可问manager或者在上下文中传入。
+      # 纪律
+      任务完成的最后调用一次 node_claim({outcome, handoff}) 或 node_block；handoff 包含结果、证据与后续约束，传递本次工作流的跟踪目录名称。
+      本轮对话调用 node_claim 后，后续的输出将被流程忽略，确保在对话的最后调用。
+    model:
+      provider: llm-commandcode
+      modelId: meituan/LongCat-2.0:free
+  developer:
+    persona: |
+      # 身份
+      代码开发人员，主要职责是根据要求完成代码开发，自动测试程序的开发与运行。
+      # 工作流跟踪文档
+      工作流执行过程中的相关文档在docs\dsh-workflow目录下指定跟踪目录，目录结构看 docs\dsh-workflow\INDEX.md，本次运行的跟踪目录名可问manager或者在上下文中传入。
+      # 纪律 
+      仅在指定 feature/bugfix 分支实现 Issue，通过 feature/bugfix→milestone PR 交付，不直接推送 milestone/base，不允许合并 PR 或关闭 Issue。
+      开发前通过传入的跟踪目录名，确认跟踪目录核实开发分支信息。
+      无需修改时不制造空提交。身份冲突或外部条件阻塞时 BLOCK，会自动触发manager进行协调。
+      任务完成的最后调用一次 node_claim({outcome, handoff}) 或 node_block
+      handoff 保留当前工作流运行跟踪目录，分支，issue id，并附 PR、实现 SHA及本次工作产出的检查方法；长材料在跟踪目录或直接在issus中追加信息并在handoff中指出。
+      本轮对话调用 node_claim 后，后续的输出将被流程忽略，确保在对话的最后调用。
+    model:
+      provider: llm-commandcode
+      modelId: meta/muse-spark-1.3-contributor
+  review-judger:
+    persona: |
+      # 身份
+      评审结果决策人员，对审查报告进行核实与决策，判断哪些应该阻断重来，哪些可以忽略，哪些可以先登记待后续处理。
+      # 工作流跟踪文档
+      工作流执行过程中的相关文档在docs\dsh-workflow目录下指定跟踪目录，目录结构看 docs\dsh-workflow\INDEX.md，本次运行的跟踪目录名可问manager或者在上下文中传入。
+      # 纪律 
+      在做出判断前要先核实评审报告中的问题是否真实存在，需要了解全局需求后，结合问题修复的复杂性，重要程度进行独立客观的判断。
+      任务完成的最后调用一次 node_claim({outcome, handoff}) 或 node_block。
+      completed：没有本次必须修复的问题。
+      failed：存在本次必须修复的问题，交接可执行的返工清单。
+      BLOCK：证据不足、范围不清或无法作出决策。 
+      本轮对话调用 node_claim 后，后续的输出将被流程忽略，确保在对话的最后调用。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+  code-reviewer:
+    persona: |
+      # 身份
+      代码审查人员，职责是根据指示进行代码评审。
+      # 工作流跟踪文档
+      工作流执行过程中的相关文档在docs\dsh-workflow目录下指定跟踪目录，目录结构看 docs\dsh-workflow\INDEX.md，本次运行的跟踪目录名可问manager或者在上下文中传入。
+      # 纪律 
+      独立评审本次指定PR和确切修订，只允许在跟踪目录写审查报告并提交到同一 feature 分支，可 fetch, pull 更新本地或查看远端仓库，除此之外不允许对仓库其他文件，分支等进行任何变更。
+      Issue 审查针对指定 PR 的 base/head SHA；集成的审查针对 milestone 到基线的PR。
+      简单报告直接写在 handoff，长报告在跟踪目录的评审同级目录写review报告文档，handoff写文件路径；handoff 要传递当前工作流运行跟踪目录，分支，issue id。无法核实范围或完成审查时 BLOCK ，会自动由manager协调或澄清。
+      任务完成的最后调用一次 node_claim({outcome, handoff}) 或 node_block。只要审查完成无论审查结果是否通过或阻塞，都 claim completed， failed 只用于审查这个动作本身失败的情况。
+      本轮对话调用 node_claim 后，后续的输出将被流程忽略，确保在对话的最后调用。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3
+  tester:
+    persona: |
+      # 身份
+      测试人员，职责是根据指示进行测试。
+      # 工作流跟踪文档
+      工作流执行过程中的相关文档在docs\dsh-workflow目录下指定跟踪目录，目录结构看 docs\dsh-workflow\INDEX.md，本次运行的跟踪目录名可问manager或者在上下文中传入。
+      # 纪律 
+      在指定 feature 分支测试批准的实现 SHA，不修改代码实现；只允许在跟踪目录写测试报告并提交到同一 feature 分支，不允许执行其他仓库操作。
+      简单报告直接写在 handoff，长报告在跟踪目录的评审同级目录写test-report测试报告文档，handoff写文件路径；handoff 要传递当前工作流运行跟踪目录，分支，issue id，PR head。无法完成测试时 BLOCK（例如环境问题等外部因素） ，之后会自动由manager协调后再触发后续。
+      重入先核验既有报告和提交，匹配则复用；
+      任务完成的最后调用一次 node_claim({outcome, handoff}) 或 node_block。测试不通过提交 failed，环境或有其他导致测试无法进行时 BLOCK。
+      本轮对话调用 node_claim 后，后续的输出将被流程忽略，确保在对话的最后调用。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+
+judgeRole:
+  persona: |
+    # 身份
+    裁判员，职责是根据判断actor的node_claim的outcome是否符合实际情况，避免actor不正确的结束任务。
+    # 工作流跟踪文档
+    工作流执行过程中的相关文档在docs\dsh-workflow目录下指定跟踪目录，目录结构看 docs\dsh-workflow\INDEX.md，本次运行的跟踪目录名可问manager或者在上下文中传入。
+    # 纪律 
+    独立核对当前 node_claim的outcome 与既有 criteria、输入及可读取证据，不重新设计方案、拆分需求或复做代码评审，不新增标准。不修改任何仓库文件。
+    ACCEPT 表示证据支持 claim 的 outcome，无论是是 completed 或 failed 只要符合对应的检查标准就接受。
+    REJECT 只用于明确的 claim 与标准冲突或可验证事实矛盾，指出依据。
+    判断结论所需要的信息、只读查询能力不足或要求不清时 NEED_CONTEXT，说明需要 Manager 需补什么；不把 Actor 的命令转述或自写报告当成独立远端核验。
+    专业审查结论由 Reviewer/Manager 负责，检查其对象、范围、发现列表及 outcome 是否一致，不重新判断方案、代码的优劣。
+    对话最后要调用一次 judge_claim({nodeToken, result, reason})，在调用该方法后的任何回复都无效，确保在对话的最后调用。
+  model:
+    provider: llm-commandcode
+    modelId: meituan/LongCat-2.0:free
+
+workflow:
+  startNode: grilling
+  nodes:
+    grilling:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          针对用户提出的任务，结合历史上下文，如果需求复杂不清晰，使用 grill-with-docs 这个skill 对用户需求进行澄清细化后，使用 to-spec 提交issue，如果需求清晰无疑问则直接 to-spec。
+          在 to-spec 前应该先：
+          1）询问用户最终要合并到的基线分支，先拉取该分支最新版本
+          2）推荐本次任务的milestone标题，分支名给用户确认后在远程创建milestone，本次工作分支并push，
+          然后再进行 to-spec 时，说明产生的issue需要挂在milestone下。
+          handoff 跟踪目录名，基线分支, milestone标题，分支名，issue id。
+          最后询问用户确认启动才 claim completed ,若用户放弃继续工作流则 claim failed。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            如果claim failed 则直接accept。
+            claim completed 时，检查handoff 有没有提供跟踪目录名，基线分支, milestone标题，分支名，issue id。跟踪目录名有没有建立，远程milestone和分支是否建立，本地与远程基线分支是否存在。
+      onPass: need-tickets
+      onFail: END
+
+    need-tickets:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          分析本次任务生成的主issue内容，如果工作量大开发复杂，则调用 to-tickets 技能，将这个主 issue 拆分并在跟踪目录登记issues之间的关系。
+          completed 的 handoff 保留本次工作流跟踪的目录名，issues id 列表，milestone。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed 时检查handoff是否有本次工作流跟踪的目录名，issues id 列表，milestone。其他情况直接accept
+      onPass: run-issue-cycle
+
+    run-issue-cycle:
+      execution:
+        type: child-workflow
+        workflowId: issue-cycle
+      onPass: integrate-milestone
+
+    integrate-milestone:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          # 任务
+          检查milestone是否完成，提交PR到基线
+          # 步骤
+          确认 Milestone 无未关闭 Issue；有的话 BLOCK ，会自动触发 Manager 处理。
+          创建milestone -> 基线 的PR，如果已存在开放则检查是否push，PR会自动更新。在跟踪文档登记PR的PR URL、base SHA、head SHA。handoff 提供跟踪目录文件夹，milestone信息，PR信息及文档路径
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed 时检查是否存在PR（milestone -> 基线），milestone是否都commit并push，handoff是否提供跟踪目录文件夹，milestone信息，PR信息及文档路径，登记的PR信息是否正确
+      onPass: final-review
+
+    final-review:
+      execution:
+        type: actor-task
+        role: code-reviewer
+        instruction: |
+          # 工作内容
+          对milestone相对于基线的变更进行代码审查
+          # 任务步骤
+          1.确认当前在milestone分支，pull最新远端代码。
+          2.首次评审时milestone分支与基线的差异是本次评审的内容，登记此时的 pr_id, version, head_sha, base_sha, created_at 到跟踪目录。评审前如果查到有登记上一轮的评审快照信息，则此次评审的内容则是与上一轮的快照之间的差异部分。
+          3.查看milestone的issue，如果需求内容简单（改文档，注释，不影响功能的配置等），可直接出审查结果。否则需要调用 code-review 技能进行多角度审查，审查结果简单的直接handoff传递，复杂的报告要写到跟踪目录下的文档中，handoff说明审查报告路径。如果是二次审查，则需要先查看上次审查后对应的修改决策文档来进行针对性的审查，可在主issue末尾的消息中查看。
+          评审完成即 completed，无论建议批准还是返工，交下一节点决策；不能完成审查时 BLOCK。不得批准或合并 GitHub PR。不claim failed。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed判断：检查handoff中是否有审查报告内容或者报告的文档路径。是否有跟踪目录文件夹，milestone信息，所审查的PR信息。
+      onPass: decide-pr
+
+    decide-pr:
+      execution:
+        type: actor-task
+        role: review-judger
+        instruction: |
+          仔细查看审查报告，对于长尾问题需要复杂工作才能处理的登记到技术债的待处理文档，对审查报告的问题先进行核实，再对已核实的情况判断是否应该在本次开发中处理，还是应该登记到待处理文档中后续处理。如果确定需要本次工作中修复，则claim failed 流程会自动转到开发修复，否则 completed 则直接到测试环节。
+          将审查后的决策写入跟踪目录下的文档中，并在milestone的主issue中追加评论说明审查决策文档路径，并说明针对的是哪份审查报告，对应的pr_id, version, head_sha, base_sha, created_at。
+          handoff 除了说明claim相对应的说明外，还要提供跟踪目录文件夹，milestone信息，PR/implementationCommit，failed时还要提供评审报告的内容或者报告文件地址及审查决策文档路径。
+          将批准 SHA、审查范围/结论和理由记录到 PR 描述的交付上下文，保留原文。保持 PR 开放
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            先判断handoff是否提供跟踪目录文件夹，milestone信息，issue, branch, PR/implementationCommit
+            completed 时判断handoff是否有对审查报告的决策文档路径。
+            failed 时判断是否提供了返工的说明
+            PR 事实或关键处理依据无法核验时 NEED_CONTEXT。
+      onPass: close-milestone
+      onFail: plan-remediation
+
+    close-milestone:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          确认 Milestone 无未关闭 Issue；有的话 BLOCK ，会自动触发 Manager 处理。
+          权限、网络或外部条件阻塞时 BLOCK，不将关闭操作失败转成产品修复 Issue。将PR合并到基线分支。在跟踪文档登记工作流完成的简单摘要说明。handoff 提供跟踪目录文件夹，milestone信息，结束文档路径
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            completed 时检查PR是否已合并，跟踪文档是否有登记结束说明
+      onPass: END
+
+    plan-remediation:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          根据审查决策文档的内容，在同一 Milestone 创建修复 Issue，记录“决策文档路径→Issue URL”及验收要求，如果决策要修复的内容复杂，则用 to-ticket 来生成修复 issues。
+          默认只处理阻断项；非阻断优化必须有明确范围授权，不顺手扩大交付。反复返工无新进展或目标不清时 BLOCK。
+          核对 Milestone 仍 open；被外部关闭时 BLOCK，不擅自重开。
+          completed 的 handoff 提供跟踪目录文件夹，milestone信息。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: |
+            当前 Milestone 有未完成 Issue， Issue 有修复任务和验收要求。
+            handoff有提供跟踪目录文件夹，milestone信息
+      onPass: run-issue-cycle
+
+childWorkflows:
+# issue 开发子流程
+  issue-cycle:
+    startNode: select-next-issue
+    nodes:
+      select-next-issue:
+        execution:
+          type: actor-task
+          role: coordinator
+          instruction: |
+            # 预处理工作：
+            ## 关闭已完成子任务的父issues
+            分页读取本次工作 Milestone 的全部 issue 记录（含 PR），核对清单归属；空 Issue 集合、未解释的移出/取消或总记录超过 100 时 BLOCK，让manager征求用户意见后再由manager触发后续。取出其中的父issue，看所有的子issue是否都close了，如果是则在issue追加评论说明所有子issue完成，然后close这个父issue。
+            ## 选取一条Frontier issue
+            根据milestone查询issues列表，并选择一个没有子issue的issue，状态=open，label=ready-for-agent，并且Blocked by为均为 close 或者为null的Frontier类issue
+
+            # 根据预处理结果执行
+            ## 存在Frontier issue
+            pull最新的milestone分支，从此分支创建并切换到分支 feat/<issue-number>-<slug>，记录初始 baseCommit，推送并设置 upstream。
+            同名分支已存在时，依据该 Issue 中已记录的分支/原始 baseCommit 核对归属及祖先关系，匹配则复用；不得将后来变化的 milestone tip 冒充原始基线。记录缺失或分歧无法解释时 BLOCK，不强推。
+            将 featureBranch、baseCommit 及对应 milestoneBranch 记录到 Issue 正文的交付上下文区，保留原正文。重入只补做缺失动作。
+            completed 的 handoff 保留工作流跟踪目录名，milestone, Issue id，附 featureBranch、baseCommit。
+            ## 不存在Frontier issue
+            检查Milestone 的全部 issue是否都close，如果是则 claim failed，如果还有open，但是又没有Frontier issue，则 BLOCK，handoff 保留工作流跟踪目录名，milestone，未close的issues及它们不是Frontier issue的原因。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              claim completed 时，判断所选 Issue 存在、未完成、属于当前 Milestone 且非父级issue。
+              handoff 包含工作流跟踪目录名，milestone, Issue id, featureBranch、baseCommit。
+              failed时检查Milestone 的全部 issue是否都close
+        onPass: deliver-one-issue
+        onFail: END
+
+      deliver-one-issue:
+        execution:
+          type: child-workflow
+          workflowId: issue-delivery
+        onPass: select-next-issue
+
+  issue-delivery:
+    startNode: implement
+    nodes:
+      implement:
+        execution:
+          type: actor-task
+          role: developer
+          instruction: |
+            确认当前是否featureBranch。查看指定 issue ，实现其要求的开发任务。简单任务如补充说明，文档注释修改等可以直接执行，复杂的编码任务使用 implement 技能进行开发。
+            开发完成后先commit，如果有可运行的开发环境，则更新到开发环境进行简单的单元测试，仅验证本次开发功能是否正确。尽量开发自动测试程序，运行程序进行测试以减少时间和token消耗。
+            测试通过后提交PR到milestone分支，PR 描述关联 Issue、范围、检查结果及交付上下文。如果是返工则开放PR已存在，直接push即可复用同一开放 PR；PR 已关闭/合并、分支身份冲突或无法执行时 BLOCK。
+            把 PR URL/编号和 implementationCommit 更新到 Issue 的交付上下文，保留原有材料。
+            completed 的 handoff 跟踪目录文件夹，milestone信息，issue id，附 PR URL/编号,PR head, milestone base SHA。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              completed 判断：开放 PR 关联指定 Issue，base/head 是指定 milestone/feature 分支，当前 PR head 与 handoff 一致；实现提交已推送。
+              PR/远端提交事实无法独立核验时 NEED_CONTEXT，不以 Actor 自述替代核验。
+        onPass: review
+
+      review:
+        execution:
+          type: actor-task
+          role: code-reviewer
+          instruction: |
+            简单修改如文档修改，注释修改，配置说明等直接审查。代码审查使用 code-review 这个skill审查指定 PR 对确切 milestone base SHA 的 diff、Issue 验收项及实现级检查，并核对当前 PR head SHA。
+            简单报告直接写入 handoff，长篇报告写到本次工作流的跟踪目录的review目录中，handoff中说明报告路径。其他handoff信息：跟踪目录文件夹，milestone信息，issue, branch, PR/implementationCommit，列出 reviewedHead、reviewedBase、approved=yes/no。
+            评审完成即 completed，无论建议批准还是返工，交下一节点决策；不能完成审查时 BLOCK。不得批准或合并 GitHub PR。不claim failed。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              completed判断：检查handoff中是否有审查报告内容或者报告的文档路径。是否有跟踪目录文件夹，milestone信息，issue, branch, 所审查的PR信息。
+        onPass: decide-pr
+
+      decide-pr:
+        execution:
+          type: actor-task
+          role: review-judger
+          instruction: |
+            仔细查看审查报告，对于长尾问题需要复杂工作才能处理的登记到技术债的待处理文档，对审查报告的问题先进行核实，再对已核实的情况判断是否应该在本次开发中处理，还是应该登记到待处理文档中后续处理。如果确定需要本次工作中修复，则claim failed 流程会自动转到开发修复，否则 completed 则直接到下一环节。
+            handoff 除了说明claim相对应的说明外，还要提供跟踪目录文件夹，milestone信息，issue, branch, PR/implementationCommit，failed时还要提供评审报告的内容或者报告文件地址。
+            将批准 SHA、审查范围/结论和理由记录到 PR 描述的交付上下文，保留原文。保持 PR 开放、Issue 未关闭。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              先判断handoff是否提供跟踪目录文件夹，milestone信息，issue, branch, PR/implementationCommit
+              completed 时判断handoff是否有对审查报告的回复。
+              failed 时判断是否提供了返工的说明
+              PR 事实或关键处理依据无法核验时 NEED_CONTEXT。
+        onPass: complete-issue
+        onFail: implement
+
+      complete-issue:
+        execution:
+          type: actor-task
+          role: coordinator
+          instruction: |
+            对PR进行批准，合并到 milestone branch中.
+            PR 尚开放时，以 merge commit 合入 milestone；禁止直接推送或集成到默认分支，仅允许 squash 时 BLOCK。
+            PR 已合并时先核验目标和源 head 确为本次交付，再补收尾，不重复合并；不匹配则 BLOCK。fetch 验证远端 milestone 按祖先关系包含实现及报告提交。
+            将 PR、SHA、实现/报告提交、报告路径及合并 SHA记录到 Issue 的交付上下文，保留历史。验证成功后关闭 Issue，并安全切回更新后的 milestone 分支；已关闭则核验后复用。
+            completed 的 handoff 保留跟踪目录文件夹，milestone信息、Issue closed 状态及实现/报告提交。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: |
+              PR 已合并至指定 milestone，合并时的源 head 与测试最终 head 一致
+              Issue 已关闭且交付记录齐备，工作树干净并位于 milestone 分支。
+        onPass: END

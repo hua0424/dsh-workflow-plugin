@@ -1,4 +1,4 @@
-﻿### Windows
+### Windows
 # Windows thumbnail cache files
 Thumbs.db
 
@@ -17,3 +17,6 @@ lib/
 
 # Review/diff scratch artifacts
 review-*.txt
+
+# Local workflow run artifacts; keep docs/dsh-workflow/INDEX.md versioned
+/docs/dsh-workflow/runs/
