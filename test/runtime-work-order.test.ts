@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { StateStore, stateDbPath } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
+import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from '../src/engine/timeouts.ts'
 
 const CONFIG = {
   schemaVersion: 'agent-workflow/v2' as const, roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
@@ -24,6 +25,13 @@ function configWithWorker(onFail?: string): import('../src/types.ts').WorkflowCo
   }
   return config
 }
+/** plan(manager) → work(worker) → again(同一个 worker Role，跨节点复用会话)。 */
+function configWithReusedWorker(): import('../src/types.ts').WorkflowConfig {
+  const config = configWithWorker()
+  config.workflow.nodes.work!.onPass = 'again'
+  config.workflow.nodes.again = { ...config.workflow.nodes.work!, onPass: 'END' }
+  return config
+}
 function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   const home = mkdtempSync(join(tmpdir(), 'workflow-t3-'))
   const store = new StateStore(home)
@@ -34,6 +42,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   const compacts: string[] = []
   const lifecycle: string[] = []
   let safe = true
+  const unsafeSessions = new Set<string>()
   let compactOutcome: { ok: boolean; detail?: string } = { ok: true }
   let compactGate: Promise<void> | undefined
   let compactEntered: (() => void) | undefined
@@ -69,7 +78,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   }, {
     async ensureRoleActor(_run, _role, text) { return { ...send('worker-session', text), childId: 'worker-session' } },
     async startJudge(_run, input) { judges.push(input); return { ...send(input.judgeSessionId, 'Judge'), judgeSessionId: input.judgeSessionId } },
-    async safeToInspect(sessionId) { lifecycle.push(`safe:${sessionId}`); if (safetyGate && gatedSession === sessionId) await safetyGate; return safe },
+    async safeToInspect(sessionId) { lifecycle.push(`safe:${sessionId}`); if (safetyGate && gatedSession === sessionId) await safetyGate; return safe && !unsafeSessions.has(sessionId) },
     async retireJudge() {}, async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); drainEntered?.(); if (drainGate) await drainGate; if (drainFailure) throw drainFailure },
     async compactRoleActor(_run, role) { compacts.push(role); lifecycle.push(`compact:${role}`); compactEntered?.(); if (compactGate) await compactGate; return compactOutcome },
     async followupJudge(_run, judgeSessionId, input) { followups.push(input); if (followupFailure) throw followupFailure; return send(judgeSessionId, 'Judge followup') },
@@ -81,6 +90,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   return {
     home, store, engine, messages, judges, followups, drains, compacts, lifecycle, caller,
     setSafe(value: boolean) { safe = value },
+    setSessionUnsafe(sessionId: string, value: boolean) { if (value) unsafeSessions.add(sessionId); else unsafeSessions.delete(sessionId) },
     setCompactOutcome(value: { ok: boolean; detail?: string }) { compactOutcome = value },
     setCompactGate(gate: Promise<void> | undefined, onEntered?: () => void) { compactGate = gate; compactEntered = onEntered },
     setBoundaryPersistGate(gate: Promise<void> | undefined, onEntered?: () => void) { boundaryPersistGate = gate; boundaryPersistEntered = onEntered },
@@ -982,12 +992,7 @@ test('resume refuses a ready successor whose predecessor Judge is not safely set
 })
 
 test('a block while Role safety check waits prevents subsequent compact and dispatch', async () => {
-  const config = structuredClone(CONFIG) as import('../src/types.ts').WorkflowConfig
-  const worker = { execution: { type: 'actor-task' as const, role: 'worker', instruction: 'Work' }, checker: CONFIG.workflow.nodes.plan.checker, onPass: 'again' }
-  config.workflow.nodes.plan.onPass = 'work'
-  config.workflow.nodes.work = worker
-  config.workflow.nodes.again = { ...worker, onPass: 'END' }
-  const h = harness(config)
+  const h = harness(configWithReusedWorker())
   let release!: () => void
   try {
     await h.start()
@@ -1007,6 +1012,72 @@ test('a block while Role safety check waits prevents subsequent compact and disp
   } finally { release?.(); h.close() }
 })
 
+/** 走到跨节点复用 worker 会话的那次派发；返回的 Judge caller 结算后会触发它。 */
+async function reachReusedWorkerDispatch(h: ReturnType<typeof harness>) {
+  await h.start()
+  await h.engine.handleTurnEnded('ws', await acceptCurrent(h))
+  const judge = await acceptCurrent(h)
+  assert.equal((await h.row()).execution.nodeId, 'again')
+  return judge
+}
+
+test('#21 F2: a cold reused Role Session dispatches without a dispatch fault', async () => {
+  const h = harness(configWithReusedWorker())
+  try {
+    const judge = await reachReusedWorkerDispatch(h)
+    // 冷置：存储层可读但无存活进程（活动不可观测）——与 resume 路径同等安全。
+    h.setSessionUnsafe('worker-session', true)
+    h.engine.actorActivity = async () => 'unknown'
+    await h.engine.handleTurnEnded('ws', judge)
+    const current = await h.row()
+    assert.equal(current.run.status, 'running')
+    assert.equal(current.execution.blockReason, null)
+    assert.equal(current.execution.dispatch?.sessionId, 'worker-session')
+    assert.deepEqual(h.compacts, ['worker'], 'the cold reuse still runs its node-boundary compact')
+    assert.equal(h.messages.at(-1)?.sessionId, 'worker-session')
+  } finally { h.close() }
+})
+
+test('#21 F2: a Session with observable activity still BLOCKs the reuse dispatch', async () => {
+  const h = harness(configWithReusedWorker())
+  try {
+    const judge = await reachReusedWorkerDispatch(h)
+    h.setSessionUnsafe('worker-session', true)
+    h.engine.actorActivity = async () => 'idle'
+    await h.engine.handleTurnEnded('ws', judge)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.match(blocked.execution.blockReason!, /previous Role execution is not safely closed/)
+    assert.deepEqual(h.compacts, [], 'the fault is raised before compact/send')
+  } finally { h.close() }
+})
+
+test('#21 F1: every dispatch-path seam timeout BLOCKs with its stage name instead of hanging the Manager turn', async () => {
+  const saved = { ...DISPATCH_TIMEOUTS }
+  DISPATCH_TIMEOUTS.whenIdle = 20
+  // 真实超时机制产出的 detail（Host 侧 cold/compact 链的返回值形状）。
+  const compactTimeout = await withTimeout(new Promise<never>(() => {}), 7, 'compactNow').then(() => '', error => (error as Error).message)
+  const seams: Array<[string, (h: ReturnType<typeof harness>) => void]> = [
+    ['whenIdle', h => h.setSafetyGate('worker-session', new Promise<never>(() => {}))],
+    ['compactNow', h => h.setCompactOutcome({ ok: false, detail: compactTimeout })],
+    ['send', h => h.setRoleSendFailure(new DispatchTimeoutError('send', DISPATCH_TIMEOUTS.send))],
+  ]
+  try {
+    for (const [stage, inject] of seams) {
+      const h = harness(configWithReusedWorker())
+      try {
+        const judge = await reachReusedWorkerDispatch(h)
+        inject(h)
+        await h.engine.handleTurnEnded('ws', judge)
+        const blocked = await h.row()
+        assert.equal(blocked.run.status, 'blocked', stage)
+        assert.equal(blocked.execution.phase, 'working', stage)
+        assert.match(blocked.execution.blockReason!, new RegExp(`timeout after \\d+ms at stage "${stage}"`))
+      } finally { h.close() }
+    }
+  } finally { Object.assign(DISPATCH_TIMEOUTS, saved) }
+})
+
 function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   const home = mkdtempSync(join(tmpdir(), 'workflow-t6-'))
   let store = new StateStore(home)
@@ -1018,6 +1089,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
   let drainFailure: Error | undefined
   let judgeFollowupFailure: Error | undefined
   let safe = true
+  let safetyGate: Promise<void> | undefined
   let activity: 'active' | 'idle' | 'unknown' = 'unknown'
   let roleAvailability: import('../src/engine/engine.ts').SessionAvailability = 'available'
   let judgeAvailability: import('../src/engine/engine.ts').SessionAvailability = 'available'
@@ -1057,7 +1129,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
       async retireJudge() {},
       async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); if (drainFailure) throw drainFailure },
       async compactRoleActor() { return { ok: true } },
-      async safeToInspect() { return safe },
+      async safeToInspect() { if (safetyGate) await safetyGate; return safe },
     }, { async run() { throw new Error('T7') } }, makeStateHost(store))
     next.cwdResolver = async () => home
     next.actorActivity = async () => activity
@@ -1070,6 +1142,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
     get engine() { return engine },
     get store() { return store },
     setSafe(value: boolean) { safe = value },
+    setSafetyGate(gate: Promise<void> | undefined) { safetyGate = gate },
     setActivity(value: 'active' | 'idle' | 'unknown') { activity = value },
     setRoleAvailability(value: import('../src/engine/engine.ts').SessionAvailability) { roleAvailability = value },
     setJudgeAvailability(value: import('../src/engine/engine.ts').SessionAvailability) { judgeAvailability = value },
@@ -1180,6 +1253,29 @@ test('Manager recovery allows unknown cold Role only after explicit resume, but 
     assert.equal(resumed.execution.dispatch?.sessionId, 'worker-session')
     assert.notEqual(resumed.execution.dispatch?.id, before.execution.dispatch?.id)
   } finally { h.close() }
+})
+
+test('#21 F1: a hanging Role probe during node_resume fails with the stage name and keeps the Run BLOCKed', async () => {
+  const h = recoveryHarness(configWithWorker())
+  const saved = { ...DISPATCH_TIMEOUTS }
+  DISPATCH_TIMEOUTS.whenIdle = 20
+  try {
+    await enterRecoveryWorker(h)
+    h.reopen()
+    await h.engine.handleRestartReconcile()
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    h.setSafe(false)
+    h.setActivity('unknown')
+    h.setSafetyGate(new Promise<never>(() => {}))
+    await assert.rejects(
+      h.engine.handleResume('ws', blocked.execution.nodeToken, '旧 Role 现场需要人工核验，先探针再决定。', 'manager', 'actor'),
+      /timeout after 20ms at stage "whenIdle"/)
+    const after = await h.row()
+    assert.equal(after.run.status, 'blocked', 'a timed-out probe changes nothing and never hangs the Manager turn')
+    assert.equal(after.execution.dispatch?.id, blocked.execution.dispatch?.id)
+    assert.equal(after.stateVersion, blocked.stateVersion)
+  } finally { Object.assign(DISPATCH_TIMEOUTS, saved); h.close() }
 })
 
 test('actor resume rechecks a settled Role dispatch and rejects a newly active Session', async () => {

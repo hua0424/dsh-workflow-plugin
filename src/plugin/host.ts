@@ -21,6 +21,7 @@ import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../e
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { JUDGE_REQUIRED_TOOLS, JUDGE_DEFAULT_DENY, judgeLabel, judgeSpawnPlan, knownDenyList, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
 import { topFrame } from '../state/invariants.ts'
+import { DISPATCH_TIMEOUTS, withTimeout } from '../engine/timeouts.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
 import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
@@ -67,7 +68,8 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   if (persistence === undefined) return undefined
   let inspection: SessionInspection
   try {
-    inspection = await persistence.inspect(SessionId(sessionId), new AbortController().signal)
+    inspection = await withTimeout(persistence.inspect(SessionId(sessionId), new AbortController().signal),
+      DISPATCH_TIMEOUTS.availability, 'availability')
   } catch (error) {
     if (error instanceof SessionPersistenceNotFoundError) throw error
     const detail = error instanceof Error ? error.message : String(error)
@@ -214,8 +216,11 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) throw new WorkflowError(`no actor mapped for role "${roleKey}"`)
       // Workflow 派发必须是独立 child turn，不可用 nearest-step sendMessage。
-      const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(childId), textBlocks(text),
-        { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
+      const controller = new AbortController()
+      const messageId = await withTimeout(
+        queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(childId), textBlocks(text),
+          { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, controller.signal),
+        DISPATCH_TIMEOUTS.send, 'send', controller)
       return { messageId }
     },
     managerSessionSeq(run) {
@@ -336,8 +341,11 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         // correct continuation for an existing mapping.
         const manager = adapters.managerAgentOf(run)
         if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-        const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(existing), textBlocks(initialText),
-          { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
+        const controller = new AbortController()
+        const messageId = await withTimeout(
+          queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(existing), textBlocks(initialText),
+            { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, controller.signal),
+          DISPATCH_TIMEOUTS.send, 'send', controller)
         return { childId: existing, messageId }
       }
       const manager = adapters.managerAgentOf(run)
@@ -431,8 +439,11 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async followupJudge(run, judgeSessionId, input) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      const messageId = await queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(judgeSessionId), textBlocks(await judgePrompt(run, input)),
-        { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, new AbortController().signal)
+      const controller = new AbortController()
+      const messageId = await withTimeout(
+        queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(judgeSessionId), textBlocks(await judgePrompt(run, input)),
+          { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, controller.signal),
+        DISPATCH_TIMEOUTS.send, 'send', controller)
       adapters.registerJudgeSession(judgeSessionId, input.cwd)
       return { messageId }
     },
@@ -456,7 +467,10 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async compactRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
-      const signal = new AbortController().signal
+      // #21 F1：这条链上的每一段都可能有真实模型调用/静默拆卸，全部加超时并把
+      // signal 接成真实中断源（此前 abort 从不触发，signal 形同装饰）。
+      const controller = new AbortController()
+      const signal = controller.signal
       // A4 plan A (docs/prd/20260903-workflow-hardening/a4-code-findings.md §3):
       // the settlement watcher releases the actor's Activation right after its
       // turn, and the next dispatch always follows a full Judge cycle, so the
@@ -471,7 +485,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         if (compaction === undefined) return noCompactionBackend(adapters.ctx, childId)
         // 收口后仍可能被外部唤醒；busy 必须拒绝，不能以FIFO排队冒充compact通过。
         try {
-          const result = await compaction.compactNow(resident, signal)
+          const result = await withTimeout(compaction.compactNow(resident, signal), DISPATCH_TIMEOUTS.compactNow, 'compactNow', controller)
           if (result === null) return { ok: true, detail: 'no compactable range' }
           return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
         } catch (error) {
@@ -483,9 +497,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       }
       const route = resolveRoleModel(run, roleKey, frozenRoute())
       const manager = adapters.managerAgentOf(run)
-      let handle: AgentHandle
-      try {
-        handle = await adapters.ctx.agents.resume({
+      const resuming = adapters.ctx.agents.resume({
           resumeSessionId: childId as SessionId,
           // Mirrors the agentOptions the continuation manager re-applies when
           // IT cold-resumes this child. This is only the summarizer's LAST
@@ -510,8 +522,14 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
               }
             }) satisfies AgentSetup,
           }),
-        })
+      })
+      let handle: AgentHandle
+      try {
+        handle = await withTimeout(resuming, DISPATCH_TIMEOUTS.coldMaterialize, 'cold materialize', controller)
       } catch (error) {
+        // 超时后迟到的物化同样必须释放：遗留 resident agent 会让后续冷 resume
+        // 在 registry id 上冲突（见下方 teardown 注释）。
+        resuming.then(late => { void late.dispose().catch(() => {}) }, () => {})
         return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
       }
       let outcome: { ok: boolean; detail: string }
@@ -520,7 +538,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         if (compaction === undefined) {
           outcome = noCompactionBackend(adapters.ctx, childId)
         } else {
-          const result = await compaction.compactNow(handle.agent, signal)
+          const result = await withTimeout(compaction.compactNow(handle.agent, signal), DISPATCH_TIMEOUTS.compactNow, 'compactNow', controller)
           outcome = result === null
             ? { ok: true, detail: 'cold: no compactable range' }
             : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
@@ -531,7 +549,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // ALWAYS tear the materialization down: a leaked resident agent would
       // collide on the registry id inside the dispatch followup's cold resume.
       try {
-        await handle.dispose()
+        await withTimeout(handle.dispose(), DISPATCH_TIMEOUTS.dispose, 'dispose', controller)
       } catch (error) {
         return { ok: false, detail: `cold materialize teardown failed: ${errorDetail(error)}` }
       }
