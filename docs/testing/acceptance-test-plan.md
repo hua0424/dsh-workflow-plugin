@@ -56,9 +56,11 @@
 
 - E1 Worker Role 首次使用创建 continuable spawn Actor，Run 内复用（继承父 Preset +
   persona/toolFilter.deny/agentOptions{provider,model} 覆盖）。
-- E2 Judge 每次 fresh non-continuable spawn；toolFilter.allow 后 visible schema
-  ⊆ {read,glob,grep,read_image,workflow_inspect_git,workflow_inspect_github} ∪ machinery；
-  超出 → fail-closed 拒绝 spawn 并 BLOCK 当前 Node。
+- E2 Judge 每次 fresh non-continuable spawn；工具面 = 全量工具目录 −（插件默认 deny
+  清单 ∪ `judgeRole.tools.deny`）：deny 的工具不可见且运行期被 authz 拒绝；必需工具
+  （`read`/`glob`/`grep`/`read_image`/两个 inspection wrapper/`judge_claim`）缺失或
+  deny 的工具仍可见 → fail-closed 拒绝 spawn 并 BLOCK 当前 Node（Issue #25 反转了
+  原先的 allow-list 语义，见 `docs/example/README.md`「Judge 工具面」）。
 - E3 Judge 不调用 Workflow tools（guard 拒绝）；Manager/Worker/Hlper 的调用按角色放行。
 - E4 `workflow_set_role_model` 只 Manager；Worker active 时拒绝；override 后旧 mapping
   删除、下次 dispatch 重建；judge override 只影响下一次判断。

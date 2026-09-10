@@ -5,6 +5,7 @@
  */
 import { z } from 'zod'
 import { LIMITS } from '../types.ts'
+import { JUDGE_PROTECTED_TOOLS } from '../roles/roles.ts'
 
 const nonEmptyTrimmed = z.string().trim().min(1)
 
@@ -33,8 +34,25 @@ const judgeRoleDefinition = z
   .object({
     persona: nonEmptyTrimmed,
     model: roleModel.optional(),
+    // Issue #25: the Judge inherits the full tool catalog; `deny` narrows it on
+    // top of the plugin default deny list. Protected tools stay undeniably
+    // present (denying `judge_claim` or the delegation machinery deadlocks the
+    // Judge), mirroring the role-level `tools.deny` shape.
+    tools: z
+      .object({
+        deny: z.array(nonEmptyTrimmed).min(1),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
+  .superRefine((value, ctx) => {
+    for (const name of value.tools?.deny ?? []) {
+      if ((JUDGE_PROTECTED_TOOLS as readonly string[]).includes(name)) {
+        ctx.addIssue({ code: 'custom', path: ['tools', 'deny'], message: `Judge tool "${name}" is required and cannot be denied` })
+      }
+    }
+  })
 
 const actorTaskExecution = z
   .object({

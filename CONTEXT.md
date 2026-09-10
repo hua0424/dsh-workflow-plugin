@@ -70,7 +70,7 @@ T5 已把 `jobs`、`compaction` 设为标准 Web composition 的 required servic
 
 Judge 是独立只读检查者，不补做 Actor 工作，不改写 claim outcome。首次判断和 respawn 创建 continuable Judge；NEED_CONTEXT 补充可复用同一 Session，但每次都先登记新的 Judge dispatch，再以 Host queue 开新真实 Turn，并在真实 message ID 返回后才允许该 Turn 提交。T6 将恢复决定持久化为 `followup|fresh`：historical NEED_CONTEXT 或重启后未判定且 available/unknown 的当前 Judge 可在同 Session 预安排新 dispatch 并 followup；只有 missing 或明确 respawn 才 fresh，旧 Turn/inputVersion 均失权。
 
-Host 用真实 tool allow-list 限制 read/glob/grep/read_image 和 workspace/repository 限定的 workflow_inspect_git/workflow_inspect_github，并授予专用 judge_claim；spawn 后检查最终工具面，异常 fail-closed。Actor/Manager 不能冒充 Judge。
+Judge 的工具面（Issue #25）：继承全量工具目录，由 deny 清单收敛——插件默认清单（`edit`/`write` + Run 控制工具）∪ `judgeRole.tools.deny`；必需工具（`read`/`glob`/`grep`/`read_image`、workspace/repository 限定的 workflow_inspect_git/workflow_inspect_github、专用 judge_claim）在 spawn 时必须全部在场且不可 deny。spawn 后检查最终工具面（必需工具在场 + 不含未豁免 deny 项），异常 fail-closed；运行期 `tools/authz.ts` 从同一清单派生同一判据，三层同源。Actor/Manager 不能冒充 Judge。
 
 Judgment Packet 来自本次工作单 input、instruction/criteria、claim.handoff 与本次 dispatch 的 Node-local projection，不从旧 Run.nodeBoundary/pendingClaim 镜像读取。投影排除旧 Node、system/tool/notice 与提交约束，不注入完整 Manager 历史。
 

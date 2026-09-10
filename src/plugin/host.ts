@@ -19,7 +19,7 @@ import type { RunState } from '../types.ts'
 import { WorkflowError } from '../types.ts'
 import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
-import { judgeLabel, judgeSpawnPlan, JUDGE_ALLOW, JUDGE_MACHINERY_EXEMPT, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
+import { JUDGE_REQUIRED_TOOLS, JUDGE_DEFAULT_DENY, judgeLabel, judgeSpawnPlan, knownDenyList, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
 import { topFrame } from '../state/invariants.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
@@ -97,21 +97,27 @@ async function sessionAvailability(ctx: Context, sessionId: string): Promise<imp
   }
 }
 
-/** Fail-closed Judge tool-surface assertion (design §2.2/E2 + A1 R9). */
-function assertJudgeToolSurface(childAgent: Agent): string | undefined {
-  const schemas = childAgent.ctx.tools.schemas(childAgent)
-  const visible = new Set(schemas.map(s => s.name))
-  for (const required of JUDGE_ALLOW) {
+/**
+ * Fail-closed Judge tool-surface assertion (design §2.2/E2 + A1 R9, Issue #25).
+ *
+ * The surface is the full catalog minus the deny list, so the check has two
+ * halves: every required tool must be present, and no denied tool may be
+ * visible. Own-scope delegation machinery is never visible-filtered (design
+ * §2.2) and is exempt from the deny check. Exported for direct unit testing.
+ */
+export function evaluateJudgeToolSurface(visibleNames: Iterable<string>, deny: readonly string[] = JUDGE_DEFAULT_DENY): string | undefined {
+  const visible = new Set(visibleNames)
+  for (const required of JUDGE_REQUIRED_TOOLS) {
     if (!visible.has(required)) return `Judge tool surface is missing required tool "${required}"`
   }
-  // Own-scope delegation machinery registered by the in-process driver is
-  // exempt from the allow-list — it is never visible-filtered (design §2.2).
   for (const name of visible) {
-    if (!(JUDGE_ALLOW as readonly string[]).includes(name) && !(JUDGE_MACHINERY_EXEMPT as readonly string[]).includes(name)) {
-      return `Judge tool surface contains unexpected tool "${name}"`
-    }
+    if (deny.includes(name)) return `Judge tool surface contains denied tool "${name}"`
   }
   return undefined
+}
+
+function assertJudgeToolSurface(childAgent: Agent, deny: readonly string[]): string | undefined {
+  return evaluateJudgeToolSurface(childAgent.ctx.tools.schemas(childAgent).map(s => s.name), deny)
 }
 
 function textBlocks(text: string) {
@@ -369,6 +375,12 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // 首次、followup 与 respawn 都从同一当前工作单材料重建完整 packet。
       const prompt = await judgePrompt(run, input)
 
+      // `ctx.tools.restrict()` 拒绝它不认识的 global 工具名并抛错（fail-closed
+      // dispatch fault）。默认 deny 清单里的宿主工具（如 `edit`/`write`）在精简
+      // profile 中并不存在，deny 一个不存在的工具本就是 no-op，因此按 Judge 继承
+      // 到的实际工具面求交集，而不是让 spawn 直接 fault。
+      const deny = knownDenyList(plan.toolFilter.deny, adapters.ctx.tools.schemas(manager).map(schema => schema.name))
+
       const started = await adapters.ctx.subagents.startContinuable({
         provider: 'spawn',
         label: judgeLabel(topFrame(run).nodeId),
@@ -380,7 +392,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
           prompt: textBlocks(prompt),
           parent: manager,
           persona: plan.persona,
-          toolFilter: plan.toolFilter,
+          toolFilter: deny.length > 0 ? { deny } : undefined,
           agentOptions: plan.agentOptions.provider !== undefined || plan.agentOptions.model !== undefined
             ? { provider: plan.agentOptions.provider, model: plan.agentOptions.model }
             : undefined,
@@ -397,7 +409,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         adapters.revokeJudgeSession(started.childId)
         throw new WorkflowError('judge child agent is not observable after spawn')
       }
-      const surfaceProblem = assertJudgeToolSurface(childAgent)
+      const surfaceProblem = assertJudgeToolSurface(childAgent, deny)
       if (surfaceProblem !== undefined) {
         // Drain the judge we just spawned and surface the detail.
         await adapters.ctx.subagents.drainContinuableChildren(manager, [started.childId]).catch(() => {})
