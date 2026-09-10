@@ -2,7 +2,7 @@
 
 GitHub 待办：[#17](https://github.com/hua0424/dsh-workflow-plugin/issues/17)。
 
-状态：仅登记，未实施、未部署。用户确认 milestone-delivery 保留两处 fail→END 语义；兼容期 YAML 用 coordinator 协调节点（handle-cancel / confirm-complete）经 onPass→END 绕行，本 issue 修复后可评估简化。
+状态：已实施并部署（#17）；`~/.dsh/workflows/milestone-delivery.yaml` 已直接使用两处 `onFail: END`，兼容期 coordinator 绕行节点（handle-cancel / confirm-complete）已移除。
 
 ## 触发事实
 

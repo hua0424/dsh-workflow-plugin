@@ -108,7 +108,7 @@ decision 至少包含：对应 review 路径与同一 PR/base/head；每项发�
 
 ## 当前已知插件限制
 
-- [#17：onFail END](https://github.com/hua0424/dsh-workflow-plugin/issues/17)：当前插件禁止 `onFail: END`，YAML 以 coordinator 协调节点兼容（根流程 `grilling.failed → handle-cancel → END`；子流程 `select-next-issue.failed → confirm-complete → END`，语义分别对应取消收尾与任务穷尽复核）。#17 修复后可评估是否简化为直接 onFail: END。根取消与子流程耗尽的终局语义见 [登记材料](../pending-discussions/onfail-end.md)。
+- [#17：onFail END](https://github.com/hua0424/dsh-workflow-plugin/issues/17)：已实施并部署。配置直接使用两处 `onFail: END`：根流程 `grilling.failed → END`（用户取消终局，Run 状态沿用 completed，终局结果由终局 claim outcome + handoff 表达）；子流程 `select-next-issue.failed → END`（任务穷尽，pop 后落父节点 onPass 进入集成，父只能经 handoff 感知穷尽事实）。终局语义见 [登记材料](../pending-discussions/onfail-end.md)。
 - [#18：Judge inspection](https://github.com/hua0424/dsh-workflow-plugin/issues/18)：当前缺 PR/CI/提交关系查询和列表完整性支持；先由 Manager 按 coordination 合同补证，不通过放宽为 Actor 自报来绕过核验。见 [登记材料](../pending-discussions/judge-repository-inspection.md)。
 
-YAML 修改不更新活动 Run 已冻结的定义快照。本次规范和配置优化不代表插件已升级、真实 Run 已迁移或上述限制已解决。
+YAML 修改不更新活动 Run 已冻结的定义快照；配置与规范文本优化只影响之后启动的新 Run。
