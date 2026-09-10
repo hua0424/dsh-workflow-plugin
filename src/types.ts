@@ -62,6 +62,8 @@ export interface RoleDefinition {
 export interface JudgeRoleDefinition {
   persona: string
   model?: RoleModel
+  /** Extra tool names to hide from the Judge, on top of the plugin default deny list. */
+  tools?: { deny: string[] }
 }
 
 export type ActorTaskExecution = {

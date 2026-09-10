@@ -4,6 +4,7 @@
  * mappings and registers them back on success.
  */
 import type { RunState } from '../types.ts'
+import { judgeDenyList } from '../roles/roles.ts'
 
 export type AuthzDecision =
   | { allow: true; kind: 'manager' }
@@ -13,9 +14,6 @@ export type AuthzDecision =
 
 /** Tools a mapped Role Actor may call (design §5.2). */
 const ROLE_ALLOWED = new Set(['node_claim', 'node_block', 'workflow_status'])
-
-/** Tools a fresh Judge may call (two read-only wrappers + judge_claim). */
-const JUDGE_ALLOWED = new Set(['workflow_inspect_git', 'workflow_inspect_github', 'judge_claim'])
 
 export interface AuthzInput {
   run: RunState
@@ -31,8 +29,11 @@ export function authorizeToolCall(input: AuthzInput): AuthzDecision {
   const { run, sessionId, toolName } = input
 
   if (input.isJudgeSession) {
-    if (JUDGE_ALLOWED.has(toolName)) return { allow: true, kind: 'judge' }
-    return { allow: false, reason: 'judge sessions may only call the read-only inspection tools' }
+    // Issue #25: the Judge sees the full tool catalog, so the runtime gate uses
+    // the same effective deny list as the spawn filter and the spawn assertion
+    // (src/roles/roles.ts). Divergence here means a visible-but-denied tool.
+    if (!judgeDenyList(run).includes(toolName)) return { allow: true, kind: 'judge' }
+    return { allow: false, reason: `judge sessions may not call the denied tool ${toolName}` }
   }
 
   if (run.managerSessionId === sessionId) {

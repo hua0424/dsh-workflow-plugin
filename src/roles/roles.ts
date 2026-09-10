@@ -1,21 +1,44 @@
 /**
  * Role Actor / Judge spawn assembly (design §2.1/§2.2 E1/E2).
  *
- * Pure decision logic (route resolution, deny lists, judge allow-list) that can
- * be unit-tested without the host. The plugin layer adapts the real
+ * Pure decision logic (route resolution, deny lists, judge tool surface) that
+ * can be unit-tested without the host. The plugin layer adapts the real
  * `ctx.subagents` service.
+ *
+ * Judge tool surface (Issue #25): the Judge inherits the full tool catalog and
+ * the surface is narrowed by a deny list, exactly like a worker Role — the
+ * default deny list below plus the catalog's optional `judgeRole.tools.deny`.
+ * The three enforcement layers (spawn filter here, spawn assertion in host.ts,
+ * runtime gate in tools/authz.ts) all derive from this one source.
  */
 import type { RunState } from '../types.ts'
 
-/** Judge fixed read-only allow-list (design §2.2) + the `judge_claim` protocol tool (A1 R9). */
-export const JUDGE_ALLOW = [
-  'read',
-  'glob',
-  'grep',
-  'read_image',
-  'workflow_inspect_git',
-  'workflow_inspect_github',
-  'judge_claim',
+/**
+ * Tools the Judge must always have: the `judge_claim` protocol tool (A1 R9)
+ * plus the core read-only inspection surface. Never deniable.
+ */
+export const JUDGE_REQUIRED_TOOLS = ['read', 'glob', 'grep', 'read_image', 'workflow_inspect_git', 'workflow_inspect_github', 'judge_claim'] as const
+
+/**
+ * Default deny list: file-write tools plus the workflow control tools that
+ * mutate Run state. The Judge is a read-only confirmer, so these stay invisible
+ * unless an operator explicitly removes them from the deny list (catalog
+ * `judgeRole.tools.deny`).
+ *
+ * Maintenance obligation (Issue #25 "注意"): DSH may add new host tools with
+ * side effects; the Judge keeps full-catalog visibility, so this list must be
+ * extended in the plugin release that starts relying on such a tool.
+ */
+export const JUDGE_DEFAULT_DENY = [
+  'edit',
+  'write',
+  'node_claim',
+  'node_block',
+  'node_resume',
+  'node_run_program',
+  'node_resolve_program',
+  'workflow_set_role_model',
+  'judge_respawn',
 ] as const
 
 /**
@@ -24,6 +47,30 @@ export const JUDGE_ALLOW = [
  * fail-closed tool-surface assertion (used by the plugin adapter, host.ts).
  */
 export const JUDGE_MACHINERY_EXEMPT = ['report', 'structured_output'] as const
+
+/**
+ * Denying any of these is a hard deadlock (the Judge could no longer claim, the
+ * driver could no longer deliver its verdict), so the catalog schema rejects it.
+ */
+export const JUDGE_PROTECTED_TOOLS = [...JUDGE_REQUIRED_TOOLS, ...JUDGE_MACHINERY_EXEMPT] as const
+
+/** Effective Judge deny list: the plugin defaults ∪ the catalog's extra entries. */
+export function judgeDenyList(run: RunState): string[] {
+  const extra = run.definitionSnapshot.judgeRole.tools?.deny ?? []
+  return [...new Set<string>([...JUDGE_DEFAULT_DENY, ...extra])]
+}
+
+/**
+ * Intersect a deny list with the tools the running profile actually ships.
+ * `ctx.tools.restrict()` faults on unknown global names, and the default list
+ * names host tools (`edit`/`write`) that a minimal profile does not register —
+ * denying an absent tool is a no-op, so dropping it preserves the intent instead
+ * of faulting every Judge spawn.
+ */
+export function knownDenyList(deny: readonly string[], available: Iterable<string>): string[] {
+  const known = new Set(available)
+  return deny.filter(name => known.has(name))
+}
 
 /**
  * Judge subagent display label carrying the current node id, aligned with the
@@ -53,20 +100,20 @@ export function roleDenyList(run: RunState, roleKey: string): string[] {
 }
 
 /**
- * Judge spawn plan: fresh continuable with a fixed allow-list (A1 R8). The
- * plugin adapter MUST verify the child's final visible schema ⊆ allow ∪
- * machinery before dispatching (design E2); this function returns the intended
- * plan.
+ * Judge spawn plan: fresh continuable (A1 R8) whose tool surface is the full
+ * catalog minus the effective deny list. The plugin adapter MUST verify the
+ * child's final visible schema contains no denied tool before dispatching
+ * (design E2); this function returns the intended plan.
  */
 export function judgeSpawnPlan(run: RunState, frozen?: { provider?: string; model?: string }): {
   persona: string
-  toolFilter: { allow: readonly string[] }
+  toolFilter: { deny: readonly string[] }
   agentOptions: { provider?: string; model?: string }
 } {
   const route = resolveRoleModel(run, 'judge', frozen)
   return {
     persona: run.definitionSnapshot.judgeRole.persona,
-    toolFilter: { allow: JUDGE_ALLOW },
+    toolFilter: { deny: judgeDenyList(run) },
     agentOptions: route,
   }
 }

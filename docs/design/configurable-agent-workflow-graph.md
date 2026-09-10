@@ -46,11 +46,12 @@ Judge最小Schema：
 ```text
 judgeRole = {
   persona,
-  model?: { provider, modelId }
+  model?: { provider, modelId },
+  tools?: { deny: string[] }   // Issue #25：在插件默认 deny 清单之上再收紧
 }
 ```
 
-Role key使用kebab-case；`manager`和`judge`保留，禁止出现在roles。Judge tools不可配置，由Engine固定只读。
+Role key使用kebab-case；`manager`和`judge`保留，禁止出现在roles。~~Judge tools不可配置，由Engine固定只读。~~ **（Issue #25 修订，2026-09-10）** Judge 的工具面改为全量工具目录 + 可配置 deny list：默认 deny 清单（`edit`/`write` + Run 控制工具，见 `src/roles/roles.ts` 的 `JUDGE_DEFAULT_DENY`）∪ `judgeRole.tools.deny` 决定不可见工具，受保护工具（`judge_claim`、inspection wrappers、委托机制）不可 deny；`judgeRole.tools.deny` 与其他静态定义一起冻结于 `definitionSnapshot`。详见 `docs/example/README.md`「Judge 工具面」。
 
 已确认`manager`是保留roleKey，可被actor-task Node引用，但禁止出现在`roles`配置中；它始终由当前主会话承担，YAML不伪装修改其persona/model/tools。`roles.*`只定义按需创建并在Run内复用的continuable worker subagents，每次派发新Node前对其执行Node边界compact（`compactNow`）。Judge使用独立`judgeRole`配置。
 
@@ -88,9 +89,9 @@ Judge提示词已确认使用三层模型：
 
 Node不能替换Judge系统职责、checker参数schema或PASS/FAIL协议。Judge-decision可以接收较自由的criteria；judge-assisted checker必须按内置template输出typed参数。
 
-Judge每次创建时使用Engine固定allow-list：`read`、`glob`、`grep`、`read_image`、专用`judge_claim`，以及插件自有`workflow_inspect_git`/`workflow_inspect_github`只读wrapper。Wrapper目标固定current workspace/repository、operation为enum，不接受任意command/URL或mutation。Judge不暴露bash/pwsh/SSH、edit/write、通用GitHub/MCP mutation、Workflow control（`judge_claim`除外）、Skill或subagent tools。缺少所需读取能力时本次判断不产生结果并BLOCK。
+Judge每次创建时的工具面（**Issue #25 修订**：原为 Engine 固定 allow-list，现为全量工具目录 + deny list）：必需工具 `read`、`glob`、`grep`、`read_image`、专用`judge_claim`，以及插件自有`workflow_inspect_git`/`workflow_inspect_github`只读wrapper 不可 deny；默认 deny 清单 `edit`/`write` + Run 控制工具，外加 `judgeRole.tools.deny`。Wrapper目标固定current workspace/repository、operation为enum，不接受任意command/URL或mutation。Judge 默认不暴露 edit/write 与 Workflow control；宿主查询类工具（bash/pwsh/通用 GitHub/MCP 查询）默认可见，这正是 #25 放开 PR/CI 核验能力的方式，故"不暴露 shell/SSH、通用 mutation"不再是默认姿态保证，改由默认 deny 清单 + 文档化的维护义务承担。缺少所需读取能力时本次判断不产生结果并BLOCK。
 
-宿主实现已确认：`toolFilter.allow`过滤整个继承工具面（global层+Preset ancestor层），仅Child自身scope注册的delegation machinery豁免，因此固定allow-list对继承Preset的Judge Child成立（历史缺陷已在`tools.view()`修复）。两个wrapper注册在Profile Bundle的host行（global layer）使Judge可见，执行时由`tools.guard()`校验调用者属于当前Judge session。Host在每次Judge spawn后对其final visible schema做fail-closed断言（⊆允许集∪machinery），超出即拒绝spawn并让当前Node BLOCK。
+宿主实现已确认：`toolFilter`（`allow` 或 `deny`）过滤整个继承工具面（global层+Preset ancestor层），仅Child自身scope注册的delegation machinery豁免（**Issue #25 起 Judge 走 `toolFilter.deny`**）。两个wrapper注册在Profile Bundle的host行（global layer）使Judge可见，执行时由`tools.guard()`校验调用者属于当前Judge session。Host在每次Judge spawn后对其final visible schema做fail-closed断言：必需工具全部在场，且**不含未豁免的 deny 项**（原为"⊆允许集∪machinery"，#25 反转）；异常即拒绝spawn并让当前Node BLOCK。运行期第三层 `tools/authz.ts` 从同一 deny 清单派生，三层同源，否则会出现"工具可见但调用被拒"的静默失效。
 
 ### 2.3 Workflow Catalog、Definition与启动方式
 

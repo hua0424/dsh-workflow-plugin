@@ -39,7 +39,10 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
 3. YAML 是受限单文档 1.2：禁止 duplicate key、anchor/alias/merge、custom tag、
    模板插值。invalid 文件**只阻塞自身**，`/dsh-flow list` 会给出诊断。
 4. 角色模型路由用可选的 `model: { provider, modelId }` 块；角色可用
-   `tools: { deny: [...] }` 收紧工具面。
+   `tools: { deny: [...] }` 收紧工具面。Judge 的工具面 = 全量工具目录减去
+   （插件默认 deny 清单 ∪ `judgeRole.tools.deny`）；默认 deny 覆盖 `edit`/`write`
+   与 Run 控制工具，`gh`/`git`/`pwsh` 等查询工具默认可用，详见
+   `docs/example/README.md`「Judge 工具面」。
 
 ## 4. 命令：`/dsh-flow`
 

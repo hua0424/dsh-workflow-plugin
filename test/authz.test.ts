@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { authorizeToolCall } from '../src/tools/authz.ts'
+import { judgeDenyList, judgeSpawnPlan, JUDGE_DEFAULT_DENY } from '../src/roles/roles.ts'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
 import { newNodeToken } from '../src/state/invariants.ts'
@@ -69,16 +70,31 @@ test('unknown session is rejected', () => {
   assert.equal(d.allow, false)
 })
 
-test('judge sessions may call the inspection wrappers and judge_claim', () => {
+test('judge sessions may call anything outside the deny list; denied tools are rejected', () => {
   const run = makeRun()
-  for (const tool of ['workflow_inspect_git', 'workflow_inspect_github', 'judge_claim']) {
+  // Issue #25: the Judge sees the full catalog minus the effective deny list —
+  // a visible-but-denied tool is exactly the divergence this test pins down.
+  for (const tool of ['workflow_inspect_git', 'workflow_inspect_github', 'judge_claim', 'read', 'grep', 'pwsh']) {
     const d = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: tool })
     assert.deepEqual(d, { allow: true, kind: 'judge' }, tool)
   }
-  for (const tool of ['node_claim', 'node_block', 'workflow_status', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'judge_respawn']) {
+  // `workflow_status` stays callable: it is a read-only Run query, not a mutation.
+  for (const tool of ['node_claim', 'node_block', 'node_resume', 'node_run_program', 'node_resolve_program', 'workflow_set_role_model', 'judge_respawn']) {
     const d = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: tool })
     assert.equal(d.allow, false, tool)
   }
+  const status = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: 'workflow_status' })
+  assert.deepEqual(status, { allow: true, kind: 'judge' })
+})
+
+test('runtime judge gate follows the catalog deny additions (same source as the spawn filter)', () => {
+  const run = makeRun()
+  run.definitionSnapshot.judgeRole.tools = { deny: ['pwsh'] }
+  const allowed = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: 'read' })
+  assert.deepEqual(allowed, { allow: true, kind: 'judge' })
+  const denied = authorizeToolCall({ run, sessionId: 'judge-1', knownRoleOfSession: undefined, isJudgeSession: true, toolName: 'pwsh' })
+  assert.equal(denied.allow, false)
+  assert.deepEqual(judgeSpawnPlan(run).toolFilter.deny, judgeDenyList(run))
 })
 
 test('an actor id not present in roleActors is rejected even with a live mapping', () => {

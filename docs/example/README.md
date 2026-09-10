@@ -40,6 +40,8 @@ judgeRole:                   # Judge
   model:                     # 同样可选
     provider: deepseek
     modelId: glm-4.7
+  tools:                     # 可选：在插件默认 deny 清单之上再收紧
+    deny: [pwsh]
 ```
 
 优先级与生效规则（`resolveRoleModel`，src/roles/roles.ts）：
@@ -67,6 +69,32 @@ judgeRole:                   # Judge
 - provider/modelId 会写入 trace log 的 `MODEL` 行（见 README「Run trace
   logs」），凭据形状的值会被 redact。
 
+## Judge 工具面（Issue #25）
+
+Judge 与其他 Role 一样继承**全量工具目录**，插件只把写类/副作用工具默认 deny
+掉，保持"只读核验"姿态。生效的 deny 清单 = 插件默认清单 ∪ `judgeRole.tools.deny`：
+
+| 类别 | 默认 deny 的工具 | 说明 |
+| --- | --- | --- |
+| 文件写入 | `edit`、`write` | Judge 只核验，不改工作树 |
+| Run 控制 | `node_claim`、`node_block`、`node_resume`、`node_run_program`、`node_resolve_program`、`workflow_set_role_model`、`judge_respawn` | 会改变 Run 状态；`workflow_status` 是只读查询，**不** deny |
+| 委托机制 | `report`、`structured_output` | 子运行时自己的机制层，从不参与可见性过滤 |
+| 受保护（不可 deny） | `read`、`glob`、`grep`、`read_image`、`workflow_inspect_git`、`workflow_inspect_github`、`judge_claim` | 写进 `judgeRole.tools.deny` 会在 catalog 校验期直接失败（deny 掉 `judge_claim` 会让 Judge 无法交判定） |
+
+放行指引：
+
+- **想放开查询类工具**：不用改插件——`gh`、`git`、`pwsh` 等本来就不在默认 deny
+  清单里，Judge 直接可见可用（`pwsh`/`gh` 是宿主工具，改动不会影响其他角色）。
+- **想再收紧**：在 `judgeRole.tools.deny` 里加名字，例如 `deny: [pwsh]` 让 Judge
+  只能用 inspection wrappers。
+- **维护义务**：默认清单是"默认开放 + 配置收敛"姿态，宿主新增的副作用工具会在
+  插件更新默认清单之前对 Judge 可见。升级 DSH 后如发现新的写类/副作用工具，请在
+  本仓库提 issue 扩充 `src/roles/roles.ts` 的 `JUDGE_DEFAULT_DENY`。
+- **配置冻结**：`judgeRole.tools.deny` 与其他静态定义一起在 Run 启动时冻结进
+  `definitionSnapshot`，Run 中途改 YAML 对进行中的 Run 不生效（下次 start 才生效）。
+- 三层强制同源（spawn 过滤 / spawn 后断言 / 运行期鉴权）都从同一份 deny 清单派生，
+  只改其中一层会静默失效。
+
 ## 配置面速查
 
 顶层字段（strict schema，unknown 字段一律拒绝）：
@@ -75,7 +103,7 @@ judgeRole:                   # Judge
 | --- | --- | --- |
 | `schemaVersion` | ✓ | 固定 `agent-workflow/v2` |
 | `roles` | ✓ | worker Role 定义表；key 即 roleKey |
-| `judgeRole` | ✓ | Judge 定义（persona 必填，model 可选） |
+| `judgeRole` | ✓ | Judge 定义（persona 必填，model / tools.deny 可选，见「Judge 工具面」） |
 | `workflow` | ✓ | 根工作流图 |
 | `childWorkflows` | ✗ | 子工作流图（按 workflowId 引用） |
 
@@ -85,7 +113,7 @@ Role 定义：
 | --- | --- | --- |
 | `persona` | ✓ | 非空，trim 后存储 |
 | `model` | ✗ | `{ provider, modelId }`，见上文 |
-| `tools.deny` | ✗ | 非空列表；Judge 的工具面固定，不走此配置 |
+| `tools.deny` | ✗ | 非空列表；在插件默认 deny 清单（`edit`/`write` + workflow 控制工具）之上再收紧，受保护工具不可 deny |
 
 节点（`workflow.nodes.<nodeId>`）三种 execution：
 
