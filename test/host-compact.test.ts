@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
@@ -10,7 +11,15 @@ import { MessageId } from '@deepseek-ai/dsh-llm'
 import { ManualCompactionError, type ManualCompactionErrorCode } from '@deepseek-ai/dsh-compaction'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { newNodeToken } from '../src/state/invariants.ts'
+import { DISPATCH_TIMEOUTS } from '../src/engine/timeouts.ts'
 import type { RunState } from '../src/types.ts'
+
+/** #21 F1 故障注入：把统一超时 SLO 压到毫秒级，结束后恢复。 */
+async function withShortTimeouts(values: Partial<typeof DISPATCH_TIMEOUTS>, body: () => Promise<void>): Promise<void> {
+  const saved = { ...DISPATCH_TIMEOUTS }
+  Object.assign(DISPATCH_TIMEOUTS, values)
+  try { await body() } finally { Object.assign(DISPATCH_TIMEOUTS, saved) }
+}
 
 const CONFIG = validateAndNormalize(parseCatalogConfig(`
 schemaVersion: agent-workflow/v2
@@ -117,20 +126,29 @@ function makeHost(options: {
   resident?: Agent
   manager?: Agent
   resumeResult?: { handle?: AgentHandle; error?: Error }
+  resumeHangs?: boolean
+  resumeLateMs?: number
   compactResult?: { shadowedSeqs: number[]; shadowedTokenCount: number } | null
   compactError?: Error
+  compactHangs?: boolean
   disposeError?: Error
+  disposeHangs?: boolean
+  persistence?: { inspect: (id: unknown) => Promise<unknown> }
   presets?: { serviceFor: (agent: Agent, name: string) => unknown; composeFrom?: (agentCtx: unknown, parentCtx: unknown) => void }
   noHostCompaction?: boolean
   events: string[]
   resumes: ResumeCall[]
   compacts: CompactCall[]
+  signals?: AbortSignal[]
   warns?: string[]
 }) {
+  const hang = () => new Promise<never>(() => {})
   const compaction = {
-    compactNow: async (agent: Agent, _signal: AbortSignal) => {
+    compactNow: async (agent: Agent, signal: AbortSignal) => {
       options.compacts.push({ agent })
+      options.signals?.push(signal)
       options.events.push('compact')
+      if (options.compactHangs === true) return hang()
       if (options.compactError !== undefined) throw options.compactError
       return options.compactResult ?? null
     },
@@ -139,6 +157,7 @@ function makeHost(options: {
   const logger = { warn: (message: string) => { options.warns?.push(message) } }
   const get = (key: string) => {
     if (key === 'agentPresets') return options.presets
+    if (key === 'sessionPersistence') return options.persistence
     if (key === 'compaction') return options.noHostCompaction === true ? undefined : compaction
     return undefined
   }
@@ -152,12 +171,15 @@ function makeHost(options: {
       resume: async (call: ResumeCall) => {
         options.resumes.push(call)
         options.events.push('resume')
+        if (options.resumeHangs === true) return hang()
+        if (options.resumeLateMs !== undefined) await delay(options.resumeLateMs)
         if (options.resumeResult?.error !== undefined) throw options.resumeResult.error
         if (call.setup !== undefined) await (call.setup as (agentCtx: unknown) => unknown)({ get, logger })
         return options.resumeResult?.handle ?? {
           agent: materialized,
           dispose: async () => {
             options.events.push('dispose')
+            if (options.disposeHangs === true) return hang()
             if (options.disposeError !== undefined) throw options.disposeError
           },
         }
@@ -343,6 +365,86 @@ test('cold maintenance resume carries no setup when the manager is not live', as
   await host.compactRoleActor(makeRun('sess-dev'), 'developer')
   assert.equal(f.resumes[0]!.setup, undefined)
   assert.deepEqual(Object.keys(f.resumes[0]!).sort(), ['agentOptions', 'resumeSessionId'])
+})
+
+// #21 F1 故障注入：派发/恢复链上 seam 挂起时必须超时降级为携带阶段名的结果，
+// 绝不永久 pending；接受 signal 的调用点还要拿到真实 abort。
+test('cold maintenance seams: a hanging materialize, compactNow or dispose degrades with its stage name', async () => {
+  await withShortTimeouts({ coldMaterialize: 20, compactNow: 20, dispose: 20 }, async () => {
+    const hangResume = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+    assert.deepEqual(await makeHost({ ...hangResume, resumeHangs: true }).host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+      { ok: false, detail: 'cold materialize failed: timeout after 20ms at stage "cold materialize"' })
+    assert.deepEqual(hangResume.events, ['resume'], 'a timed-out materialization has no handle to compact or dispose')
+
+    const hangCompact = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], signals: [] as AbortSignal[] }
+    assert.deepEqual(await makeHost({ ...hangCompact, compactHangs: true }).host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+      { ok: false, detail: 'timeout after 20ms at stage "compactNow"' })
+    assert.deepEqual(hangCompact.events, ['resume', 'compact', 'dispose'], 'the materialization is still released')
+    assert.equal(hangCompact.signals[0]!.aborted, true, 'the timeout is a real interrupt source, not a decorative signal')
+
+    const residentCompact = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], signals: [] as AbortSignal[] }
+    assert.deepEqual(await makeHost({ ...residentCompact, resident: { id: 'sess-dev' } as unknown as Agent, compactHangs: true })
+      .host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+    { ok: false, detail: 'timeout after 20ms at stage "compactNow"' })
+    assert.equal(residentCompact.signals[0]!.aborted, true)
+
+    const hangDispose = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+    assert.deepEqual(await makeHost({ ...hangDispose, compactResult: null, disposeHangs: true }).host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+      { ok: false, detail: 'cold materialize teardown failed: timeout after 20ms at stage "dispose"' })
+    assert.deepEqual(hangDispose.events, ['resume', 'compact', 'dispose'])
+  })
+})
+
+test('cold maintenance: a materialization that lands after the timeout is still torn down', async () => {
+  await withShortTimeouts({ coldMaterialize: 20 }, async () => {
+    const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+    const { host } = makeHost({ ...f, resumeLateMs: 60 })
+    assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+      { ok: false, detail: 'cold materialize failed: timeout after 20ms at stage "cold materialize"' })
+    assert.deepEqual(f.events, ['resume'], 'the timeout verdict is returned before the materialization lands')
+    await delay(80)
+    assert.deepEqual(f.events, ['resume', 'dispose'], 'a late resident agent must not leak into the next cold resume')
+    assert.deepEqual(f.compacts, [])
+  })
+})
+
+test('dispatch seams: a hanging prompt queue times out with its stage name and aborts the delivered signal', async () => {
+  await withShortTimeouts({ send: 20 }, async () => {
+    const manager = { session: { id: 'manager', seq: 0, snapshotEvents: () => [] } } as unknown as Agent
+    const signals: AbortSignal[] = []
+    const queue: HostPromptQueue = {
+      async [queueSubagentPrompt](_parent, _childId, _content, _source, signal) {
+        signals.push(signal)
+        return new Promise<never>(() => {})
+      },
+    }
+    const adapters: HostAdapters = {
+      ctx: { subagents: queue, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
+      managerAgentOf: () => manager,
+      cwdOfManager: async () => undefined,
+      registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    }
+    const run = makeRun('sess-dev')
+    await assert.rejects(makeDispatchTargets(adapters).sendRoleActor(run, 'developer', 'next node'),
+      /timeout after 20ms at stage "send"/)
+    await assert.rejects(makeSubagentHost(adapters, () => ({})).followupJudge(run, 'sess-judge', {
+      nodeToken: run.callStack[0]!.nodeToken, instruction: 'Do.', criteria: 'PASS.', input: 'root input',
+      boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
+      cwd: '.', judgeSessionId: 'sess-judge',
+    }), /timeout after 20ms at stage "send"/)
+    assert.deepEqual(signals.map(signal => signal.aborted), [true, true])
+  })
+})
+
+test('availability seam: a hanging persistence probe degrades to unknown instead of pinning the caller', async () => {
+  await withShortTimeouts({ availability: 20 }, async () => {
+    const host = makeHost({
+      events: [], resumes: [], compacts: [],
+      persistence: { inspect: async () => new Promise<never>(() => {}) },
+    }).host
+    assert.equal(await host.roleSessionAvailability('slow-session'), 'unknown')
+    assert.equal(await host.judgeSessionAvailability('slow-session'), 'unknown')
+  })
 })
 
 test('Role/Judge Session availability distinguishes durable absence from unreadable persistence', async () => {
