@@ -2,16 +2,16 @@
 
 GitHub 待办：[#18](https://github.com/hua0424/dsh-workflow-plugin/issues/18)。
 
-状态：仅登记，未实施、未部署。当前由 Manager 独立查询后补充证据，Judge 保留 NEED_CONTEXT 和 fail-closed 行为。
+状态：**已被 [#25](https://github.com/hua0424/dsh-workflow-plugin/issues/25) 取代（2026-09-10 用户确认），本轮不实施本文件的 typed 扩展**。Judge 工具面改为全量工具默认 + 可配置 deny list 后，`gh`/`git`/`pwsh` 等查询工具对 Judge 直接可见可用，本文件第 18 行的能力缺口随之消失；下面的 typed/enum 扩展、分页完整性验收与固定工具面安全检查不再作为验收项（收到关闭动作时以 #25 的说明为准）。
 
 ## 触发事实
 
 milestone-delivery 的实现、决策和合并节点需要查询 PR base/head、合并状态、保护检查及提交祖先关系。
 
-- `src/roles/roles.ts` 的 JUDGE_ALLOW 为固定白名单，没有 shell、任意 HTTP 或 gh 工具。
+- ~~`src/roles/roles.ts` 的 JUDGE_ALLOW 为固定白名单，没有 shell、任意 HTTP 或 gh 工具。~~ 已由 #25 解除：`JUDGE_ALLOW` 白名单替换为默认 deny 清单（`JUDGE_DEFAULT_DENY`，定义在 `src/roles/roles.ts`），Judge 继承全量工具目录。
 - `src/tools/tools.ts` / `src/index.ts` 的 inspection 只有 Git status/branch/remote/top-level 和 GitHub milestones/issues/milestone-issues。
 - 当前 GitHub inspection 列表仅取 per_page=100 的一页，不能据此证明大集合完整性。
-- `judgeRole` 的严格 schema 不接受 tools 配置；改 YAML/persona 或换模型不能提供这些能力。
+- ~~`judgeRole` 的严格 schema 不接受 tools 配置；改 YAML/persona 或换模型不能提供这些能力。~~ 已由 #25 解除：`judgeRole.tools.deny` 可配置（只收不能放），默认清单之外的查询工具默认可见。
 
 ## 待实施范围
 
