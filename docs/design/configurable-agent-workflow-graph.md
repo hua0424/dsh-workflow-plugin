@@ -141,7 +141,7 @@ Schema已确认精确`agent-workflow/v2`，输入使用受限YAML 1.2：单文�
 
 ### 2.5 Parent/Child Workflow
 
-已确认：Parent Workflow Definition可以引用可复用Child Workflow Definition。每次引用在运行时push一个Child Workflow Run frame。Child内部FAIL通过自己的onFail循环/修复；达到END才pop并让Parent调用Node视为PASS。Child BLOCK只暂停并保留frame，不返回FAIL；首期Child是“必须完成的可复用子流程”，不设计RETURN_FAIL终点。
+已确认：Parent Workflow Definition可以引用可复用Child Workflow Definition。每次引用在运行时push一个Child Workflow Run frame。Child内部FAIL通过自己的onFail循环/修复，或经 onFail→END 直接结束子流程并返回父调用节点 onPass（#17 起允许，对父读作 PASS，父只能经 handoff 文本感知失败）；达到END才pop并让Parent调用Node视为PASS。Child BLOCK只暂停并保留frame，不返回FAIL；首期Child是“必须完成的可复用子流程”，不设计RETURN_FAIL终点。
 
 该模型用于复用主流程中多次出现的区域子流程。Parent/Child不再固定解释为Milestone/Issue；Milestone/Issue是某个具体Graph中的业务对象，由Node action/checker处理。Root Parent与所有Child Run共享同一个Judge Role配置，但每次判断使用fresh Judge Agent。
 
@@ -176,11 +176,11 @@ child-workflow
 
 `nodes`使用map，Node ID由key提供，不在对象内重复。Strict discriminated union已确认：
 
-- `actor-task`：`execution={type,role,instruction}`，必须有`checker={checkerId,config?}`、`onPass`，可选`onFail`；
-- `builtin-program`：`execution={type,programId,instruction?,config?}`，禁止role/checker，必须有onPass，可选onFail；instruction只指导Manager临时填写program parameters；
+- `actor-task`：`execution={type,role,instruction}`，必须有`checker={checkerId,config?}`、`onPass`，可选`onFail`（可指向 END，语义见下）；
+- `builtin-program`：`execution={type,programId,instruction?,config?}`，禁止role/checker，必须有onPass，可选onFail（可指向 END，语义见下）；instruction只指导Manager临时填写program parameters；
 - `child-workflow`：`execution={type,workflowId}`，禁止role/instruction/checker/onFail，只允许onPass。
 
-Actor/program结果固定PASS|FAIL。`onPass` target是同Workflow Node ID或END；`onFail`只能是同Workflow Node ID或省略，不能END。FAIL且onFail缺失时当前Node默认BLOCK。Child Workflow是一个Node，不允许Edge直接引用Workflow ID。运行时不改图，不支持任意表达式、变量脚本、多结果分支或并行Node。
+Actor/program结果固定PASS|FAIL。`onPass` target是同Workflow Node ID或END；`onFail`是同Workflow Node ID、END（#17 起允许）或省略。FAIL且onFail缺失时当前Node默认BLOCK。根 failed→END 沿用 `completed` 表示执行结束，终局业务结果由终局工作单 claim outcome + handoff 表达，终局 steerManager 消息按 PASS/FAIL 区分措辞。子流程 failed→END pop 后落父节点 `onPass`（对父读作 PASS，父 Checker 只能经 handoff 文本感知失败）。Child Workflow是一个Node，不允许Edge直接引用Workflow ID。运行时不改图，不支持任意表达式、变量脚本、多结果分支或并行Node。
 
 ## 3. 内置Checker Catalog
 
