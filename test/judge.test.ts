@@ -27,7 +27,11 @@ function makeSource(id: string, events: Array<{ time: number; seq: number; type:
   }
 }
 
-test('plugin-owned dispute protocol tells Actor to BLOCK disagreements and Judge not to invent criteria', () => {
+test('#46 P5: consolidated submission text carries single-source key clauses', () => {
+  assert.match(SUBMISSION_CONSTRAINT, /结果只通过 node_claim 交付/)
+  assert.match(SUBMISSION_CONSTRAINT, /node_claim 必须是本轮对话的最后一个动作/)
+  assert.match(SUBMISSION_CONSTRAINT, /仅输出文字不视为提交.*BLOCK/)
+  assert.match(SUBMISSION_CONSTRAINT, /不要向父会话 send_message 汇报结果/)
   assert.match(SUBMISSION_CONSTRAINT, /认可.*修正/)
   assert.match(SUBMISSION_CONSTRAINT, /分歧.*证据.*Manager/)
   assert.match(SUBMISSION_CONSTRAINT, /不伪报 failed/)

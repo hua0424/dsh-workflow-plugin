@@ -200,7 +200,7 @@ v2唯一可用Checker是`judge.claim-correct`（A1自`judge.goal-satisfied`更�
 
 Config只允许非空`criteria`文本。Engine用内置Judge system template包装：独立检查真实现场、不信任Worker自报、禁止修改、只输出strict确认结果+reason。Node criteria不能覆盖Judge职责、只读toolFilter或output协议。
 
-Fresh Judge固定接收：global Judge persona、内置template、Node instruction/criteria、Worker transient claim、可选的`pendingCorrection`证据段（`[previous rejection]`/`[previous claim]`，来自同Node先前一次REJECT）、workspace cwd，以及Host从当前Node dispatch边界投影的Node-local可见文本conversation（Manager/User/Actor合并，排除tool/plugin/替换/hidden与旧Node历史）。投影是Host内自定义瞬时纯函数；不使用`deriveMessages()`（它会混入tool results与插件注入内容）。投影不写State；Manager路径的correction证据不经projection（plugin source被排除）而经`pendingCorrection`持久化通道进入packet。
+Fresh Judge固定接收：global Judge persona、内置template、冻结 criteria（权威判定依据）、Worker transient claim、可选的`pendingCorrection`证据段（`[previous rejection]`/`[previous claim]`，来自同Node先前一次REJECT）、workspace cwd，以及Host从当前Node dispatch边界投影的Node-local可见文本conversation（Manager/User/Actor合并，排除tool/plugin/替换/hidden与旧Node历史；投影中 executor 首条 dispatch 只保留 `[handoff]`）。投影是Host内自定义瞬时纯函数；不使用`deriveMessages()`（它会混入tool results与插件注入内容）。投影不写State；Manager路径的correction证据不经projection（plugin source被排除）而经`pendingCorrection`持久化通道进入packet。
 
 ```text
 output = {
@@ -855,7 +855,7 @@ Program/Checker Catalog只是插件源码内部固定ID→implementation/schema 
 
 ### 10.3 `judge.claim-correct`合同
 
-Node config只允许`{criteria}`文本，trim后1..8000字符。每次fresh Judge收到global persona、内置独立只读判断template、Node instruction/criteria、Worker transient claim、可选的`pendingCorrection`证据段（同Node先前REJECT的`[previous rejection]`/`[previous claim]`）、workspace cwd，以及Host按当前Node dispatch边界生成的Node-local projection（Manager/User/Actor合并）；projection排除system/tool/subagent/hidden内容与引擎注入的`[提交要求]`且不写State。Manager路径的correction证据经`pendingCorrection`持久化通道进入packet（projection的plugin source过滤不放宽）。
+Node config只允许`{criteria}`文本，trim后1..8000字符。每次fresh Judge收到global persona、内置独立只读判断template、冻结 criteria（权威判定依据）、Worker transient claim、可选的`pendingCorrection`证据段（同Node先前REJECT的`[previous rejection]`/`[previous claim]`）、workspace cwd，以及Host按当前Node dispatch边界生成的Node-local projection（Manager/User/Actor合并；投影中 executor 首条 dispatch 只保留 `[handoff]`）；projection排除system/tool/subagent/hidden内容与引擎注入的`[提交要求]`且不写State。Manager路径的correction证据经`pendingCorrection`持久化通道进入packet（projection的plugin source过滤不放宽）。
 
 `judge_claim({nodeToken,result,reason})`协议固定`{result:ACCEPT|REJECT|NEED_CONTEXT,reason}`，reason必填，trim后1..2000字符，不能返回nextNode/tool/handoff。ACCEPT按claim outcome映射Graph PASS/FAIL（Judge不改写结果）；REJECT必须写明如何修正并触发同Node correction重派（原Actor、boundary保留、token轮换、CORRECT事件）；NEED_CONTEXT进入可恢复BLOCK。Judge provider/timeout/invalid output/缺read能力/现场不可读不产生Graph结果，当前Node BLOCK并可由Manager创建fresh Judge重试。
 
