@@ -44,7 +44,7 @@ Actor 只提交 outcome 与 handoff；Judge、Manager、后继和最终用户共
 16. As a Role Actor, I want 在整个 Root/Child Run 复用 continuable Session, so that 历史工作经验得以延续。
 17. As a Role Actor, I want 进入下一 Node 前 compact 后继承上下文, so that 既延续经验又控制上下文规模。
 18. As a Role Actor, I want 同一工作单补充和返工继续原 Session, so that 不因普通恢复丢失当前对话。
-19. As a Role Actor, I want 每次收到完整当前 input、instruction 和 criteria, so that 历史记忆不是接单前提。
+19. As a Role Actor, I want 每次收到完整当前 input 和 instruction（+ correction/resolution/recovery/引擎提交要求），不含 criteria；criteria 仅进 Judge packet 作为判定依据, so that 历史记忆不是接单前提。
 20. As a Role Actor, I want 只提交 outcome 与一份 handoff, so that 不必维护重复或矛盾的 summary。
 21. As a Role Actor, I want completed/failed 使用相同交接能力, so that 失败后的处理人也有完整材料。
 22. As a Role Actor, I want 接到中断工作时被提醒先检查现场, so that 不机械重跑已经完成的动作。

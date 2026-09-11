@@ -42,6 +42,17 @@ export function validateAndNormalize(config: WorkflowConfig, extra?: { workflowI
     problems.push(`workflow id "${workflowId}" is not a valid lowercase [a-z][a-z0-9-]* id`)
   }
 
+/** #42 P5 (#46): persona keywords that duplicate the engine-owned submission
+ * protocol — the protocol is single-sourced in SUBMISSION_CONSTRAINT. */
+const PERSONA_PROTOCOL_KEYWORDS = ['node_claim', 'judge_claim', 'send_message']
+
+function checkPersonaProtocol(label: string, persona: string, problems: string[]): void {
+  const hit = PERSONA_PROTOCOL_KEYWORDS.find(keyword => persona.includes(keyword))
+  if (hit !== undefined) {
+    problems.push(`${label} persona must not hand-write submission protocol (found "${hit}"); the submission protocol is engine-owned (SUBMISSION_CONSTRAINT) — keep only business discipline in persona`)
+  }
+}
+
   // roles
   for (const [roleKey, role] of Object.entries(config.roles)) {
     if (!ID_PATTERN.test(roleKey)) {
@@ -51,10 +62,12 @@ export function validateAndNormalize(config: WorkflowConfig, extra?: { workflowI
       problems.push(`role key "${roleKey}" is reserved and cannot be configured`)
     }
     role.persona = role.persona.trim()
+    checkPersonaProtocol(`role "${roleKey}"`, role.persona, problems)
   }
 
   // judge role
   config.judgeRole.persona = config.judgeRole.persona.trim()
+  checkPersonaProtocol('judgeRole', config.judgeRole.persona, problems)
 
   // workflows (root + children)
   const allWorkflows: Record<string, WorkflowDef> = { ...(config.childWorkflows ?? {}) }

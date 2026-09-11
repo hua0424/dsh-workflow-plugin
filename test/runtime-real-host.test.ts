@@ -222,7 +222,7 @@ roles:
   worker:
     persona: Complete only the current workflow work order and use its control tools.
 judgeRole:
-  persona: Read-only verification; submit only judge_claim.
+  persona: Read-only verification of the isolated workspace.
 workflow:
   startNode: kickoff
   nodes:
