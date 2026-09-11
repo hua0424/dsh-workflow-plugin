@@ -12,6 +12,7 @@ import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
 import { endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
+import { checkCatalogProviders, renderProviderCheckReport } from './catalog/provider-check.ts'
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
 import type { RunState } from './types.ts'
@@ -339,6 +340,20 @@ export function apply(ctx: Context) {
       if (diagnostic) return Promise.resolve({ ok: true, status: maintenanceText(diagnostic) })
       if (workspaceKey === undefined) return Promise.resolve({ ok: false, reason: '当前会话没有 workspace cwd' })
       return toolHost.status(workspaceKey, caller)
+    },
+    async check(workflowId) {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
+      if (diagnostic) return { ok: false, reason: maintenanceText(diagnostic) }
+      try {
+        const entry = await loadCatalogEntry(home, workflowId)
+        if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
+        // 纯静态比对：宿主已注册 provider 清单是本地注册表读取，无网络调用。
+        const available = ctx.llm.listProviders().map(provider => provider.id)
+        const report = checkCatalogProviders(workflowId, entry.config, available)
+        return { ok: true, message: renderProviderCheckReport(report) }
+      } catch (error) {
+        return { ok: false, reason: String(error) }
+      }
     },
     async reset(agent, workspaceKey, mode) {
       const diagnostic = stateAccess.maintenanceDiagnostic()

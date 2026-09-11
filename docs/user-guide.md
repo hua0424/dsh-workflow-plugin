@@ -52,7 +52,13 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）
 /dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store
+/dsh-flow check <workflow-id>         静态检查该 catalog 各角色的 provider 是否已注册（只报告，不阻断）
 ```
+
+- `check` 把 catalog 每个角色（含 Judge）的 `model.provider` 与当前
+  profile 已注册 provider 清单做纯静态比对（无网络调用），逐角色输出
+  OK/不可用 + 原因；不可用只报告，不影响正常加载与运行。未配置 model
+  的角色视为运行时继承 Manager route，不报错。
 
 - `start` 的附加文本会作为初始指令的一部分交给 Manager（比如本次目标）。
 - `reset` 只是终止插件侧的 Run 状态，**不会**回滚 Actor 已经做过的外部动作
