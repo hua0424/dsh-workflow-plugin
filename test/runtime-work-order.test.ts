@@ -241,6 +241,25 @@ async function acceptCurrent(h: ReturnType<typeof harness>, handoff = 'artifact'
   return judge
 }
 
+test('actor dispatch excludes criteria but keeps handoff, instruction and submission constraint', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const prompt = h.messages.at(-1)!.text
+    assert.match(prompt, /\[handoff\]\nroot request/)
+    assert.match(prompt, /\[instruction\]\nPlan/)
+    assert.match(prompt, /\[提交要求\]/)
+    assert.doesNotMatch(prompt, /\[criteria\]/)
+    assert.doesNotMatch(prompt, /Correct plan/)
+    // criteria 仍冻结进 Judge packet，不随派发瘦身丢失。
+    assert.equal(h.judges.length, 0)
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    assert.equal(h.judges.at(-1)!.criteria, 'Correct plan')
+  } finally { h.close() }
+})
+
 test('END final handoff persists; a retired read-only Judge missing end does not lock workspace', async () => {
   const h = harness()
   try {
@@ -1342,7 +1361,7 @@ test('missing Role Session is replaced in the resume transaction and correction 
     const replacementPrompt = h.messages.at(-1)!.text
     assert.match(replacementPrompt, /manager handoff/)
     assert.match(replacementPrompt, /\[instruction\]\nWork/)
-    assert.match(replacementPrompt, /\[criteria\]\nCorrect plan/)
+    assert.doesNotMatch(replacementPrompt, /\[criteria\]/)
     assert.match(replacementPrompt, /持久Session确认不存在/)
     assert.match(replacementPrompt, /已完成勿重复副作用/)
     assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'old Role late claim' }, oldActor)).ok, false)
@@ -1459,7 +1478,7 @@ test('checking with an unsettled Actor defaults auto recovery back to Actor and 
     assert.equal(resumed.execution.previousClaim?.id, claim.id)
     assert.match(h.messages.at(-1)!.text, /root request/)
     assert.match(h.messages.at(-1)!.text, /\[instruction\]\nPlan/)
-    assert.match(h.messages.at(-1)!.text, /\[criteria\]\nCorrect plan/)
+    assert.doesNotMatch(h.messages.at(-1)!.text, /\[criteria\]/)
     assert.match(h.messages.at(-1)!.text, /possibly completed before interruption/)
     assert.match(h.messages.at(-1)!.text, /默认交还Actor核查并重新claim/)
     assert.match(h.messages.at(-1)!.text, /之前中断/)
