@@ -14,8 +14,14 @@ import { isAppendSurfaceEvent, deriveEventMessage } from '@deepseek-ai/dsh-sessi
 import type { NodeContextBoundary } from '../types.ts'
 import { SUBMISSION_CONSTRAINT } from '../engine/texts.ts'
 
-/** Max projected transcript length in characters (defensive bound). */
+/** Max projected transcript length in characters (defensive bound, #45 P3 保留). */
 export const PROJECTION_MAX_CHARS = 120_000
+
+/**
+ * #45 P3 投影窗口：MANAGER/ACTOR 消息只保留最近 6 条。首条 dispatch 与全部
+ * USER 消息保底（USER 全保留——用户中途指示是范围变更判据，数量极少）。
+ */
+export const PROJECTION_WINDOW_MANAGER_ACTOR = 6
 
 /**
  * Minimal session shape the projection needs. A live DSH `Session` satisfies
@@ -143,44 +149,62 @@ function sessionOrder(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0
 }
 
+/** Ordering for projected messages: (time, sessionId, seq within a session). */
+function compareProjected(a: ProjectedMessage, b: ProjectedMessage): number {
+  return a.time - b.time
+    // A1 R3: seq orders ONLY within one session at equal time; different
+    // sessions at equal time break ties by the stable session id.
+    || sessionOrder(a.sessionId, b.sessionId)
+    || (a.sessionId === b.sessionId ? a.seq - b.seq : 0)
+}
+
 /**
- * Node-local projection (A1 R5–R7): Manager + User messages from the boundary
- * cursor, merged with the executing Actor's own Node-scoped messages, ordered
- * by (time, seq, session). Excludes all pre-boundary history.
+ * Node-local projection (A1 R5–R7; #45 P3 窗口): Manager + User messages from
+ * the boundary cursor, merged with the executing Actor's own Node-scoped
+ * messages, ordered by (time, seq, session). Excludes all pre-boundary
+ * history. 窗口规则：首条 dispatch + 全部 USER 保底，MANAGER/ACTOR 只取最近
+ * PROJECTION_WINDOW_MANAGER_ACTOR 条；无 actor 会话时仅 Manager 侧参与窗口。
  */
 export function projectNodeLocal(
   managerSession: ProjectionSource,
   boundary: NodeContextBoundary,
   actorSession?: ProjectionSource,
 ): string {
-  const parts: ProjectedMessage[] = []
-
-  // Manager session: user/message (real user) + assistant/message (manager).
-  parts.push(...projectSessionSurface(managerSession, boundary.managerFromSeq, 'MANAGER'))
+  const managerParts = projectSessionSurface(managerSession, boundary.managerFromSeq, 'MANAGER')
+  const actorParts: ProjectedMessage[] = []
 
   // Executing Actor session: its own Node-scoped visible assistant + dispatch
   // text (the dispatch message itself is a user/message with source.kind ===
   // 'user' on first creation, or this Workflow plugin on host Queue continuation
   // (legacy coordinator history is also kept for the ACTOR role per A1 R6).
+  let dispatch: ProjectedMessage | undefined
   if (actorSession !== undefined && boundary.executorSessionId !== undefined) {
     const from = executorFromSeq(actorSession, boundary)
-    const actorParts = projectSessionSurface(actorSession, from, 'ACTOR')
+    const scoped = projectSessionSurface(actorSession, from, 'ACTOR')
     // #44 P2: the executor's dispatch message (the boundary anchor at `from`)
     // keeps only [handoff] in the projection; later actor messages are untouched.
-    const dispatchAt = actorParts.findIndex(p => p.seq === from)
+    const dispatchAt = scoped.findIndex(p => p.seq === from)
     if (dispatchAt !== -1) {
-      actorParts[dispatchAt] = { ...actorParts[dispatchAt]!, text: compressDispatchToHandoff(actorParts[dispatchAt]!.text) }
+      dispatch = { ...scoped[dispatchAt]!, text: compressDispatchToHandoff(scoped[dispatchAt]!.text) }
+      scoped.splice(dispatchAt, 1)
     }
-    parts.push(...actorParts)
+    actorParts.push(...scoped)
   }
 
-  parts.sort((a, b) =>
-    a.time - b.time
-    // A1 R3: seq orders ONLY within one session at equal time; different
-    // sessions at equal time break ties by the stable session id.
-    || sessionOrder(a.sessionId, b.sessionId)
-    || (a.sessionId === b.sessionId ? a.seq - b.seq : 0),
-  )
+  // #45 P3: 窗口只对 MANAGER/ACTOR 生效；USER 全保留。先按最终展示顺序
+  // 排好序，再取 MANAGER/ACTOR 的尾部 N 条 = 合并口径的"最近 N 条"。
+  const nonUser = [...managerParts, ...actorParts]
+    .filter(p => p.role !== 'USER')
+    .sort(compareProjected)
+    .slice(-PROJECTION_WINDOW_MANAGER_ACTOR)
+  const parts: ProjectedMessage[] = [
+    ...managerParts.filter(p => p.role === 'USER'),
+    ...actorParts.filter(p => p.role === 'USER'),
+    ...(dispatch !== undefined ? [dispatch] : []),
+    ...nonUser,
+  ]
+
+  parts.sort(compareProjected)
 
   const rendered = parts.map(p => `[${p.role}]\n${p.text}`)
   let out = rendered.join('\n\n')

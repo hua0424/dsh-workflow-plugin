@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseJudgeClaim, renderJudgePrompt } from '../src/judge/checker.ts'
-import { projectNodeLocal, projectSessionSurface, messageText, compressDispatchToHandoff, type ProjectionSource } from '../src/judge/projection.ts'
+import { projectNodeLocal, projectSessionSurface, messageText, compressDispatchToHandoff, PROJECTION_MAX_CHARS, PROJECTION_WINDOW_MANAGER_ACTOR, type ProjectionSource } from '../src/judge/projection.ts'
 import { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SUBMISSION_CONSTRAINT } from '../src/engine/texts.ts'
@@ -370,4 +370,50 @@ test('projectSessionSurface filters plugin/user and assistant text', () => {
   assert.equal(out.length, 2)
   assert.equal(out[0]!.text, 'u')
   assert.equal(out[1]!.text, 'a')
+})
+
+test('#45 P3: projection window keeps dispatch + all USER + latest 6 MANAGER/ACTOR', () => {
+  assert.equal(PROJECTION_WINDOW_MANAGER_ACTOR, 6)
+  assert.equal(PROJECTION_MAX_CHARS, 120_000)
+  const events: Array<{ type: string; data: unknown; surfaceOp?: unknown }> = [
+    // 10 条 MANAGER 消息 + 2 条 USER（USER 全保留）。
+    ...Array.from({ length: 10 }, (_, i) =>
+      ({ type: 'assistant/message' as string, data: { turn: i + 1, step: 1, message: { id: `m${i}` as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: `manager ${i}` }], source: { kind: 'model', model: 'm' } } }, surfaceOp: 'append' as const })),
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'user scope change 1' }], source: { kind: 'user' } }), surfaceOp: 'append' },
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'user scope change 2' }], source: { kind: 'user' } }), surfaceOp: 'append' },
+  ]
+  const manager = makeSession(events)
+  const text = projectNodeLocal(manager, { dispatchedAt: 0, managerFromSeq: 0 })
+  // USER 全保留；MANAGER 只剩最近 6 条（manager 4..9）。
+  assert.match(text, /user scope change 1/)
+  assert.match(text, /user scope change 2/)
+  assert.match(text, /manager 9/)
+  assert.match(text, /manager 4/)
+  assert.doesNotMatch(text, /manager 3/)
+  assert.doesNotMatch(text, /manager 0/)
+})
+
+test('#45 P3: no actor boundary keeps all USER with an empty manager window', () => {
+  const user = createUserMessage({ content: [{ type: 'text', text: 'human question' }], source: { kind: 'user' } })
+  const text = projectNodeLocal(makeSession([{ type: 'user/message', data: user, surfaceOp: 'append' }]), { dispatchedAt: 0, managerFromSeq: 0 })
+  assert.match(text, /\[USER\]\nhuman question/)
+})
+
+test('#45 P4: REJECT re-judgment packet carries the point-by-point recheck instruction', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'fixed', workerOutcome: 'completed',
+    workspaceCwd: '.', transcript: '',
+    previousFeedback: { result: 'REJECT', reason: 'tests missing', claim: { outcome: 'completed', handoff: 'draft' } },
+  })
+  assert.match(text, /逐点核对.*新 handoff 是否解决.*旧 REJECT.*每个问题/)
+  assert.match(text, /未全部解决的不得 ACCEPT/)
+})
+
+test('#45 P4: NEED_CONTEXT feedback carries no REJECT recheck instruction', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'candidate', workerOutcome: 'completed',
+    workspaceCwd: '.', transcript: '',
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need scope', claim: { outcome: 'completed', handoff: 'draft' } },
+  })
+  assert.doesNotMatch(text, /逐点核对/)
 })
