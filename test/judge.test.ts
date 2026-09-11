@@ -372,7 +372,7 @@ test('projectSessionSurface filters plugin/user and assistant text', () => {
   assert.equal(out[1]!.text, 'a')
 })
 
-test('#45 P3: projection window keeps dispatch + all USER + latest 6 MANAGER/ACTOR', () => {
+test('#45 P3: projection window keeps all USER + latest 6 MANAGER with no actor session', () => {
   assert.equal(PROJECTION_WINDOW_MANAGER_ACTOR, 6)
   assert.equal(PROJECTION_MAX_CHARS, 120_000)
   const events: Array<{ type: string; data: unknown; surfaceOp?: unknown }> = [
@@ -391,6 +391,42 @@ test('#45 P3: projection window keeps dispatch + all USER + latest 6 MANAGER/ACT
   assert.match(text, /manager 4/)
   assert.doesNotMatch(text, /manager 3/)
   assert.doesNotMatch(text, /manager 0/)
+})
+
+test('#45 P3 rework: dispatch 保底 survives window pressure with an actor session', () => {
+  // 压力场景：dispatch 在展示顺序上最早，合并 nonUser 候选 = 8 manager + 3 actor = 11 > 6；
+  // 无保底时 dispatch 必被窗口淘汰（复现判据：去掉保底槽后本用例必须失败）。
+  const dispatchText = `[handoff]\nroot request\n\n[instruction]\nBuild it.${SUBMISSION_CONSTRAINT}`
+  const dispatch = { id: 'dispatch-45-pressure' as never, role: 'user' as const, content: [{ type: 'text' as const, text: dispatchText }], source: { kind: 'user' as const } }
+  const actorReply = (id: string, text: string) => ({ turn: 2, step: 1, message: { id: id as never, role: 'assistant' as const, content: [{ type: 'text' as const, text }], source: { kind: 'model', model: 'm' } } })
+  const actor = makeSource('actor-session', [
+    { time: 5, seq: 0, type: 'user/message', data: dispatch },
+    { time: 6, seq: 1, type: 'assistant/message', data: actorReply('a1', 'actor reply A') },
+    { time: 7, seq: 2, type: 'assistant/message', data: actorReply('a2', 'actor reply B') },
+    { time: 8, seq: 3, type: 'assistant/message', data: actorReply('a3', 'actor reply C') },
+  ])
+  const managerEvents: Array<{ time: number; seq: number; type: string; data: unknown }> = [
+    ...Array.from({ length: 8 }, (_, i) =>
+      ({ time: 10 + i, seq: 10 + i, type: 'assistant/message' as string, data: { turn: i + 1, step: 1, message: { id: `m${i}` as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: `manager ${i}` }], source: { kind: 'model', model: 'm' } } } })),
+    { time: 30, seq: 30, type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'user scope change' }], source: { kind: 'user' } }) },
+  ]
+  const manager = makeSource('manager-session', managerEvents)
+  const text = projectNodeLocal(manager, {
+    dispatchedAt: 0, managerFromSeq: 0, executorSessionId: 'actor-session', executorDispatchMessageId: 'dispatch-45-pressure',
+  }, actor)
+  // dispatch 保底：最早但仍保留；[handoff] 保留、[instruction] 已 strip。
+  assert.match(text, /\[ACTOR\]\n\[handoff\]\nroot request/)
+  assert.doesNotMatch(text, /Build it\./)
+  // USER 全保留。
+  assert.match(text, /user scope change/)
+  // 只保留最近 6 条 MANAGER/ACTOR（manager 2..7）；最早的 nonUser 被淘汰。
+  assert.match(text, /manager 7/)
+  assert.match(text, /manager 2/)
+  assert.doesNotMatch(text, /manager 1/)
+  assert.doesNotMatch(text, /manager 0/)
+  assert.doesNotMatch(text, /actor reply A/)
+  assert.doesNotMatch(text, /actor reply B/)
+  assert.doesNotMatch(text, /actor reply C/)
 })
 
 test('#45 P3: no actor boundary keeps all USER with an empty manager window', () => {

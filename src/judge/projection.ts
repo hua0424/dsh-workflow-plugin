@@ -197,9 +197,10 @@ export function projectNodeLocal(
     .filter(p => p.role !== 'USER')
     .sort(compareProjected)
     .slice(-PROJECTION_WINDOW_MANAGER_ACTOR)
+  // 不变式：ACTOR 面永不产出 USER 角色（projectSessionSurface 仅在 role === 'MANAGER'
+  // 时改写 USER）；USER 保底只来自 Manager 面。
   const parts: ProjectedMessage[] = [
     ...managerParts.filter(p => p.role === 'USER'),
-    ...actorParts.filter(p => p.role === 'USER'),
     ...(dispatch !== undefined ? [dispatch] : []),
     ...nonUser,
   ]
