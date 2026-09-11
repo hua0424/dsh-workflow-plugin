@@ -73,7 +73,11 @@ cwd: {workspaceCwd}
 /** Render the latest non-terminal Judge feedback with its exact claim. */
 function renderPreviousFeedback(feedback: JudgePromptInput['previousFeedback']): string {
   if (feedback === undefined) return ''
-  return `\n# Previous Judge feedback on this node (${feedback.result})\n[judge reason]\n${feedback.reason}\n\n[judged claim]\noutcome: ${feedback.claim.outcome}\nhandoff: ${feedback.claim.handoff}\n`
+  // #45 P4：REJECT 重判必须逐点核对新 handoff 是否解决旧 REJECT 每个问题。
+  const recheck = feedback.result === 'REJECT'
+    ? '\n[重判要求]\n逐点核对 Actor 新 handoff 是否解决了旧 REJECT 指出的每个问题；未全部解决的不得 ACCEPT。\n'
+    : ''
+  return `\n# Previous Judge feedback on this node (${feedback.result})\n[judge reason]\n${feedback.reason}\n\n[judged claim]\noutcome: ${feedback.claim.outcome}\nhandoff: ${feedback.claim.handoff}\n${recheck}`
 }
 
 function renderManagerContext(context: string | undefined): string {
