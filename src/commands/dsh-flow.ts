@@ -1,6 +1,6 @@
 /**
  * /dsh-flow native command (design §2.3 A1-A5).
- * list | start <workflow-id> [extra text] | status | reset
+ * list | start <workflow-id> [extra text] | status | reset | check <workflow-id>
  * No arguments = usage error.
  */
 import type { CommandDefinition } from '@deepseek-ai/dsh-commands'
@@ -14,6 +14,8 @@ export interface CommandHost {
   start(agent: Agent, workspaceKey: string, workflowId: string, extraText: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
   reset(agent: Agent, workspaceKey: string | undefined, mode: 'compatible' | 'incompatible-store'): Promise<{ ok: boolean; reason?: string; message?: string }>
+  /** Static provider check for one catalog entry: report-only, never blocks loading. */
+  check(workflowId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
 }
 
 export function isRootCommandAgent(agent: Agent): boolean {
@@ -26,13 +28,14 @@ const USAGE = `用法：
 /dsh-flow start <workflow-id> [文本]  启动 workflow（附加文本交给 Manager）
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）
-/dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store`
+/dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store
+/dsh-flow check <workflow-id>         静态检查该 catalog 各角色的 provider 是否已注册（只报告，不阻断）`
 
 export function makeDshFlowCommand(host: CommandHost): CommandDefinition {
   return {
     name: 'dsh-flow',
-    description: 'Agent-team workflow 控制：list / start / status / reset',
-    input: { hint: 'list | start <workflow-id> [text] | status | reset' },
+    description: 'Agent-team workflow 控制：list / start / status / reset / check',
+    input: { hint: 'list | start <workflow-id> [text] | status | reset | check <workflow-id>' },
     recordInput: true,
     async handler(invocation) {
       const raw = invocation.rawInput.trim()
@@ -82,6 +85,15 @@ export function makeDshFlowCommand(host: CommandHost): CommandDefinition {
           const outcome = await host.reset(invocation.agent, ws, mode)
           if (!outcome.ok) return { kind: 'error', text: `reset 失败：${outcome.reason ?? '未知错误'}` }
           return { kind: 'success', text: outcome.message ?? 'reset done' }
+        }
+        case 'check': {
+          const workflowId = rest[0]
+          if (workflowId === undefined || rest.length !== 1 || !/^[a-z][a-z0-9-]*$/.test(workflowId)) {
+            return { kind: 'error', text: `check 需要一个 workflow-id（[a-z][a-z0-9-]*）；${USAGE}` }
+          }
+          const outcome = await host.check(workflowId)
+          if (!outcome.ok) return { kind: 'error', text: `check 失败：${outcome.reason ?? '未知错误'}` }
+          return { kind: 'success', text: outcome.message ?? 'check done' }
         }
         default:
           return { kind: 'error', text: `未知子命令 "${verb}"；${USAGE}` }
