@@ -4,6 +4,7 @@ import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim } from '
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
+import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
@@ -199,7 +200,9 @@ export class WorkflowEngine {
         if (predecessor?.judge && !predecessor.judge.settled) knownSessions.add(predecessor.judge.sessionId)
       }
       for (const sessionId of knownSessions) {
-        const safe = await this.subagents.safeToInspect(sessionId)
+        let safe: boolean
+        try { safe = await this.whenIdleProbe(sessionId) }
+        catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
         if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run safety inspection')
         if (!safe) {
           const activity = await this.actorActivity(sessionId)
@@ -275,12 +278,14 @@ export class WorkflowEngine {
         if (role !== 'manager' && run.roleActors[role]) {
           if (!previousDispatchSettled) {
             const sessionId = run.roleActors[role]
-            const safe = await this.subagents.safeToInspect(sessionId)
+            const safe = await this.whenIdleProbe(sessionId)
             if (!await this.stillCurrent(ws, e, arrangedVersion)) return
             if (!safe) {
               const activity = await this.actorActivity(sessionId)
               if (!await this.stillCurrent(ws, e, arrangedVersion)) return
-              if (e.resolution?.target !== 'actor' || activity !== 'unknown') throw new WorkflowError('previous Role execution is not safely closed')
+              // 冷会话（activity==='unknown'：无存活进程=无未收口执行）与 resume
+              // 路径同等安全，直接放行；只有仍可观测到活动的会话才是 dispatch fault。
+              if (activity !== 'unknown') throw new WorkflowError('previous Role execution is not safely closed')
             }
           }
           if (!e.roleBoundaryPrepared) {
@@ -349,6 +354,24 @@ export class WorkflowEngine {
       fresh.execution.judge!.messageId = sent.messageId
       await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
     } catch (error) { await this.dispatchFault(ws, e, error, committedVersion) }
+  }
+  /**
+   * whenIdle 挂起是派发/恢复路径的已知 seam（#21 F1）：safeToInspect 内部的
+   * `agent.whenIdle()` 没有任何 signal 可用，只能放弃等待并让调用方降级。
+   */
+  private whenIdleProbe(sessionId: string): Promise<boolean> {
+    return withTimeout(this.subagents.safeToInspect(sessionId), DISPATCH_TIMEOUTS.whenIdle, 'whenIdle')
+  }
+  /**
+   * 探针超时=技术故障，不是"不安全"：降级为携带阶段名的 BLOCK 并返回 undefined；
+   * 其它错误保持原样抛出。调用方看到 undefined 即已 BLOCK，不得继续推进。
+   */
+  private async safetyProbe(ws: string, row: RuntimeRow, sessionId: string): Promise<boolean | undefined> {
+    try { return await this.whenIdleProbe(sessionId) }
+    catch (error) {
+      if (!(error instanceof DispatchTimeoutError)) throw error
+      await this.blockRow(ws, row, error.message)
+    }
   }
   private async stillCurrent(ws: string, e: NodeExecution, version: number): Promise<RuntimeRow | undefined> {
     const row = await this.state.get(ws)
@@ -555,7 +578,9 @@ export class WorkflowEngine {
     if (e.phase === 'ready' && e.predecessorId) {
       const predecessor = await this.state.execution(ws, e.predecessorId)
       if (!predecessor || !matches(predecessor.judge, caller) || predecessor.judge!.settled) return
-      if (!await this.subagents.safeToInspect(caller.sessionId)) { await this.blockRow(ws, row, 'Judge/known tools not safely closed'); return }
+      const settledSafe = await this.safetyProbe(ws, row, caller.sessionId)
+      if (settledSafe === undefined) return
+      if (!settledSafe) { await this.blockRow(ws, row, 'Judge/known tools not safely closed'); return }
       const fresh = await this.state.get(ws)
       if (!fresh || fresh.version !== row.version || fresh.execution.executionId !== e.executionId) return
       predecessor.judge!.settled = true
@@ -566,7 +591,8 @@ export class WorkflowEngine {
     const actor = matches(e.dispatch, caller) && !e.dispatch!.settled
     const judge = matches(e.judge, caller) && !e.judge!.settled
     if (!actor && !judge) return
-    const safe = await this.subagents.safeToInspect(caller.sessionId)
+    const safe = await this.safetyProbe(ws, row, caller.sessionId)
+    if (safe === undefined) return
     const fresh = await this.stillCurrent(ws, e, row.version)
     if (!fresh) return
     e = fresh.execution
@@ -642,7 +668,7 @@ export class WorkflowEngine {
     let replaceRole = false
     if (role !== 'manager' && run.roleActors[role] && (resolvedTarget === 'actor' || !e.dispatch?.settled)) {
       const sessionId = run.roleActors[role]
-      const safe = await this.subagents.safeToInspect(sessionId)
+      const safe = await this.whenIdleProbe(sessionId)
       if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role safety inspection')
       if (!safe) {
         const activity = await this.actorActivity(sessionId)
@@ -678,7 +704,7 @@ export class WorkflowEngine {
         const availability = await this.subagents.judgeSessionAvailability(judgeToContinue.sessionId)
         if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge Session inspection')
         if (availability !== 'missing') {
-          const safe = await this.subagents.safeToInspect(judgeToContinue.sessionId)
+          const safe = await this.whenIdleProbe(judgeToContinue.sessionId)
           if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge safety inspection')
           if (!safe) {
             const activity = await this.actorActivity(judgeToContinue.sessionId)
@@ -906,7 +932,7 @@ export class WorkflowEngine {
     const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
     if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')
     if (mapped) {
-      const safe = await this.subagents.safeToInspect(mapped)
+      const safe = await this.whenIdleProbe(mapped)
       if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role safety inspection')
       if (!safe) {
         const activity = await this.actorActivity(mapped)
