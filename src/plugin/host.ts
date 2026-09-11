@@ -11,6 +11,7 @@ import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-c
 import type {} from '@deepseek-ai/dsh-agent-presets'
 import type { JobStatus } from '@deepseek-ai/dsh-jobs'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
+import type { ContinuableStartSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError, type SessionInspection, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
@@ -68,8 +69,14 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   if (persistence === undefined) return undefined
   let inspection: SessionInspection
   try {
-    inspection = await withTimeout(persistence.inspect(SessionId(sessionId), new AbortController().signal),
-      DISPATCH_TIMEOUTS.availability, 'availability')
+    // #32 D-002：controller 必须真正接线，超时即 abort —— 否则留下一个永不中断的
+    // 只读观察者。接线收益有上限：宿主 `SessionPersistence.prepareCore(id)` 不把
+    // signal 转发给 `backend.loadStored(id)`（dsh-session-persistence
+    // lib/index.js:1161-1163），因此这里实际能取消的只有"排队等待共享读"阶段；
+    // backend 自身的冷读一旦开始只能放弃等待（30s 兜底降级为 unknown）。
+    const controller = new AbortController()
+    inspection = await withTimeout(persistence.inspect(SessionId(sessionId), controller.signal),
+      DISPATCH_TIMEOUTS.availability, 'availability', controller)
   } catch (error) {
     if (error instanceof SessionPersistenceNotFoundError) throw error
     const detail = error instanceof Error ? error.message : String(error)
@@ -159,6 +166,37 @@ function noCompactionBackend(ctx: Context, sessionId: string): { ok: true; detai
   return { ok: true, detail: 'no compaction backend; boundary compact skipped' }
 }
 
+/** Durable host-authored provenance for every workflow dispatch. */
+const PLUGIN_SOURCE = { kind: 'plugin' as const, plugin: 'dsh-agent-team-workflow' }
+
+/**
+ * Queue one dispatcher turn to a continuable child, bounded by the `send` SLO.
+ * Every send site shares this shape so the timeout and the abort wiring cannot
+ * drift apart per caller.
+ */
+async function queueDispatch(subagents: SubagentRuntime, parent: Agent, childId: string, text: string): Promise<string> {
+  const controller = new AbortController()
+  return withTimeout(
+    queueHostSubagentPrompt(subagents, parent, SessionId(childId), textBlocks(text), PLUGIN_SOURCE, controller.signal),
+    DISPATCH_TIMEOUTS.send, 'send', controller)
+}
+
+/**
+ * Bounded `startContinuable` (首次角色派发 / Judge spawn, #32 D-001). The host
+ * contract gives the caller's signal ownership only until inbox acceptance, so
+ * a timeout here aborts the still-pending lookup/materialization instead of
+ * leaving a dead signal behind.
+ */
+function startContinuableWithin(subagents: Pick<SubagentRuntime, 'startContinuable'>, spec: Omit<ContinuableStartSpec, 'signal'>, stage: string): ReturnType<SubagentRuntime['startContinuable']> {
+  const controller = new AbortController()
+  return withTimeout(subagents.startContinuable({ ...spec, signal: controller.signal }), DISPATCH_TIMEOUTS.spawn, stage, controller)
+}
+
+/** `drainContinuableChildren` takes no signal: a hang is abandoned, never awaited forever. */
+function drainWithin(subagents: Pick<SubagentRuntime, 'drainContinuableChildren'>, parent: Agent, childIds: readonly SessionId[]): Promise<void> {
+  return withTimeout(subagents.drainContinuableChildren(parent, childIds), DISPATCH_TIMEOUTS.drain, 'drain')
+}
+
 export function makeStateHost(source: StateStore | (() => StateStore)): StateHost {
   const store = (): StateStore => typeof source === 'function' ? source() : source
   return {
@@ -216,11 +254,7 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) throw new WorkflowError(`no actor mapped for role "${roleKey}"`)
       // Workflow 派发必须是独立 child turn，不可用 nearest-step sendMessage。
-      const controller = new AbortController()
-      const messageId = await withTimeout(
-        queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(childId), textBlocks(text),
-          { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, controller.signal),
-        DISPATCH_TIMEOUTS.send, 'send', controller)
+      const messageId = await queueDispatch(adapters.ctx.subagents, manager, childId, text)
       return { messageId }
     },
     managerSessionSeq(run) {
@@ -341,11 +375,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         // correct continuation for an existing mapping.
         const manager = adapters.managerAgentOf(run)
         if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-        const controller = new AbortController()
-        const messageId = await withTimeout(
-          queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(existing), textBlocks(initialText),
-            { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, controller.signal),
-          DISPATCH_TIMEOUTS.send, 'send', controller)
+        const messageId = await queueDispatch(adapters.ctx.subagents, manager, existing, initialText)
         return { childId: existing, messageId }
       }
       const manager = adapters.managerAgentOf(run)
@@ -354,7 +384,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       if (roleDef === undefined) throw new WorkflowError(`unknown role "${roleKey}"`)
       const route = resolveRoleModel(run, roleKey, frozenRoute())
       const deny = roleDenyList(run, roleKey)
-      const started = await adapters.ctx.subagents.startContinuable({
+      const started = await startContinuableWithin(adapters.ctx.subagents, {
         provider: 'spawn',
         label: `workflow-role:${roleKey}`,
         request: {
@@ -366,8 +396,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
             ? { provider: route.provider, model: route.model }
             : undefined,
         },
-        signal: new AbortController().signal,
-      })
+      }, `spawn role ${roleKey}`)
       // Record the session mapping IMMEDIATELY at creation — the child's first
       // turn may end before the engine persists roleActors, and its node_claim
       // authorization needs this mapping.
@@ -389,7 +418,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       // 到的实际工具面求交集，而不是让 spawn 直接 fault。
       const deny = knownDenyList(plan.toolFilter.deny, adapters.ctx.tools.schemas(manager).map(schema => schema.name))
 
-      const started = await adapters.ctx.subagents.startContinuable({
+      const started = await startContinuableWithin(adapters.ctx.subagents, {
         provider: 'spawn',
         label: judgeLabel(topFrame(run).nodeId),
         // P1: use the engine-reserved id, which was persisted BEFORE child
@@ -405,22 +434,21 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
             ? { provider: plan.agentOptions.provider, model: plan.agentOptions.model }
             : undefined,
         },
-        signal: new AbortController().signal,
-      })
+      }, 'spawn judge')
 
       // Fail-closed tool-surface assertion over the freshly published child
       // (CONTEXT.md "每次 spawn 后对 Judge final visible schema 做 fail-closed
       // 断言"): an unobservable child is itself a fault, never a pass.
       const childAgent = adapters.ctx.agents.get(started.childId)
       if (childAgent === undefined) {
-        await adapters.ctx.subagents.drainContinuableChildren(manager, [started.childId]).catch(() => {})
+        await drainWithin(adapters.ctx.subagents, manager, [started.childId]).catch(() => {})
         adapters.revokeJudgeSession(started.childId)
         throw new WorkflowError('judge child agent is not observable after spawn')
       }
       const surfaceProblem = assertJudgeToolSurface(childAgent, deny)
       if (surfaceProblem !== undefined) {
         // Drain the judge we just spawned and surface the detail.
-        await adapters.ctx.subagents.drainContinuableChildren(manager, [started.childId]).catch(() => {})
+        await drainWithin(adapters.ctx.subagents, manager, [started.childId]).catch(() => {})
         adapters.revokeJudgeSession(started.childId)
         throw new WorkflowError(surfaceProblem)
       }
@@ -439,11 +467,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async followupJudge(run, judgeSessionId, input) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      const controller = new AbortController()
-      const messageId = await withTimeout(
-        queueHostSubagentPrompt(adapters.ctx.subagents, manager, SessionId(judgeSessionId), textBlocks(await judgePrompt(run, input)),
-          { kind: 'plugin', plugin: 'dsh-agent-team-workflow' }, controller.signal),
-        DISPATCH_TIMEOUTS.send, 'send', controller)
+      const messageId = await queueDispatch(adapters.ctx.subagents, manager, judgeSessionId, await judgePrompt(run, input))
       adapters.registerJudgeSession(judgeSessionId, input.cwd)
       return { messageId }
     },
@@ -461,7 +485,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       const manager = adapters.managerAgentOf(run)
       adapters.revokeJudgeSession(judgeSessionId)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      await adapters.ctx.subagents.drainContinuableChildren(manager, [SessionId(judgeSessionId)])
+      // #32 D-001：drain 无 signal 形参，挂起只能放弃等待（fail-closed），不能永久 pending。
+      await drainWithin(adapters.ctx.subagents, manager, [SessionId(judgeSessionId)])
     },
 
     async compactRoleActor(run, roleKey) {
@@ -525,11 +550,12 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       })
       let handle: AgentHandle
       try {
-        handle = await withTimeout(resuming, DISPATCH_TIMEOUTS.coldMaterialize, 'cold materialize', controller)
+        handle = await withTimeout(resuming, DISPATCH_TIMEOUTS.coldMaterialize, 'coldMaterialize', controller)
       } catch (error) {
         // 超时后迟到的物化同样必须释放：遗留 resident agent 会让后续冷 resume
-        // 在 registry id 上冲突（见下方 teardown 注释）。
-        resuming.then(late => { void late.dispose().catch(() => {}) }, () => {})
+        // 在 registry id 上冲突（见下方 teardown 注释）。#32 D-004：释放本身也要收口，
+        // 否则一个卡住的 dispose 会变成后台永久 pending 的 promise。
+        resuming.then(late => void withTimeout(late.dispose(), DISPATCH_TIMEOUTS.dispose, 'dispose late').catch(() => {}), () => {})
         return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
       }
       let outcome: { ok: boolean; detail: string }
