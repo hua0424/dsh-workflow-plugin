@@ -106,4 +106,4 @@ trace 是派生产物，不是业务 events。Runtime 保留 trace helper 的转
 
 最高 controlled seam 是真实 Workflow Runtime + 临时 SQLite（恢复、Program、嵌套 Child 与 Reset/升级测试真实关闭重开）+ 受控 Host Adapter；关键来源测试使用精确派发 ID 集合。`scripts/t3-smoke.mjs` 保留 ACCEPT 基线，`scripts/e2e-smoke.mjs` 覆盖 REJECT/failed-onFail/修正闭环；二者都使用独立临时 home，不操作真实 Run。
 
-T9 已按 `docs/testing/runtime-refact-test-migration.md` 删除旧 MemState/单表结构测试并以新 seam 动态证据替代，full suite 必须 0 fail/0 skip。`test/runtime-real-host.test.ts` 另以 exact DSH 0.1.2-rc.1 真实 Host 组合覆盖 A30 的 Role Activation cold continuation、真实 Basic compact、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume；它使用脚本 LLM，不冒充外部模型质量或完整进程重启。
+T9 已按 `docs/testing/runtime-refact-test-migration.md` 删除旧 MemState/单表结构测试并以新 seam 动态证据替代，full suite 必须 0 fail/0 skip。`test/runtime-real-host.test.ts` 另以 exact DSH 0.1.5-rc.2 真实 Host 组合覆盖 A30 的 Role Activation cold continuation、真实 Basic compact、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume；它使用脚本 LLM，不冒充外部模型质量或完整进程重启。

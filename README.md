@@ -6,7 +6,7 @@ workflows (`agent-workflow/v2`).
 **当前 `refact` 已完成 T6–T9 实现与 A01–A30 自动化验收冻结，仍未部署；最终 Standards/Spec 审查与 commit 由父代理执行。**
 三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT、Manager 定向 resume/Judge respawn、争议协议、Manager-only 有界历史，以及关闭重开后的统一恢复。Role Actor 在新 visit（含自环）前安全收口并 compact 后续接同一 continuable Session；同 execution 返工/resume 不做 Node 边界 compact，持久 Session 确认不存在时由 fresh replacement 接手完整材料。
 
-受控 Runtime/SQLite smoke 与 exact DSH `0.1.2-rc.1` 真实 Host 组合分开报告：[`A01–A30 验收账本`](docs/testing/node-execution-runtime-acceptance.md)记录 Role Activation cold continuation、真实 Basic compaction、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume。脚本 LLM 不代表外部模型质量，Activation cold 也不冒充完整进程重启。
+受控 Runtime/SQLite smoke 与 exact DSH `0.1.5-rc.2` 真实 Host 组合分开报告：[`A01–A30 验收账本`](docs/testing/node-execution-runtime-acceptance.md)记录 Role Activation cold continuation、真实 Basic compaction、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume。脚本 LLM 不代表外部模型质量，Activation cold 也不冒充完整进程重启。
 
 T6 重启 reconciliation 不依赖崩溃前存在中断事件：未结束工作单保留 phase/input/claim 并进入可恢复
 BLOCK。Manager resume 重新进入普通 driver；working 或未可靠收口的 claim 默认交 Actor 检查现场并重新
@@ -62,8 +62,8 @@ cordis.patch.yml      profile-bundle patch (inserts the plugin row)
 ## Development
 
 - Build: `pnpm run build` (tsc → `lib/`). The profile bundle loads `lib/index.js`; Node refuses to strip `.ts` inside node_modules, so the compiled output is the runtime artifact.
-- Test: `pnpm test`（全部 node:test，要求 0 fail/0 skip）；`pnpm run test:real-host` 单独运行 exact 0.1.2-rc.1 真实 Host 组合；`node scripts/t3-smoke.mjs` / `pnpm run test:e2e` 运行两套隔离 controlled smoke。
-- Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.1.2-rc.1` types and are required Host services, not plugin runtime dependencies.
+- Test: `pnpm test`（全部 node:test，要求 0 fail/0 skip）；`pnpm run test:real-host` 单独运行 exact 0.1.5-rc.2 真实 Host 组合；`node scripts/t3-smoke.mjs` / `pnpm run test:e2e` 运行两套隔离 controlled smoke。
+- Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.1.5-rc.2` types and are required Host services, not plugin runtime dependencies.
 
 ## Installation (development)
 

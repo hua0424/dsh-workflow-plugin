@@ -42,7 +42,8 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 
 ## DSH 运行基线（用户确认）
 
-- 当前运行版本：`0.1.2-rc.1`；对应源码：`D:\project\github\deepseek-harness`。分析宿主兼容性、continuable Actor、compact 或 Session 行为时，查询此版本源码。
+- 当前运行版本：`0.1.5-rc.2`（2026-09-11 自 `0.1.2-rc.1` 升级，见 issue #37 / PR #38）；对应源码：`D:\project\github\deepseek-harness`（master 已含 tag `dsh-v0.1.5-rc.2`）。分析宿主兼容性、continuable Actor、compact 或 Session 行为时，查询此版本源码。
+- 0.1.2-rc.1 的宿主缺陷「冷 resume 已完成 turn 的 continuable 子会话永不 settle」（原事故 run 20260911-105817 的 B-001~B-007：复用任一 Role Actor 会话即 60s 超时降级 BLOCK）已在 0.1.5-rc.2 上实测不再复现：4 轮 `cold-resume-test` 的冷复用全部正常 settle，会话内 `compaction/start → compaction/end` 实测 10–16s，零 `coldMaterialize` 超时 BLOCK（详见 issue #37）。
 - 该仓库已用 codebase-memory 索引，project：`D-project-github-deepseek-harness`；优先图查询，引用前检查 coverage，必要时读取源文件核实。源码仓库与已安装运行产物是不同路径。
 - 本仓库的默认远端是github，相关操作可使用gh命令行工具。
 
