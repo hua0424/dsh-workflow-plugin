@@ -22,6 +22,10 @@ export const DISPATCH_TIMEOUTS = {
   send: 60_000,
   /** 会话可用性探针（持久化 inspect）。 */
   availability: 30_000,
+  /** startContinuable 冷启动（首次角色派发、Judge spawn）：查表 + 物化 + 准入。 */
+  spawn: 60_000,
+  /** drainContinuableChildren（无 signal 形参，只能放弃等待并 fail-closed）。 */
+  drain: 60_000,
 }
 
 /** 阶段超时=技术故障（非业务结论）：reason 必带阶段名，便于诊断与人工接手。 */

@@ -8,6 +8,7 @@ import { StateStore, stateDbPath } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from '../src/engine/timeouts.ts'
+import { withShortTimeouts } from './helpers/timeouts.ts'
 
 const CONFIG = {
   schemaVersion: 'agent-workflow/v2' as const, roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
@@ -1053,16 +1054,19 @@ test('#21 F2: a Session with observable activity still BLOCKs the reuse dispatch
 })
 
 test('#21 F1: every dispatch-path seam timeout BLOCKs with its stage name instead of hanging the Manager turn', async () => {
-  const saved = { ...DISPATCH_TIMEOUTS }
-  DISPATCH_TIMEOUTS.whenIdle = 20
   // 真实超时机制产出的 detail（Host 侧 cold/compact 链的返回值形状）。
   const compactTimeout = await withTimeout(new Promise<never>(() => {}), 7, 'compactNow').then(() => '', error => (error as Error).message)
+  const coldTimeout = await withTimeout(new Promise<never>(() => {}), 7, 'coldMaterialize').then(() => '', error => (error as Error).message)
   const seams: Array<[string, (h: ReturnType<typeof harness>) => void]> = [
     ['whenIdle', h => h.setSafetyGate('worker-session', new Promise<never>(() => {}))],
     ['compactNow', h => h.setCompactOutcome({ ok: false, detail: compactTimeout })],
     ['send', h => h.setRoleSendFailure(new DispatchTimeoutError('send', DISPATCH_TIMEOUTS.send))],
+    // #32 D-003：冷物化（agents.resume）挂起此前只有 Host 层用例；引擎层必须
+    // 在有限时间内 BLOCK 且 blockReason 带阶段名（Host 侧真实 resume 挂起的
+    // 超时由 test/host-compact.test.ts 的 coldMaterialize 用例覆盖）。
+    ['coldMaterialize', h => h.setCompactOutcome({ ok: false, detail: `cold materialize failed: ${coldTimeout}` })],
   ]
-  try {
+  await withShortTimeouts({ whenIdle: 20 }, async () => {
     for (const [stage, inject] of seams) {
       const h = harness(configWithReusedWorker())
       try {
@@ -1075,7 +1079,7 @@ test('#21 F1: every dispatch-path seam timeout BLOCKs with its stage name instea
         assert.match(blocked.execution.blockReason!, new RegExp(`timeout after \\d+ms at stage "${stage}"`))
       } finally { h.close() }
     }
-  } finally { Object.assign(DISPATCH_TIMEOUTS, saved) }
+  })
 })
 
 function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
@@ -1257,25 +1261,25 @@ test('Manager recovery allows unknown cold Role only after explicit resume, but 
 
 test('#21 F1: a hanging Role probe during node_resume fails with the stage name and keeps the Run BLOCKed', async () => {
   const h = recoveryHarness(configWithWorker())
-  const saved = { ...DISPATCH_TIMEOUTS }
-  DISPATCH_TIMEOUTS.whenIdle = 20
   try {
-    await enterRecoveryWorker(h)
-    h.reopen()
-    await h.engine.handleRestartReconcile()
-    const blocked = await h.row()
-    assert.equal(blocked.run.status, 'blocked')
-    h.setSafe(false)
-    h.setActivity('unknown')
-    h.setSafetyGate(new Promise<never>(() => {}))
-    await assert.rejects(
-      h.engine.handleResume('ws', blocked.execution.nodeToken, '旧 Role 现场需要人工核验，先探针再决定。', 'manager', 'actor'),
-      /timeout after 20ms at stage "whenIdle"/)
-    const after = await h.row()
-    assert.equal(after.run.status, 'blocked', 'a timed-out probe changes nothing and never hangs the Manager turn')
-    assert.equal(after.execution.dispatch?.id, blocked.execution.dispatch?.id)
-    assert.equal(after.stateVersion, blocked.stateVersion)
-  } finally { Object.assign(DISPATCH_TIMEOUTS, saved); h.close() }
+    await withShortTimeouts({ whenIdle: 20 }, async () => {
+      await enterRecoveryWorker(h)
+      h.reopen()
+      await h.engine.handleRestartReconcile()
+      const blocked = await h.row()
+      assert.equal(blocked.run.status, 'blocked')
+      h.setSafe(false)
+      h.setActivity('unknown')
+      h.setSafetyGate(new Promise<never>(() => {}))
+      await assert.rejects(
+        h.engine.handleResume('ws', blocked.execution.nodeToken, '旧 Role 现场需要人工核验，先探针再决定。', 'manager', 'actor'),
+        /timeout after 20ms at stage "whenIdle"/)
+      const after = await h.row()
+      assert.equal(after.run.status, 'blocked', 'a timed-out probe changes nothing and never hangs the Manager turn')
+      assert.equal(after.execution.dispatch?.id, blocked.execution.dispatch?.id)
+      assert.equal(after.stateVersion, blocked.stateVersion)
+    })
+  } finally { h.close() }
 })
 
 test('actor resume rechecks a settled Role dispatch and rejects a newly active Session', async () => {
