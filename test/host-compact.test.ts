@@ -6,7 +6,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
 import { makeDispatchTargets, makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
-import { queueSubagentPrompt, type HostPromptQueue } from '@deepseek-ai/dsh-subagent/internal'
+import { deliverSubagentPrompt, type HostPromptDeliverer } from '@deepseek-ai/dsh-subagent/internal'
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { ManualCompactionError, type ManualCompactionErrorCode } from '@deepseek-ai/dsh-compaction'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
@@ -53,8 +53,8 @@ function makeRun(actorForDeveloper: string | undefined): RunState {
 test('Role and Judge continuation use host distinct-turn queue with exact Manager authority', async () => {
   const manager = { session: { id: 'manager', seq: 0, snapshotEvents: () => [] } } as unknown as Agent
   const deliveries: Array<{ parent: Agent; childId: string; text: string; source: unknown }> = []
-  const queue: HostPromptQueue = {
-    async [queueSubagentPrompt](parent, childId, content, source, signal) {
+  const queue: HostPromptDeliverer = {
+    async [deliverSubagentPrompt](parent, childId, content, source, signal) {
       assert.equal(signal.aborted, false)
       deliveries.push({ parent, childId, text: (content[0] as { text: string }).text, source })
       return MessageId(`dispatch-${deliveries.length}`)
@@ -174,7 +174,7 @@ function makeHost(options: {
   compactHangs?: boolean
   disposeError?: Error
   disposeHangs?: boolean
-  persistence?: { inspect: (id: unknown, signal?: AbortSignal) => Promise<unknown> }
+  persistence?: { open: (id: unknown, access: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> }
   presets?: { serviceFor: (agent: Agent, name: string) => unknown; composeFrom?: (agentCtx: unknown, parentCtx: unknown) => void }
   noHostCompaction?: boolean
   events: string[]
@@ -453,8 +453,8 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
   await withShortTimeouts({ send: 20 }, async () => {
     const manager = { session: { id: 'manager', seq: 0, snapshotEvents: () => [] } } as unknown as Agent
     const signals: AbortSignal[] = []
-    const queue: HostPromptQueue = {
-      async [queueSubagentPrompt](_parent, _childId, _content, _source, signal) {
+    const queue: HostPromptDeliverer = {
+      async [deliverSubagentPrompt](_parent, _childId, _content, _source, signal) {
         signals.push(signal)
         return new Promise<never>(() => {})
       },
@@ -480,12 +480,20 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
 test('availability seam: a hanging persistence probe degrades to unknown and aborts the underlying read', async () => {
   await withShortTimeouts({ availability: 20 }, async () => {
     // #32 D-002：沿用 #21 的"不得残留装饰 signal"验收——超时即 abort，否则会留下
-    // 一个被放弃、永不中断的只读观察者（宿主 prepareCore 不转发 signal，故可取消
-    // 的只有排队等待共享读阶段，见 host.ts 注释）。
+    // 一个被放弃、永不中断的只读观察者。0.1.5 的 handle API 把 signal 直达后端读。
     const signals: Array<AbortSignal | undefined> = []
     const host = makeHost({
       events: [], resumes: [], compacts: [],
-      persistence: { inspect: async (_id, signal) => { signals.push(signal); return new Promise<never>(() => {}) } },
+      persistence: {
+        open: async () => ({
+          header: { id: 'slow-session' },
+          read: async (_offset: unknown, _length: unknown, readOptions?: { signal?: AbortSignal }) => {
+            signals.push(readOptions?.signal)
+            return new Promise<never>(() => {})
+          },
+          close: async () => {},
+        }),
+      },
     }).host
     assert.equal(await host.roleSessionAvailability('slow-session'), 'unknown')
     assert.equal(await host.judgeSessionAvailability('slow-session'), 'unknown')
@@ -498,10 +506,10 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
   const ctx = {
     agents: { get: (id: unknown) => id === 'live-session' ? live : undefined },
     get: (key: string) => key === 'sessionPersistence' ? {
-      inspect: async (id: string) => {
+      open: async (id: string) => {
         if (id === 'broken-session') throw new Error('persistence read failed')
         if (id === 'missing-session') throw new SessionPersistenceNotFoundError(id as never)
-        return { meta: { id }, events: [] }
+        return { header: { id }, read: async () => ({ events: [] }), close: async () => {} }
       },
     } : undefined,
     jobs: { onJobDone: () => () => {} }, effect: () => {},

@@ -32,7 +32,7 @@ test('turn/end binds its exact completed turn, never a later dispatch', () => {
 })
 
 test('safe inspection rejects a different live Activation for the observed Session', async () => {
-  const oldActor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent
+  const oldActor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
   const replacement = { ...oldActor, whenIdle: async () => {} } as unknown as Agent
   let current: Agent | undefined = oldActor
   const ctx = {
@@ -50,8 +50,8 @@ test('safe inspection rejects a descendant that appears while idle checks await'
   let checks = 0
   let child: Agent | undefined
   const actor = {
-    id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { hasPending: false },
-    whenIdle: async () => { if (++checks === 2) child = { id: 'child', status: 'running', session: { id: 'child', header: { parentSession: 'actor' } }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent },
+    id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] },
+    whenIdle: async () => { if (++checks === 2) child = { id: 'child', status: 'running', session: { id: 'child', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent },
   } as unknown as Agent
   const ctx = {
     jobs: { list: () => [], onJobDone: () => () => {} }, effect: () => {},
@@ -63,8 +63,8 @@ test('safe inspection rejects a descendant that appears while idle checks await'
 })
 
 test('safe inspection requires observable idle descendants, empty inboxes, and terminal non-orphan jobs', async () => {
-  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent
-  const child = { id: 'child', status: 'idle', session: { id: 'child', header: { parentSession: 'actor' } }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent
+  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  const child = { id: 'child', status: 'idle', session: { id: 'child', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
   let descendants: unknown[] = []
   let live: Agent[] = [actor]
   let jobs: Array<{ status: string; ownerSession?: string; detail?: string }> = []
@@ -83,7 +83,7 @@ test('safe inspection requires observable idle descendants, empty inboxes, and t
   assert.equal(await host.safeToInspect('actor'), false, 'running descriptor without an Agent is unknown')
   live = [actor, { ...child, status: 'running' } as unknown as Agent]
   assert.equal(await host.safeToInspect('actor'), false)
-  live = [actor, { ...child, inbox: { hasPending: true } } as unknown as Agent]
+  live = [actor, { ...child, inbox: { nextTurn: [{}], nextStep: [] } } as unknown as Agent]
   assert.equal(await host.safeToInspect('actor'), false)
   live = [actor, child]
   jobs = [{ status: 'running' }]
@@ -97,10 +97,10 @@ test('safe inspection requires observable idle descendants, empty inboxes, and t
 })
 
 test('orphan evidence follows its exact nested Session across descriptor removal without tainting a new Session', async () => {
-  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent
-  const branch = { id: 'branch-old', status: 'idle', session: { id: 'branch-old', header: { parentSession: 'actor' } }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent
-  const leaf = { id: 'leaf-old', status: 'idle', session: { id: 'leaf-old', header: { parentSession: 'branch-old' } }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent
-  const fresh = { id: 'fresh', status: 'idle', session: { id: 'fresh', header: {} }, inbox: { hasPending: false }, whenIdle: async () => {} } as unknown as Agent
+  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  const branch = { id: 'branch-old', status: 'idle', session: { id: 'branch-old', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  const leaf = { id: 'leaf-old', status: 'idle', session: { id: 'leaf-old', header: { parentSession: 'branch-old' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  const fresh = { id: 'fresh', status: 'idle', session: { id: 'fresh', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
   let descendants: unknown[] = [
     { kind: 'child', id: 'branch-old', activity: 'running', hasChildren: true, mode: 'continuable', label: 'branch', parentId: 'actor', depth: 1 },
     { kind: 'child', id: 'leaf-old', activity: 'inactive', hasChildren: false, mode: 'continuable', label: 'leaf', parentId: 'branch-old', depth: 2 },
@@ -131,7 +131,7 @@ test('safe inspection waits exact Agent, rejects job tail and retains cold/orpha
   let done: ((job: { detail?: string }, owner?: Agent) => void) | undefined
   let dispose: (() => void) | undefined
   let unsubscribed = false
-  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { hasPending: false }, whenIdle: () => idle.promise } as unknown as Agent
+  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: () => idle.promise } as unknown as Agent
   const ctx = {
     get: () => { throw new Error('required services must use direct Context properties') },
     jobs: { list: () => jobs, onJobDone: (listener: typeof done) => { done = listener; return () => { unsubscribed = true; done = undefined } } },

@@ -14,7 +14,7 @@ import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import type { ContinuableStartSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
-import { SessionPersistenceNotFoundError, type SessionInspection, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
+import { SessionPersistenceNotFoundError, type SessionHandle, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { StateStore } from '../state/store.ts'
 import type { RunState } from '../types.ts'
 import { WorkflowError } from '../types.ts'
@@ -28,6 +28,11 @@ import { renderJudgePrompt } from '../judge/checker.ts'
 import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
 
 const TERMINAL_JOB_STATUSES = new Set<JobStatus>(['completed', 'failed', 'killed'])
+
+/** 0.1.5 起 Inbox 公共接口移除 hasPending：两个 pending 队列均为空即无待处理输入。 */
+function inboxEmpty(agent: Agent): boolean {
+  return agent.inbox.nextTurn.length === 0 && agent.inbox.nextStep.length === 0
+}
 
 /** 从 durable 根集合按 parentSession 线性补齐 live 后代。 */
 function liveDescendantIds(seedIds: Iterable<string>, agents: readonly Agent[]): Set<string> {
@@ -67,29 +72,29 @@ function sessionPersistence(ctx: Context): SessionPersistence | undefined {
 async function inspectPersistedSession(ctx: Context, sessionId: string): Promise<ProjectionSource | undefined> {
   const persistence = sessionPersistence(ctx)
   if (persistence === undefined) return undefined
-  let inspection: SessionInspection
+  const controller = new AbortController()
+  let handle: SessionHandle | undefined
   try {
     // #32 D-002：controller 必须真正接线，超时即 abort —— 否则留下一个永不中断的
-    // 只读观察者。接线收益有上限：宿主 `SessionPersistence.prepareCore(id)` 不把
-    // signal 转发给 `backend.loadStored(id)`（dsh-session-persistence
-    // lib/index.js:1161-1163），因此这里实际能取消的只有"排队等待共享读"阶段；
-    // backend 自身的冷读一旦开始只能放弃等待（30s 兜底降级为 unknown）。
-    const controller = new AbortController()
-    inspection = await withTimeout(persistence.inspect(SessionId(sessionId), controller.signal),
+    // 只读观察者。0.1.5 起持久化改为 SessionHandle：open('read') 不取写所有权，
+    // read 的 signal 直达后端读（旧 prepareCore 不转发 signal 的缺陷随之消失）；
+    // finally 中的 close 保证超时后迟到的读也不泄漏句柄。
+    handle = await withTimeout(persistence.open(SessionId(sessionId), 'read', { signal: controller.signal }),
       DISPATCH_TIMEOUTS.availability, 'availability', controller)
+    const result = await withTimeout(handle.read(0, undefined, { signal: controller.signal }),
+      DISPATCH_TIMEOUTS.availability, 'availability read', controller)
+    const events = result.events.slice()
+    return {
+      id: handle.header.id,
+      snapshotEvents: () => events,
+      seq: events.length > 0 ? events[events.length - 1]!.seq + 1 : 0,
+    }
   } catch (error) {
     if (error instanceof SessionPersistenceNotFoundError) throw error
     const detail = error instanceof Error ? error.message : String(error)
     throw new WorkflowError(`actor session projection failed: ${detail}`)
-  }
-  if (inspection === undefined || !Array.isArray(inspection.events)) {
-    throw new WorkflowError(`actor session projection failed: inspect returned no events for "${sessionId}"`)
-  }
-  const events = inspection.events.slice()
-  return {
-    id: inspection.meta.id,
-    snapshotEvents: () => events,
-    seq: events.length > 0 ? events[events.length - 1]!.seq + 1 : 0,
+  } finally {
+    await handle?.close().catch(() => {})
   }
 }
 
@@ -346,7 +351,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         const agents: Agent[] = []
         for (const id of requiredIds) {
           const candidate = observed.get(id) ?? adapters.ctx.agents.get(SessionId(id))
-          if (!candidate || candidate.status !== 'idle' || candidate.inbox.hasPending || unsafe.has(id)) return false
+          if (!candidate || candidate.status !== 'idle' || !inboxEmpty(candidate) || unsafe.has(id)) return false
           agents.push(candidate)
         }
         await Promise.all(agents.map(candidate => candidate.whenIdle()))
@@ -362,7 +367,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         if (currentLive.some(child => currentTreeIds.has(child.id) && !requiredIds.has(child.id))) return false
         return agents.every(candidate => {
           const current = adapters.ctx.agents.get(candidate.id)
-          return (current === undefined || current === candidate) && candidate.status === 'idle' && !candidate.inbox.hasPending && !unsafe.has(candidate.id)
+          return (current === undefined || current === candidate) && candidate.status === 'idle' && inboxEmpty(candidate) && !unsafe.has(candidate.id)
             && adapters.ctx.jobs.list(candidate).filter(job => job.ownerSession === candidate.id)
               .every(job => TERMINAL_JOB_STATUSES.has(job.status) && !job.detail?.includes('work may be orphaned'))
         })

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
-import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
+// 0.1.5 起 SessionProjectionRegistry 由 mountAgentLoopTestDependencies 内置挂载。
 import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
@@ -255,7 +255,6 @@ workflow:
 
   try {
     await mountAgentLoopTestDependencies(ctx)
-    await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(JsonlSessionPersistence, { root: sessions, compression: 'none', packChunks: false })
     await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
     await ctx.plugin(AgentLoop, { agents: [] })
@@ -282,7 +281,7 @@ workflow:
 
     const WorkflowPlugin = await import('../src/index.ts')
     await ctx.plugin(WorkflowPlugin)
-    const manager = ctx.agentLoop.create(SessionId('a30-manager'), { provider: MODEL, model: MODEL }, { cwd: workspace })
+    const manager = await ctx.agentLoop.create(SessionId('a30-manager'), { provider: MODEL, model: MODEL }, { cwd: workspace })
     const start = await ctx.commands.execute(manager, '/dsh-flow start a30 isolated-host-input', [], signal)
     assert.ok(start)
     assert.equal(start.result.kind, 'success', start.result.kind === 'error' ? start.result.text : undefined)
@@ -318,7 +317,14 @@ workflow:
 
     const roleSessionId = adapter.roleSessionId
     assert.ok(roleSessionId)
-    const persisted = await ctx.sessionPersistence.inspect(SessionId(roleSessionId))
+    // 0.1.5 起持久化读走 SessionHandle：open('read') 不取写所有权，读完即 close。
+    const persistedHandle = await ctx.sessionPersistence.open(SessionId(roleSessionId), 'read')
+    let persisted: { events: readonly SessionEvent[] }
+    try {
+      persisted = { events: (await persistedHandle.read(0)).events }
+    } finally {
+      await persistedHandle.close()
+    }
     const abortedEnd = persisted.events.find(event => event.type === 'turn/end' && event.data.reason.kind === 'aborted')
     assert.ok(abortedEnd)
     assert.equal(persisted.events.some(event => event.type === 'tool/call'
@@ -344,8 +350,9 @@ workflow:
     const replacement = persisted.events.find(event => event.type === 'user/message'
       && typeof event.surfaceOp === 'object' && event.surfaceOp.op === 'replace')
     assert.ok(replacement)
-    assert.equal(replacement.surfaceOp.start, summaryEvent.data.shadowedRange.start)
-    assert.equal(replacement.surfaceOp.end, summaryEvent.data.shadowedRange.end)
+    // 0.1.5 起 surfaceOp.replace 的字段名为 startSeq/endSeq（旧名 start/end）。
+    assert.equal(replacement.surfaceOp.startSeq, summaryEvent.data.shadowedRange.start)
+    assert.equal(replacement.surfaceOp.endSeq, summaryEvent.data.shadowedRange.end)
 
     const resumedRequest = adapter.roleRequests.at(-1)
     assert.ok(resumedRequest)
