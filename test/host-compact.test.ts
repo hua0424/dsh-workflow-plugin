@@ -72,7 +72,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
   assert.deepEqual(await dispatch.sendRoleActor(run, 'developer', 'next node'), { messageId: 'dispatch-1' })
   assert.deepEqual(await host.ensureRoleActor(run, 'developer', 'resume node'), { childId: 'sess-dev', messageId: 'dispatch-2' })
   assert.deepEqual(await host.followupJudge(run, 'sess-judge', {
-    nodeToken: run.callStack[0]!.nodeToken, instruction: 'Do.', criteria: 'PASS.', input: 'root input',
+    nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
     boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
     previousFeedback: { result: 'NEED_CONTEXT', reason: 'need facts', claim: { outcome: 'completed', handoff: 'candidate' } },
     managerContext: 'more evidence', cwd: '.', judgeSessionId: 'sess-judge', recovery: true,
@@ -128,7 +128,7 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
     await assert.rejects(host.ensureRoleActor(run, 'developer', 'first dispatch'),
       /timeout after 20ms at stage "spawn role developer"/)
     await assert.rejects(host.startJudge(run, {
-      nodeToken: run.callStack[0]!.nodeToken, instruction: 'Do.', criteria: 'PASS.', input: 'root input',
+      nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
       boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
       cwd: '.', judgeSessionId: 'judge-new',
     }), /timeout after 20ms at stage "spawn judge"/)
@@ -469,7 +469,7 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
     await assert.rejects(makeDispatchTargets(adapters).sendRoleActor(run, 'developer', 'next node'),
       /timeout after 20ms at stage "send"/)
     await assert.rejects(makeSubagentHost(adapters, () => ({})).followupJudge(run, 'sess-judge', {
-      nodeToken: run.callStack[0]!.nodeToken, instruction: 'Do.', criteria: 'PASS.', input: 'root input',
+      nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
       boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
       cwd: '.', judgeSessionId: 'sess-judge',
     }), /timeout after 20ms at stage "send"/)

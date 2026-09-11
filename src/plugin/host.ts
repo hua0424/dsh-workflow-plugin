@@ -25,7 +25,6 @@ import { topFrame } from '../state/invariants.ts'
 import { DISPATCH_TIMEOUTS, withTimeout } from '../engine/timeouts.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
-import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
 
 const TERMINAL_JOB_STATUSES = new Set<JobStatus>(['completed', 'failed', 'killed'])
 
@@ -308,8 +307,8 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     }
     return renderJudgePrompt({
       nodeToken: input.nodeToken,
-      nodeInstruction: `[当前工作单 input]\n${input.input}\n\n[instruction]\n${input.instruction}${input.recovery ? JUDGE_RECOVERY_INSTRUCTION : ''}`,
       criteria: input.criteria,
+      recovery: input.recovery,
       workerOutcome: input.claim.outcome,
       workerHandoff: input.claim.handoff,
       workspaceCwd: input.cwd,
