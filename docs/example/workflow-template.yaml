@@ -47,7 +47,7 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          根据当前用户目标规划里程碑交付：选定 Milestone 标题和 milestone 分支名。仅做规划——本节点内不要创建或修改工作区文件、分支或 GitHub对象；下一节点会初始化它们。声明 completed 时，handoffContext 必须携带仓库（owner/repo 与 origin URL）、milestoneTitle、branchName，以及用户目标的简短复述。
+          根据当前用户目标规划里程碑交付：选定 Milestone 标题和 milestone 分支名。仅做规划——本节点内不要创建或修改工作区文件、分支或 GitHub对象；下一节点会初始化它们。声明 completed 时，handoff 必须携带仓库（owner/repo 与 origin URL）、milestoneTitle、branchName，以及用户目标的简短复述。
       checker:
         checkerId: judge.claim-correct
         config:
@@ -68,7 +68,7 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          工作区现已位于 milestone 分支。在 docs/prd/ 下使用 /to-prd 这个skill 创建或更新 PRD（遵循仓库的 PRD 约定），覆盖用户目标、范围、非目标与验收标准。提交创建的 PRD 文档，务必在声明 completed 之前把该提交推送到远端 milestone 分支。声明completed 时，handoffContext 必须携带 PRD 路径、PRD 提交、仓库、分支、milestoneTitle 和 milestoneNumber。
+          工作区现已位于 milestone 分支。在 docs/prd/ 下使用 /to-prd 这个skill 创建或更新 PRD（遵循仓库的 PRD 约定），覆盖用户目标、范围、非目标与验收标准。提交创建的 PRD 文档，务必在声明 completed 之前把该提交推送到远端 milestone 分支。声明completed 时，handoff 必须携带 PRD 路径、PRD 提交、仓库、分支、milestoneTitle 和 milestoneNumber。
       checker:
         checkerId: judge.claim-correct
         config:
@@ -81,7 +81,7 @@ workflow:
         type: actor-task 
         role: manager
         instruction: |
-          使用 /to-issues 这个skill创建并组织交付 PRD 所需的 GitHub Issues。使用 `gh issue create` 时， 按标题传 milestone（--milestone "<title>"），而非编号——gh CLI 的 --milestone 参数接受标题，而 `gh api ...?milestone=` 接受编号。声明 completed 时，在 handoffContext 中继续携带 milestoneTitle 和 milestoneNumber。
+          使用 /to-issues 这个skill创建并组织交付 PRD 所需的 GitHub Issues。使用 `gh issue create` 时， 按标题传 milestone（--milestone "<title>"），而非编号——gh CLI 的 --milestone 参数接受标题，而 `gh api ...?milestone=` 接受编号。声明 completed 时，在 handoff 中继续携带 milestoneTitle 和 milestoneNumber。
       checker:
         checkerId: judge.claim-correct
         config:
@@ -104,7 +104,7 @@ workflow:
           检查 Milestone 无未关闭 Issue、所有交付与测试报告齐备，满足 CI 和分支保护后合并该 PR。
           必须保留各 Issue 实现与测试报告提交的祖先可达性；仅支持 squash 或需要外部批准时 BLOCK，不绕过限制。
           fetch 后验证远端默认分支包含 milestone 交付修订及所有实现/报告提交。
-          completed 的 handoffContext 携带仓库、PRD 路径、milestoneTitle/Number、milestoneBranch、
+          completed 的 handoff 携带仓库、PRD 路径、milestoneTitle/Number、milestoneBranch、
           默认分支名、集成 PR URL、milestone 修订和默认分支集成修订，供 final-review 使用。
       checker:
         checkerId: judge.claim-correct
@@ -119,7 +119,7 @@ workflow:
         type: actor-task
         role: reviewer
         instruction: |
-          以远端默认分支作为权威基线（而非 milestone 分支），使用 /review skill对照 PRD 评审已完成的 Milestone。检查 PRD 验收标准、每个 Milestone Issue、每个 Issue 已集成的修订，以及默认分支上的测试报告。评审本身完成后即声明 completed（无论结论如何），并在 handoffContext 中记录结果，结果中要包含 PRD 路径、 Milestone 编号/标题，以及所评审的默认分支修订。
+          以远端默认分支作为权威基线（而非 milestone 分支），使用 /review skill对照 PRD 评审已完成的 Milestone。检查 PRD 验收标准、每个 Milestone Issue、每个 Issue 已集成的修订，以及默认分支上的测试报告。评审本身完成后即声明 completed（无论结论如何），并在 handoff 中记录结果，结果中要包含 PRD 路径、 Milestone 编号/标题，以及所评审的默认分支修订。
       checker:
         checkerId: judge.claim-correct
         config:
@@ -133,7 +133,7 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          关闭已交付的 Milestone。先确认终审已被接受且该 Milestone 无未关闭Issue。然后用 `gh api --method PATCH repos/{owner}/{repo}/milestones/{number} -fstate=closed` 关闭——REST API 使用数字 Milestone 编号；不要与`gh issue create --milestone` 的标题语义混淆。声明 completed 时，handoffContext 必须携带 Milestone URL、编号、标题、最终状态，以及默认分支集成修订。
+          关闭已交付的 Milestone。先确认终审已被接受且该 Milestone 无未关闭Issue。然后用 `gh api --method PATCH repos/{owner}/{repo}/milestones/{number} -fstate=closed` 关闭——REST API 使用数字 Milestone 编号；不要与`gh issue create --milestone` 的标题语义混淆。声明 completed 时，handoff 必须携带 Milestone URL、编号、标题、最终状态，以及默认分支集成修订。
       checker:
         checkerId: judge.claim-correct
         config:
@@ -147,7 +147,7 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          先将 handoff 中来自 final-review（或 close-milestone）的阻断性发现，转化为当前 Milestone 中一个或多个未完成、可执行的修复 Issue，再评估其他非阻断性问题，如果你觉得有必要优化的，也在当前Milestone中创建Issue。声明 completed 时，在 handoffContext 中继续携带修复 Issue 的 URL。
+          先将 handoff 中来自 final-review（或 close-milestone）的阻断性发现，转化为当前 Milestone 中一个或多个未完成、可执行的修复 Issue，再评估其他非阻断性问题，如果你觉得有必要优化的，也在当前Milestone中创建Issue。声明 completed 时，在 handoff 中继续携带修复 Issue 的 URL。
       checker:
         checkerId: judge.claim-correct
         config:
@@ -164,7 +164,7 @@ childWorkflows:
           type: actor-task
           role: coordinator
           instruction: |
-            检查当前 Milestone，选择一个所需的未完成 Issue。在 node_claim 的handoffContext 中携带 Issue URL，以及本次交付所针对的仓库、milestone 分支和 milestone 编号。处理成功完成后，最后声明 completed 。
+            检查当前 Milestone，选择一个所需的未完成 Issue。在 node_claim 的handoff 中携带 Issue URL，以及本次交付所针对的仓库、milestone 分支和 milestone 编号。处理成功完成后，最后声明 completed 。
         checker:
           checkerId: judge.claim-correct
           config:
@@ -200,7 +200,7 @@ childWorkflows:
             fetch origin，从最新远端 milestone 分支创建并切换到 feat/<issue-number>-<slug>，推送并设置 upstream。
             如同名分支已存在，仅在确认属于本 Issue、基线正确且无冲突工作后复用；否则 BLOCK，禁止强推覆盖。
             后续实现、返工与测试报告均在该 feature 分支进行，禁止直接向 milestone/default 推送实现。
-            completed 的 handoffContext 必须携带 Issue URL/编号、仓库、milestoneTitle/Number、
+            completed 的 handoff 必须携带 Issue URL/编号、仓库、milestoneTitle/Number、
             milestoneBranch、featureBranch、baseCommit；所有后续节点均须继续传递这些上下文。
         checker:
           checkerId: judge.claim-correct
@@ -237,7 +237,7 @@ childWorkflows:
           instruction: |
             只读评审当前 PR 对 milestone base 的 diff、Issue 要求及实现级检查，确认 PR 当前 head SHA。
             评审完成生成评审结果，随即声明 completed，无论建议批准还是返工；不要用 failed 表达代码存在问题，failed 代表审查工作有问题而不是代码有问题。
-            handoffContext 必须传递完整 Issue/仓库/Milestone/分支/PR/implementationCommit 上下文，
+            handoff 必须传递完整 Issue/仓库/Milestone/分支/PR/implementationCommit 上下文，
             并记录 reviewedHead、reviewedBase、approved=yes/no、阻断性发现、证据和建议，交 Manager 决策。
             不合并或批准 GitHub PR，不修改实现。无法完成评审时 BLOCK 并说明缺失的信息。
         checker:
@@ -255,10 +255,10 @@ childWorkflows:
           role: manager
           instruction: |
             根据 Reviewer 报告独立决定当前 PR 是否可进入测试；先核对 PR 仍开放、base/head 正确且 head 未偏离 reviewedHead。
-            有阻断问题、审查不完整或 head 变化时声明 failed：summary 只概括退回原因；handoffContext 必须携带返工所需的
+            有阻断问题、审查不完整或 head 变化时声明 failed：outcome=failed，退回原因只在 handoff 开头概括；handoff 必须携带返工所需的
             完整上下文——Issue、PR、两条分支、被退回的 head SHA、每条阻断发现与具体修正要求——引擎将沿 onFail
-            把它原样交给 implement；不要把这些返工内容写进 summary。
-            同意时声明 completed，handoffContext 携带全部交付上下文、审查结论、批准理由和 approvedHead=reviewedHead。
+            把它原样交给 implement；返工内容只写进唯一的 handoff 文本。
+            同意时声明 completed，handoff 携带全部交付上下文、审查结论、批准理由和 approvedHead=reviewedHead。
             此处同意是工作流内批准进入测试，不是提前合并；仓库要求的 GitHub review/保护规则仍必须满足。
             禁止绕过平台的自审限制或保护规则；权限或外部批准阻塞使用 BLOCK。测试完成前保持 PR 开放、Issue 未关闭。
         checker:
@@ -279,8 +279,8 @@ childWorkflows:
             在 featureBranch 上验证 PR head 仍为 approvedHead，测试该批准提交，禁止修改产品实现。
             在 docs/test-reports/<issue-number>-<slug>-test-report.md 发布报告，记录 Issue、PR、仓库、两条分支、
             被测 SHA、环境、命令、结果与隔离说明；仅提交报告并推送至同一 feature 分支。
-            全部所需测试通过才声明 completed，handoffContext 传递全部上下文、approvedHead、被测提交、报告路径/提交和最终 PR head。
-            测试失败则发布失败报告并声明 failed：summary 只概括失败结论；handoffContext 携带完整身份、报告路径/提交、
+            全部所需测试通过才声明 completed，handoff 传递全部上下文、approvedHead、被测提交、报告路径/提交和最终 PR head。
+            测试失败则发布失败报告并声明 failed：outcome=failed，失败结论只在 handoff 开头概括；handoff 携带完整身份、报告路径/提交、
             复现步骤和返工要求，引擎沿 onFail 把它原样交回 implement，修复后必须重新 review → decide-pr → test。
             环境阻塞或未经审查的 head 漂移使用 BLOCK。
         checker:
@@ -305,7 +305,7 @@ childWorkflows:
             合并前确认仓库允许保留原始提交的 merge commit 策略；实际结果必须保留实现和报告提交可达性，
             仅允许 squash 或无法满足该验证契约时 BLOCK，不强行绕过。合并后 fetch 验证远端 milestone 包含实现与报告提交，
             然后关闭 Issue 并切回更新后的 milestone 分支，供下一个 Issue 初始化。
-            completed 的 handoffContext 携带完整 Issue/Milestone/仓库/分支上下文、PR URL、合并修订、
+            completed 的 handoff 携带完整 Issue/Milestone/仓库/分支上下文、PR URL、合并修订、
             实现和测试报告提交、Issue closed 状态。合并/权限/CI 阻塞使用 BLOCK，不回到已合并 PR 继续开发。
         checker:
           checkerId: judge.claim-correct
