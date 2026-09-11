@@ -167,7 +167,7 @@ Judge 收到只读核验提示：基于当前有效 claim、当前判定材料�
 
 Role mappings 归 Root Run。DSH continuable 持久的是 Session 身份，不保证 live Activation 一直存在；冷续接沿用同一 Session，而不是正常新建 Actor。
 
-Actor 再次承担新 Node Execution（包括自环）前执行 Node 边界 compact，随后接收明确的当前 input、instruction/criteria、补充和适用提示。同工作单返工/resume 不额外触发 Node 边界 compact。
+Actor 再次承担新 Node Execution（包括自环）前执行 Node 边界 compact，随后接收明确的当前 input、instruction（+ correction/resolution/recovery/引擎提交要求）、补充和适用提示，不含 criteria；criteria 仅进 Judge packet 作为判定依据。同工作单返工/resume 不额外触发 Node 边界 compact。
 
 compact 需要合适的 idle live Agent。Host Adapter 封装冷物化/维护/释放等宿主细节，区分成功、有明确语义的无可压缩范围 no-op、busy 和失败。busy 不能伪装为压缩成功；失败保留材料并可恢复 BLOCK，不绕过必要准备直接派发。
 
@@ -175,7 +175,7 @@ Manager 主会话不创建 Role mapping，不执行此 Role compact。模型覆�
 
 ### 7.2 Judge 独立性与版本
 
-Judge 根据当前 input、instruction/criteria、claim.handoff、最近拒绝依据、Manager 补充及只读现场判断。必要的 Session 投影限定当前 Node-local 材料，排除旧 Node 历史/compact 摘要及完整 Manager 历史。
+Judge 根据冻结 criteria（权威判定依据）、claim.handoff、最近拒绝依据、Manager 补充及只读现场判断；另有边界内 Node-local 投影（executor 首条 dispatch 只保留 `[handoff]`）与可选 previousFeedback / Manager context / 中断恢复段。必要的 Session 投影限定当前 Node-local 材料，排除旧 Node 历史/compact 摘要及完整 Manager 历史。
 
 每轮判断绑定具体 claim 与本轮判定输入；补充改变判定输入、Actor 重新提交或 Manager 退回 Actor 后，旧 Judge 不能提交针对旧输入的有效结论。REJECT 后重新提交创建新的判断安排，不只覆盖一段无关联的 judgment 文本。
 

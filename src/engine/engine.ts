@@ -15,9 +15,7 @@ export interface DispatchTargets {
 }
 export interface JudgeSpawnInput {
   nodeToken: string
-  instruction: string
   criteria: string
-  input: string
   boundary: NodeContextBoundary
   claim: NodeClaim
   previousFeedback?: { result: 'REJECT' | 'NEED_CONTEXT'; reason: string; claim: NodeClaim }
@@ -136,8 +134,8 @@ export class WorkflowEngine {
         ? { result: e.judgment.result, reason: e.judgment.reason, claim: { outcome: e.claim.outcome, handoff: e.claim.handoff } }
         : undefined
     return {
-      nodeToken: e.nodeToken, instruction: node.execution.instruction ?? '', criteria: String(node.checker?.config.criteria ?? ''),
-      input: e.input, boundary: e.boundary!, claim: { outcome: e.claim!.outcome, handoff: e.claim!.handoff }, cwd, judgeSessionId: e.judge!.sessionId!,
+      nodeToken: e.nodeToken, criteria: String(node.checker?.config.criteria ?? ''),
+      boundary: e.boundary!, claim: { outcome: e.claim!.outcome, handoff: e.claim!.handoff }, cwd, judgeSessionId: e.judge!.sessionId!,
       ...(feedback ? { previousFeedback: feedback } : {}),
       ...(e.resolution?.context ? { managerContext: e.resolution.context } : {}),
       ...(e.resolution?.target === 'judge' ? { recovery: true } : {}),
@@ -308,7 +306,7 @@ export class WorkflowEngine {
           : ''
         const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
         const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
-        const text = `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[criteria]\n${String(node.checker?.config.criteria ?? '')}${correction}${resolution}${recovery}${SUBMISSION_CONSTRAINT}`
+        const text = `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}${correction}${resolution}${recovery}${SUBMISSION_CONSTRAINT}`
         const sent = role === 'manager'
           ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
           : run.roleActors[role]

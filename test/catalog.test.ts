@@ -348,3 +348,25 @@ workflow:
 `)
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /unknown role/)
 })
+
+test('#46 P5: persona hand-written submission protocol keywords are rejected', () => {
+  for (const keyword of ['node_claim', 'judge_claim', 'send_message']) {
+    const roleHit = parseCatalogConfig(VALID_CONFIG.replace(
+      '  developer:\n    persona: Implement.',
+      `  developer:\n    persona: Finish work then ${keyword} it.`,
+    ))
+    assert.throws(() => validateAndNormalize(roleHit, { workflowId: 'w' }), CatalogValidationError, /must not hand-write submission protocol/)
+    const judgeHit = parseCatalogConfig(VALID_CONFIG.replace(
+      '  persona: Judge.',
+      `  persona: Verify then ${keyword} it.`,
+    ))
+    assert.throws(() => validateAndNormalize(judgeHit, { workflowId: 'w' }), CatalogValidationError, /judgeRole.*must not hand-write submission protocol/)
+  }
+})
+
+test('#46 P5: business-discipline personas without protocol keywords still pass', () => {
+  const config = parseCatalogConfig(VALID_CONFIG)
+  const normalized = validateAndNormalize(config, { workflowId: 'w' })
+  assert.equal(normalized.roles['developer']!.persona, 'Implement.')
+  assert.equal(normalized.judgeRole.persona, 'Judge.')
+})

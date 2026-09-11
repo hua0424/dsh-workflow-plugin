@@ -62,7 +62,7 @@ execution ID 标识 visit；dispatch.id 标识一次安排；真实 Host 返回�
 
 Role Definition 定义 persona、model route 与 tool restrictions，Preset 提供基础环境。Role mappings 属于 Root Run，跨 Node 复用 continuable Session；工作单独立不意味着每 Node 创建新 Session。Manager 不建 Role mapping，不 compact。
 
-Role 首次使用创建 Session；再次承担新 visit 前先确认无冲突活动，再执行 Node 边界 compact，之后用 exact Host queue 交付本次 input/instruction/criteria。T1 已对齐 `queueHostSubagentPrompt` 与 `snapshotEvents()`，不用 nearest-step sendMessage 替代独立派发。
+Role 首次使用创建 Session；再次承担新 visit 前先确认无冲突活动，再执行 Node 边界 compact，之后用 exact Host queue 交付本次 input/instruction（+ correction/resolution/recovery/引擎提交要求），不含 criteria；criteria 仅进 Judge packet 作为判定依据。T1 已对齐 `queueHostSubagentPrompt` 与 `snapshotEvents()`，不用 nearest-step sendMessage 替代独立派发。
 
 T5 已把 `jobs`、`compaction` 设为标准 Web composition 的 required service，并在 Host Adapter 内用正式接口完成 cold resume（无 prompt）、idle maintenance、释放和原 Session Queue 续接。成功与合法 no-range 可继续；busy、压缩/resume/dispose 失败均不伪装成功，工作单保留并 BLOCK。T6 的 Session availability 为 `available|missing|unknown`：live 或持久读取成功为 available，只有正式 `SessionPersistenceNotFoundError` 是 missing，服务缺失/损坏/读取异常保持 unknown；仅 missing 自动 fresh replacement，unknown 保留原身份并在 Manager 明确确认后尝试 cold 续接，失败继续 BLOCK。
 
@@ -72,7 +72,7 @@ Judge 是独立只读检查者，不补做 Actor 工作，不改写 claim outcom
 
 Judge 的工具面（Issue #25）：继承全量工具目录，由 deny 清单收敛——插件默认清单（`edit`/`write` + Run 控制工具）∪ `judgeRole.tools.deny`；必需工具（`read`/`glob`/`grep`/`read_image`、workspace/repository 限定的 workflow_inspect_git/workflow_inspect_github、专用 judge_claim）在 spawn 时必须全部在场且不可 deny。spawn 后检查最终工具面（必需工具在场 + 不含未豁免 deny 项），异常 fail-closed；运行期 `tools/authz.ts` 从同一清单派生同一判据，三层同源。Actor/Manager 不能冒充 Judge。
 
-Judgment Packet 来自本次工作单 input、instruction/criteria、claim.handoff 与本次 dispatch 的 Node-local projection，不从旧 Run.nodeBoundary/pendingClaim 镜像读取。投影排除旧 Node、system/tool/notice 与提交约束，不注入完整 Manager 历史。
+Judgment Packet 由冻结 criteria（权威判定依据）+ claim.handoff + 边界内 Node-local 投影 + 可选 previousFeedback / Manager context / 中断恢复段构成，不从旧 Run.nodeBoundary/pendingClaim 镜像读取；投影中 executor 首条 dispatch 只保留 `[handoff]`。投影排除旧 Node、system/tool/notice 与提交约束，不注入完整 Manager 历史。
 
 `judge_claim({nodeToken,result,reason})` 的真实 caller Turn 绑定当前 Judge dispatch，且必须匹配 claim/input version。ACCEPT 后 completed→PASS、failed→FAIL；有合法出口才原子交接。REJECT 在同 execution 保存完整旧 claim 与 Judge/input 关联、使当前资格失效并重派原 Actor，不走 onFail/新 visit/compact；NEED_CONTEXT 保留当前 claim 并 BLOCK。Manager 的完整当前补充先入库/事件、递增 inputVersion，再开 Judge followup；失败仍保留材料，旧 Turn 无效。
 

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { parseJudgeClaim, renderJudgePrompt } from '../src/judge/checker.ts'
-import { projectNodeLocal, projectSessionSurface, messageText, type ProjectionSource } from '../src/judge/projection.ts'
+import { projectNodeLocal, projectSessionSurface, messageText, compressDispatchToHandoff, PROJECTION_MAX_CHARS, PROJECTION_WINDOW_MANAGER_ACTOR, type ProjectionSource } from '../src/judge/projection.ts'
 import { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SUBMISSION_CONSTRAINT } from '../src/engine/texts.ts'
@@ -27,12 +27,16 @@ function makeSource(id: string, events: Array<{ time: number; seq: number; type:
   }
 }
 
-test('plugin-owned dispute protocol tells Actor to BLOCK disagreements and Judge not to invent criteria', () => {
+test('#46 P5: consolidated submission text carries single-source key clauses', () => {
+  assert.match(SUBMISSION_CONSTRAINT, /结果只通过 node_claim 交付/)
+  assert.match(SUBMISSION_CONSTRAINT, /node_claim 必须是本轮对话的最后一个动作/)
+  assert.match(SUBMISSION_CONSTRAINT, /仅输出文字不视为提交.*BLOCK/)
+  assert.match(SUBMISSION_CONSTRAINT, /不要向父会话 send_message 汇报结果/)
   assert.match(SUBMISSION_CONSTRAINT, /认可.*修正/)
   assert.match(SUBMISSION_CONSTRAINT, /分歧.*证据.*Manager/)
   assert.match(SUBMISSION_CONSTRAINT, /不伪报 failed/)
   const prompt = renderJudgePrompt({
-    nodeToken: 'tok', nodeInstruction: 'work', criteria: 'existing criteria', workerOutcome: 'completed', workerHandoff: 'claim', workspaceCwd: '.', transcript: '',
+    nodeToken: 'tok', criteria: 'existing criteria', workerOutcome: 'completed', workerHandoff: 'claim', workspaceCwd: '.', transcript: '',
   })
   assert.match(prompt, /existing criteria/)
   assert.match(prompt, /verifiable fact/i)
@@ -60,22 +64,41 @@ test('parseJudgeClaim rejects invalid shapes', () => {
 
 test('T2 Judge packet preserves the actual handoff literally, without a summary', () => {
   const handoff = '实际交付 $& {workspaceCwd} {transcript}'
-  const text = renderJudgePrompt({ nodeToken: 'token', nodeInstruction: 'work', criteria: 'verify', workerOutcome: 'failed', workerHandoff: handoff, workspaceCwd: '.', transcript: '' })
+  const text = renderJudgePrompt({ nodeToken: 'token', criteria: 'verify', workerOutcome: 'failed', workerHandoff: handoff, workspaceCwd: '.', transcript: '' })
   assert.ok(text.includes(`Worker handoff:\n${handoff}`))
   assert.doesNotMatch(text, /Worker summary/)
+})
+
+test('#44 P2: Judgment packet carries no nodeInstruction and anchors ACCEPT on facts + frozen criteria', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-44', criteria: 'PASS when built', workerHandoff: 'I built it',
+    workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+  })
+  assert.doesNotMatch(text, /Node instruction/)
+  assert.doesNotMatch(text, /node instruction/)
+  assert.doesNotMatch(text, /当前工作单 input/)
+  assert.match(text, /ACCEPT: the worker's claim is consistent with the facts and the goal criteria/)
+  assert.match(text, /Goal criteria \(authoritative and frozen for this execution\):\nPASS when built/)
+})
+
+test('#44 P2: recovery packet keeps the read-only recovery protocol segment without any instruction', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-44', criteria: 'PASS', workerHandoff: 'candidate',
+    workerOutcome: 'completed', workspaceCwd: '.', transcript: '', recovery: true,
+  })
+  assert.match(text, /只读核验当前 claim 与实际现场，不补做 Actor 工作/)
+  assert.doesNotMatch(text, /Node instruction/)
 })
 
 test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_claim protocol', () => {
   const text = renderJudgePrompt({
     nodeToken: 'tok-1',
-    nodeInstruction: 'Build it',
     criteria: 'PASS when built',
     workerHandoff: 'I built it',
     workerOutcome: 'completed',
     workspaceCwd: 'C:\\ws',
     transcript: 'USER\nhello',
   })
-  assert.match(text, /Build it/)
   assert.match(text, /PASS when built/)
   assert.match(text, /I built it/)
   assert.match(text, /C:\\ws/)
@@ -92,7 +115,6 @@ test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_
 test('renderJudgePrompt renders the [previous rejection] evidence before the claim (A1 §7.1)', () => {
   const text = renderJudgePrompt({
     nodeToken: 'tok-1',
-    nodeInstruction: 'Build it',
     criteria: 'PASS when built',
     workerHandoff: 'I built it',
     workerOutcome: 'completed',
@@ -111,7 +133,7 @@ test('renderJudgePrompt renders the [previous rejection] evidence before the cla
 
 test('fresh Judge packet preserves NEED_CONTEXT feedback and the current Manager resolution', () => {
   const text = renderJudgePrompt({
-    nodeToken: 'tok-1', nodeInstruction: 'Build it', criteria: 'PASS when built',
+    nodeToken: 'tok-1', criteria: 'PASS when built',
     workerHandoff: 'candidate', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
     previousFeedback: { result: 'NEED_CONTEXT', reason: 'need the approved scope decision', claim: { outcome: 'completed', handoff: 'candidate' } },
     managerContext: 'The approved scope explicitly includes this behavior.',
@@ -125,7 +147,7 @@ test('fresh Judge packet preserves NEED_CONTEXT feedback and the current Manager
 
 test('renderJudgePrompt renders an empty transcript placeholder', () => {
   const text = renderJudgePrompt({
-    nodeToken: 'tok-1', nodeInstruction: 'x', criteria: 'y', workerHandoff: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+    nodeToken: 'tok-1', criteria: 'y', workerHandoff: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
   })
   assert.match(text, /no node-local conversation since dispatch/)
 })
@@ -236,6 +258,38 @@ test('the A3 submission constraint is stripped from the projected dispatch text 
   assert.doesNotMatch(out[0]!.text, /node_claim/)
 })
 
+test('#44 P2: executor dispatch compresses to [handoff]; later actor messages are untouched', () => {
+  const dispatchText = `[handoff]\nroot request\n\n[instruction]\nPlan${SUBMISSION_CONSTRAINT}`
+  const dispatch = { id: 'dispatch-44' as never, role: 'user' as const, content: [{ type: 'text' as const, text: dispatchText }], source: { kind: 'user' as const } }
+  const actor = makeSession([
+    { type: 'user/message', data: dispatch, surfaceOp: 'append' },
+    { type: 'assistant/message', data: { turn: 2, step: 1, message: { id: 'a44' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'actor followup mentions [instruction] verbatim' }], source: { kind: 'model', model: 'm' } } }, surfaceOp: 'append' },
+  ])
+  const text = projectNodeLocal(makeSession([]), {
+    dispatchedAt: 0, managerFromSeq: 0, executorSessionId: 'actor', executorDispatchMessageId: 'dispatch-44',
+  }, actor)
+  assert.match(text, /\[ACTOR\]\n\[handoff\]\nroot request$/m)
+  assert.doesNotMatch(text, /\[ACTOR\]\n\[handoff\]\nroot request\n\n\[instruction\]/)
+  assert.match(text, /actor followup mentions \[instruction\] verbatim/)
+  // Manager/user surface is unaffected by dispatch compression.
+  const user = createUserMessage({ content: [{ type: 'text', text: '[instruction]\nhuman note' }], source: { kind: 'user' } })
+  const managerView = projectNodeLocal(makeSession([{ type: 'user/message', data: user, surfaceOp: 'append' }]), { dispatchedAt: 0, managerFromSeq: 0 })
+  assert.match(managerView, /\[USER\]\n\[instruction\]\nhuman note/)
+})
+
+test('#44 P2: compressDispatchToHandoff strips instruction/criteria/constraint segments, keeps plain text', () => {
+  assert.equal(
+    compressDispatchToHandoff(`[handoff]\nroot request\n\n[instruction]\nPlan${SUBMISSION_CONSTRAINT}`),
+    '[handoff]\nroot request',
+  )
+  // Legacy dispatch text with [criteria] compresses the same way.
+  assert.equal(
+    compressDispatchToHandoff('[handoff]\nreq\n\n[instruction]\nDo.\n\n[criteria]\nOld.'),
+    '[handoff]\nreq',
+  )
+  assert.equal(compressDispatchToHandoff('plain actor note'), 'plain actor note')
+})
+
 test('stripping preserves the surrounding instruction and handoff text verbatim (A3 AC3)', () => {
   const text = `[handoff]\nrepo=acme/server\n\n[instruction]\nWrite the file.${SUBMISSION_CONSTRAINT}`
   const s = makeSession([
@@ -320,4 +374,86 @@ test('projectSessionSurface filters plugin/user and assistant text', () => {
   assert.equal(out.length, 2)
   assert.equal(out[0]!.text, 'u')
   assert.equal(out[1]!.text, 'a')
+})
+
+test('#45 P3: projection window keeps all USER + latest 6 MANAGER with no actor session', () => {
+  assert.equal(PROJECTION_WINDOW_MANAGER_ACTOR, 6)
+  assert.equal(PROJECTION_MAX_CHARS, 120_000)
+  const events: Array<{ type: string; data: unknown; surfaceOp?: unknown }> = [
+    // 10 条 MANAGER 消息 + 2 条 USER（USER 全保留）。
+    ...Array.from({ length: 10 }, (_, i) =>
+      ({ type: 'assistant/message' as string, data: { turn: i + 1, step: 1, message: { id: `m${i}` as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: `manager ${i}` }], source: { kind: 'model', model: 'm' } } }, surfaceOp: 'append' as const })),
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'user scope change 1' }], source: { kind: 'user' } }), surfaceOp: 'append' },
+    { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'user scope change 2' }], source: { kind: 'user' } }), surfaceOp: 'append' },
+  ]
+  const manager = makeSession(events)
+  const text = projectNodeLocal(manager, { dispatchedAt: 0, managerFromSeq: 0 })
+  // USER 全保留；MANAGER 只剩最近 6 条（manager 4..9）。
+  assert.match(text, /user scope change 1/)
+  assert.match(text, /user scope change 2/)
+  assert.match(text, /manager 9/)
+  assert.match(text, /manager 4/)
+  assert.doesNotMatch(text, /manager 3/)
+  assert.doesNotMatch(text, /manager 0/)
+})
+
+test('#45 P3 rework: dispatch 保底 survives window pressure with an actor session', () => {
+  // 压力场景：dispatch 在展示顺序上最早，合并 nonUser 候选 = 8 manager + 3 actor = 11 > 6；
+  // 无保底时 dispatch 必被窗口淘汰（复现判据：去掉保底槽后本用例必须失败）。
+  const dispatchText = `[handoff]\nroot request\n\n[instruction]\nBuild it.${SUBMISSION_CONSTRAINT}`
+  const dispatch = { id: 'dispatch-45-pressure' as never, role: 'user' as const, content: [{ type: 'text' as const, text: dispatchText }], source: { kind: 'user' as const } }
+  const actorReply = (id: string, text: string) => ({ turn: 2, step: 1, message: { id: id as never, role: 'assistant' as const, content: [{ type: 'text' as const, text }], source: { kind: 'model', model: 'm' } } })
+  const actor = makeSource('actor-session', [
+    { time: 5, seq: 0, type: 'user/message', data: dispatch },
+    { time: 6, seq: 1, type: 'assistant/message', data: actorReply('a1', 'actor reply A') },
+    { time: 7, seq: 2, type: 'assistant/message', data: actorReply('a2', 'actor reply B') },
+    { time: 8, seq: 3, type: 'assistant/message', data: actorReply('a3', 'actor reply C') },
+  ])
+  const managerEvents: Array<{ time: number; seq: number; type: string; data: unknown }> = [
+    ...Array.from({ length: 8 }, (_, i) =>
+      ({ time: 10 + i, seq: 10 + i, type: 'assistant/message' as string, data: { turn: i + 1, step: 1, message: { id: `m${i}` as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: `manager ${i}` }], source: { kind: 'model', model: 'm' } } } })),
+    { time: 30, seq: 30, type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'user scope change' }], source: { kind: 'user' } }) },
+  ]
+  const manager = makeSource('manager-session', managerEvents)
+  const text = projectNodeLocal(manager, {
+    dispatchedAt: 0, managerFromSeq: 0, executorSessionId: 'actor-session', executorDispatchMessageId: 'dispatch-45-pressure',
+  }, actor)
+  // dispatch 保底：最早但仍保留；[handoff] 保留、[instruction] 已 strip。
+  assert.match(text, /\[ACTOR\]\n\[handoff\]\nroot request/)
+  assert.doesNotMatch(text, /Build it\./)
+  // USER 全保留。
+  assert.match(text, /user scope change/)
+  // 只保留最近 6 条 MANAGER/ACTOR（manager 2..7）；最早的 nonUser 被淘汰。
+  assert.match(text, /manager 7/)
+  assert.match(text, /manager 2/)
+  assert.doesNotMatch(text, /manager 1/)
+  assert.doesNotMatch(text, /manager 0/)
+  assert.doesNotMatch(text, /actor reply A/)
+  assert.doesNotMatch(text, /actor reply B/)
+  assert.doesNotMatch(text, /actor reply C/)
+})
+
+test('#45 P3: no actor boundary keeps all USER with an empty manager window', () => {
+  const user = createUserMessage({ content: [{ type: 'text', text: 'human question' }], source: { kind: 'user' } })
+  const text = projectNodeLocal(makeSession([{ type: 'user/message', data: user, surfaceOp: 'append' }]), { dispatchedAt: 0, managerFromSeq: 0 })
+  assert.match(text, /\[USER\]\nhuman question/)
+})
+
+test('#45 P4: REJECT re-judgment packet carries the point-by-point recheck instruction', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'fixed', workerOutcome: 'completed',
+    workspaceCwd: '.', transcript: '',
+    previousFeedback: { result: 'REJECT', reason: 'tests missing', claim: { outcome: 'completed', handoff: 'draft' } },
+  })
+  assert.match(text, /逐点核对.*新 handoff 是否解决.*旧 REJECT.*每个问题/)
+  assert.match(text, /未全部解决的不得 ACCEPT/)
+})
+
+test('#45 P4: NEED_CONTEXT feedback carries no REJECT recheck instruction', () => {
+  const text = renderJudgePrompt({
+    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'candidate', workerOutcome: 'completed',
+    workspaceCwd: '.', transcript: '',
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need scope', claim: { outcome: 'completed', handoff: 'draft' } },
+  })
+  assert.doesNotMatch(text, /逐点核对/)
 })

@@ -44,7 +44,30 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
    与 Run 控制工具，`gh`/`git`/`pwsh` 等查询工具默认可用，详见
    `docs/example/README.md`「Judge 工具面」。
 
-## 4. 命令：`/dsh-flow`
+## 4. 提交协议单源化：旧 catalog 迁移指引
+
+提交协议只有引擎一个来源：每次派发末尾的 `[提交要求]` 段（含
+`node_claim` 最后动作条款、纯文字不提交→BLOCK、`send_message` 覆盖条款、
+REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona` 里
+手写提交纪律句——catalog 校验会直接报 problem（关键词 `node_claim` /
+`judge_claim` / `send_message` 任一出现即拒收该文件）。
+
+旧 `~/.dsh/workflows/*.yaml` 按三步迁移（插件不代改你的用户文件）：
+
+1. **删 persona 纪律段**：去掉 persona 里"仅通过 node_claim/node_block
+   汇报""是本轮最终动作""调用之后输出无效""向父 send_message 汇报"之类
+   的句子，只留业务纪律（角色职责、分支/PR 规则、只读约束等）。
+2. **instruction 补验收边界**：Actor 派发不再含 `[criteria]`，验收边界归属
+   instruction 单源——每个 `actor-task` 节点的 instruction 必须自己写清
+   验收标准，不要指望派发里的 criteria。
+3. **criteria 写自足**：Judge 只看冻结 criteria 判定——每个 checker 的
+   criteria 必须自足、可核验（判据 + 事实依据），不要引用 persona 里删掉
+   的纪律句。
+
+改完可用 `node scripts/validate-catalog.mjs <你的yaml> <workflowId>` 本地
+校验（OK 即通过；problem 会指明 persona 关键词位置）。
+
+## 5. 命令：`/dsh-flow`
 
 ```
 /dsh-flow list                        列出所有合法 workflow（含 invalid 诊断）
@@ -67,7 +90,7 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
   （无 parentSession、origin 不是 subagent、delegationDepth 为 0）；
   工作流 Actor / Judge / 子代理内执行会被拒绝。
 
-## 5. 工作流控制工具（对话内使用）
+## 6. 工作流控制工具（对话内使用）
 
 | 工具 | 谁用 | 作用 |
 | --- | --- | --- |
@@ -85,7 +108,7 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
 所有工具调用都会校验调用者身份（authz）：以 `workflow_status` 返回的最新
 nodeToken 为准，不要缓存旧 token。
 
-## 6. 运行中会发生什么
+## 7. 运行中会发生什么
 
 - 节点推进：Manager 派发 → Actor 工作 → `node_claim` → Judge 核验 →
   通过走 `onPass`，REJECT 以 reason 作为纠正指令重派同节点，NEED_CONTEXT
@@ -100,15 +123,15 @@ nodeToken 为准，不要缓存旧 token。
   Manager 用 `node_resume` 恢复。
 - Host 重启后 Run 可冷恢复：状态在 SQLite，会话在持久层，重进即可续跑。
 
-## 7. 故障排查（FAQ）
+## 8. 故障排查（FAQ）
 
-### 7.1 `dsh web` 启动报 `pending (waiting for service: compaction)`
+### 8.1 `dsh web` 启动报 `pending (waiting for service: compaction)`
 
 dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿主平面没有
 这个服务；插件模块级 inject 它会永久 pending 并卡死整个 boot。本插件已修复
 （见 §2 版本兼容提示）；若再次出现，检查部署产物是否为最新构建。
 
-### 7.2 `/dsh-flow list` 报 maintenance mode（incompatible state format）
+### 8.2 `/dsh-flow list` 报 maintenance mode（incompatible state format）
 
 **原因**：`~/.dsh/workflows/state.sqlite3` 里的数据不是当前 v9 三表格式。
 典型场景：旧版本插件（重构前单表 `workflow_state`）留下的真实数据——v9
@@ -132,7 +155,7 @@ dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿�
 什么时候**不要**直接重置：如果旧 Run 的 `snapshot_json` 里有必须续跑的
 现场——先用 sqlite 备份文件把 handoff/claim 文本取出来存档，再重置。
 
-### 7.3 其他常见信息
+### 8.3 其他常见信息
 
 - `resident actor busy`：节点边界压缩时 Actor 恰被外部唤醒，本轮压缩跳过
   （良性，下个边界再试）。
@@ -142,7 +165,7 @@ dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿�
   宿主平面都没挂压缩后端，节点边界压缩被跳过（附 host 日志告警）；Run 继续，
   但 Role 会话上下文不再受控压缩。
 
-## 8. 开发者快速参考
+## 9. 开发者快速参考
 
 ```bash
 pnpm test            # 单测（node:test，直接跑 .ts 源码）

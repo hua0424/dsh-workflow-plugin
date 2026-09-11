@@ -11,6 +11,7 @@
  */
 import type { JudgeResult, NodeClaim } from '../types.ts'
 import { LIMITS } from '../types.ts'
+import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
 
 /** Validate a parsed judge_claim argument into a JudgeResult (A1 v2). */
 export function parseJudgeClaim(args: unknown): JudgeResult | undefined {
@@ -25,12 +26,13 @@ export function parseJudgeClaim(args: unknown): JudgeResult | undefined {
 
 export interface JudgePromptInput {
   nodeToken: string
-  nodeInstruction: string
   criteria: string
   workerOutcome: 'completed' | 'failed'
   workerHandoff: string
   workspaceCwd: string
   transcript: string
+  /** Judge 中断恢复：只读核验，不补做 Actor 工作（固定协议段，随 packet 下发）。 */
+  recovery?: boolean
   /** 最近 REJECT/NEED_CONTEXT 反馈；fresh/followup Judge 读取同一材料。 */
   previousFeedback?: { result: 'REJECT' | 'NEED_CONTEXT'; reason: string; claim: NodeClaim }
   managerContext?: string
@@ -49,17 +51,14 @@ Submit your verdict ONLY through the \`judge_claim\` tool, exactly once, with:
 - "result": "ACCEPT" | "REJECT" | "NEED_CONTEXT"
 - "reason": 1..2000 characters explaining the judgment
 
-- ACCEPT: the worker's claim is consistent with the facts, the node instruction, and the goal criteria. The node then concludes exactly as the worker claimed (completed → PASS edge, failed → FAIL edge).
+- ACCEPT: the worker's claim is consistent with the facts and the goal criteria. The node then concludes exactly as the worker claimed (completed → PASS edge, failed → FAIL edge).
 - REJECT: the claim conflicts with an existing criterion or a verifiable fact. Your reason MUST identify that criterion, cite the factual basis, and state concretely HOW to correct the work — the worker receives it verbatim for another attempt at the SAME node.
 - Use NEED_CONTEXT when information is insufficient or an existing requirement is unclear. State what is missing, why it affects judgment, and what the Manager should provide — never turn a personal preference into a new criterion and never just say "cannot judge".
 
 # Current judgment
-Node instruction:
-{nodeInstruction}
-
 Goal criteria (authoritative and frozen for this execution):
 {criteria}
-{previousFeedback}{managerContext}
+{recovery}{previousFeedback}{managerContext}
 Worker claimed outcome: {workerOutcome}
 
 Worker handoff:
@@ -74,17 +73,26 @@ cwd: {workspaceCwd}
 /** Render the latest non-terminal Judge feedback with its exact claim. */
 function renderPreviousFeedback(feedback: JudgePromptInput['previousFeedback']): string {
   if (feedback === undefined) return ''
-  return `\n# Previous Judge feedback on this node (${feedback.result})\n[judge reason]\n${feedback.reason}\n\n[judged claim]\noutcome: ${feedback.claim.outcome}\nhandoff: ${feedback.claim.handoff}\n`
+  // #45 P4：REJECT 重判必须逐点核对新 handoff 是否解决旧 REJECT 每个问题。
+  const recheck = feedback.result === 'REJECT'
+    ? '\n[重判要求]\n逐点核对 Actor 新 handoff 是否解决了旧 REJECT 指出的每个问题；未全部解决的不得 ACCEPT。\n'
+    : ''
+  return `\n# Previous Judge feedback on this node (${feedback.result})\n[judge reason]\n${feedback.reason}\n\n[judged claim]\noutcome: ${feedback.claim.outcome}\nhandoff: ${feedback.claim.handoff}\n${recheck}`
 }
 
 function renderManagerContext(context: string | undefined): string {
   return context === undefined ? '' : `\n# Manager context (clarifies existing inputs; does not change frozen criteria)\n${context}\n`
 }
 
+function renderRecovery(recovery: boolean | undefined): string {
+  return recovery === true ? `${JUDGE_RECOVERY_INSTRUCTION}\n` : ''
+}
+
 /** Render the Judgment Packet sent as the Judge's initial user message (A1 R7). */
 export function renderJudgePrompt(input: JudgePromptInput): string {
   const fields: Record<string, string> = {
     ...input,
+    recovery: renderRecovery(input.recovery),
     previousFeedback: renderPreviousFeedback(input.previousFeedback),
     managerContext: renderManagerContext(input.managerContext),
     transcript: input.transcript === '' ? '(no node-local conversation since dispatch)' : input.transcript,
