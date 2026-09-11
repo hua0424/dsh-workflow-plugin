@@ -103,6 +103,23 @@ function stripSubmissionConstraint(text: string): string {
 }
 
 /**
+ * #44 P2：executor 首条 dispatch 在投影中只留 `[handoff]`。模板化压缩——
+ * 按 `[instruction]` / `[criteria]` / `[提交要求]` 段边界截断（#43 后派发
+ * 已无 `[criteria]`，此处兼容旧文本）；派发模板内的纠错/补充/恢复段都挂在
+ * `[instruction]` 之后，随之一并截掉。无模板标记时原文保留，不破坏未知文本。
+ */
+export function compressDispatchToHandoff(text: string): string {
+  const markers = ['\n\n[instruction]', '\n\n[criteria]', '\n\n[提交要求]']
+  let end = text.length
+  for (const marker of markers) {
+    const at = text.indexOf(marker)
+    if (at !== -1 && at < end) end = at
+  }
+  if (end === text.length) return text
+  return text.slice(0, end)
+}
+
+/**
  * Locate the first event seq of the executor's dispatch message: the message id
  * recorded in the boundary (A1 R2/R6) — the authoritative cursor. When the id
  * cannot be found, the actor surface contributes NOTHING (`session.seq` = next
@@ -147,7 +164,14 @@ export function projectNodeLocal(
   // (legacy coordinator history is also kept for the ACTOR role per A1 R6).
   if (actorSession !== undefined && boundary.executorSessionId !== undefined) {
     const from = executorFromSeq(actorSession, boundary)
-    parts.push(...projectSessionSurface(actorSession, from, 'ACTOR'))
+    const actorParts = projectSessionSurface(actorSession, from, 'ACTOR')
+    // #44 P2: the executor's dispatch message (the boundary anchor at `from`)
+    // keeps only [handoff] in the projection; later actor messages are untouched.
+    const dispatchAt = actorParts.findIndex(p => p.seq === from)
+    if (dispatchAt !== -1) {
+      actorParts[dispatchAt] = { ...actorParts[dispatchAt]!, text: compressDispatchToHandoff(actorParts[dispatchAt]!.text) }
+    }
+    parts.push(...actorParts)
   }
 
   parts.sort((a, b) =>
