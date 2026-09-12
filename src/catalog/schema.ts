@@ -4,7 +4,7 @@
  * level (zod object default = strip; we use .strict()).
  */
 import { z } from 'zod'
-import { LIMITS } from '../types.ts'
+import { LIMITS, ROLE_REUSE_MODES } from '../types.ts'
 import { JUDGE_PROTECTED_TOOLS } from '../roles/roles.ts'
 
 const nonEmptyTrimmed = z.string().trim().min(1)
@@ -21,6 +21,9 @@ const roleDefinition = z
   .object({
     persona: nonEmptyTrimmed,
     model: roleModel.optional(),
+    // #60: node | continuable；省略由 validateAndNormalize 归一化为 `node`。
+    // 非法取值在这里被拒（strict + enum），只阻塞声明它的那个 catalog 文件。
+    reuse: z.enum(ROLE_REUSE_MODES).optional(),
     tools: z
       .object({
         deny: z.array(nonEmptyTrimmed).min(1),

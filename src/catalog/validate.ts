@@ -4,7 +4,7 @@
  * CatalogValidationError listing every structural violation.
  */
 import { createHash } from 'node:crypto'
-import { ID_PATTERN, LIMITS, RESERVED_ROLE_KEYS, type CheckerRef, type NodeDef, type WorkflowConfig, type WorkflowDef } from '../types.ts'
+import { ID_PATTERN, LIMITS, RESERVED_ROLE_KEYS, roleReuseMode, type CheckerRef, type NodeDef, type WorkflowConfig, type WorkflowDef } from '../types.ts'
 
 export class CatalogValidationError extends Error {
   readonly problems: string[]
@@ -62,6 +62,9 @@ function checkPersonaProtocol(label: string, persona: string, problems: string[]
       problems.push(`role key "${roleKey}" is reserved and cannot be configured`)
     }
     role.persona = role.persona.trim()
+    // #60: 缺省 reuse 在此归一化为 `node`，随 definitionSnapshot 一并冻结；
+    // 之后修改 YAML 只影响新启动的 Run。
+    role.reuse = roleReuseMode(role)
     checkPersonaProtocol(`role "${roleKey}"`, role.persona, problems)
   }
 
