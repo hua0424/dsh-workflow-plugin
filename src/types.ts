@@ -38,6 +38,18 @@ export interface RoleModel {
 }
 
 /**
+ * Issue #41：catalog def 层 → 角色 route 的共享单源（`'judge'` 固定取
+ * judgeRole，其余取 roles[roleKey]）。`checkCatalogProviders`、start 前置
+ * 检查与 `resolveRoleModel` 的 def 分支三方共用；签名不依赖 RunState。
+ */
+export function readRoleDefModel(
+  config: Pick<WorkflowConfig, 'roles' | 'judgeRole'>,
+  roleKey: 'judge' | string,
+): RoleModel | undefined {
+  return roleKey === 'judge' ? config.judgeRole.model : config.roles[roleKey]?.model
+}
+
+/**
  * A1 D3: the single trim-then-normalize rule for model routes, shared by the
  * catalog schema caps and `handleSetRoleModel`. Empty-after-trim or
  * over-limit components are rejected with the limit in the message; the

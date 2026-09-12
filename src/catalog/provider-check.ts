@@ -6,7 +6,7 @@
  * 的 `listProviders()` 结果 id 集）比对。未配置 model 的角色视为 OK
  *（运行时继承 Manager route，不属误配）。检查只报告、不阻断加载。
  */
-import type { WorkflowConfig } from '../types.ts'
+import { readRoleDefModel, type WorkflowConfig } from '../types.ts'
 
 export interface ProviderCheckRow {
   role: string
@@ -22,13 +22,15 @@ export interface ProviderCheckReport {
   rows: ProviderCheckRow[]
 }
 
-/** 收集 catalog 全部待查角色：roles 各键 + judgeRole（键名固定 `judge`）。 */
+/** 收集 catalog 全部待查角色：roles 各键 + judgeRole（键名固定 `judge`）。def 层读取走共享单源。 */
 export function collectRoleRoutes(config: WorkflowConfig): Array<{ role: string; provider?: string; modelId?: string }> {
   const routes: Array<{ role: string; provider?: string; modelId?: string }> = []
-  for (const [roleKey, role] of Object.entries(config.roles)) {
-    routes.push({ role: roleKey, provider: role.model?.provider, modelId: role.model?.modelId })
+  for (const roleKey of Object.keys(config.roles)) {
+    const def = readRoleDefModel(config, roleKey)
+    routes.push({ role: roleKey, provider: def?.provider, modelId: def?.modelId })
   }
-  routes.push({ role: 'judge', provider: config.judgeRole.model?.provider, modelId: config.judgeRole.model?.modelId })
+  const judge = readRoleDefModel(config, 'judge')
+  routes.push({ role: 'judge', provider: judge?.provider, modelId: judge?.modelId })
   return routes
 }
 
@@ -45,6 +47,20 @@ export function checkCatalogProviders(workflowId: string, config: WorkflowConfig
     return { role, provider, modelId: modelId ?? null, ok: false, reason: `provider "${provider}" 未在当前 profile 注册` }
   })
   return { workflowId, ok: rows.every(row => row.ok), rows }
+}
+
+/**
+ * Issue #41：start 前置阻断用的失败渲染。逐角色点名（角色/provider/原因），
+ * 与 check 命令的纯诊断渲染区分（check 保持非阻断，见 renderProviderCheckReport）。
+ */
+export function renderStartProviderBlock(report: ProviderCheckReport): string {
+  const bad = report.rows.filter(row => !row.ok)
+  const lines = bad.map(row => {
+    const route = row.provider === null ? '(inherit)' : `${row.provider}${row.modelId === null ? '' : `/${row.modelId}`}`
+    return `- ${row.role}: ${route} — ${row.reason}`
+  })
+  lines.push(`start ${report.workflowId} 已拒绝：${bad.length}/${report.rows.length} 个角色的 provider 不可用；用 /dsh-flow check ${report.workflowId} 诊断或修正 catalog`)
+  return lines.join('\n')
 }
 
 /** 逐角色一行 + 总计；失败只报告。 */

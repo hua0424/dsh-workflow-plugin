@@ -12,7 +12,7 @@ import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
 import { endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
-import { checkCatalogProviders, renderProviderCheckReport } from './catalog/provider-check.ts'
+import { checkCatalogProviders, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
 import type { RunState } from './types.ts'
@@ -325,6 +325,11 @@ export function apply(ctx: Context) {
       try {
         const entry = await loadCatalogEntry(home, workflowId)
         if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
+        // Issue #41：静态校验通过后、创建 Run 前做纯静态 provider 比对（本地
+        // 注册表读取，无网络）；任一角色不可用即拒绝启动，不创建 Run。
+        const available = ctx.llm.listProviders().map(provider => provider.id)
+        const report = checkCatalogProviders(workflowId, entry.config, available)
+        if (!report.ok) return { ok: false, reason: renderStartProviderBlock(report) }
         const run = engine.buildInitialRun(agent.session.id, workflowId, entry.config, entry.definitionHash)
         sessionWorkspaces.set(agent.session.id, workspaceKey)
         const outcome = await engine.startRun(workspaceKey, run, entry.path, extraText)
