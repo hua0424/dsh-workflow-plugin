@@ -493,6 +493,16 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       await drainWithin(adapters.ctx.subagents, manager, [SessionId(judgeSessionId)])
     },
 
+    async drainRoleActor(run, roleKey) {
+      const childId = run.roleActors[roleKey]
+      if (childId === undefined) return
+      const manager = adapters.managerAgentOf(run)
+      if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+      // 与 Judge 同一条有界路径：`drainContinuableChildren` 无 signal，挂起即放弃等待；
+      // 失败由引擎降级为仅删映射撤权（reuse: node 的离开节点释放）。冷会话是 no-op。
+      await drainWithin(adapters.ctx.subagents, manager, [SessionId(childId)])
+    },
+
     async compactRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }

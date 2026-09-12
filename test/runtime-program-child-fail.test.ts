@@ -50,7 +50,7 @@ function harness(config: WorkflowConfig, programs: ProgramHost) {
       async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, ...send(input.judgeSessionId, 'judge') } },
       async followupJudge(_run, judgeSessionId) { return send(judgeSessionId, 'judge followup') },
       async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
-      async retireJudge() {}, async drainJudge() {}, async compactRoleActor(_run, role) { compacts.push(role); return { ok: true } }, async safeToInspect() { return safe },
+      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor(_run, role) { compacts.push(role); return { ok: true } }, async safeToInspect() { return safe },
     }, programs, makeStateHost(store))
     engine.cwdResolver = async () => home
     engine.actorActivity = async () => activity
@@ -187,6 +187,9 @@ test('reopen resumes the stored Child top without pushing the parent again', asy
 
 test('nested Child unwinds one final handoff, keeps one top, and reuses the Root Role mapping', async () => {
   const config = childConfig()
+  // 跨 child 边界的会话复用 + 边界 compact 是 `reuse: continuable` 的语义；缺省 node 见
+  // runtime-work-order.test.ts 的「reuse: node」用例。
+  config.roles.worker = { persona: 'Worker', reuse: 'continuable' }
   config.workflow.nodes.after = { execution: { type: 'actor-task', role: 'worker', instruction: 'Use child output' }, checker: CHECKER, onPass: 'END' }
   config.childWorkflows!['child-a'] = { startNode: 'call-inner', nodes: {
     'call-inner': { execution: { type: 'child-workflow', workflowId: 'child-b' }, onPass: 'END' },
@@ -415,7 +418,7 @@ test('Program ERROR retains parameters across reopen and manual resolution route
       async ensureRoleActor() { return { childId: 'unused', messageId: 'unused' } },
       async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge' } }, async followupJudge() { return { messageId: 'followup' } },
       async judgeSessionAvailability() { return 'available' }, async roleSessionAvailability() { return 'available' },
-      async retireJudge() {}, async drainJudge() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
+      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
     }, { async run() { throw new Error('manual resolution must not run Program') } }, makeStateHost(reopened))
     engine.cwdResolver = async () => h.home
     try {
