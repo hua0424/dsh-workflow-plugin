@@ -1,6 +1,6 @@
 # 工作流跟踪目录
 
-供 `milestone-delivery` 的 Manager、Role Actors 和 Judge 共享运行材料。首次进入节点先读本文件，再读 handoff 指定的 `run.md`；只处理该运行和本节点对象，不依赖角色会话的历史记忆。
+供 `milestone-delivery` 的 Manager、Role Actors 和 Judge 共享运行材料。首次执行读本文件建立合同认知；**重入会话直接读 handoff 的 run.md（任务表 + 当前进度）即可，无需重读全文**。只处理该运行和本节点对象，不依赖角色会话的历史记忆。rNNN-review/decision 的详细格式合同另见 `docs/dsh-workflow/review-contract.md`（code-reviewer / review-judger 首次执行与轮次有疑义时读）。
 
 ## 存放与版本管理
 
@@ -16,6 +16,7 @@
 ```text
 docs/dsh-workflow/
 ├─ INDEX.md                         # 本规范（纳入 Git）
+├─ review-contract.md               # rNNN-review/decision 详细格式合同（纳入 Git）
 └─ runs/                            # 本地运行产物（gitignore）
    └─ <timestamp>-milestone-delivery-<slug>/
       ├─ run.md                     # 必建：身份、范围、任务索引和当前进度
@@ -40,6 +41,12 @@ docs/dsh-workflow/
 已有 PRD、ADR、设计和测试文档优先引用原位置。澄清草稿确需长文时按需放 `notes/<slug>.md`；正式需求以 Issue 为准，项目级长期设计决策回归项目原有规范，不在每次运行复制一套文档体系。
 
 ## 文件合同与写入责任
+
+多角色共用同一工作区，并发写按以下分区协议执行，避免覆盖他人区块：
+
+- **任务表（run.md）仅 coordinator 维护**；其他角色读到过期任务表时以远端实查为准，不代改。
+- **当前进度（run.md）为追加时间线**：每个角色只追加带时间与角色前缀的自己的行，不编辑他人行、不改写历史行。
+- delivery/review/decision/deferred 按下述归属角色编辑自有区块；发现他人区块有误时记录在 coordination.md 交 Manager 处理，不直接改。
 
 ### run.md — 稳定入口
 
@@ -67,20 +74,7 @@ coordinator 建立分支/PR身份；developer 补实现与自测；coordinator �
 
 code-reviewer 写 review，review-judger 写 decision。即使报告很短，也保留这两个最小文件，使后继与重入有固定入口；handoff 只摘要和引用。
 
-轮次按对象分别从 r001 递增。先读取上一轮，再固定本轮，不能把刚写的本轮当作上一轮。相同 PR/base/head 且任务未改变的重入复用原轮次；补充/纠错注明时间和原因，保留旧结论。不同修订开新轮次。
-
-review 至少包含：
-
-- PR URL、轮次、observedAt、baseBranch/headBranch、完整 baseSha/headSha、mergeBaseSha（区分 PR base tip 与 diff 起点）。
-- 范围与方法：Issue 验收入口、精确 diff、检查过的证据、未核实项。
-- 发现列表：稳定编号如 r001-F1、位置/证据、影响、建议；没有发现明确写“无”。
-- 建议结论（非正式 GitHub approval）、上轮必修项的复核状态。
-
-默认审查固定 base/head 的完整 PR diff。仅当 base 未变、head 是上轮 head 的后继且旧发现全部可追踪时，允许增量审查；仍须复核旧必修项。分支/base 漂移、范围改变或材料不足时重新确定完整范围，不能继承旧批准。
-
-decision 至少包含：对应 review 路径与同一 PR/base/head；每项发现的核实结论、处置（本次修复/延期/不成立）和理由；剩余必修清单；批准或返工结论。修复复杂不是延期阻断问题的理由；范围外争议交 Manager。通过才记录 approvedBase/approvedHead，返工不保留有效批准。
-
-决策摘要同步至对应 PR；集成决策同时同步主 Issue。评论包含远端可读的关键结论与修订信息，不只有本地文件路径。变更实现、PR head 或批准 base 后，原批准失效；合并前发现漂移时 BLOCK，由 Manager 安排重新审查和决策，补充证据不能代替新修订的专业评审。
+核心规则（详细格式合同见 `docs/dsh-workflow/review-contract.md`）：轮次按对象从 r001 递增，先读上一轮再固定本轮；相同 PR/base/head 且任务未变的重入复用原轮次，不同修订开新轮次。默认审查固定 base/head 的完整 PR diff，仅满足增量条件时可增量但仍复核旧必修项。通过才记录 approvedBase/approvedHead，返工不保留有效批准；变更实现、head 或批准 base 后原批准失效，漂移时 BLOCK。决策摘要同步至对应 PR（集成同时同步主 Issue）。
 
 ### coordination.md / deferred.md / completion.md
 
@@ -106,8 +100,17 @@ decision 至少包含：对应 review 路径与同一 PR/base/head；每项发�
 - 外部副作用重入先查现场，匹配则补缺失收尾；不匹配 BLOCK，不强推、不重复创建、不替换原始基线。合并前保护检查/权限不满足时 BLOCK，不绕过保护。
 - 技能用实际 catalog 的精确名称。必需技能缺失先由 Manager 决定替代步骤或 BLOCK，不虚构调用成功。
 
+## gh CLI 操作备忘（真实 Run 踩坑沉淀）
+
+- `gh issue edit --milestone` 接受**标题**而非编号（`--milestone 9` 报 not found，须 `--milestone 'prompt-slim-protocol-single-source'`）。
+- REST 过滤 `gh api "issues?milestone=<N>&state=all"` 在部分环境返回空数组（工具怪癖，非数据缺失）；用 `gh issue list --milestone <标题>` 或 search API 双路补偿后再下完整性结论。
+- sub-issue API（`POST issues/<parent>/sub_issues`、`GET .../sub_issues`）响应体是**数组**；`--jq '.[].number'` 对空数组返回空而非错误，勿据单次输出误判挂载失败，需 GET 复核。
+- 无 CI 仓库的合并前检查证据：`gh pr checks <n>` 无 checks + 分支保护 404 + `/rulesets` 空，配合在批准 head 上实跑回归，即构成"无适用检查"的明确依据。
+
 ## 当前已知插件限制
 
+- [#54：空回合安全闭合误伤并行子代理等待](https://github.com/hua0424/dsh-workflow-plugin/issues/54)：并行子代理等待期的无工具回合被结算为 `not safely closed` 自动 BLOCK 并解除 claim 绑定；触发后 Actor 无法自恢复，需 Manager `node_resume` 兜底（run 295ad986 先例：coordination.md 2026-09-12 节）。
+- [#55：node-boundary compact 失败无降级](https://github.com/hua0424/dsh-workflow-plugin/issues/55)：长会话角色派发时 compact 摘要无法再缩小即 BLOCK；Manager 可 `workflow_set_role_model` 切换更强模型后 `node_resume` 恢复（run 295ad986 先例：coordinator 切 glm-5.3 后一次成功）。
 - [#17：onFail END](https://github.com/hua0424/dsh-workflow-plugin/issues/17)：已实施并部署。配置直接使用两处 `onFail: END`：根流程 `grilling.failed → END`（用户取消终局，Run 状态沿用 completed，终局结果由终局 claim outcome + handoff 表达）；子流程 `select-next-issue.failed → END`（任务穷尽，pop 后落父节点 onPass 进入集成，父只能经 handoff 感知穷尽事实）。终局语义见 [登记材料](../pending-discussions/onfail-end.md)。
 - [#18：Judge inspection](https://github.com/hua0424/dsh-workflow-plugin/issues/18)：当前缺 PR/CI/提交关系查询和列表完整性支持；先由 Manager 按 coordination 合同补证，不通过放宽为 Actor 自报来绕过核验。见 [登记材料](../pending-discussions/judge-repository-inspection.md)。
 
