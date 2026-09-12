@@ -387,6 +387,50 @@ test('same-execution Role correction reuses its Session without node-boundary co
   } finally { h.close() }
 })
 
+/**
+ * #62 AC1：`reuse: continuable` 显式配置后的现状回归——跨节点复用同一会话、
+ * 新 visit 派发前执行边界 compact、会话不释放（整 Run 复用），同 visit 返工不额外 compact。
+ */
+test('reuse: continuable 现状回归：跨节点复用同一会话 + 边界 compact，同 visit 返工不额外 compact', async () => {
+  const h = harness(configWithReusedWorker('continuable'))
+  try {
+    await h.start()
+    assert.equal((await h.row()).run.definitionSnapshot.roles.worker!.reuse, 'continuable')
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan handoff'))
+    const first = await h.row()
+    assert.equal(first.execution.nodeId, 'work')
+    assert.equal(first.execution.dispatch?.sessionId, 'worker-session')
+    assert.deepEqual(h.compacts, [], '首次创建 Role 不做边界 compact')
+
+    // 同 visit 返工：REJECT 复用当前会话，不额外 compact、不释放会话。
+    const actor = h.caller(first.execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'first candidate' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    const checking = await h.row()
+    await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'REJECT', 'fix the evidence', h.caller(checking.execution.judge!))
+    const corrected = await h.row()
+    assert.equal(corrected.execution.executionId, first.execution.executionId, 'REJECT 仍留在同一节点')
+    assert.equal(corrected.execution.dispatch?.sessionId, 'worker-session')
+    assert.deepEqual(h.compacts, [], '同 visit 返工不触发边界 compact')
+    assert.deepEqual(h.roleDrains, [], '同 visit 不释放会话')
+
+    // 跨节点：ACCEPT 后派发下一节点前 compact，会话沿用（整 Run 复用）。
+    const workerJudge = await acceptCurrent(h, 'worker handoff')
+    const ready = await h.row()
+    assert.equal(ready.execution.nodeId, 'again')
+    assert.equal(ready.execution.phase, 'ready')
+    assert.deepEqual(h.compacts, [], '边界 compact 在派发新节点时才执行')
+    await h.engine.handleTurnEnded('ws', workerJudge)
+    const advanced = await h.row()
+    assert.equal(advanced.execution.phase, 'working')
+    assert.deepEqual(h.compacts, ['worker'], '进入新节点前执行边界 compact')
+    assert.equal(advanced.run.roleActors.worker, 'worker-session', '整 Run 复用：映射保留')
+    assert.equal(advanced.execution.dispatch?.sessionId, 'worker-session', '跨节点复用同一会话')
+    assert.deepEqual(h.roleDrains, [], 'continuable 离开节点不 drain 会话')
+    assert.ok(h.lifecycle.includes('safe:worker-session'), '派发前仍做安全闭合检查')
+  } finally { h.close() }
+})
+
 test('reuse: node（缺省）：节点内修正复用同一会话且无边界 compact；离开节点 drain + 删映射，回边重入拿到全新会话', async () => {
   const h = harness(configWithWorker('work'))
   try {
@@ -1194,6 +1238,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
   const judgeFollowups: Array<import('../src/engine/engine.ts').JudgeSpawnInput> = []
   const ensuredActors: string[] = []
   const drains: string[] = []
+  const roleDrains: string[] = []
   let drainFailure: Error | undefined
   let judgeFollowupFailure: Error | undefined
   let safe = true
@@ -1236,7 +1281,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
       async roleSessionAvailability() { return roleAvailability },
       async retireJudge() {},
       async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); if (drainFailure) throw drainFailure },
-      async drainRoleActor() {},
+      async drainRoleActor(run, role) { roleDrains.push(run.roleActors[role]!) },
       async compactRoleActor() { return { ok: true } },
       async safeToInspect() { if (safetyGate) await safetyGate; return safe },
     }, { async run() { throw new Error('T7') } }, makeStateHost(store))
@@ -1247,7 +1292,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
   let engine = makeEngine()
   const caller = (dispatch: { sessionId?: string; messageId?: string }) => ({ sessionId: dispatch.sessionId!, turnUserMessageIds: new Set([dispatch.messageId!]) })
   return {
-    home, messages, judgeStarts, judgeFollowups, ensuredActors, drains, caller,
+    home, messages, judgeStarts, judgeFollowups, ensuredActors, drains, roleDrains, caller,
     get engine() { return engine },
     get store() { return store },
     setSafe(value: boolean) { safe = value },
@@ -1431,6 +1476,7 @@ test('missing Role Session is replaced in the resume transaction and correction 
   const h = recoveryHarness(configWithWorker())
   try {
     const before = await enterRecoveryWorker(h)
+    assert.equal(before.run.definitionSnapshot.roles.worker!.reuse, 'node', '缺省 reuse 即 node：本用例固定节点级复用下的 replacement 语义')
     const oldActor = h.caller(before.execution.dispatch!)
     h.reopen()
     await h.engine.handleRestartReconcile()
@@ -1463,6 +1509,7 @@ test('missing Role Session is replaced in the resume transaction and correction 
     assert.equal(row.execution.roleBoundaryPrepared, true)
     assert.deepEqual(h.ensuredActors, ['worker-session', 'worker-replacement-2'])
     assert.match(h.messages.at(-1)!.text, /replacement candidate/)
+    assert.deepEqual(h.roleDrains, [], 'replacement 是 resume 事务内的替换，未离开节点，不触发节点级 drain')
   } finally { h.close() }
 })
 
