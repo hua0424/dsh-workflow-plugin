@@ -26,7 +26,7 @@ export const name = 'dsh-agent-team-workflow'
 // 会话 preset 的 isolate 域（web-app bundle 显式禁用宿主平面副本），宿主行
 // inject 它只会永久 `waiting for service: compaction` 并卡死整个 boot。
 // 改为运行期按目标 agent 解析（plugin/host.ts 的 compactionFor）。
-export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs'] as const
+export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', 'jobs', 'llm'] as const
 
 export function apply(ctx: Context) {
   const home = resolveDshHome()
