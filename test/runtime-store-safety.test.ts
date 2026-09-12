@@ -31,7 +31,7 @@ async function fixture(roleReview = false) {
     async ensureRoleActor(_run, role) { return { childId: `role-${role}`, messageId: `actor-message-${++message}` } },
     async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge-message-1' } },
     async followupJudge() { return { messageId: `judge-followup-${++message}` } }, async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
-    async retireJudge() {}, async drainJudge() {}, async compactRoleActor() { return { ok: true } },
+    async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } },
     async safeToInspect() { return true },
   }, { async run() { throw new Error('unexpected Program') } }, makeStateHost(store))
   engine.cwdResolver = async () => home

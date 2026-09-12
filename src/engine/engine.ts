@@ -1,6 +1,6 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
 import type { WorkflowConfig, NodeClaim, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
-import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim } from '../types.ts'
+import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim, roleReuseMode } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
@@ -33,6 +33,8 @@ export interface SubagentHost {
   roleSessionAvailability(roleSessionId: string): Promise<SessionAvailability>
   retireJudge(run: RunState, judgeSessionId: string): Promise<void>
   drainJudge(run: RunState, judgeSessionId: string): Promise<void>
+  /** 节点级复用（`reuse: node`）离开节点时释放会话：drain 内存驻留。失败的降级由引擎决定。 */
+  drainRoleActor(run: RunState, roleKey: string): Promise<void>
   compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
   /** 必须覆盖普通工具 tail、已知后台写任务及未收口后代；unknown=false。 */
   safeToInspect(sessionId: string): Promise<boolean>
@@ -121,7 +123,11 @@ export class WorkflowEngine {
     const frame = topFrame(run)
     const execution = this.nodeAt(run, frame)?.execution
     const role = execution?.type === 'actor-task' ? execution.role : undefined
-    const roleBoundaryPrepared = role === undefined || role === 'manager' || run.roleActors[role] === undefined
+    // 边界 compact 只服务于 `reuse: continuable` 的跨节点复用。`reuse: node`（缺省）的新访问
+    // 要么拿到全新会话、要么（同节点 resume 等）用的就是本访问自己的会话，没有跨节点上下文
+    // 可压缩——离开节点时该会话已被 drain + 撤权。
+    const roleBoundaryPrepared = role === undefined || role === 'manager'
+      || roleReuseMode(run.definitionSnapshot.roles[role]) === 'node' || run.roleActors[role] === undefined
     return { runId: run.runId, ...frame, visit, revision: 0,
       input, phase: 'ready', roleBoundaryPrepared, restartPending: false, inputVersion: 1, blockReason: null, enteredAt: new Date().toISOString(),
       ...(predecessorId === undefined ? {} : { predecessorId }) }
@@ -444,6 +450,9 @@ export class WorkflowEngine {
       await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n材料已保存；Manager 核查后可显式恢复。`).catch(() => {})
       return { ok: true, run, message: e.blockReason }
     }
+    // `reuse: node` 的会话生命周期止于节点：先 drain 会话（失败降级为仅撤权，不阻塞推进），
+    // 再删映射；映射删除随节点推进在同一次 state.put 落库。旧会话由 authz 的精确比对失权。
+    const released = await this.releaseNodeScopedActor(run, node)
     e.phase = 'exited'
     e.exitedAt = new Date().toISOString()
     const changes = [change(e, ...events, 'exited')]
@@ -481,6 +490,7 @@ export class WorkflowEngine {
     }
     await this.state.put(ws, run, version, changes)
     this.trace(run, 'ROUTE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, target })
+    if (released) this.trace(run, 'RELEASE', { workflow: e.workflowId, role: released.role, drained: released.drained })
     if (run.status === 'completed') {
       this.traceWarned.delete(run.runId)
       const terminal = result === 'FAIL'
@@ -489,6 +499,20 @@ export class WorkflowEngine {
       await this.targets.steerManager(run, terminal).catch(() => {})
     }
     return { ok: true, run, message: `${result} committed` }
+  }
+  /**
+   * `reuse: node` 离开节点时的会话释放：drain 内存驻留（best-effort——失败降级为仅撤权，
+   * 绝不阻塞节点推进），并删除映射使旧会话失权（authz 按 roleActors 精确比对）。
+   * 映射删除由调用方随节点推进并进同一次 state.put。
+   */
+  private async releaseNodeScopedActor(run: RunState, node: NodeView): Promise<{ role: string; drained: boolean } | undefined> {
+    const role = node.execution.type === 'actor-task' ? node.execution.role : undefined
+    if (role === undefined || role === 'manager' || run.roleActors[role] === undefined) return undefined
+    if (roleReuseMode(run.definitionSnapshot.roles[role]) !== 'node') return undefined
+    let drained = true
+    try { await this.subagents.drainRoleActor(run, role) } catch { drained = false }
+    delete run.roleActors[role]
+    return { role, drained }
   }
   async handleClaim(ws: string, claim: NodeClaim, caller: ClaimCaller): Promise<EngineOutcome> {
     try { claim = normalizeNodeClaim(claim) } catch (error) { return rejected(String(error)) }
