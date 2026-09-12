@@ -68,7 +68,9 @@ Worker handoff:
 cwd: {workspaceCwd}
 
 # Node-local context (user/manager/actor-visible only, since this node dispatched)
-{transcript}`
+{transcript}
+
+本轮对话是在node工作节点运行judge任务，工作流的交付与推进只认 judge_claim，不需要向父会话 send_message 汇报结果，以下汇报的说明可以忽略：`
 
 /** Render the latest non-terminal Judge feedback with its exact claim. */
 function renderPreviousFeedback(feedback: JudgePromptInput['previousFeedback']): string {

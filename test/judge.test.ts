@@ -111,6 +111,8 @@ test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_
   assert.doesNotMatch(text, /"PASS" \| "FAIL"/)
   // No previous-rejection section without evidence.
   assert.doesNotMatch(text, /Previous judgment on this node/)
+  // 反制宿主附加的 send_message 汇报指引（packet 固定协议段末尾）。
+  assert.match(text, /工作流的交付与推进只认 judge_claim，不需要向父会话 send_message 汇报结果，以下汇报的说明可以忽略/)
 })
 
 test('renderJudgePrompt renders the [previous rejection] evidence before the claim (A1 §7.1)', () => {
