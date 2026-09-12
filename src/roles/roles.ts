@@ -11,7 +11,7 @@
  * The three enforcement layers (spawn filter here, spawn assertion in host.ts,
  * runtime gate in tools/authz.ts) all derive from this one source.
  */
-import type { RunState } from '../types.ts'
+import { readRoleDefModel, type RunState } from '../types.ts'
 
 /**
  * Tools the Judge must always have: the `judge_claim` protocol tool (A1 R9)
@@ -81,11 +81,11 @@ export function judgeLabel(nodeId: string): string {
   return `workflow-judge:${nodeId}`
 }
 
-/** Resolve a Role's effective model route: override > role def > frozen Manager route. */
+/** Resolve a Role's effective model route: override > role def > frozen Manager route. def 分支走共享单源。 */
 export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: { provider?: string; model?: string }): { provider?: string; model?: string } {
   const override = run.modelOverrides[roleKey]
   if (override !== undefined) return { provider: override.provider, model: override.modelId }
-  const def = roleKey === 'judge' ? run.definitionSnapshot.judgeRole.model : run.definitionSnapshot.roles[roleKey]?.model
+  const def = readRoleDefModel(run.definitionSnapshot, roleKey)
   if (def !== undefined) return { provider: def.provider, model: def.modelId }
   if (frozen !== undefined && (frozen.provider !== undefined || frozen.model !== undefined)) {
     return { provider: frozen.provider, model: frozen.model }
