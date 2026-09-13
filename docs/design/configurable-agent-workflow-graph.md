@@ -279,9 +279,9 @@ Host启动时不尝试恢复进程内Turn/队列：所有`status=running` Row都
 
 ## 5. 最小Runtime State
 
-已确认使用Home级极简SQLite多行表：`${DSH_HOME}/workflows/state.sqlite3`。每Row以current session cwd解析出的canonical workspace root path为`workspaceKey`，保存一个current Run；不同Workspace可并发，同Workspace最多一个Run并由managerSessionId拒绝其他Session操作。
+已确认使用Home级极简SQLite多行表：`${DSH_HOME}/workflows/state.sqlite3`。每Row以current session cwd解析出的canonical workspace root path为`workspaceKey`，保存一个current Run；不同Workspace可并发，同Workspace最多一个Run；Run的推进/控制仍绑定启动Manager Session（`managerSessionId`），自#30起仅`reset`放宽为任意顶层会话。
 
-Host仍只使用一个SQLite connection和一个短mutation queue；不建设Lease/PID/fencing/takeover/connection pool。Run永久绑定启动Manager Session，其他Session不能接管/推进。Workspace移动不自动迁移旧Row。Current workspace任意direct-human Session可通过`/dsh-flow reset`删除该Row，解决owner Session永久不可恢复问题；Reset不停止旧Actors或清外部资源。SQLite只提供原子写和损坏检测，不增加Event/Attempt/History。
+Host仍只使用一个SQLite connection和一个短mutation queue；不建设Lease/PID/fencing/takeover/connection pool。Run永久绑定启动Manager Session，其他Session不能接管/推进。Workspace移动不自动迁移旧Row。Current workspace任意顶层会话（`isRootCommandAgent`：无parentSession、origin非subagent、delegationDepth为0）可通过`/dsh-flow reset`终止该Row，解决owner Session永久不可恢复问题；工作流内部参与者（Role Actor/Judge/派发subagent）执行reset被拒绝，无活动Run时幂等返回`no active run`；Reset不停止旧Actors或清外部资源。SQLite只提供原子写和损坏检测，不增加Event/Attempt/History。
 
 ```sql
 CREATE TABLE workflow_state (

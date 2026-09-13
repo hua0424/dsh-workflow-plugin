@@ -92,7 +92,7 @@ T4 支持显式 node_block、Actor 未提交结果、Judge 未提交结论、NEE
 
 T7 已接通 Builtin Program、嵌套 Child、FAIL 无出口重开与 model replacement。Program 参数/安排先存再执行，PASS/FAIL 无 Judge 原子路由；显式 handoff 或原 input 是唯一交接，ERROR/抛错先 BLOCK，由 Manager 显式重试或裁决。Child caller 与 frame.executionId 稳定关联，首节点继承调用 input，最终 handoff 原子逐层 pop 到父后继，Root/Child 共用 Role mappings。Actor accepted FAIL 无 onFail 保留 claim/judgment 于 settling BLOCK，Manager actor resume 在同 execution 重开新工作版本。
 
-T8 已接通 Manager-only `/dsh-flow reset`：一个短 CAS 事务把当前 active Run 标为 terminated，保留 execution/事件/Snapshot/Role mapping 并写 terminated event；重复 Reset 与非 Manager 拒绝。新 Run 前检查 terminated 当前 Role/Judge 及 ready 前驱未收口 Judge，known active/idle 拒绝，Host unknown 仅因新的显式 start 才允许，旧 Actor/Judge/Program 回调不能推进新 Run。
+T8 已接通顶层会话 `/dsh-flow reset`：一个短 CAS 事务把当前 active Run 标为 terminated，保留 execution/事件/Snapshot/Role mapping 并写 terminated event；重复 Reset 与已 completed/terminated 的 Run 拒绝。执行主体自 #30 起放宽为**同 workspace 的任意顶层会话**（判定复用 `isRootCommandAgent`，不再要求 `managerSessionId`），Role Actor / Judge / 派发 subagent 会话一律拒绝；无活动 Run 的 workspace 幂等成功（`no active run`）。新 Run 前检查 terminated 当前 Role/Judge 及 ready 前驱未收口 Judge，known active/idle 拒绝，Host unknown 仅因新的显式 start 才允许，旧 Actor/Judge/Program 回调不能推进新 Run。
 
 ## Workflow State Store / 可观察性
 

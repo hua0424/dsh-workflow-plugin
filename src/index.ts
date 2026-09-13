@@ -335,7 +335,7 @@ export function apply(ctx: Context) {
         sessionWorkspaces.set(agent.session.id, workspaceKey)
         const outcome = await engine.startRun(workspaceKey, run, entry.path, extraText)
         if (!outcome.ok) return { ok: false, reason: outcome.reason }
-        return { ok: true, message: `started ${workflowId} (run ${outcome.run.runId})` }
+        return { ok: true, message: `started ${workflowId} (run ${outcome.run?.runId})` }
       } catch (error) {
         if (error instanceof StateConflictError) return { ok: false, reason: error.message }
         return { ok: false, reason: String(error) }
@@ -375,7 +375,7 @@ export function apply(ctx: Context) {
       if (mode === 'incompatible-store') return { ok: false, reason: 'state store is compatible; use plain /dsh-flow reset for the current Run' }
       if (workspaceKey === undefined) return { ok: false, reason: '当前会话没有 workspace cwd' }
       try {
-        const outcome = await engine.handleReset(workspaceKey, agent.session.id)
+        const outcome = await engine.handleReset(workspaceKey, isRootCommandAgent(agent))
         return outcome.ok ? { ok: true, message: outcome.message } : { ok: false, reason: outcome.reason }
       } catch (error) {
         return { ok: false, reason: String(error) }
