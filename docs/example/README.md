@@ -69,6 +69,38 @@ judgeRole:                   # Judge
 - provider/modelId 会写入 trace log 的 `MODEL` 行（见 README「Run trace
   logs」），凭据形状的值会被 redact。
 
+## 会话复用粒度（Issue #60）
+
+`roles.<roleKey>.reuse` 选择该 worker Role 的会话复用粒度：
+
+| 取值 | 语义 |
+| --- | --- |
+| `node`（缺省） | 节点级复用：同一节点的重复派发/修正复用同一会话，离开节点即 drain + 撤权，跨节点边界不再 compact |
+| `continuable` | 旧行为：Role 的 continuable 会话跨节点复用，每次派发新节点前执行 Node 边界 compact |
+
+```yaml
+roles:
+  developer:
+    persona: |
+      Implement the current issue.
+    reuse: continuable      # 省略即 node
+```
+
+要点：
+
+- **缺省是 `node`**：省略 `reuse` 时静态校验把它归一化为 `node` 并写入
+  `definitionSnapshot`，Run 启动时冻结；之后再改 YAML 只影响下一个 Run。
+- **非法值只阻塞自己**：`reuse` 只接受 `node` / `continuable`，其他值（含大小写
+  变体）被 strict schema 拒绝，该 catalog 文件在 `/dsh-flow list` 显示为
+  diagnostic，其他 workflow 不受影响。
+- **`manager` 不适用 `reuse`**：`manager` 是保留 roleKey，禁止出现在 `roles` 中，
+  所以 `roles.manager.reuse` 在校验期直接失败（"reserved"）；manager 节点始终由
+  当前主会话承担，不参与 Role 会话复用。`judgeRole` 同样不接受 `reuse`——Judge
+  每个节点都是全新会话。
+- **`continuable` 的代价与选型**：单一权威说明在 `docs/user-guide.md` §3.1
+  「会话复用粒度 `reuse`」——边界 compact 的派发前时延、compact 失败 fail-closed
+  BLOCK（风险面见 issue #55）与何时该选它。
+
 ## Judge 工具面（Issue #25）
 
 Judge 与其他 Role 一样继承**全量工具目录**，插件只把写类/副作用工具默认 deny
@@ -114,6 +146,7 @@ Role 定义：
 | `persona` | ✓ | 非空，trim 后存储 |
 | `model` | ✗ | `{ provider, modelId }`，见上文 |
 | `tools.deny` | ✗ | 非空列表；在插件默认 deny 清单（`edit`/`write` + workflow 控制工具）之上再收紧，受保护工具不可 deny |
+| `reuse` | ✗ | `node`（缺省）或 `continuable`；会话复用粒度，见「会话复用粒度（Issue #60）」 |
 
 节点（`workflow.nodes.<nodeId>`）三种 execution：
 

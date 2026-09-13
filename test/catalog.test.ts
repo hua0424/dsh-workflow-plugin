@@ -4,6 +4,7 @@ import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize, computeDefinitionHash, CatalogValidationError } from '../src/catalog/validate.ts'
 import { classifyCatalogFilename } from '../src/catalog/loader.ts'
 import { scanCatalog } from '../src/catalog/loader.ts'
+import { roleReuseMode } from '../src/types.ts'
 import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -63,6 +64,53 @@ test('model route caps: provider ≤64 / modelId ≤128 after trim (A1 D3)', () 
   // Boundary values parse fine (≤ caps) and arrive trimmed (stored trimmed).
   const capped = validateAndNormalize(withModel(' p2 ', ' m2 '), { workflowId: 'caps-wf' })
   assert.deepEqual(capped.roles['developer']!.model, { provider: 'p2', modelId: 'm2' })
+})
+
+test('#60: role reuse defaults to node and survives into the frozen snapshot', () => {
+  const withReuse = (line: string) => parseCatalogConfig(VALID_CONFIG.replace(
+    '  developer:\n    persona: Implement.',
+    `  developer:\n    persona: Implement.\n${line}`,
+  ))
+  // 省略 → 归一化为 node（快照里显式存在，不再依赖读取方各自兜底）。
+  const defaulted = validateAndNormalize(withReuse(''), { workflowId: 'reuse-wf' })
+  assert.equal(defaulted.roles['developer']!.reuse, 'node')
+  // 显式 continuable 原样保留。
+  const continuable = validateAndNormalize(withReuse('    reuse: continuable'), { workflowId: 'reuse-wf' })
+  assert.equal(continuable.roles['developer']!.reuse, 'continuable')
+  // 解析结果参与 definitionHash ⇒ 缺省值与显式值一样被定义快照冻结。
+  assert.notEqual(computeDefinitionHash(defaulted), computeDefinitionHash(continuable))
+  assert.equal(roleReuseMode(undefined), 'node')
+  assert.equal(roleReuseMode({ persona: 'P' }), 'node')
+  assert.equal(roleReuseMode({ persona: 'P', reuse: 'continuable' }), 'continuable')
+})
+
+test('#60: invalid reuse is rejected by the schema (only that file is blocked)', async () => {
+  const invalid = VALID_CONFIG.replace(
+    '  developer:\n    persona: Implement.',
+    '  developer:\n    persona: Implement.\n    reuse: always',
+  )
+  assert.throws(() => parseCatalogConfig(invalid), /reuse/)
+
+  const home = await mkdtemp(join(tmpdir(), 'wfhome-'))
+  const dir = join(home, 'workflows')
+  await mkdir(dir, { recursive: true })
+  try {
+    await writeFile(join(dir, 'good.yaml'), VALID_CONFIG)
+    await writeFile(join(dir, 'bad-reuse.yaml'), invalid)
+    const scan = await scanCatalog(home)
+    assert.deepEqual(scan.entries.map(e => e.workflowId), ['good'])
+    assert.deepEqual(scan.diagnostics.map(d => d.workflowId), ['bad-reuse'])
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('#60: manager cannot configure reuse (reserved roleKey is rejected)', () => {
+  const config = parseCatalogConfig(VALID_CONFIG.replace(
+    '  developer:\n    persona: Implement.',
+    '  manager:\n    persona: Implement.\n    reuse: node',
+  ))
+  assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /reserved/)
 })
 
 test('duplicate keys are rejected', () => {

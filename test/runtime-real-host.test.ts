@@ -220,6 +220,9 @@ test('A30 real DSH Host composes cold Role continuation, Basic compaction, Host 
   writeFileSync(join(home, 'workflows', 'a30.yaml'), `schemaVersion: agent-workflow/v2
 roles:
   worker:
+    # A30 场景断言的是 continuable 语义（整 Run 复用 + 节点边界 compact + 冷延续）；
+    # 缺省 reuse: node 的节点级释放由 scripts/e2e-smoke.mjs 与 runtime-work-order 的 node 用例覆盖。
+    reuse: continuable
     persona: Complete only the current workflow work order and use its control tools.
 judgeRole:
   persona: Read-only verification of the isolated workspace.

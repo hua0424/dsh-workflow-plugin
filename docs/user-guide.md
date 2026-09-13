@@ -7,7 +7,7 @@
 
 在 DSH（deepseek harness）中运行可配置的**串行团队工作流**（`agent-workflow/v2`）：
 一个 **Manager**（你当前会话）按工作单（work order）逐节点推进，每个节点把任务
-派发给一个 **Role Actor**（continuable 子会话，跨节点复用），完成后由独立的
+派发给一个 **Role Actor**（子会话，默认节点级复用，可配置为跨节点复用），完成后由独立的
 **Judge**（只读）核验 claim（ACCEPT / REJECT / NEED_CONTEXT），通过才进入下一
 节点；全部节点完成即 Run 结束。
 
@@ -43,6 +43,26 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
    （插件默认 deny 清单 ∪ `judgeRole.tools.deny`）；默认 deny 覆盖 `edit`/`write`
    与 Run 控制工具，`gh`/`git`/`pwsh` 等查询工具默认可用，详见
    `docs/example/README.md`「Judge 工具面」。
+
+### 3.1 会话复用粒度 `reuse`（Issue #60 起）
+
+worker Role 可选 `reuse: node | continuable`，决定该 Role 的会话在节点之间是否延续：
+
+- `node`（**缺省**，省略 `reuse` 即此值）：**节点级复用**——同一节点内的重复派发、
+  REJECT 修正轮与 BLOCK 恢复复用同一会话；离开节点时先 drain 会话再删除映射（旧
+  会话就此失权），再次进入（含 `onFail` 回边）得到全新会话；跨节点不再做边界
+  compact（没有跨节点上下文需要压缩）。drain 失败只降级为“仅撤权”，不阻塞推进。
+- `continuable`：**旧行为**——Role 的 continuable 会话在整个 Run 内复用，每次派发
+  新节点前先做一次节点边界 compact（cold materialize → compactNow → dispose）再
+  派发，保留跨节点历史但要付代价：派发前时延，且 compact 失败是 fail-closed（Run
+  进入 BLOCK，等 Manager `node_resume` 重试，风险面见 issue #55）。**选型**：只有
+  确实需要 Role 跨节点带着历史继续工作时才选 `continuable`；同一节点内的复用与
+  REJECT 返工 `node` 已覆盖，缺省 `node` 即可。
+- **`manager` 不适用 `reuse`**：`manager` 是保留 roleKey（禁止出现在 `roles` 中），
+  manager 节点始终由当前主会话承担；`judgeRole` 也不接受 `reuse`——Judge 每个节点
+  都是全新会话。
+- 取值在 Run 启动时随 `definitionSnapshot` 冻结，Run 中途改 YAML 只影响下一个 Run。
+  配置细节见 `docs/example/README.md`「会话复用粒度」。
 
 ## 4. 提交协议单源化：旧 catalog 迁移指引
 
@@ -117,8 +137,10 @@ nodeToken 为准，不要缓存旧 token。
   业务结果由终局 claim outcome + handoff 表达（`workflow_status` 的
   `claimOutcome` / `finalHandoffPreview` 可见）；子流程 FAIL→END 返回父
   节点 `onPass`（对父读作 PASS，父只能经 handoff 文本感知失败）。
-- Role Actor 是 continuable 子会话，跨节点复用；**节点边界**会对其做一次
-  压缩（cold materialize → compactNow → dispose），token 得以受控。
+- Role Actor 的会话按 `roles.<role>.reuse` 复用（缺省 `node`，见 §3.1）：
+  `node` 为节点级复用、离开节点即 drain + 撤权、无边界 compact；`continuable`
+  保留整 Run 复用，并在**节点边界**对其做一次压缩（cold materialize →
+  compactNow → dispose），token 得以受控但派发前有额外时延。
 - BLOCK：Actor 主动 `node_block`，或技术故障（Judge fault 等）自动进入；
   Manager 用 `node_resume` 恢复。
 - Host 重启后 Run 可冷恢复：状态在 SQLite，会话在持久层，重进即可续跑。
@@ -156,6 +178,9 @@ dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿�
 现场——先用 sqlite 备份文件把 handoff/claim 文本取出来存档，再重置。
 
 ### 8.3 其他常见信息
+
+以下三条只与 `reuse: continuable` 的 Role 有关——缺省 `node` 的 Role 不做节点边界
+压缩（见 §3.1）。
 
 - `resident actor busy`：节点边界压缩时 Actor 恰被外部唤醒，本轮压缩跳过
   （良性，下个边界再试）。

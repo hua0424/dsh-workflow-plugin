@@ -36,6 +36,9 @@ const ROLE_CONFIG: WorkflowConfig = {
 }
 const SAME_ROLE_CONFIG: WorkflowConfig = {
   ...ROLE_CONFIG,
+  // 同一个 Role 跨节点复用（整 Run 复用 + 边界 compact）是 `reuse: continuable` 的语义；
+  // 缺省 `reuse: node` 在离开节点时即释放会话（见 runtime-work-order.test.ts 的 node 用例）。
+  roles: { worker: { persona: 'Worker', reuse: 'continuable' } },
   workflow: { startNode: 'plan', nodes: {
     plan: { ...ROLE_CONFIG.workflow.nodes.plan!, onPass: 'first' },
     first: { ...ROLE_CONFIG.workflow.nodes.work!, onPass: 'second' },
@@ -74,6 +77,7 @@ function resetHarness() {
     async roleSessionAvailability() { return 'available' as const },
     async retireJudge(_run, id) { retired.push(id) },
     async drainJudge() { throw new Error('Reset must not drain external work') },
+    async drainRoleActor() { throw new Error('Reset must not drain external work') },
     async compactRoleActor() { return { ok: true } },
     async safeToInspect(id) { inspected.push(id); return safe },
   }, { async run() { if (!programEffect) throw new Error('unexpected Program'); return programEffect } }, makeStateHost(store))
@@ -323,7 +327,7 @@ test('incompatible v8 store enters maintenance and root-authorized cutover prese
       async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge' } },
       async followupJudge() { return { messageId: 'judge' } },
       async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
-      async retireJudge() {}, async drainJudge() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
+      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
     }, { async run() { throw new Error('unexpected Program') } }, makeStateHost(() => access!.current()))
     assert.equal((await recovered.startRun('new-ws', recovered.buildInitialRun('new-manager', 'test', CONFIG, 'ignored'), undefined, 'new after cutover')).ok, true)
     const fresh = new DatabaseSync(stateDbPath(h.home), { readOnly: true })

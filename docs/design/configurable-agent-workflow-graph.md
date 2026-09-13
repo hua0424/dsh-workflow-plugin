@@ -37,7 +37,8 @@ Worker Role最小Schema已确认：
 roles.<roleKey> = {
   persona,
   model?: { provider, modelId },
-  tools?: { deny: string[] }
+  tools?: { deny: string[] },
+  reuse?: 'node' | 'continuable'   // #60：缺省 'node'（节点级复用）
 }
 ```
 
@@ -53,7 +54,9 @@ judgeRole = {
 
 Role key使用kebab-case；`manager`和`judge`保留，禁止出现在roles。~~Judge tools不可配置，由Engine固定只读。~~ **（Issue #25 修订，2026-09-10）** Judge 的工具面改为全量工具目录 + 可配置 deny list：默认 deny 清单（`edit`/`write` + Run 控制工具，见 `src/roles/roles.ts` 的 `JUDGE_DEFAULT_DENY`）∪ `judgeRole.tools.deny` 决定不可见工具，受保护工具（`judge_claim`、inspection wrappers、委托机制）不可 deny；`judgeRole.tools.deny` 与其他静态定义一起冻结于 `definitionSnapshot`。详见 `docs/example/README.md`「Judge 工具面」。
 
-已确认`manager`是保留roleKey，可被actor-task Node引用，但禁止出现在`roles`配置中；它始终由当前主会话承担，YAML不伪装修改其persona/model/tools。`roles.*`只定义按需创建并在Run内复用的continuable worker subagents，每次派发新Node前对其执行Node边界compact（`compactNow`）。Judge使用独立`judgeRole`配置。
+**（Issue #60 修订，2026-09-12）** worker Role 增加 `reuse: node | continuable`：缺省 `node`（节点级复用），由静态校验归一化写入 `definitionSnapshot` 冻结，改动 YAML 只影响之后启动的 Run；非法取值被 strict schema 拒绝且只阻塞声明它的那个 catalog 文件。`manager` 不适用 `reuse` —— `manager` 是保留 roleKey，禁止出现在 `roles` 中（`roles.manager.reuse` 在校验期被拒绝），manager 节点始终由当前主会话承担，不参与复用。`judgeRole` 也不接受 `reuse`（Judge 每 Node 全新会话，见 §2.2）。字段语义详见 `docs/example/README.md`「会话复用粒度」。
+
+已确认`manager`是保留roleKey，可被actor-task Node引用，但禁止出现在`roles`配置中；它始终由当前主会话承担，YAML不伪装修改其persona/model/tools。`roles.*`只定义按需创建并在Run内复用的worker subagents；**（Issue #60 起）**「每次派发新Node前对其执行Node边界compact（`compactNow`）」只适用于 `reuse: continuable` 的 Role，缺省 `reuse: node` 为节点级复用（离开节点即 drain + 撤权，跨节点边界不再 compact）。Judge使用独立`judgeRole`配置。
 
 Preset与Workflow分工已确认：当前Session Preset定义基础persona/tool/Skills/MCP和generic/specialized helper-subagent tools；Workflow YAML定义本Run的worker Role persona/model/toolFilter和Graph。Role Actor先继承Parent Preset composition，再应用Workflow Role覆盖/收窄，因此可以继续使用Preset提供的`qa-expert`、`vue-developer`等helper。首期不为每个Workflow创建独立Preset，也不把Workflow Role仅放在Preset中。
 

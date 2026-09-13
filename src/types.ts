@@ -13,6 +13,22 @@ export const STATE_DB_NAME = 'state.sqlite3' as const
 /** Reserved role keys that must never appear in `roles`. */
 export const RESERVED_ROLE_KEYS = ['manager', 'judge'] as const
 
+/**
+ * #60: Role 会话复用粒度。`node` = 节点级复用（离开节点即 drain + 撤权），
+ * `continuable` = 旧行为（复用 continuable 会话、跨节点边界 compact）。
+ */
+export const ROLE_REUSE_MODES = ['node', 'continuable'] as const
+
+export type RoleReuseMode = (typeof ROLE_REUSE_MODES)[number]
+
+/**
+ * #60: `reuse` 的缺省是 `node`。catalog 归一化（写进 definitionSnapshot）与
+ * 运行期读取共用这一个缺省源，避免两处各写一个默认值而漂移。
+ */
+export function roleReuseMode(role: RoleDefinition | undefined): RoleReuseMode {
+  return role?.reuse ?? 'node'
+}
+
 /** Allowed workflow-id / role-key / node-id filename grammar. */
 export const ID_PATTERN = /^[a-z][a-z0-9-]*$/
 
@@ -69,6 +85,11 @@ export interface RoleDefinition {
   persona: string
   model?: RoleModel
   tools?: { deny: string[] }
+  /**
+   * #60: 会话复用粒度。省略时归一化为 `node`。manager 不使用该字段
+   * （`manager` 是保留 roleKey，禁止出现在 `roles` 中）。
+   */
+  reuse?: RoleReuseMode
 }
 
 export interface JudgeRoleDefinition {

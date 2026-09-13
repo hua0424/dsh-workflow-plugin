@@ -10,6 +10,7 @@ import { StateStore, workspaceKeyOf } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { loadCatalogEntry } from '../src/catalog/loader.ts'
+import { authorizeToolCall } from '../src/tools/authz.ts'
 
 const home = mkdtempSync(join(tmpdir(), 'dsh-t4-e2e-'))
 const cwd = join(home, 'workspace')
@@ -41,9 +42,11 @@ try {
   assert.ok(entry)
 
   let sequence = 0
+  let actorSerial = 0
   const actorPrompts = []
   const judgePackets = []
   const compacts = []
+  const drained = []
   const send = (sessionId, text) => {
     const messageId = `message-${++sequence}`
     actorPrompts.push({ sessionId, messageId, text })
@@ -51,10 +54,11 @@ try {
   }
   const engine = new WorkflowEngine({
     async steerManager(_run, text) { return send('manager', text) },
-    async sendRoleActor(_run, _role, text) { return send('worker', text) },
+    async sendRoleActor(run, role, text) { return send(run.roleActors[role], text) },
     managerSessionSeq() { return 0 },
   }, {
-    async ensureRoleActor(_run, _role, text) { return { ...send('worker', text), childId: 'worker' } },
+    // 缺省 `reuse: node`：每次 fresh spawn 都是新 child，回边重入必须可区分。
+    async ensureRoleActor(_run, _role, text) { const childId = `worker-${++actorSerial}`; return { ...send(childId, text), childId } },
     async startJudge(_run, input) {
       judgePackets.push(structuredClone(input))
       return { judgeSessionId: input.judgeSessionId, messageId: `judge-message-${++sequence}` }
@@ -65,6 +69,7 @@ try {
     },
     async safeToInspect() { return true },
     async retireJudge() {}, async drainJudge() {}, async judgeSessionExists() { return true },
+    async drainRoleActor(run, role) { drained.push(run.roleActors[role]) },
     async compactRoleActor(_run, role) { compacts.push(role); return { ok: true, detail: 'controlled no-op' } },
   }, { async run() { throw new Error('no Program in this smoke') } }, makeStateHost(store))
   engine.cwdResolver = async () => cwd
@@ -103,20 +108,30 @@ try {
   assert.equal(current.execution.input, 'wrote smoke ok')
 
   const failedHandoff = 'rework: append the exact line worker ok'
-  assert.equal((await engine.handleClaim(ws, { outcome: 'failed', handoff: failedHandoff }, caller(current.execution.dispatch))).ok, true)
+  const releasedWorkerCaller = caller(current.execution.dispatch)
+  assert.equal((await engine.handleClaim(ws, { outcome: 'failed', handoff: failedHandoff }, releasedWorkerCaller)).ok, true)
   const failureAccepted = await settleActorAndJudge('ACCEPT', 'honest failure; worker line is absent')
   await engine.handleTurnEnded(ws, failureAccepted)
   current = await row()
   assert.equal(current.execution.nodeId, 'worker-echo')
   assert.equal(current.execution.input, failedHandoff)
-  assert.deepEqual(compacts, ['worker'])
+  assert.deepEqual(drained, ['worker-1'], '离开节点先 drain 被释放的 Role 会话')
+  assert.deepEqual(compacts, [], 'reuse: node 全程不做节点边界 compact')
+  assert.equal(current.run.roleActors.worker, 'worker-2', '回边重入同一节点得到全新 child 会话')
+  assert.equal(current.execution.dispatch.sessionId, 'worker-2')
+  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'stale worker-1 claim' }, releasedWorkerCaller)).ok, false,
+    '旧会话随映射删除失权：worker-1 的迟到 claim 不被接受')
+  assert.equal(authorizeToolCall({
+    run: current.run, sessionId: 'worker-1', knownRoleOfSession: 'worker', isJudgeSession: false, toolName: 'node_claim',
+  }).allow, false, '映射已删除：worker-1 不再持有 workflow 工具授权（authz 精确比对 roleActors）')
 
   writeFileSync(join(cwd, 'result.txt'), 'smoke ok\nwrong worker\n')
   assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'appended wrong worker line' }, caller(current.execution.dispatch))).ok, true)
   await settleActorAndJudge('REJECT', 'existing criteria requires the exact worker ok line')
   current = await row()
   assert.match(actorPrompts.at(-1).text, /appended wrong worker line/)
-  assert.deepEqual(compacts, ['worker'], 'same-execution correction must not compact')
+  assert.deepEqual(compacts, [], 'same-execution correction must not compact')
+  assert.deepEqual(drained, ['worker-1'], '节点内修正不离开节点，会话不释放')
 
   writeFileSync(join(cwd, 'result.txt'), 'smoke ok\nworker ok\n')
   assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'final verified result.txt' }, caller(current.execution.dispatch))).ok, true)
@@ -142,7 +157,7 @@ try {
   const trace = readFileSync(join(logDir, logs[0]), 'utf8')
   for (const marker of [' START ', ' CLAIM ', ' JUDGE ', ' result=REJECT ', ' result=ACCEPT ', ' ROUTE ']) assert.match(trace, new RegExp(marker))
 
-  console.log('E2E SMOKE PASS: REJECT correction + failed onFail self-loop + Role reuse/compact + final ACCEPT + SQLite reopen')
+  console.log('E2E SMOKE PASS: REJECT correction + failed onFail self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen')
 } finally {
   store.close()
   rmSync(home, { recursive: true, force: true })
