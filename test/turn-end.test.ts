@@ -172,3 +172,47 @@ test('#29 无失败事实时（正常结束）BLOCK 原因保持原文，成功�
     assert.doesNotMatch(h.messages.at(-1)!, /turn-end reason=/)
   } finally { h.close() }
 })
+
+// ---- #24 O1：判定侧（Judge）无产出同样透传底层失败分类 ----
+
+/** 把该节点的手工行推到「已 claim、Judge 已派发待判定」状态。 */
+async function driveToJudge(h: ReturnType<typeof harness>) {
+  const row = (await h.store.get('ws'))!
+  const e = row.execution
+  e.phase = 'checking'
+  e.claim = { id: 'claim-1', dispatchId: e.dispatch!.id, outcome: 'completed', handoff: 'Actor handoff' }
+  e.judge = { id: 'judge-1', sessionId: 'judge', messageId: 'judge-message-1', settled: false, claimId: 'claim-1', inputVersion: e.inputVersion }
+  await h.store.updateRow('ws', row.run, row.stateVersion, [
+    { execution: e, expectedRevision: row.execution.revision, events: ['claim'] },
+  ])
+  return { sessionId: 'judge', turnUserMessageIds: new Set(['judge-message-1']) }
+}
+
+test('#24 O1 判定回合无产出时，BLOCK 原因携带 Judge 侧额度耗尽分类且 Manager 通知同文', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const judge = await driveToJudge(h)
+    const { events, end } = ending({ kind: 'error', error: { message: 'insufficient balance', code: 'QUOTA', status: 402 } })
+    const failure = turnEndFailure(events, end)!
+    await h.engine.handleTurnEnded('ws', judge, failure)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.equal(blocked.execution.blockReason, `judge turn ended without judge_claim | ${failure}`)
+    assert.match(blocked.execution.blockReason, /code=QUOTA status=402/)
+    assert.equal(h.messages.at(-1), `Workflow BLOCK: ${blocked.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`)
+  } finally { h.close() }
+})
+
+test('#24 O1 判定回合正常结束（无失败事实）时，Judge BLOCK 原因保持原文', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const judge = await driveToJudge(h)
+    const { events, end } = ending({ kind: 'completed' })
+    await h.engine.handleTurnEnded('ws', judge, turnEndFailure(events, end))
+    const blocked = await h.row()
+    assert.equal(blocked.execution.blockReason, 'judge turn ended without judge_claim')
+    assert.doesNotMatch(h.messages.at(-1)!, /turn-end reason=/)
+  } finally { h.close() }
+})
