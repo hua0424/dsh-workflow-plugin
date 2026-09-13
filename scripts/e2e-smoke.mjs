@@ -10,6 +10,7 @@ import { StateStore, workspaceKeyOf } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { loadCatalogEntry } from '../src/catalog/loader.ts'
+import { authorizeToolCall } from '../src/tools/authz.ts'
 
 const home = mkdtempSync(join(tmpdir(), 'dsh-t4-e2e-'))
 const cwd = join(home, 'workspace')
@@ -107,7 +108,8 @@ try {
   assert.equal(current.execution.input, 'wrote smoke ok')
 
   const failedHandoff = 'rework: append the exact line worker ok'
-  assert.equal((await engine.handleClaim(ws, { outcome: 'failed', handoff: failedHandoff }, caller(current.execution.dispatch))).ok, true)
+  const releasedWorkerCaller = caller(current.execution.dispatch)
+  assert.equal((await engine.handleClaim(ws, { outcome: 'failed', handoff: failedHandoff }, releasedWorkerCaller)).ok, true)
   const failureAccepted = await settleActorAndJudge('ACCEPT', 'honest failure; worker line is absent')
   await engine.handleTurnEnded(ws, failureAccepted)
   current = await row()
@@ -117,6 +119,11 @@ try {
   assert.deepEqual(compacts, [], 'reuse: node 全程不做节点边界 compact')
   assert.equal(current.run.roleActors.worker, 'worker-2', '回边重入同一节点得到全新 child 会话')
   assert.equal(current.execution.dispatch.sessionId, 'worker-2')
+  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'stale worker-1 claim' }, releasedWorkerCaller)).ok, false,
+    '旧会话随映射删除失权：worker-1 的迟到 claim 不被接受')
+  assert.equal(authorizeToolCall({
+    run: current.run, sessionId: 'worker-1', knownRoleOfSession: 'worker', isJudgeSession: false, toolName: 'node_claim',
+  }).allow, false, '映射已删除：worker-1 不再持有 workflow 工具授权（authz 精确比对 roleActors）')
 
   writeFileSync(join(cwd, 'result.txt'), 'smoke ok\nwrong worker\n')
   assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'appended wrong worker line' }, caller(current.execution.dispatch))).ok, true)
