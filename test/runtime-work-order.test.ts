@@ -53,6 +53,9 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   let roleDrainFailure: Error | undefined
   let roleSerial = 0
   let safe = true
+  // #54: explicit probe override for the waiting regression.
+  let sessionSafety: 'waiting' | undefined
+  let lastJudgeSession = ''
   const unsafeSessions = new Set<string>()
   let compactOutcome: { ok: boolean; detail?: string } = { ok: true }
   let compactGate: Promise<void> | undefined
@@ -90,8 +93,8 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   }, {
     // 每次 fresh spawn 都是新 child：节点级复用（reuse: node）的「再次进入节点」必须可区分。
     async ensureRoleActor(_run, _role, text) { const childId = roleSerial++ === 0 ? 'worker-session' : `worker-session-${roleSerial}`; return { ...send(childId, text), childId } },
-    async startJudge(_run, input) { judges.push(input); return { ...send(input.judgeSessionId, 'Judge'), judgeSessionId: input.judgeSessionId } },
-    async safeToInspect(sessionId) { lifecycle.push(`safe:${sessionId}`); if (safetyGate && gatedSession === sessionId) await safetyGate; return safe && !unsafeSessions.has(sessionId) },
+    async startJudge(_run, input) { judges.push(input); lastJudgeSession = input.judgeSessionId; return { ...send(input.judgeSessionId, 'Judge'), judgeSessionId: input.judgeSessionId } },
+    async safeToInspect(sessionId) { lifecycle.push(`safe:${sessionId}`); if (safetyGate && gatedSession === sessionId) await safetyGate; if (sessionSafety) return sessionSafety; return safe && !unsafeSessions.has(sessionId) ? 'safe' : 'unsafe' },
     async retireJudge() {}, async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); drainEntered?.(); if (drainGate) await drainGate; if (drainFailure) throw drainFailure },
     async drainRoleActor(run, role) { roleDrains.push(run.roleActors[role]!); lifecycle.push(`drain:${role}`); if (roleDrainFailure) throw roleDrainFailure },
     async compactRoleActor(_run, role) { compacts.push(role); lifecycle.push(`compact:${role}`); compactEntered?.(); if (compactGate) await compactGate; return compactOutcome },
@@ -103,7 +106,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   const caller = (dispatch: { sessionId?: string; messageId?: string }) => ({ sessionId: dispatch.sessionId!, turnUserMessageIds: new Set([dispatch.messageId!]) })
   return {
     home, store, engine, messages, judges, followups, drains, roleDrains, compacts, lifecycle, puts, caller,
-    setSafe(value: boolean) { safe = value },
+    setSafe(value: boolean | 'waiting') { if (value === 'waiting') { sessionSafety = 'waiting'; return } sessionSafety = undefined; safe = value === true; if (value) unsafeSessions.clear(); else for (const id of ['manager', 'worker-session', lastJudgeSession]) unsafeSessions.add(id) },
     setSessionUnsafe(sessionId: string, value: boolean) { if (value) unsafeSessions.add(sessionId); else unsafeSessions.delete(sessionId) },
     setCompactOutcome(value: { ok: boolean; detail?: string }) { compactOutcome = value },
     setCompactGate(gate: Promise<void> | undefined, onEntered?: () => void) { compactGate = gate; compactEntered = onEntered },
@@ -1241,7 +1244,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
   const roleDrains: string[] = []
   let drainFailure: Error | undefined
   let judgeFollowupFailure: Error | undefined
-  let safe = true
+  let safety: 'safe' | 'waiting' | 'unsafe' = 'safe'
   let safetyGate: Promise<void> | undefined
   let activity: 'active' | 'idle' | 'unknown' = 'unknown'
   let roleAvailability: import('../src/engine/engine.ts').SessionAvailability = 'available'
@@ -1283,7 +1286,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
       async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); if (drainFailure) throw drainFailure },
       async drainRoleActor(run, role) { roleDrains.push(run.roleActors[role]!) },
       async compactRoleActor() { return { ok: true } },
-      async safeToInspect() { if (safetyGate) await safetyGate; return safe },
+      async safeToInspect() { if (safetyGate) await safetyGate; return safety },
     }, { async run() { throw new Error('T7') } }, makeStateHost(store))
     next.cwdResolver = async () => home
     next.actorActivity = async () => activity
@@ -1295,7 +1298,7 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
     home, messages, judgeStarts, judgeFollowups, ensuredActors, drains, roleDrains, caller,
     get engine() { return engine },
     get store() { return store },
-    setSafe(value: boolean) { safe = value },
+    setSafe(value: boolean | 'waiting') { safety = value === true ? 'safe' : value === false ? 'unsafe' : value },
     setSafetyGate(gate: Promise<void> | undefined) { safetyGate = gate },
     setActivity(value: 'active' | 'idle' | 'unknown') { activity = value },
     setRoleAvailability(value: import('../src/engine/engine.ts').SessionAvailability) { roleAvailability = value },
@@ -1309,6 +1312,49 @@ function recoveryHarness(config: import('../src/types.ts').WorkflowConfig = CONF
     close() { store.close(); rmSync(home, { recursive: true, force: true }) },
   }
 }
+
+// #54：并行子代理（code-reviewer 两轴）等待期的空回合是预期形态。闭合探针报
+// `waiting` 时必须什么都不做：既不结算 dispatch、也不 BLOCK 解绑 claim，
+// 子代理完成后同一 nodeToken 下 node_claim 照常可提交。
+test('#54 actor turn end while a running subagent is awaited keeps the claim binding instead of BLOCKing', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    const before = await enterRecoveryWorker(h)
+    const actor = h.caller(before.execution.dispatch!)
+    h.setSafe('waiting')
+    await h.engine.handleTurnEnded('ws', actor)
+
+    const waiting = await h.row()
+    assert.equal(waiting.run.status, 'running', '等待并行子代理不是异常闭合')
+    assert.equal(waiting.execution.blockReason, null)
+    assert.equal(waiting.execution.phase, 'working')
+    assert.equal(waiting.execution.dispatch!.settled, false)
+    assert.equal(waiting.execution.nodeToken, before.execution.nodeToken)
+    assert.equal(waiting.stateVersion, before.stateVersion, '等待不写状态')
+
+    h.setSafe(true)
+    const late = await h.engine.handleClaim('ws', { outcome: 'completed', handoff: '子代理结果已合并' }, actor)
+    assert.equal(late.ok, true, 'claim 绑定未被解除，同一 Actor 仍可提交')
+    await h.engine.handleTurnEnded('ws', actor)
+    const checking = await h.row()
+    assert.equal(checking.execution.phase, 'checking')
+    assert.equal((await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'ACCEPT', '只读核验通过', h.caller(checking.execution.judge!))).ok, true)
+    assert.equal((await h.row()).run.status, 'completed')
+  } finally { h.close() }
+})
+
+// 对照：收口未知（非"仍在跑的已知后代"）仍必须 fail-closed。
+test('#54 unsafe closure still BLOCKs the same turn end', async () => {
+  const h = recoveryHarness(configWithWorker())
+  try {
+    const before = await enterRecoveryWorker(h)
+    h.setSafe(false)
+    await h.engine.handleTurnEnded('ws', h.caller(before.execution.dispatch!))
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.match(blocked.execution.blockReason!, /not safely closed/)
+  } finally { h.close() }
+})
 
 async function acceptRecoveryCurrent(h: ReturnType<typeof recoveryHarness>, handoff: string) {
   const actor = h.caller((await h.row()).execution.dispatch!)
@@ -1790,7 +1836,7 @@ test('restart reconciliation contains one workspace CAS failure and continues th
     async startJudge(_run: never, input: import('../src/engine/engine.ts').JudgeSpawnInput) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge' } },
     async followupJudge() { return { messageId: 'followup' } },
     async judgeSessionAvailability() { return 'missing' as const }, async roleSessionAvailability() { return 'missing' as const },
-    async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
+    async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return 'safe' },
   }
   const targets = {
     async steerManager() { return { messageId: crypto.randomUUID() } },

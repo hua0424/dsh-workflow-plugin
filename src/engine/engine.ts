@@ -25,6 +25,11 @@ export interface JudgeSpawnInput {
   recovery?: boolean
 }
 export type SessionAvailability = 'available' | 'missing' | 'unknown'
+/**
+ * 闭合探针三态（#54）：`safe` 可安全结算；`waiting` 只表示"仍在跑的已知后代"这一
+ * 唯一阻碍（等待中的正常空回合）；`unsafe` 收口未知，必须 fail-closed。
+ */
+export type SafeInspection = 'safe' | 'waiting' | 'unsafe'
 export interface SubagentHost {
   ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<{ childId: string; messageId: string }>
   startJudge(run: RunState, input: JudgeSpawnInput): Promise<{ judgeSessionId: string; messageId: string }>
@@ -36,8 +41,8 @@ export interface SubagentHost {
   /** 节点级复用（`reuse: node`）离开节点时释放会话：drain 内存驻留。失败的降级由引擎决定。 */
   drainRoleActor(run: RunState, roleKey: string): Promise<void>
   compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
-  /** 必须覆盖普通工具 tail、已知后台写任务及未收口后代；unknown=false。 */
-  safeToInspect(sessionId: string): Promise<boolean>
+  /** 必须覆盖普通工具 tail、已知后台写任务及未收口后代；unknown 一律 `unsafe`。 */
+  safeToInspect(sessionId: string): Promise<SafeInspection>
 }
 export interface ProgramHost {
   run(run: RunState, programId: string, parameters: Record<string, unknown>, cwd: string): Promise<ProgramResult>
@@ -204,11 +209,11 @@ export class WorkflowEngine {
         if (predecessor?.judge && !predecessor.judge.settled) knownSessions.add(predecessor.judge.sessionId)
       }
       for (const sessionId of knownSessions) {
-        let safe: boolean
+        let safe: 'safe' | 'unsafe'
         try { safe = await this.whenIdleProbe(sessionId) }
         catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
         if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run safety inspection')
-        if (!safe) {
+        if (safe !== 'safe') {
           const activity = await this.actorActivity(sessionId)
           if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run activity inspection')
           if (activity !== 'unknown') return rejected(`terminated Run session ${sessionId} is not safely closed`)
@@ -284,7 +289,7 @@ export class WorkflowEngine {
             const sessionId = run.roleActors[role]
             const safe = await this.whenIdleProbe(sessionId)
             if (!await this.stillCurrent(ws, e, arrangedVersion)) return
-            if (!safe) {
+            if (safe !== 'safe') {
               const activity = await this.actorActivity(sessionId)
               if (!await this.stillCurrent(ws, e, arrangedVersion)) return
               // 冷会话（activity==='unknown'：无存活进程=无未收口执行）与 resume
@@ -362,16 +367,19 @@ export class WorkflowEngine {
   /**
    * whenIdle 挂起是派发/恢复路径的已知 seam（#21 F1）：safeToInspect 内部的
    * `agent.whenIdle()` 没有任何 signal 可用，只能放弃等待并让调用方降级。
+   * 等待状态（`waiting`）在恢复/派发路径上同样是"不干净"，按 fail-closed 折叠。
    */
-  private whenIdleProbe(sessionId: string): Promise<boolean> {
-    return withTimeout(this.subagents.safeToInspect(sessionId), DISPATCH_TIMEOUTS.whenIdle, 'whenIdle')
+  private async whenIdleProbe(sessionId: string): Promise<'safe' | 'unsafe'> {
+    const result = await withTimeout(this.subagents.safeToInspect(sessionId), DISPATCH_TIMEOUTS.whenIdle, 'whenIdle')
+    return result === 'safe' ? 'safe' : 'unsafe'
   }
   /**
    * 探针超时=技术故障，不是"不安全"：降级为携带阶段名的 BLOCK 并返回 undefined；
    * 其它错误保持原样抛出。调用方看到 undefined 即已 BLOCK，不得继续推进。
+   * 只有 turn/end 结算保留 `waiting` 三态；其余路径用 whenIdleProbe 折叠为二态。
    */
-  private async safetyProbe(ws: string, row: RuntimeRow, sessionId: string): Promise<boolean | undefined> {
-    try { return await this.whenIdleProbe(sessionId) }
+  private async safetyProbe(ws: string, row: RuntimeRow, sessionId: string): Promise<SafeInspection | undefined> {
+    try { return await withTimeout(this.subagents.safeToInspect(sessionId), DISPATCH_TIMEOUTS.whenIdle, 'whenIdle') }
     catch (error) {
       if (!(error instanceof DispatchTimeoutError)) throw error
       await this.blockRow(ws, row, error.message)
@@ -602,7 +610,9 @@ export class WorkflowEngine {
       if (!predecessor || !matches(predecessor.judge, caller) || predecessor.judge!.settled) return
       const settledSafe = await this.safetyProbe(ws, row, caller.sessionId)
       if (settledSafe === undefined) return
-      if (!settledSafe) { await this.blockRow(ws, row, 'Judge/known tools not safely closed'); return }
+      // #54：Judge 结算路径没有"等待并行子代理"语义——waiting 在此仍是收口未知，
+      // 与 unsafe 同样 BLOCK（本 PR 未改变该行为，仅保留折叠）。
+      if (settledSafe !== 'safe') { await this.blockRow(ws, row, 'Judge/known tools not safely closed'); return }
       const fresh = await this.state.get(ws)
       if (!fresh || fresh.version !== row.version || fresh.execution.executionId !== e.executionId) return
       predecessor.judge!.settled = true
@@ -618,7 +628,14 @@ export class WorkflowEngine {
     const fresh = await this.stillCurrent(ws, e, row.version)
     if (!fresh) return
     e = fresh.execution
-    if (!safe) { await this.blockRow(ws, fresh, 'Actor/Judge or known tools not safely closed'); return }
+    // #54：该会话的 turn 以空回合结束、但仍有 running 子代理 → 它是在等并行子代理，
+    // 不是异常闭合。不结算、不 BLOCK：claim 绑定与 nodeToken 保持有效，等子代理
+    // 完成后的下一回合照常提交 node_claim（绑定不再被解除，#54 的"claim 被拒后同
+    // turn 自恢复"兜底因此不需要）。
+    // ponytail: 只覆盖"期望中的等待"；子代理永不 settle 时 Run 留在 working，
+    // 由 Manager 经 workflow_status + node_block/node_resume 兜底，不做等待超时。
+    if (safe === 'waiting') return
+    if (safe === 'unsafe') { await this.blockRow(ws, fresh, 'Actor/Judge or known tools not safely closed'); return }
     if (actor && e.phase === 'checking') {
       e.dispatch!.settled = true
       await this.state.put(ws, fresh.run, fresh.version, [change(e)])
@@ -692,7 +709,7 @@ export class WorkflowEngine {
       const sessionId = run.roleActors[role]
       const safe = await this.whenIdleProbe(sessionId)
       if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role safety inspection')
-      if (!safe) {
+      if (safe !== 'safe') {
         const activity = await this.actorActivity(sessionId)
         if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role activity inspection')
         if (activity !== 'unknown') return rejected('previous Role execution is not safely closed')
@@ -728,7 +745,7 @@ export class WorkflowEngine {
         if (availability !== 'missing') {
           const safe = await this.whenIdleProbe(judgeToContinue.sessionId)
           if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge safety inspection')
-          if (!safe) {
+          if (safe !== 'safe') {
             const activity = await this.actorActivity(judgeToContinue.sessionId)
             if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge activity inspection')
             if (!restartRecovery || activity !== 'unknown') return rejected('previous Judge turn is not safely closed')
@@ -956,7 +973,7 @@ export class WorkflowEngine {
     if (mapped) {
       const safe = await this.whenIdleProbe(mapped)
       if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role safety inspection')
-      if (!safe) {
+      if (safe !== 'safe') {
         const activity = await this.actorActivity(mapped)
         if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role activity inspection')
         if (activity !== 'unknown') return rejected('active actor cannot be replaced')

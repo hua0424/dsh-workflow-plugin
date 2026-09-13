@@ -51,7 +51,7 @@ async function fixture(roleReview = false) {
     async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge-message-1' } },
     async followupJudge() { return { messageId: `judge-followup-${++message}` } }, async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
     async retireJudge() {}, async drainJudge() {}, async drainRoleActor(run, role) { roleDrains.push(run.roleActors[role]!) }, async compactRoleActor() { return { ok: true } },
-    async safeToInspect() { return true },
+    async safeToInspect() { return 'safe' },
   }, { async run() { throw new Error('unexpected Program') } }, stateHost)
   engine.cwdResolver = async () => home
   const definition = structuredClone(config)
