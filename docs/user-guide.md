@@ -55,7 +55,9 @@ worker Role 可选 `reuse: node | continuable`，决定该 Role 的会话在节�
 - `continuable`：**旧行为**——Role 的 continuable 会话在整个 Run 内复用，每次派发
   新节点前先做一次节点边界 compact（cold materialize → compactNow → dispose）再
   派发，保留跨节点历史但要付代价：派发前时延，且 compact 失败是 fail-closed（Run
-  进入 BLOCK，等 Manager `node_resume` 重试，风险面见 issue #55）。
+  进入 BLOCK，等 Manager `node_resume` 重试，风险面见 issue #55）。**选型**：只有
+  确实需要 Role 跨节点带着历史继续工作时才选 `continuable`；同一节点内的复用与
+  REJECT 返工 `node` 已覆盖，缺省 `node` 即可。
 - **`manager` 不适用 `reuse`**：`manager` 是保留 roleKey（禁止出现在 `roles` 中），
   manager 节点始终由当前主会话承担；`judgeRole` 也不接受 `reuse`——Judge 每个节点
   都是全新会话。
