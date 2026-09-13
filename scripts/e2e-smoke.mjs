@@ -9,7 +9,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, rmSyn
 import { StateStore, workspaceKeyOf } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
-import { loadCatalogEntry } from '../src/catalog/loader.ts'
+import { loadCatalogEntry, scanCatalog } from '../src/catalog/loader.ts'
 import { authorizeToolCall } from '../src/tools/authz.ts'
 
 const home = mkdtempSync(join(tmpdir(), 'dsh-t4-e2e-'))
@@ -34,12 +34,35 @@ workflow:
       onFail: worker-echo
 `)
 
+// #59: a catalog whose persona hand-writes the submission protocol must stay
+// loadable/startable (warning diagnostic only).
+writeFileSync(join(home, 'workflows', 'warn-persona.yaml'), `schemaVersion: agent-workflow/v2
+roles:
+  worker: { persona: Report only through node_claim. }
+judgeRole: { persona: Read-only verification. }
+workflow:
+  startNode: hello
+  nodes:
+    hello:
+      execution: { type: actor-task, role: manager, instruction: Say ok. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: ok was said. } }
+      onPass: END
+`)
+
 let store = new StateStore(home)
 try {
   const ws = await workspaceKeyOf(cwd)
   assert.ok(ws)
   const entry = await loadCatalogEntry(home, 'smoke-test')
   assert.ok(entry)
+
+  // #59: warned catalog is an ordinary entry; only its diagnostic severity differs.
+  const warned = await loadCatalogEntry(home, 'warn-persona')
+  assert.ok(warned, '#59: persona 协议关键词只警告、不阻止加载')
+  assert.equal(warned.config.roles.worker.persona, 'Report only through node_claim.')
+  const catalog = await scanCatalog(home)
+  assert.deepEqual(catalog.entries.map(e => e.workflowId), ['smoke-test', 'warn-persona'])
+  assert.deepEqual(catalog.diagnostics.map(d => [d.workflowId, d.severity, /node_claim/.test(d.reason)]), [['warn-persona', 'warning', true]])
 
   let sequence = 0
   let actorSerial = 0
@@ -157,7 +180,7 @@ try {
   const trace = readFileSync(join(logDir, logs[0]), 'utf8')
   for (const marker of [' START ', ' CLAIM ', ' JUDGE ', ' result=REJECT ', ' result=ACCEPT ', ' ROUTE ']) assert.match(trace, new RegExp(marker))
 
-  console.log('E2E SMOKE PASS: REJECT correction + failed onFail self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen')
+  console.log('E2E SMOKE PASS: REJECT correction + failed onFail self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen + #59 warned-persona catalog loadable')
 } finally {
   store.close()
   rmSync(home, { recursive: true, force: true })

@@ -69,8 +69,10 @@ worker Role 可选 `reuse: node | continuable`，决定该 Role 的会话在节�
 提交协议只有引擎一个来源：每次派发末尾的 `[提交要求]` 段（含
 `node_claim` 最后动作条款、纯文字不提交→BLOCK、`send_message` 覆盖条款、
 REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona` 里
-手写提交纪律句——catalog 校验会直接报 problem（关键词 `node_claim` /
-`judge_claim` / `send_message` 任一出现即拒收该文件）。
+手写提交纪律句——catalog 校验会对关键词 `node_claim` / `judge_claim` /
+`send_message` 报**非阻塞警告**（#59）：文件照常进入 catalog、照常可
+`/dsh-flow start`，`/dsh-flow list` 中以 `[warn]` 单独一档提示（角色、
+关键词、迁移指引），迁移完警告即消失。
 
 旧 `~/.dsh/workflows/*.yaml` 按三步迁移（插件不代改你的用户文件）：
 
@@ -85,12 +87,13 @@ REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona`
    的纪律句。
 
 改完可用 `node scripts/validate-catalog.mjs <你的yaml> <workflowId>` 本地
-校验（OK 即通过；problem 会指明 persona 关键词位置）。
+校验（OK 即通过；`WARN` 行会指明 persona 关键词位置与迁移指引，不影响
+文件可用）。
 
 ## 5. 命令：`/dsh-flow`
 
 ```
-/dsh-flow list                        列出所有合法 workflow（含 invalid 诊断）
+/dsh-flow list                        列出所有合法 workflow（含 [invalid]/[warn] 诊断）
 /dsh-flow start <workflow-id> [文本]  启动 workflow（附加文本交给 Manager）
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）

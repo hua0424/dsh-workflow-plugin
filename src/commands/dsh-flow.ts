@@ -9,7 +9,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 export interface CommandHost {
   /** Workspace key of the invoking session's cwd. */
   currentWorkspaceKey(agent: Agent): Promise<string | undefined>
-  list(): Promise<{ entries: Array<{ workflowId: string }>; diagnostics: Array<{ workflowId: string | null; path: string; reason: string }>; ok?: boolean; reason?: string }>
+  list(): Promise<{ entries: Array<{ workflowId: string }>; diagnostics: Array<{ workflowId: string | null; path: string; reason: string; severity: 'error' | 'warning' }>; ok?: boolean; reason?: string }>
   /** Start a workflow run on behalf of the given agent session. */
   start(agent: Agent, workspaceKey: string, workflowId: string, extraText: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
@@ -53,7 +53,9 @@ export function makeDshFlowCommand(host: CommandHost): CommandDefinition {
           const lines: string[] = []
           for (const entry of result.entries) lines.push(`- ${entry.workflowId}`)
           for (const d of result.diagnostics) {
-            lines.push(`- [invalid] ${d.workflowId ?? '?'} — ${d.reason}`)
+            // #59: warnings stay startable — they get their own tag, never [invalid].
+            const tag = d.severity === 'warning' ? '[warn]' : '[invalid]'
+            lines.push(`- ${tag} ${d.workflowId ?? '?'} — ${d.reason}`)
           }
           return { kind: 'success', text: lines.join('\n') }
         }
