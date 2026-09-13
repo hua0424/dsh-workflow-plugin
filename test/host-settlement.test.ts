@@ -43,7 +43,7 @@ test('safe inspection rejects a different live Activation for the observed Sessi
   const host = makeSafetyHost(ctx, oldActor)
   host.observeTurnEnd('actor')
   current = replacement
-  assert.equal(await host.safeToInspect('actor'), false)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe')
 })
 
 test('safe inspection rejects a descendant that appears while idle checks await', async () => {
@@ -59,7 +59,7 @@ test('safe inspection rejects a descendant that appears while idle checks await'
     subagents: { listDescendants: async () => [] },
   } as unknown as Context
   const host = makeSafetyHost(ctx, actor)
-  assert.equal(await host.safeToInspect('actor'), false)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe')
 })
 
 test('safe inspection requires observable idle descendants, empty inboxes, and terminal non-orphan jobs', async () => {
@@ -76,24 +76,42 @@ test('safe inspection requires observable idle descendants, empty inboxes, and t
   const host = makeSafetyHost(ctx, actor)
 
   descendants = [{ kind: 'diagnostic', id: 'child', reason: 'corrupt', parentId: 'actor', depth: 1 }]
-  assert.equal(await host.safeToInspect('actor'), false)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe')
   descendants = [{ kind: 'child', id: 'child', activity: 'inactive', hasChildren: false, mode: 'continuable', label: 'child', parentId: 'actor', depth: 1 }]
-  assert.equal(await host.safeToInspect('actor'), true, 'durably inactive descendant has no live Activation')
+  assert.equal(await host.safeToInspect('actor'), 'safe', 'durably inactive descendant has no live Activation')
   descendants = [{ kind: 'child', id: 'child', activity: 'running', hasChildren: false, mode: 'continuable', label: 'child', parentId: 'actor', depth: 1 }]
-  assert.equal(await host.safeToInspect('actor'), false, 'running descriptor without an Agent is unknown')
+  assert.equal(await host.safeToInspect('actor'), 'unsafe', 'running descriptor without an Agent is unknown')
   live = [actor, { ...child, status: 'running' } as unknown as Agent]
-  assert.equal(await host.safeToInspect('actor'), false)
+  assert.equal(await host.safeToInspect('actor'), 'waiting', '#54 只有"仍在跑的已知后代"这一唯一阻碍 = 等待，不是收口未知')
   live = [actor, { ...child, inbox: { nextTurn: [{}], nextStep: [] } } as unknown as Agent]
-  assert.equal(await host.safeToInspect('actor'), false)
+  assert.equal(await host.safeToInspect('actor'), 'waiting')
   live = [actor, child]
   jobs = [{ status: 'running' }]
-  assert.equal(await host.safeToInspect('actor'), true, 'unowned jobs do not belong to the Role tree')
+  assert.equal(await host.safeToInspect('actor'), 'safe', 'unowned jobs do not belong to the Role tree')
   jobs = [{ status: 'stopping', ownerSession: 'actor' }]
-  assert.equal(await host.safeToInspect('actor'), false)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe')
   jobs = [{ status: 'completed', ownerSession: 'actor' }]
-  assert.equal(await host.safeToInspect('actor'), true)
+  assert.equal(await host.safeToInspect('actor'), 'safe')
   jobs = [{ status: 'failed', ownerSession: 'actor', detail: 'work may be orphaned after teardown' }]
-  assert.equal(await host.safeToInspect('actor'), false)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe')
+})
+
+test('safe inspection keeps failing closed when a non-waitable member of the closure is busy', async () => {
+  // #54 r001-F1：只有 `kind: 'child'` 的 durable 后代才可算"等待并行子代理"；
+  // 其余 busy 成员（会话自身、tree/observed 补齐的 live 后代）保持 fail-closed。
+  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  const neverInDescendants = { id: 'absent', status: 'running', session: { id: 'absent', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  let live: Agent[] = [actor, neverInDescendants]
+  const ctx = {
+    jobs: { list: () => [], onJobDone: () => () => {} }, effect: () => {},
+    agents: { get: (id: unknown) => live.find(agent => agent.id === id), list: () => live },
+    subagents: { listDescendants: async () => [] },
+  } as unknown as Context
+  const host = makeSafetyHost(ctx, actor)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe',
+    'busy live descendant outside the durable descriptor list is not a waitable parallel subagent')
+  live = [{ ...actor, status: 'running' } as unknown as Agent, neverInDescendants]
+  assert.equal(await host.safeToInspect('actor'), 'unsafe', 'the inspected Session itself is never waitable')
 })
 
 test('orphan evidence follows its exact nested Session across descriptor removal without tainting a new Session', async () => {
@@ -116,12 +134,12 @@ test('orphan evidence follows its exact nested Session across descriptor removal
     subagents: { listDescendants: async (id: unknown) => id === 'actor' ? descendants : [] },
   } as unknown as Context
   const host = makeSafetyHost(ctx, actor)
-  assert.equal(await host.safeToInspect('actor'), true)
+  assert.equal(await host.safeToInspect('actor'), 'safe')
   branchLive = false
   done?.({ detail: 'work may be orphaned after forced cleanup' }, leaf)
   descendants = []
-  assert.equal(await host.safeToInspect('actor'), false, 'known ancestry survives an unavailable middle Agent and descriptor removal')
-  assert.equal(await host.safeToInspect('fresh'), true)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe', 'known ancestry survives an unavailable middle Agent and descriptor removal')
+  assert.equal(await host.safeToInspect('fresh'), 'safe')
 })
 
 test('safe inspection waits exact Agent, rejects job tail and retains cold/orphan evidence', async () => {
@@ -147,17 +165,17 @@ test('safe inspection waits exact Agent, rejects job tail and retains cold/orpha
   assert.equal(settled, false, 'public idle does not prove maintenance/driver quiescence')
   jobs = [{ status: 'stopping', ownerSession: 'actor' }]
   idle.resolve()
-  assert.equal(await checking, false)
+  assert.equal(await checking, 'unsafe')
   jobs = []
   live = false
-  assert.equal(await host.safeToInspect('actor'), true, 'recorded exact Agent survives cold release')
+  assert.equal(await host.safeToInspect('actor'), 'safe', 'recorded exact Agent survives cold release')
   done?.({ detail: 'cancel threw during teardown; work may be orphaned: boom' }, actor)
-  assert.equal(await host.safeToInspect('actor'), false, 'removing job snapshots cannot erase orphan evidence')
+  assert.equal(await host.safeToInspect('actor'), 'unsafe', 'removing job snapshots cannot erase orphan evidence')
   dispose?.()
   assert.equal(unsubscribed, true)
   assert.equal(done, undefined)
   live = true
-  assert.equal(await host.safeToInspect('actor'), true, 'disposal clears old orphan evidence')
+  assert.equal(await host.safeToInspect('actor'), 'safe', 'disposal clears old orphan evidence')
   live = false
-  assert.equal(await host.safeToInspect('actor'), false, 'disposal releases retained Agent references')
+  assert.equal(await host.safeToInspect('actor'), 'unsafe', 'disposal releases retained Agent references')
 })

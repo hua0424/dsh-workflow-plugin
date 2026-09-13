@@ -79,7 +79,7 @@ function resetHarness() {
     async drainJudge() { throw new Error('Reset must not drain external work') },
     async drainRoleActor() { throw new Error('Reset must not drain external work') },
     async compactRoleActor() { return { ok: true } },
-    async safeToInspect(id) { inspected.push(id); return safe },
+    async safeToInspect(id) { inspected.push(id); return safe ? 'safe' : 'unsafe' },
   }, { async run() { if (!programEffect) throw new Error('unexpected Program'); return programEffect } }, makeStateHost(store))
   engine.cwdResolver = async () => home
   engine.actorActivity = async () => activity
@@ -327,7 +327,7 @@ test('incompatible v8 store enters maintenance and root-authorized cutover prese
       async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge' } },
       async followupJudge() { return { messageId: 'judge' } },
       async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
-      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
+      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return 'safe' },
     }, { async run() { throw new Error('unexpected Program') } }, makeStateHost(() => access!.current()))
     assert.equal((await recovered.startRun('new-ws', recovered.buildInitialRun('new-manager', 'test', CONFIG, 'ignored'), undefined, 'new after cutover')).ok, true)
     const fresh = new DatabaseSync(stateDbPath(h.home), { readOnly: true })
