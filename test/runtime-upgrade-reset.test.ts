@@ -91,18 +91,31 @@ function resetHarness() {
   }
 }
 
-test('Manager Reset terminates the compatible active Run without erasing current work or reporting success', async () => {
+/** #30: reset is no longer Manager-only — the caller is the host-derived
+ * root-session verdict (`isRootCommandAgent`), not the Run's managerSessionId. */
+const ROOT_SESSION = true
+const WORKFLOW_SESSION = false
+
+test('any top-level Session of the workspace terminates the Run without erasing history; workflow Sessions stay denied', async () => {
   const h = resetHarness()
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', CONFIG, 'ignored'), undefined, 'root input')
     const before = (await h.store.get('ws'))!
     const messageCount = h.messages.length
 
-    const outcome = await h.engine.handleReset('ws', 'manager')
+    // 工作流内部参与者（Role Actor / Judge / subagent）拒绝，且不触碰任何状态。
+    const denied = await h.engine.handleReset('ws', WORKFLOW_SESSION)
+    assert.equal(denied.ok, false)
+    assert.match(denied.reason!, /requires a root session/)
+    assert.deepEqual(await h.store.get('ws'), before)
+
+    // 另一个顶层会话（不是当初 start 的 Manager）成功。
+    const outcome = await h.engine.handleReset('ws', ROOT_SESSION)
 
     assert.equal(outcome.ok, true)
     const after = (await h.store.get('ws'))!
     assert.equal(after.run.status, 'terminated')
+    assert.equal(after.run.managerSessionId, 'manager')
     assert.equal(after.execution.phase, before.execution.phase)
     assert.equal(after.execution.input, 'root input')
     assert.equal(after.execution.dispatch?.id, before.execution.dispatch?.id)
@@ -115,12 +128,30 @@ test('Manager Reset terminates the compatible active Run without erasing current
   } finally { h.close() }
 })
 
+test('a workspace with no active Run resets idempotently while a finished Run stays rejected', async () => {
+  const h = resetHarness()
+  try {
+    const absent = await h.engine.handleReset('ws', ROOT_SESSION)
+    assert.equal(absent.ok, true)
+    assert.match(absent.message ?? '', /no active run/)
+    assert.equal(await h.store.get('ws'), undefined)
+
+    await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', CONFIG, 'ignored'), undefined, 'root input')
+    assert.equal((await h.engine.handleReset('ws', ROOT_SESSION)).ok, true)
+    const terminated = (await h.store.get('ws'))!
+    const repeated = await h.engine.handleReset('ws', ROOT_SESSION)
+    assert.equal(repeated.ok, false)
+    assert.match(repeated.reason!, /requires the current active Run/)
+    assert.deepEqual(await h.store.get('ws'), terminated)
+  } finally { h.close() }
+})
+
 test('a new Run follows a terminated Run while retained SQLite history stays outside current workflow_status', async () => {
   const h = resetHarness()
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('old-manager', 'test', CONFIG, 'ignored'), undefined, 'old input')
     const old = (await h.store.get('ws'))!
-    await h.engine.handleReset('ws', 'old-manager')
+    await h.engine.handleReset('ws', ROOT_SESSION)
 
     const started = await h.engine.startRun('ws', h.engine.buildInitialRun('new-manager', 'test', CONFIG, 'ignored'), undefined, 'new input')
 
@@ -152,7 +183,7 @@ test('known active work from a terminated Run blocks immediate start while expli
     await h.engine.handleTurnEnded('ws', judge)
     row = (await h.store.get('ws'))!
     assert.equal(row.execution.dispatch?.sessionId, 'old-role')
-    await h.engine.handleReset('ws', 'old-manager')
+    await h.engine.handleReset('ws', ROOT_SESSION)
 
     h.setSafety(false, 'active')
     const denied = await h.engine.startRun('ws', h.engine.buildInitialRun('new-manager', 'test', CONFIG, 'ignored'), undefined, 'new input')
@@ -176,7 +207,7 @@ test('known active Judge from a terminated Run blocks start and a safely inspect
     await h.engine.handleTurnEnded('ws', actor)
     const checking = (await h.store.get('ws'))!
     const oldJudge = { sessionId: checking.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-1']) }
-    await h.engine.handleReset('ws', 'old-manager')
+    await h.engine.handleReset('ws', ROOT_SESSION)
     assert.equal((await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'ACCEPT', 'late old Judge', oldJudge)).ok, false)
 
     h.setSafety(false, 'idle')
@@ -214,7 +245,7 @@ test('terminated ready Role visit inspects its mapped Actor and unsettled predec
     assert.equal(row.execution.dispatch, undefined)
     assert.equal(row.run.roleActors.worker, 'old-role')
     assert.ok(row.execution.predecessorId)
-    await h.engine.handleReset('ws', 'old-manager')
+    await h.engine.handleReset('ws', ROOT_SESSION)
     h.inspected.length = 0
 
     h.setSafety(true, 'active')
@@ -238,16 +269,13 @@ test('plain reset command passes the invoking Agent and compatible mode to Comma
   assert.deepEqual(calls, [[agent, 'ws', 'compatible']])
 })
 
-test('non-Manager and repeated Reset are rejected; restart and late Actor work cannot mutate terminated state', async () => {
+test('repeated Reset is rejected; restart and late Actor work cannot mutate terminated state', async () => {
   const h = resetHarness()
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', CONFIG, 'ignored'), undefined, 'root input')
-    const before = (await h.store.get('ws'))!
-    assert.equal((await h.engine.handleReset('ws', 'intruder')).ok, false)
-    assert.deepEqual(await h.store.get('ws'), before)
-    assert.equal((await h.engine.handleReset('ws', 'manager')).ok, true)
+    assert.equal((await h.engine.handleReset('ws', ROOT_SESSION)).ok, true)
     const terminated = (await h.store.get('ws'))!
-    assert.equal((await h.engine.handleReset('ws', 'manager')).ok, false)
+    assert.equal((await h.engine.handleReset('ws', ROOT_SESSION)).ok, false)
     await h.engine.handleRestartReconcile()
     assert.deepEqual(await h.store.get('ws'), terminated)
     const late = { sessionId: 'manager', turnUserMessageIds: new Set(['manager-1']) }
@@ -275,7 +303,7 @@ test('late Program result from a terminated Run cannot advance its replacement R
     const pending = h.engine.handleRunProgram('ws', row.execution.nodeToken, { milestoneNumber: 1 }, 'old-manager')
     await new Promise(resolve => setImmediate(resolve))
     assert.equal((await h.store.get('ws'))!.execution.phase, 'working')
-    await h.engine.handleReset('ws', 'old-manager')
+    await h.engine.handleReset('ws', ROOT_SESSION)
     const started = await h.engine.startRun('ws', h.engine.buildInitialRun('new-manager', 'test', CONFIG, 'ignored'), undefined, 'new input')
     assert.equal(started.ok, true)
     const replacement = (await h.store.get('ws'))!
@@ -454,6 +482,54 @@ test('plugin apply stays active on an incompatible store and only root plus expl
     for (const cleanup of cleanups.reverse()) cleanup()
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('plugin reset command is available to any top-level Session of the workspace and denied inside workflow Sessions', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-t30-reset-apply-'))
+  const workspace = mkdtempSync(join(tmpdir(), 'workflow-t30-reset-ws-'))
+  const previousHome = process.env.DSH_HOME
+  const cleanups: Array<() => void> = []
+  let command: CommandDefinition | undefined
+  try {
+    new StateStore(home).close()
+    process.env.DSH_HOME = home
+    const ctx = {
+      effect(register: () => void | (() => void)) { const cleanup = register(); if (cleanup) cleanups.push(cleanup) },
+      get() { return undefined },
+      on() {},
+      logger: { warn() {} },
+      commands: { register(definition: CommandDefinition) { command = definition; return () => {} } },
+      tools: { register() { return () => {} }, schemas() { return [] } },
+      jobs: { onJobDone() { return () => {} }, list() { return [] } },
+      agents: { get() { return undefined }, list() { return [] }, currentInitiator() { return undefined } },
+      subagents: {}, compaction: {}, sessions: {},
+    }
+
+    assert.doesNotThrow(() => apply(ctx as never))
+    assert.ok(command)
+    const invoke = (agent: unknown, rawInput: string) => command!.handler({ commandId: 'x' as never, agent: agent as never, rawInput, attachments: [], signal: new AbortController().signal })
+    const root = { session: { id: 'root', header: { cwd: workspace } } }
+    const actor = { session: { id: 'actor', header: { cwd: workspace, parentSession: 'root' } } }
+    const judge = { session: { id: 'judge', header: { cwd: workspace, parentSession: 'root', origin: 'subagent' } } }
+
+    // 无活动 Run：幂等成功（不再要求 managerSessionId，也不再报错）。
+    const empty = await invoke(root, 'reset')
+    assert.equal(empty.kind, 'success')
+    assert.match(empty.text ?? '', /no active run/)
+
+    // 工作流内部参与者仍被拒绝，且给出明确理由（运行期第二层 fail-closed）。
+    for (const denied of [actor, judge]) {
+      const result = await invoke(denied, 'reset')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /requires a root session/)
+    }
+  } finally {
+    for (const cleanup of cleanups.reverse()) cleanup()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(workspace, { recursive: true, force: true })
     rmSync(home, { recursive: true, force: true })
   }
 })

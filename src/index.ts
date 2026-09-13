@@ -11,6 +11,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
 import { endedTurnUserMessageIds } from './plugin/turnbind.ts'
+import { turnEndFailure, type TurnEndFact } from './plugin/turn-end.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
 import { checkCatalogProviders, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
 import { WorkflowEngine } from './engine/engine.ts'
@@ -334,7 +335,7 @@ export function apply(ctx: Context) {
         sessionWorkspaces.set(agent.session.id, workspaceKey)
         const outcome = await engine.startRun(workspaceKey, run, entry.path, extraText)
         if (!outcome.ok) return { ok: false, reason: outcome.reason }
-        return { ok: true, message: `started ${workflowId} (run ${outcome.run.runId})` }
+        return { ok: true, message: `started ${workflowId} (run ${outcome.run?.runId})` }
       } catch (error) {
         if (error instanceof StateConflictError) return { ok: false, reason: error.message }
         return { ok: false, reason: String(error) }
@@ -374,7 +375,7 @@ export function apply(ctx: Context) {
       if (mode === 'incompatible-store') return { ok: false, reason: 'state store is compatible; use plain /dsh-flow reset for the current Run' }
       if (workspaceKey === undefined) return { ok: false, reason: '当前会话没有 workspace cwd' }
       try {
-        const outcome = await engine.handleReset(workspaceKey, agent.session.id)
+        const outcome = await engine.handleReset(workspaceKey, isRootCommandAgent(agent))
         return outcome.ok ? { ok: true, message: outcome.message } : { ok: false, reason: outcome.reason }
       } catch (error) {
         return { ok: false, reason: String(error) }
@@ -389,15 +390,19 @@ export function apply(ctx: Context) {
   // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。
   ctx.on('session/event', (session, event) => {
     if (stateAccess.maintenanceDiagnostic() || event.type !== 'turn/end') return
-    const ids = endedTurnUserMessageIds(session.snapshotEvents(), event)
+    const snapshot = session.snapshotEvents()
+    const ids = endedTurnUserMessageIds(snapshot, event)
     if (ids === undefined) return
+    // #29：同一次读取里取该 Turn 的失败事实（正常结束为 undefined）。诊断在这里
+    // 定格，引擎只收到成品文本——它不需要理解 Host 的 TurnEndReason 形状。
+    const turnFailure = turnEndFailure(snapshot as ReadonlyArray<TurnEndFact>, event as TurnEndFact)
     subagentHost.observeTurnEnd(session.id)
     const caller = { sessionId: session.id, turnUserMessageIds: ids }
     setImmediate(() => {
       void (async () => {
         const ws = sessionWorkspaces.get(session.id) ?? await durableJudgeWorkspace(session.id)
           ?? await workspaceKeyOf(session.header.cwd)
-        if (ws !== undefined) await engine.handleTurnEnded(ws, caller)
+        if (ws !== undefined) await engine.handleTurnEnded(ws, caller, turnFailure)
       })().catch(error => ctx.logger.warn(`workflow turn settlement failed: ${String(error)}`))
     })
   })
