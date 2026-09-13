@@ -326,15 +326,18 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       }
     },
     async safeToInspect(sessionId) {
+      // #54：`waiting` 只在"唯一阻碍是仍在跑的已知后代"时返回；其余一律 fail-closed。
+      // 该会话的 turn 结束没有 claim，只说明它在等并行子代理，不是异常闭合。
+      let waiting = false
       const agent = observed.get(sessionId) ?? adapters.ctx.agents.get(SessionId(sessionId))
-      if (!agent || unsafe.has(sessionId)) return false
+      if (!agent || unsafe.has(sessionId)) return 'unsafe'
       try {
         await agent.whenIdle()
         const descendants = await adapters.ctx.subagents.listDescendants(SessionId(sessionId))
-        if (descendants.some(child => child.kind === 'diagnostic')) return false
+        if (descendants.some(child => child.kind === 'diagnostic')) return 'unsafe'
         for (const child of descendants) parents.set(String(child.id), String(child.parentId))
         const durableIds = new Set([sessionId, ...descendants.map(child => String(child.id))])
-        if ([...durableIds].some(id => unsafe.has(id))) return false
+        if ([...durableIds].some(id => unsafe.has(id))) return 'unsafe'
         const requiredIds = new Set([sessionId, ...descendants
           .filter(child => child.kind === 'child' && child.activity === 'running')
           .map(child => String(child.id))])
@@ -348,9 +351,19 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         for (const child of live) if (treeIds.has(child.id)) requiredIds.add(child.id)
 
         const agents: Agent[] = []
+        // #54：只有 `kind: 'child'` 的 durable 后代才是并行子代理的等待对象。
+        // tree/observed 补齐的会话（例如 Manager 自己的 Session）属于同一收口
+        // closure，非 idle 时仍是 fail-closed，不能算"等待"。
+        const waitableIds = new Set(descendants
+          .filter(child => child.kind === 'child')
+          .map(child => String(child.id)))
         for (const id of requiredIds) {
           const candidate = observed.get(id) ?? adapters.ctx.agents.get(SessionId(id))
-          if (!candidate || candidate.status !== 'idle' || !inboxEmpty(candidate) || unsafe.has(id)) return false
+          if (!candidate || unsafe.has(id)) return 'unsafe'
+          if (candidate.status !== 'idle' || !inboxEmpty(candidate)) {
+            if (waitableIds.has(id)) waiting = true
+            continue
+          }
           agents.push(candidate)
         }
         await Promise.all(agents.map(candidate => candidate.whenIdle()))
@@ -359,18 +372,19 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
         for (const child of currentDescendants) parents.set(String(child.id), String(child.parentId))
         if (currentDescendants.some(child => child.kind === 'diagnostic'
           || unsafe.has(String(child.id))
-          || (child.activity === 'running' && !requiredIds.has(String(child.id))))) return false
+          || (child.activity === 'running' && !requiredIds.has(String(child.id))))) return 'unsafe'
         const currentLive = adapters.ctx.agents.list()
         for (const candidate of currentLive) recordParentSession(candidate)
         const currentTreeIds = liveDescendantIds([sessionId, ...currentDescendants.map(child => String(child.id))], currentLive)
-        if (currentLive.some(child => currentTreeIds.has(child.id) && !requiredIds.has(child.id))) return false
-        return agents.every(candidate => {
+        if (currentLive.some(child => currentTreeIds.has(child.id) && !requiredIds.has(child.id))) return 'unsafe'
+        const settled = agents.every(candidate => {
           const current = adapters.ctx.agents.get(candidate.id)
           return (current === undefined || current === candidate) && candidate.status === 'idle' && inboxEmpty(candidate) && !unsafe.has(candidate.id)
             && adapters.ctx.jobs.list(candidate).filter(job => job.ownerSession === candidate.id)
               .every(job => TERMINAL_JOB_STATUSES.has(job.status) && !job.detail?.includes('work may be orphaned'))
         })
-      } catch { return false }
+        return settled ? (waiting ? 'waiting' : 'safe') : 'unsafe'
+      } catch { return 'unsafe' }
     },
     async ensureRoleActor(run, roleKey, initialText) {
       const existing = run.roleActors[roleKey]

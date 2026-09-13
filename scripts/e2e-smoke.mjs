@@ -67,7 +67,7 @@ try {
       judgePackets.push(structuredClone(input))
       return { messageId: `judge-followup-${sessionId}-${++sequence}` }
     },
-    async safeToInspect() { return true },
+    async safeToInspect() { return 'safe' },
     async retireJudge() {}, async drainJudge() {}, async judgeSessionExists() { return true },
     async drainRoleActor(run, role) { drained.push(run.roleActors[role]) },
     async compactRoleActor(_run, role) { compacts.push(role); return { ok: true, detail: 'controlled no-op' } },

@@ -50,7 +50,7 @@ function harness(config: WorkflowConfig, programs: ProgramHost) {
       async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, ...send(input.judgeSessionId, 'judge') } },
       async followupJudge(_run, judgeSessionId) { return send(judgeSessionId, 'judge followup') },
       async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
-      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor(_run, role) { compacts.push(role); return { ok: true } }, async safeToInspect() { return safe },
+      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor(_run, role) { compacts.push(role); return { ok: true } }, async safeToInspect() { return safe ? 'safe' : 'unsafe' },
     }, programs, makeStateHost(store))
     engine.cwdResolver = async () => home
     engine.actorActivity = async () => activity
@@ -418,7 +418,7 @@ test('Program ERROR retains parameters across reopen and manual resolution route
       async ensureRoleActor() { return { childId: 'unused', messageId: 'unused' } },
       async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge' } }, async followupJudge() { return { messageId: 'followup' } },
       async judgeSessionAvailability() { return 'available' }, async roleSessionAvailability() { return 'available' },
-      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return true },
+      async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } }, async safeToInspect() { return 'safe' },
     }, { async run() { throw new Error('manual resolution must not run Program') } }, makeStateHost(reopened))
     engine.cwdResolver = async () => h.home
     try {
