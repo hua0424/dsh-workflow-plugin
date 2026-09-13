@@ -6,6 +6,7 @@ import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
+import { withTurnEndFailure } from '../plugin/turn-end.ts'
 import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
 export interface DispatchTargets {
@@ -602,8 +603,12 @@ export class WorkflowEngine {
     return advanced
   }
 
-  /** Host 必须退出append回调再调用；caller只带该turn/end对应Turn的消息ID。 */
-  async handleTurnEnded(ws: string, caller: ClaimCaller): Promise<EngineOutcome | undefined> {
+  /**
+   * Host 必须退出append回调再调用；caller只带该turn/end对应Turn的消息ID。
+   * `turnFailure` 是该 Turn 的非正常结束诊断（#29），只作用于「Actor 回合无产出」
+   * 这条 BLOCK：正常结束/无诊断时不追加任何文字，成功路径零噪音。
+   */
+  async handleTurnEnded(ws: string, caller: ClaimCaller, turnFailure?: string): Promise<EngineOutcome | undefined> {
     const row = await this.state.get(ws)
     if (!row || row.run.status !== 'running') return
     let e = row.execution
@@ -642,7 +647,7 @@ export class WorkflowEngine {
       e.dispatch!.settled = true
       await this.state.put(ws, fresh.run, fresh.version, [change(e)])
       await this.drive(ws)
-    } else if (actor && e.phase === 'working') await this.blockRow(ws, fresh, 'actor-turn-ended-without-result')
+    } else if (actor && e.phase === 'working') await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
     else if (judge && e.phase === 'checking') await this.blockRow(ws, fresh, 'judge turn ended without judge_claim')
   }
   async handleBlock(ws: string, token: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
