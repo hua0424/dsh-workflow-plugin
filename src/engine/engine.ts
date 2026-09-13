@@ -58,7 +58,8 @@ export interface StateHost {
   events(workspaceKey: string, executionId: string, after?: number, limit?: number): Promise<NodeExecutionEvent[]>
   historyOwner(workspaceKey: string, executionId: string): Promise<{ runId: string; managerSessionId: string } | undefined>
 }
-export type EngineOutcome = { ok: true; run: RunState; message: string } | { ok: false; reason: string }
+// `run` 缺席只表示「没有可返回的 Run」（#30 的幂等 reset）；失败分支不带 run。
+export type EngineOutcome = { ok: true; run?: RunState; message: string } | { ok: false; reason: string }
 export interface NodeView {
   execution: { type: 'actor-task' | 'builtin-program' | 'child-workflow'; role?: string; instruction?: string; programId?: string; workflowId?: string; config?: Record<string, unknown> }
   checker?: { checkerId: string; config: Record<string, unknown> }
@@ -933,7 +934,7 @@ export class WorkflowEngine {
     }
     try {
       const advanced = await this.advanceKnownResult(ws, current, normalized.kind, normalized.handoff, 'program-result')
-      if (advanced.ok && advanced.run.status === 'running') await this.drive(ws)
+      if (advanced.ok && advanced.run?.status === 'running') await this.drive(ws)
       return advanced
     } catch (error) {
       const after = await this.state.get(ws)
@@ -961,7 +962,7 @@ export class WorkflowEngine {
     row.run.status = 'running'
     row.run.blockReason = null
     const advanced = await this.advanceKnownResult(ws, row, result, handoff, 'program-resolved')
-    if (advanced.ok && advanced.run.status === 'running') await this.drive(ws)
+    if (advanced.ok && advanced.run?.status === 'running') await this.drive(ws)
     return advanced
   }
   async handleSetRoleModel(ws: string, role: string, provider: string, model: string, caller: string): Promise<EngineOutcome> {
@@ -993,10 +994,18 @@ export class WorkflowEngine {
     this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax) })
     return { ok: true, run: row.run, message: `model override saved for ${role}` }
   }
-  async handleReset(ws: string, caller: string): Promise<EngineOutcome> {
+  /**
+   * `rootSession` 是 host 边界（`src/commands/dsh-flow.ts` 的 `isRootCommandAgent`）判定
+   * 的会话性质快照，engine 只消费不重算。#30：执行主体从「当初 start 的 Manager 会话」
+   * 放宽为「同 workspace 的任意顶层会话」——Run 永久绑定 managerSessionId 且无 takeover，
+   * 原会话被 fork/删除/重启后合法用户会永久失去 reset 权。安全边界保留：工作流内部参与者
+   * （Role Actor / Judge / 派发 subagent）拒绝，防止工作流会话杀掉自己的 Run。
+   */
+  async handleReset(ws: string, rootSession: boolean): Promise<EngineOutcome> {
+    if (!rootSession) return rejected('reset requires a root session; workflow Actor/Judge/subagent Sessions are not authorized')
     const row = await this.state.get(ws)
-    if (!row || (row.run.status !== 'running' && row.run.status !== 'blocked')) return rejected('reset requires the current active Run')
-    if (caller !== row.run.managerSessionId) return rejected('reset is Manager-only')
+    if (!row) return { ok: true, message: 'no active run' }
+    if (row.run.status !== 'running' && row.run.status !== 'blocked') return rejected('reset requires the current active Run')
     const judgeSessionId = row.execution.judge?.sessionId
     row.run.status = 'terminated'
     row.run.blockReason = TERMINATED_REASON

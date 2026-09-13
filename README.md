@@ -25,7 +25,7 @@ State format 为 `agent-workflow-state/v9`：`runs`、`node_executions`、
 fail-closed，不静默迁移。只有 root 人类显式执行 `/dsh-flow reset --incompatible-store` 才会备份整个 SQLite（含 WAL；坏库保留原始 bundle）后切换空 v9，失败不替换源库。REJECT 后当前单保留一代完整 previous claim/Judge 与统一 judgment 关联，
 补充/恢复材料只保留当前完整版本，旧值由 events 解释；正常恢复不回放 events。
 
-当前接通 Actor Task 的 ACCEPT/REJECT/NEED_CONTEXT、正常 BLOCK 的 auto/actor/judge resume、有效 claim 下 Judge respawn、Program 直接结算/人工裁决、嵌套 Child 原子返回、FAIL 无出口重开、显式 Role/Judge model override、Manager-only Reset/terminated，以及 `workflow_status` 的 Manager-only 当前 Run execution 历史分页（stable after、limit ≤ 50，跨 Run 拒绝）。标准 Web profile 必须提供正式 `jobs` 与 `compaction`；Session persistence 缺失/读取异常只记为 availability unknown，不冒充 missing。不兼容 Store 的 status/全库备份退出命令在 maintenance 下保持可用，普通 list/start/tools 明确拒绝，不退回旧引擎。
+当前接通 Actor Task 的 ACCEPT/REJECT/NEED_CONTEXT、正常 BLOCK 的 auto/actor/judge resume、有效 claim 下 Judge respawn、Program 直接结算/人工裁决、嵌套 Child 原子返回、FAIL 无出口重开、显式 Role/Judge model override、Reset/terminated（自 #30 起同 workspace 任意顶层会话可执行，工作流内部参与者拒绝），以及 `workflow_status` 的 Manager-only 当前 Run execution 历史分页（stable after、limit ≤ 50，跨 Run 拒绝）。标准 Web profile 必须提供正式 `jobs` 与 `compaction`；Session persistence 缺失/读取异常只记为 availability unknown，不冒充 missing。不兼容 Store 的 status/全库备份退出命令在 maintenance 下保持可用，普通 list/start/tools 明确拒绝，不退回旧引擎。
 真实宿主组合命令为 `pnpm run test:real-host`；受控 smoke、真实 Host + 脚本 LLM、外部模型行为三者不得混称。
 
 ## Current documentation

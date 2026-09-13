@@ -109,6 +109,11 @@ REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona`
 - `start` 的附加文本会作为初始指令的一部分交给 Manager（比如本次目标）。
 - `reset` 只是终止插件侧的 Run 状态，**不会**回滚 Actor 已经做过的外部动作
   （提交、PR、issue 等），处理前先人工确认现场。
+- `reset` 可由**当前 workspace 的任意顶层会话**执行（不要求是当初 `start` 的那个
+  对话）——Run 永久绑定启动会话且没有 takeover，原对话被 fork/删除/重启后仍能
+  收尾。工作流内部的 Role Actor / Judge / 子代理会话执行会被拒绝；当前
+  workspace 没有活动 Run 时返回 `no active run`（幂等成功），已 terminated /
+  completed 的 Run 重复 reset 仍被拒绝。
 - `--incompatible-store` 只允许 **root 会话**执行：即用户顶层聊天会话
   （无 parentSession、origin 不是 subagent、delegationDepth 为 0）；
   工作流 Actor / Judge / 子代理内执行会被拒绝。
