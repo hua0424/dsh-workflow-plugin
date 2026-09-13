@@ -2,6 +2,7 @@
  * Host adapters: wire the real DSH services into the engine's narrow
  * interfaces (design §2.3 deployment / §4 runtime).
  */
+import { setTimeout as delay } from 'node:timers/promises'
 import type { Agent, AgentHandle, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-compaction'
@@ -168,6 +169,20 @@ function compactionFor(ctx: Context, agent: Agent): CompactionEngine | undefined
 function noCompactionBackend(ctx: Context, sessionId: string): { ok: true; detail: string } {
   ctx.logger.warn(`workflow boundary compact skipped: session ${sessionId} has no compaction backend (neither its agent preset nor the host plane mounts one)`)
   return { ok: true, detail: 'no compaction backend; boundary compact skipped' }
+}
+
+/**
+ * 边界 compact 的自动重试（#55）：单次 `compactNow` 走真实摘要模型，历史越长
+ * 失败概率越高，且同一会话在真实 run 里重试一次即通过（run 295ad986 先例）。
+ * 只重试 compact 本身——物化/拆卸仍各做一次，`resident actor busy`（Judge 撞上
+ * Actor turn 尾巴）也可能在下一次调用前自解；重试仍失败才由引擎 fail-closed。
+ * ponytail: 固定一次重试 + 2s 间隔，压不住的是"历史超出摘要模型能力"这类
+ * 确定性失败——那种情况留给 Manager 换模型，不在这里加更多轮次。
+ */
+const COMPACT_MAX_ATTEMPTS = 2
+/** 重试间隔默认 2s；`DSH_WF_COMPACT_RETRY_MS` 是测试 seam，避免单测被真实退避拖成秒级。 */
+function compactRetryDelayMs(): number {
+  return Number(process.env.DSH_WF_COMPACT_RETRY_MS ?? 2_000)
 }
 
 /** Durable host-authored provenance for every workflow dispatch. */
@@ -520,99 +535,140 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       await drainWithin(adapters.ctx.subagents, manager, [SessionId(childId)])
     },
 
+    /**
+     * #55：边界 compact 失败自动重试，重试仍失败才把失败交回引擎（引擎据此
+     * fail-closed BLOCK 并给出恢复指引）。
+     */
     async compactRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
-      // #21 F1：这条链上的每一段都可能有真实模型调用/静默拆卸，全部加超时并把
-      // signal 接成真实中断源（此前 abort 从不触发，signal 形同装饰）。
-      const controller = new AbortController()
-      const signal = controller.signal
-      // A4 plan A (docs/prd/20260903-workflow-hardening/a4-code-findings.md §3):
-      // the settlement watcher releases the actor's Activation right after its
-      // turn, and the next dispatch always follows a full Judge cycle, so the
-      // actor is cold at this point on every cross-node path. Compact a COLD
-      // actor by materializing it WITHOUT a prompt (no turn starts), running
-      // compactNow on the idle agent (its result is durably flushed before it
-      // resolves), then releasing the handle so the dispatch followup
-      // cold-resumes the compacted surface.
-      const resident = adapters.ctx.agents.get(childId as SessionId)
-      if (resident !== undefined) {
-        const compaction = compactionFor(adapters.ctx, resident)
-        if (compaction === undefined) return noCompactionBackend(adapters.ctx, childId)
-        // 收口后仍可能被外部唤醒；busy 必须拒绝，不能以FIFO排队冒充compact通过。
-        try {
-          const result = await withTimeout(compaction.compactNow(resident, signal), DISPATCH_TIMEOUTS.compactNow, 'compactNow', controller)
-          if (result === null) return { ok: true, detail: 'no compactable range' }
-          return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
-        } catch (error) {
-          if (error instanceof ManualCompactionError && error.code === 'busy') {
-            return { ok: false, detail: 'resident actor busy' }
-          }
-          return { ok: false, detail: compactErrorDetail(error) }
-        }
-      }
-      const route = resolveRoleModel(run, roleKey, frozenRoute())
-      const manager = adapters.managerAgentOf(run)
-      const resuming = adapters.ctx.agents.resume({
-          resumeSessionId: childId as SessionId,
-          // Mirrors the agentOptions the continuation manager re-applies when
-          // IT cold-resumes this child. This is only the summarizer's LAST
-          // fallback (compaction summarization* config > the session's own
-          // latest routed request), so the summary model may differ from the
-          // actor's model.
-          agentOptions: route.provider !== undefined || route.model !== undefined ? route : undefined,
-          // Maintenance materialization must join the parent preset too: the
-          // compaction backend (and every model-facing row) lives in the
-          // preset's isolate domain, and an unjoined agent resolves no backend
-          // via serviceFor (dsh also warns about publishing unjoined agents).
-          // Mirrors applyChildComposition's join step only — persona/tool
-          // filter are turn-facing and irrelevant to a compact-only surface.
-          // Join failure degrades to the host-plane fallback / skip below, so
-          // it is logged rather than failing the resume.
-          ...(manager === undefined ? {} : {
-            setup: ((agentCtx: Context) => {
-              try {
-                agentCtx.get('agentPresets')?.composeFrom(agentCtx, manager.ctx)
-              } catch (error) {
-                agentCtx.logger.warn(`workflow maintenance preset join skipped: ${errorDetail(error)}`)
-              }
-            }) satisfies AgentSetup,
-          }),
-      })
-      let handle: AgentHandle
-      try {
-        handle = await withTimeout(resuming, DISPATCH_TIMEOUTS.coldMaterialize, 'coldMaterialize', controller)
-      } catch (error) {
-        // 超时后迟到的物化同样必须释放：遗留 resident agent 会让后续冷 resume
-        // 在 registry id 上冲突（见下方 teardown 注释）。#32 D-004：释放本身也要收口，
-        // 否则一个卡住的 dispose 会变成后台永久 pending 的 promise。
-        resuming.then(late => void withTimeout(late.dispose(), DISPATCH_TIMEOUTS.dispose, 'dispose late').catch(() => {}), () => {})
-        return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
-      }
-      let outcome: { ok: boolean; detail: string }
-      try {
-        const compaction = compactionFor(adapters.ctx, handle.agent)
-        if (compaction === undefined) {
-          outcome = noCompactionBackend(adapters.ctx, childId)
-        } else {
-          const result = await withTimeout(compaction.compactNow(handle.agent, signal), DISPATCH_TIMEOUTS.compactNow, 'compactNow', controller)
-          outcome = result === null
-            ? { ok: true, detail: 'cold: no compactable range' }
-            : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
-        }
-      } catch (error) {
-        outcome = { ok: false, detail: compactErrorDetail(error) }
-      }
-      // ALWAYS tear the materialization down: a leaked resident agent would
-      // collide on the registry id inside the dispatch followup's cold resume.
-      try {
-        await withTimeout(handle.dispose(), DISPATCH_TIMEOUTS.dispose, 'dispose', controller)
-      } catch (error) {
-        return { ok: false, detail: `cold materialize teardown failed: ${errorDetail(error)}` }
-      }
-      return outcome
+      return await compactWithRetry(adapters, frozenRoute, run, roleKey, childId)
     },
   }
+}
+
+/**
+ * #55：只重试 `compactNow` 本身的失败——那是真实摘要模型调用，历史越长越容易
+ * 随机失败（run 295ad986：重试一次即通过）。物化/拆卸失败不重试：重试会在超时后
+ * 迟到物化的 registry id 上再撞一次，且遗留 agent 正是 teardown 要防的东西。
+ */
+async function compactWithRetry(
+  adapters: HostAdapters,
+  frozenRoute: () => { provider?: string; model?: string },
+  run: RunState,
+  roleKey: string,
+  childId: string,
+): Promise<{ ok: boolean; detail: string }> {
+  let last: { ok: false; detail: string } = { ok: false, detail: 'compact was never attempted' }
+  for (let attempt = 1; attempt <= COMPACT_MAX_ATTEMPTS; attempt++) {
+    const outcome = await compactOnce(adapters, frozenRoute, run, roleKey, childId)
+    if (outcome.ok) return { ok: true, detail: outcome.detail }
+    last = { ok: false, detail: outcome.detail }
+    // 不可重试的失败（物化/拆卸）立即交回引擎，不再白跑一轮真实模型调用。
+    if (outcome.retryable !== true) return last
+    if (attempt < COMPACT_MAX_ATTEMPTS) {
+      adapters.ctx.logger.warn(`workflow boundary compact failed (attempt ${attempt}/${COMPACT_MAX_ATTEMPTS}): ${last.detail}; retrying`)
+      await delay(compactRetryDelayMs())
+    }
+  }
+  return last
+}
+
+/**
+ * 一次 compact 尝试。#21 F1：这条链上的每一段都可能有真实模型调用/静默拆卸，
+ * 全部加超时并把 signal 接成真实中断源（此前 abort 从不触发，signal 形同装饰）。
+ */
+async function compactOnce(
+  adapters: HostAdapters,
+  frozenRoute: () => { provider?: string; model?: string },
+  run: RunState,
+  roleKey: string,
+  childId: string,
+): Promise<{ ok: true; detail: string } | { ok: false; detail: string; retryable?: boolean }> {
+  const controller = new AbortController()
+  const signal = controller.signal
+  // A4 plan A (docs/prd/20260903-workflow-hardening/a4-code-findings.md §3):
+  // the settlement watcher releases the actor's Activation right after its
+  // turn, and the next dispatch always follows a full Judge cycle, so the
+  // actor is cold at this point on every cross-node path. Compact a COLD
+  // actor by materializing it WITHOUT a prompt (no turn starts), running
+  // compactNow on the idle agent (its result is durably flushed before it
+  // resolves), then releasing the handle so the dispatch followup
+  // cold-resumes the compacted surface.
+  const resident = adapters.ctx.agents.get(childId as SessionId)
+  if (resident !== undefined) {
+    const compaction = compactionFor(adapters.ctx, resident)
+    if (compaction === undefined) return noCompactionBackend(adapters.ctx, childId)
+    // 收口后仍可能被外部唤醒；busy 必须拒绝，不能以FIFO排队冒充compact通过。
+    try {
+      const result = await withTimeout(compaction.compactNow(resident, signal), DISPATCH_TIMEOUTS.compactNow, 'compactNow', controller)
+      if (result === null) return { ok: true, detail: 'no compactable range' }
+      return { ok: true, detail: `compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+    } catch (error) {
+      if (error instanceof ManualCompactionError && error.code === 'busy') return { ok: false, detail: 'resident actor busy', retryable: true }
+      return { ok: false, detail: compactErrorDetail(error), retryable: true }
+    }
+  }
+  const route = resolveRoleModel(run, roleKey, frozenRoute())
+  const manager = adapters.managerAgentOf(run)
+  const resuming = adapters.ctx.agents.resume({
+      resumeSessionId: childId as SessionId,
+      // Mirrors the agentOptions the continuation manager re-applies when
+      // IT cold-resumes this child. This is only the summarizer's LAST
+      // fallback (compaction summarization* config > the session's own
+      // latest routed request), so the summary model may differ from the
+      // actor's model.
+      agentOptions: route.provider !== undefined || route.model !== undefined ? route : undefined,
+      // Maintenance materialization must join the parent preset too: the
+      // compaction backend (and every model-facing row) lives in the
+      // preset's isolate domain, and an unjoined agent resolves no backend
+      // via serviceFor (dsh also warns about publishing unjoined agents).
+      // Mirrors applyChildComposition's join step only — persona/tool
+      // filter are turn-facing and irrelevant to a compact-only surface.
+      // Join failure degrades to the host-plane fallback / skip below, so
+      // it is logged rather than failing the resume.
+      ...(manager === undefined ? {} : {
+        setup: ((agentCtx: Context) => {
+          try {
+            agentCtx.get('agentPresets')?.composeFrom(agentCtx, manager.ctx)
+          } catch (error) {
+            agentCtx.logger.warn(`workflow maintenance preset join skipped: ${errorDetail(error)}`)
+          }
+        }) satisfies AgentSetup,
+      }),
+  })
+  let handle: AgentHandle
+  try {
+    handle = await withTimeout(resuming, DISPATCH_TIMEOUTS.coldMaterialize, 'coldMaterialize', controller)
+  } catch (error) {
+    // 超时后迟到的物化同样必须释放：遗留 resident agent 会让后续冷 resume
+    // 在 registry id 上冲突（见下方 teardown 注释）。#32 D-004：释放本身也要收口，
+    // 否则一个卡住的 dispose 会变成后台永久 pending 的 promise。
+    resuming.then(late => void withTimeout(late.dispose(), DISPATCH_TIMEOUTS.dispose, 'dispose late').catch(() => {}), () => {})
+    return { ok: false, detail: `cold materialize failed: ${errorDetail(error)}` }
+  }
+  let outcome: { ok: true; detail: string } | { ok: false; detail: string; retryable?: boolean }
+  try {
+    const compaction = compactionFor(adapters.ctx, handle.agent)
+    if (compaction === undefined) {
+      outcome = noCompactionBackend(adapters.ctx, childId)
+    } else {
+      const result = await withTimeout(compaction.compactNow(handle.agent, signal), DISPATCH_TIMEOUTS.compactNow, 'compactNow', controller)
+      outcome = result === null
+        ? { ok: true, detail: 'cold: no compactable range' }
+        : { ok: true, detail: `cold compacted ${result.shadowedSeqs.length} items (~${result.shadowedTokenCount} tokens)` }
+    }
+  } catch (error) {
+    outcome = { ok: false, detail: compactErrorDetail(error), retryable: true }
+  }
+  // ALWAYS tear the materialization down: a leaked resident agent would
+  // collide on the registry id inside the dispatch followup's cold resume.
+  try {
+    await withTimeout(handle.dispose(), DISPATCH_TIMEOUTS.dispose, 'dispose', controller)
+  } catch (error) {
+    return { ok: false, detail: `cold materialize teardown failed: ${errorDetail(error)}` }
+  }
+  return outcome
 }
 
 export function makeProgramHost(adapters: HostAdapters): ProgramHost {

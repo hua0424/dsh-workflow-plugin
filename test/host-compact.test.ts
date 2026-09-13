@@ -12,7 +12,7 @@ import { ManualCompactionError, type ManualCompactionErrorCode } from '@deepseek
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import { newNodeToken } from '../src/state/invariants.ts'
 import { DISPATCH_TIMEOUTS } from '../src/engine/timeouts.ts'
-import { withShortTimeouts } from './helpers/timeouts.ts'
+import { withShortTimeouts, withFastCompactRetry } from './helpers/timeouts.ts'
 import type { RunState } from '../src/types.ts'
 
 const CONFIG = validateAndNormalize(parseCatalogConfig(`
@@ -171,6 +171,8 @@ function makeHost(options: {
   resumeLateMs?: number
   compactResult?: { shadowedSeqs: number[]; shadowedTokenCount: number } | null
   compactError?: Error
+  /** #55：让前 N 次 compactNow 失败，之后按 compactResult 成功——模拟摘要失败的随机性。 */
+  compactFailuresBeforeSuccess?: number
   compactHangs?: boolean
   disposeError?: Error
   disposeHangs?: boolean
@@ -190,6 +192,9 @@ function makeHost(options: {
       options.signals?.push(signal)
       options.events.push('compact')
       if (options.compactHangs === true) return hang()
+      if (options.compactFailuresBeforeSuccess !== undefined && options.compacts.length <= options.compactFailuresBeforeSuccess) {
+        throw options.compactError ?? manualError('summary', 'manual compaction could not produce a smaller summary')
+      }
       if (options.compactError !== undefined) throw options.compactError
       return options.compactResult ?? null
     },
@@ -259,12 +264,14 @@ test('cold actor: null compact result continues with cold-noop detail and still 
   assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
 })
 
+// #55：重试仍失败时 fail-closed 的结论不变，只是现在会多跑一次真实 compact。
 test('cold actor: ManualCompactionError fail-closes but the materialization is still released', async () => {
   const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
   const { host } = makeHost({ ...f, compactError: manualError('summary', 'summarizer exploded') })
-  const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
+  const result = await withFastCompactRetry(() => host.compactRoleActor(makeRun('sess-dev'), 'developer'))
   assert.deepEqual(result, { ok: false, detail: 'compaction summary: summarizer exploded' })
-  assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
+  assert.deepEqual(f.events, ['resume', 'compact', 'dispose', 'resume', 'compact', 'dispose'],
+    'the failed attempt retries compact and every attempt releases its own materialization')
 })
 
 test('cold actor: busy and ordinary compact failures remain distinct and always dispose', async () => {
@@ -274,8 +281,9 @@ test('cold actor: busy and ordinary compact failures remain distinct and always 
   ] as const) {
     const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
     const { host } = makeHost({ ...f, compactError: error })
-    assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: false, detail })
-    assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
+    const result = await withFastCompactRetry(() => host.compactRoleActor(makeRun('sess-dev'), 'developer'))
+    assert.deepEqual(result, { ok: false, detail })
+    assert.deepEqual(f.events, ['resume', 'compact', 'dispose', 'resume', 'compact', 'dispose'])
   }
 })
 
@@ -335,8 +343,47 @@ test('resident busy actor (Judge raced the actor turn tail): fails closed', asyn
 test('resident actor non-busy manual failure fail-closes', async () => {
   const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
   const { host } = makeHost({ ...f, resident: {} as Agent, compactError: manualError('commit', 'durable marker lost') })
-  const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
+  const result = await withFastCompactRetry(() => host.compactRoleActor(makeRun('sess-dev'), 'developer'))
   assert.deepEqual(result, { ok: false, detail: 'compaction commit: durable marker lost' })
+})
+
+// #55 验收：compact 失败先自动重试（摘要输出有随机性，run 295ad986 重试一次即过），
+// 重试仍失败才 fail-closed 交回引擎。
+test('resident actor compact failure is retried once and the retry result wins', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+  const { host } = makeHost({
+    ...f, resident: { id: 'sess-dev' } as unknown as Agent,
+    compactFailuresBeforeSuccess: 1, compactResult: { shadowedSeqs: [1, 2], shadowedTokenCount: 30 },
+  })
+  const result = await withFastCompactRetry(() => host.compactRoleActor(makeRun('sess-dev'), 'developer'))
+  assert.deepEqual(result, { ok: true, detail: 'compacted 2 items (~30 tokens)' })
+  assert.equal(f.compacts.length, 2, 'compaction summary failure must be retried automatically')
+  assert.equal(f.resumes.length, 0, 'a resident actor is still compacted in place on the retry')
+})
+
+test('cold actor compact failure is retried once and the retry result wins', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+  const { host } = makeHost({
+    ...f, compactFailuresBeforeSuccess: 1, compactResult: { shadowedSeqs: [3], shadowedTokenCount: 7 },
+  })
+  const result = await withFastCompactRetry(() => host.compactRoleActor(makeRun('sess-dev'), 'developer'))
+  assert.deepEqual(result, { ok: true, detail: 'cold compacted 1 items (~7 tokens)' })
+  assert.deepEqual(f.events, ['resume', 'compact', 'dispose', 'resume', 'compact', 'dispose'],
+    'each attempt re-materializes and always releases its own materialization')
+})
+
+test('compact retry is bounded: a permanent failure fail-closes after the last attempt', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], signals: [] as AbortSignal[] }
+  const { host } = makeHost({
+    ...f, resident: { id: 'sess-dev' } as unknown as Agent,
+    compactError: manualError('summary', 'manual compaction could not produce a smaller summary'),
+    compactFailuresBeforeSuccess: 99,
+  })
+  const result = await withFastCompactRetry(() => host.compactRoleActor(makeRun('sess-dev'), 'developer'))
+  assert.deepEqual(result, { ok: false, detail: 'compaction summary: manual compaction could not produce a smaller summary' })
+  assert.equal(f.compacts.length, 2, 'retries are bounded: one retry, never unbounded')
+  assert.deepEqual(f.signals.map(signal => signal.aborted), [false, false],
+    'a failed attempt must not abort the next attempt signal')
 })
 
 test('unmapped role is a no-op', async () => {
@@ -418,16 +465,18 @@ test('cold maintenance seams: a hanging materialize, compactNow or dispose degra
     assert.deepEqual(hangResume.events, ['resume'], 'a timed-out materialization has no handle to compact or dispose')
 
     const hangCompact = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], signals: [] as AbortSignal[] }
-    assert.deepEqual(await makeHost({ ...hangCompact, compactHangs: true }).host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+    // #55：compactNow 超时同样算 compact 失败 → 自动重试一次，两次都超时后交回失败。
+    assert.deepEqual(await withFastCompactRetry(() => makeHost({ ...hangCompact, compactHangs: true }).host.compactRoleActor(makeRun('sess-dev'), 'developer')),
       { ok: false, detail: 'timeout after 20ms at stage "compactNow"' })
-    assert.deepEqual(hangCompact.events, ['resume', 'compact', 'dispose'], 'the materialization is still released')
+    assert.deepEqual(hangCompact.events, ['resume', 'compact', 'dispose', 'resume', 'compact', 'dispose'], 'the materialization is still released')
     assert.equal(hangCompact.signals[0]!.aborted, true, 'the timeout is a real interrupt source, not a decorative signal')
+    assert.equal(hangCompact.signals[1]!.aborted, true, 'the retry attempt gets its own real interrupt source')
 
     const residentCompact = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], signals: [] as AbortSignal[] }
-    assert.deepEqual(await makeHost({ ...residentCompact, resident: { id: 'sess-dev' } as unknown as Agent, compactHangs: true })
-      .host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+    assert.deepEqual(await withFastCompactRetry(() => makeHost({ ...residentCompact, resident: { id: 'sess-dev' } as unknown as Agent, compactHangs: true })
+      .host.compactRoleActor(makeRun('sess-dev'), 'developer')),
     { ok: false, detail: 'timeout after 20ms at stage "compactNow"' })
-    assert.equal(residentCompact.signals[0]!.aborted, true)
+    assert.deepEqual(residentCompact.signals.map(signal => signal.aborted), [true, true])
 
     const hangDispose = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
     assert.deepEqual(await makeHost({ ...hangDispose, compactResult: null, disposeHangs: true }).host.compactRoleActor(makeRun('sess-dev'), 'developer'),

@@ -518,6 +518,8 @@ test('node-boundary compact failure BLOCKs the new visit and resume retries the 
     assert.equal(blocked.execution.dispatch?.sessionId, 'worker-session')
     assert.equal(blocked.execution.dispatch?.messageId, undefined)
     assert.match(blocked.execution.blockReason!, /node-boundary compact failed: compaction busy/)
+    // #55 验收：BLOCK reason 必须自带恢复指引，Manager 不该再靠摸索。
+    assert.match(blocked.execution.blockReason!, /workflow_set_role_model 切换更强模型后 node_resume 重试/)
     assert.equal(h.messages.filter(message => message.sessionId === 'worker-session').length, sentBefore)
 
     h.setCompactOutcome({ ok: true })
