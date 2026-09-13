@@ -87,12 +87,14 @@ code-reviewer 写 review，review-judger 写 decision。即使报告很短，也
 每次 claim 的 handoff 必须自足且不超工具长度限制；后继只有前驱交接，不自动累计所有历史字段。使用如下短格式，按节点删去不适用字段：
 
 ```text
-入口：run.md 路径；repo；Milestone 编号；当前 Issue/集成对象。
+入口：run.md 的**绝对路径**（形如 `<repo 绝对路径>/docs/dsh-workflow/runs/<runDir>/run.md`）+ 该 runDir 绝对路径；repo；Milestone 编号；当前 Issue/集成对象。
 结果：实际完成内容或明确失败原因。
 修订：PR URL；base/head 分支与 SHA；原始 baseCommit/实现 SHA（适用时）。
 证据：delivery/review/decision 路径；远端摘要链接；必要检查结果。
 后续：必修清单、未核实项、约束；下一角色需要的批准修订等信息。
 ```
+
+- **运行产物一律写 handoff 给定的 runDir 绝对路径**，不得相对当前 cwd 猜测或写到 `docs/dsh-workflow/` 其它位置：曾出现 coordinator 把交付文件建到 runDir 外（`docs/dsh-workflow/issues/17/`）再由 Manager 迁移（issue #24 O5）。
 
 - 调用前核对当前任务身份；claim/block 是本轮最后动作，读取和写入证据须先完成。
 - 报告角色完成报告即 completed，不以发现缺陷表达动作失败；决策角色 completed=无本次必修项，failed=需要返工。无法执行/核验或缺权限用 BLOCK。

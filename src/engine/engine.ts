@@ -605,8 +605,8 @@ export class WorkflowEngine {
 
   /**
    * Host 必须退出append回调再调用；caller只带该turn/end对应Turn的消息ID。
-   * `turnFailure` 是该 Turn 的非正常结束诊断（#29），只作用于「Actor 回合无产出」
-   * 这条 BLOCK：正常结束/无诊断时不追加任何文字，成功路径零噪音。
+   * `turnFailure` 是该 Turn 的非正常结束诊断（#29/#24 O1），作用于「回合无产出」的
+   * 两条 BLOCK（Actor 与 Judge）：正常结束/无诊断时不追加任何文字，成功路径零噪音。
    */
   async handleTurnEnded(ws: string, caller: ClaimCaller, turnFailure?: string): Promise<EngineOutcome | undefined> {
     const row = await this.state.get(ws)
@@ -648,7 +648,7 @@ export class WorkflowEngine {
       await this.state.put(ws, fresh.run, fresh.version, [change(e)])
       await this.drive(ws)
     } else if (actor && e.phase === 'working') await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
-    else if (judge && e.phase === 'checking') await this.blockRow(ws, fresh, 'judge turn ended without judge_claim')
+    else if (judge && e.phase === 'checking') await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim', turnFailure))
   }
   async handleBlock(ws: string, token: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
     const row = await this.state.get(ws)
