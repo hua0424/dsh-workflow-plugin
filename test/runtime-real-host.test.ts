@@ -303,7 +303,9 @@ workflow:
     assert.equal(blocked.status, 'blocked')
     assert.equal(blocked.execution.nodeId, 'second-role', `${JSON.stringify(blocked, null, 2)}\nadapter trace:\n${adapter.trace.join('\n')}`)
     assert.equal(blocked.execution.hasClaim, false, 'interrupted old Turn did not gain claim qualification')
-    assert.equal(blocked.execution.blockReason, 'actor-turn-ended-without-result')
+    // #29：BLOCK 文本必须自带可辨识的失败分类（此处为父会话中断），而不是只有裸的基础原因。
+    assert.match(blocked.execution.blockReason ?? '', /^actor-turn-ended-without-result \| turn-end reason=aborted cause=parent \| turn=\d+ tools=used$/,
+      `blockReason should carry the turn-end failure classification: ${blocked.execution.blockReason}`)
     const blockedExecutionId = blocked.execution.executionId
     const blockedToken = blocked.execution.nodeToken
     adapter.resumeGate.resolve()
