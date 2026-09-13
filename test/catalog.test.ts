@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize, computeDefinitionHash, CatalogValidationError } from '../src/catalog/validate.ts'
 import { classifyCatalogFilename } from '../src/catalog/loader.ts'
-import { scanCatalog } from '../src/catalog/loader.ts'
+import { scanCatalog, loadCatalogEntry } from '../src/catalog/loader.ts'
 import { roleReuseMode } from '../src/types.ts'
 import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -397,24 +397,77 @@ workflow:
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /unknown role/)
 })
 
-test('#46 P5: persona hand-written submission protocol keywords are rejected', () => {
+test('#59: persona hand-written submission protocol keywords warn but never block', async () => {
   for (const keyword of ['node_claim', 'judge_claim', 'send_message']) {
     const roleHit = parseCatalogConfig(VALID_CONFIG.replace(
       '  developer:\n    persona: Implement.',
       `  developer:\n    persona: Finish work then ${keyword} it.`,
     ))
-    assert.throws(() => validateAndNormalize(roleHit, { workflowId: 'w' }), CatalogValidationError, /must not hand-write submission protocol/)
+    const roleWarnings: string[] = []
+    const normalized = validateAndNormalize(roleHit, { workflowId: 'w', warnings: roleWarnings })
+    assert.equal(normalized.roles['developer']!.persona, `Finish work then ${keyword} it.`)
+    assert.deepEqual(roleWarnings.length, 1)
+    assert.match(roleWarnings[0]!, /role "developer" persona must not hand-write submission protocol/)
+    assert.match(roleWarnings[0]!, new RegExp(keyword))
+    assert.match(roleWarnings[0]!, /docs\/user-guide\.md/)
+
     const judgeHit = parseCatalogConfig(VALID_CONFIG.replace(
       '  persona: Judge.',
       `  persona: Verify then ${keyword} it.`,
     ))
-    assert.throws(() => validateAndNormalize(judgeHit, { workflowId: 'w' }), CatalogValidationError, /judgeRole.*must not hand-write submission protocol/)
+    const judgeWarnings: string[] = []
+    validateAndNormalize(judgeHit, { workflowId: 'w', warnings: judgeWarnings })
+    assert.deepEqual(judgeWarnings.length, 1)
+    assert.match(judgeWarnings[0]!, /judgeRole persona must not hand-write submission protocol/)
   }
 })
 
-test('#46 P5: business-discipline personas without protocol keywords still pass', () => {
+test('#59: keyword-hit catalog loads with a warning diagnostic and is not blocked', async () => {
+  const warned = VALID_CONFIG.replace(
+    '  developer:\n    persona: Implement.',
+    '  developer:\n    persona: Report only via node_claim.',
+  )
+  const home = await mkdtemp(join(tmpdir(), 'wfhome-'))
+  const dir = join(home, 'workflows')
+  await mkdir(dir, { recursive: true })
+  try {
+    await writeFile(join(dir, 'warned.yaml'), warned)
+    await writeFile(join(dir, 'broken.yaml'), 'schemaVersion: agent-workflow/v2\nnope: 1\n')
+    const scan = await scanCatalog(home)
+    assert.deepEqual(scan.entries.map(e => e.workflowId), ['warned'])
+    assert.deepEqual(scan.diagnostics.map(d => [d.workflowId, d.severity]), [['broken', 'error'], ['warned', 'warning']])
+    const entry = await loadCatalogEntry(home, 'warned')
+    assert.ok(entry, 'warning 不阻止加载')
+    assert.equal(entry.config.roles['developer']!.persona, 'Report only via node_claim.')
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('#59: parse/schema/validation errors stay blocking errors', async () => {
+  const cases: Array<[string, string]> = [
+    ['parse-error.yaml', 'a: 1\na: 2\n'],
+    ['schema-error.yaml', 'schemaVersion: agent-workflow/v2\nnope: 1\n'],
+    ['validation-error.yaml', VALID_CONFIG.replace('        role: developer', '        role: ghost')],
+  ]
+  const home = await mkdtemp(join(tmpdir(), 'wfhome-'))
+  const dir = join(home, 'workflows')
+  await mkdir(dir, { recursive: true })
+  try {
+    for (const [name, text] of cases) await writeFile(join(dir, name), text)
+    const scan = await scanCatalog(home)
+    assert.deepEqual(scan.entries, [])
+    assert.deepEqual(scan.diagnostics.map(d => [d.workflowId, d.severity]), cases.map(([name]) => [name.slice(0, -5), 'error']))
+  } finally {
+    await rm(home, { recursive: true, force: true })
+  }
+})
+
+test('#46 P5: business-discipline personas without protocol keywords warn nothing', () => {
   const config = parseCatalogConfig(VALID_CONFIG)
-  const normalized = validateAndNormalize(config, { workflowId: 'w' })
+  const warnings: string[] = []
+  const normalized = validateAndNormalize(config, { workflowId: 'w', warnings })
+  assert.deepEqual(warnings, [])
   assert.equal(normalized.roles['developer']!.persona, 'Implement.')
   assert.equal(normalized.judgeRole.persona, 'Judge.')
 })

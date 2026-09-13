@@ -278,7 +278,7 @@ test('target host Code Mode snapshot binds claim/block only with the real root a
 function makeCommandHost(overrides: Partial<CommandHost> = {}): CommandHost {
   return {
     currentWorkspaceKey: async () => 'ws-1',
-    list: async () => ({ entries: [{ workflowId: 'a' }, { workflowId: 'b' }], diagnostics: [{ workflowId: 'bad', path: 'p', reason: 'broken' }] }),
+    list: async () => ({ entries: [{ workflowId: 'a' }, { workflowId: 'b' }], diagnostics: [{ workflowId: 'bad', path: 'p', reason: 'broken', severity: 'error' }] }),
     start: async (_agent, _ws, workflowId, extra) => ({ ok: true, message: `started ${workflowId} [${extra}]` }),
     status: async () => ({ ok: true, status: { status: 'running' } }),
     reset: async () => ({ ok: true, message: 'removed' }),
@@ -299,6 +299,20 @@ test('dsh-flow list renders entries and diagnostics', async () => {
   assert.equal(result.kind, 'success')
   assert.match(result.text ?? '', /a/)
   assert.match(result.text ?? '', /invalid/)
+})
+
+test('#59: dsh-flow list tags warnings as [warn], never as [invalid]', async () => {
+  const cmd = makeDshFlowCommand(makeCommandHost({
+    list: async () => ({
+      entries: [{ workflowId: 'warned' }],
+      diagnostics: [{ workflowId: 'warned', path: 'p', reason: 'role "developer" persona must not hand-write submission protocol (found "node_claim")', severity: 'warning' }],
+    }),
+  }))
+  const result = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'list', attachments: [], signal: new AbortController().signal })
+  assert.equal(result.kind, 'success')
+  assert.match(result.text ?? '', /^- warned$/m)
+  assert.match(result.text ?? '', /- \[warn\] warned — role "developer".*node_claim/)
+  assert.doesNotMatch(result.text ?? '', /\[invalid\]/)
 })
 
 test('dsh-flow start parses workflow id and extra text', async () => {

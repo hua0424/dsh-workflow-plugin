@@ -21,6 +21,8 @@ export interface CatalogDiagnostic {
   workflowId: string | null
   path: string
   reason: string
+  /** #59: `error` = the file is unusable and stays out of `entries`; `warning` = the file loads fine and only needs cleanup. */
+  severity: 'error' | 'warning'
 }
 
 export interface CatalogScan {
@@ -69,37 +71,43 @@ export async function scanCatalog(home: string): Promise<CatalogScan> {
     try {
       const stat = await lstat(path)
       if (stat.isSymbolicLink()) {
-        diagnostics.push({ workflowId: classified.workflowId, path, reason: 'symlinks are not accepted' })
+        diagnostics.push({ workflowId: classified.workflowId, path, reason: 'symlinks are not accepted', severity: 'error' })
         continue
       }
       if (!stat.isFile()) {
-        diagnostics.push({ workflowId: classified.workflowId, path, reason: 'not a regular file' })
+        diagnostics.push({ workflowId: classified.workflowId, path, reason: 'not a regular file', severity: 'error' })
         continue
       }
     } catch (error) {
       const err = error as NodeJS.ErrnoException
       if (err.code === 'ENOENT') continue // vanished between readdir and lstat
-      diagnostics.push({ workflowId: classified.workflowId, path, reason: `cannot stat: ${String(error)}` })
+      diagnostics.push({ workflowId: classified.workflowId, path, reason: `cannot stat: ${String(error)}`, severity: 'error' })
       continue
     }
     let text: string
     try {
       text = await readFile(path, 'utf8')
     } catch (error) {
-      diagnostics.push({ workflowId: classified.workflowId, path, reason: `cannot read: ${String(error)}` })
+      diagnostics.push({ workflowId: classified.workflowId, path, reason: `cannot read: ${String(error)}`, severity: 'error' })
       continue
     }
     try {
       const parsed = parseCatalogConfig(text)
-      const normalized = validateAndNormalize(parsed, { workflowId: classified.workflowId! })
+      // #59: non-blocking warnings (e.g. persona hand-written protocol keywords)
+      // are collected next to the entry instead of rejecting the file.
+      const warnings: string[] = []
+      const normalized = validateAndNormalize(parsed, { workflowId: classified.workflowId!, warnings })
       entries.push({
         workflowId: classified.workflowId!,
         path,
         config: normalized,
         definitionHash: computeDefinitionHash(normalized),
       })
+      for (const reason of warnings) {
+        diagnostics.push({ workflowId: classified.workflowId, path, reason, severity: 'warning' })
+      }
     } catch (error) {
-      diagnostics.push({ workflowId: classified.workflowId, path, reason: String(error) })
+      diagnostics.push({ workflowId: classified.workflowId, path, reason: String(error), severity: 'error' })
     }
   }
   entries.sort((a, b) => a.workflowId.localeCompare(b.workflowId))

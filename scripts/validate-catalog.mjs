@@ -19,7 +19,8 @@ const workflowId = process.argv[3] ?? 'milestone-delivery'
 try {
   const text = readFileSync(file, 'utf8')
   const parsed = parseCatalogConfig(text)
-  const normalized = validateAndNormalize(structuredClone(parsed), { workflowId })
+  const warnings = []
+  const normalized = validateAndNormalize(structuredClone(parsed), { workflowId, warnings })
   const hash = computeDefinitionHash(normalized)
   const root = normalized.workflow
   const countNodes = def => Object.keys(def.nodes).length
@@ -29,6 +30,8 @@ try {
   for (const [id, def] of Object.entries(normalized.childWorkflows ?? {})) {
     console.log(`child ${id}: startNode=${def.startNode}, ${countNodes(def)} nodes`)
   }
+  // #59: non-blocking warnings still keep the file OK.
+  for (const warning of warnings) console.warn(`WARN ${file}: ${warning}`)
 } catch (error) {
   console.error(`INVALID ${file}: ${String(error)}`)
   process.exit(1)

@@ -33,9 +33,14 @@ function validNodeTarget(target: string, workflow: WorkflowDef): boolean {
   return Object.prototype.hasOwnProperty.call(workflow.nodes, target)
 }
 
-/** Normalize (trim persona/instruction/criteria) and deep-validate one config. */
-export function validateAndNormalize(config: WorkflowConfig, extra?: { workflowId?: string }): WorkflowConfig {
+/**
+ * Normalize (trim persona/instruction/criteria) and deep-validate one config.
+ * Blocking problems throw `CatalogValidationError`; #59 non-blocking warnings
+ * are appended to `extra.warnings` and never reject the config.
+ */
+export function validateAndNormalize(config: WorkflowConfig, extra?: { workflowId?: string; warnings?: string[] }): WorkflowConfig {
   const problems: string[] = []
+  const warnings = extra?.warnings ?? []
   const workflowId = extra?.workflowId
 
   if (workflowId !== undefined && !ID_PATTERN.test(workflowId)) {
@@ -43,13 +48,14 @@ export function validateAndNormalize(config: WorkflowConfig, extra?: { workflowI
   }
 
 /** #42 P5 (#46): persona keywords that duplicate the engine-owned submission
- * protocol — the protocol is single-sourced in SUBMISSION_CONSTRAINT. */
+ * protocol — the protocol is single-sourced in SUBMISSION_CONSTRAINT.
+ * #59: drift risk only, so this is a non-blocking warning, never a problem. */
 const PERSONA_PROTOCOL_KEYWORDS = ['node_claim', 'judge_claim', 'send_message']
 
-function checkPersonaProtocol(label: string, persona: string, problems: string[]): void {
+function checkPersonaProtocol(label: string, persona: string, warnings: string[]): void {
   const hit = PERSONA_PROTOCOL_KEYWORDS.find(keyword => persona.includes(keyword))
   if (hit !== undefined) {
-    problems.push(`${label} persona must not hand-write submission protocol (found "${hit}"); the submission protocol is engine-owned (SUBMISSION_CONSTRAINT) — keep only business discipline in persona`)
+    warnings.push(`${label} persona must not hand-write submission protocol (found "${hit}"); the submission protocol is engine-owned (SUBMISSION_CONSTRAINT) — keep only business discipline in persona (migration: docs/user-guide.md §4)`)
   }
 }
 
@@ -65,12 +71,12 @@ function checkPersonaProtocol(label: string, persona: string, problems: string[]
     // #60: 缺省 reuse 在此归一化为 `node`，随 definitionSnapshot 一并冻结；
     // 之后修改 YAML 只影响新启动的 Run。
     role.reuse = roleReuseMode(role)
-    checkPersonaProtocol(`role "${roleKey}"`, role.persona, problems)
+    checkPersonaProtocol(`role "${roleKey}"`, role.persona, warnings)
   }
 
   // judge role
   config.judgeRole.persona = config.judgeRole.persona.trim()
-  checkPersonaProtocol('judgeRole', config.judgeRole.persona, problems)
+  checkPersonaProtocol('judgeRole', config.judgeRole.persona, warnings)
 
   // workflows (root + children)
   const allWorkflows: Record<string, WorkflowDef> = { ...(config.childWorkflows ?? {}) }
