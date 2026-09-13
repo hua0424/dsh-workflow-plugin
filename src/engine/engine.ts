@@ -610,6 +610,8 @@ export class WorkflowEngine {
       if (!predecessor || !matches(predecessor.judge, caller) || predecessor.judge!.settled) return
       const settledSafe = await this.safetyProbe(ws, row, caller.sessionId)
       if (settledSafe === undefined) return
+      // #54：Judge 结算路径没有"等待并行子代理"语义——waiting 在此仍是收口未知，
+      // 与 unsafe 同样 BLOCK（本 PR 未改变该行为，仅保留折叠）。
       if (settledSafe !== 'safe') { await this.blockRow(ws, row, 'Judge/known tools not safely closed'); return }
       const fresh = await this.state.get(ws)
       if (!fresh || fresh.version !== row.version || fresh.execution.executionId !== e.executionId) return

@@ -361,7 +361,10 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
           const candidate = observed.get(id) ?? adapters.ctx.agents.get(SessionId(id))
           if (!candidate || unsafe.has(id)) return 'unsafe'
           if (candidate.status !== 'idle' || !inboxEmpty(candidate)) {
-            if (waitableIds.has(id)) waiting = true
+            // #54：非 waitable 的 busy 成员（会话自身、tree/observed 补齐的会话、
+            // descriptor 发布窗口期的 live 后代）仍属"收口未知"，必须 fail-closed。
+            if (!waitableIds.has(id)) return 'unsafe'
+            waiting = true
             continue
           }
           agents.push(candidate)

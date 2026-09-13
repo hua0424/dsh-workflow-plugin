@@ -96,6 +96,24 @@ test('safe inspection requires observable idle descendants, empty inboxes, and t
   assert.equal(await host.safeToInspect('actor'), 'unsafe')
 })
 
+test('safe inspection keeps failing closed when a non-waitable member of the closure is busy', async () => {
+  // #54 r001-F1：只有 `kind: 'child'` 的 durable 后代才可算"等待并行子代理"；
+  // 其余 busy 成员（会话自身、tree/observed 补齐的 live 后代）保持 fail-closed。
+  const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  const neverInDescendants = { id: 'absent', status: 'running', session: { id: 'absent', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
+  let live: Agent[] = [actor, neverInDescendants]
+  const ctx = {
+    jobs: { list: () => [], onJobDone: () => () => {} }, effect: () => {},
+    agents: { get: (id: unknown) => live.find(agent => agent.id === id), list: () => live },
+    subagents: { listDescendants: async () => [] },
+  } as unknown as Context
+  const host = makeSafetyHost(ctx, actor)
+  assert.equal(await host.safeToInspect('actor'), 'unsafe',
+    'busy live descendant outside the durable descriptor list is not a waitable parallel subagent')
+  live = [{ ...actor, status: 'running' } as unknown as Agent, neverInDescendants]
+  assert.equal(await host.safeToInspect('actor'), 'unsafe', 'the inspected Session itself is never waitable')
+})
+
 test('orphan evidence follows its exact nested Session across descriptor removal without tainting a new Session', async () => {
   const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
   const branch = { id: 'branch-old', status: 'idle', session: { id: 'branch-old', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
