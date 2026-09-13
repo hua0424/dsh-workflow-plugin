@@ -294,7 +294,9 @@ export class WorkflowEngine {
           }
           if (!e.roleBoundaryPrepared) {
             const compact = await this.subagents.compactRoleActor(run, role)
-            if (!compact.ok) throw new WorkflowError(`node-boundary compact failed: ${compact.detail ?? 'unknown'}`)
+            // #55：host 已自动重试仍失败时，BLOCK 文本必须自带恢复路径——事故里
+            // Manager 是自己摸索出"换模型再 resume"的（run 295ad986）。
+            if (!compact.ok) throw new WorkflowError(`node-boundary compact failed: ${compact.detail ?? 'unknown'}；Manager 可 workflow_set_role_model 切换更强模型后 node_resume 重试`)
             const current = await this.stillCurrent(ws, e, arrangedVersion)
             if (!current) return
             current.execution.roleBoundaryPrepared = true
