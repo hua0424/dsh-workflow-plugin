@@ -97,11 +97,9 @@ roles:
   所以 `roles.manager.reuse` 在校验期直接失败（"reserved"）；manager 节点始终由
   当前主会话承担，不参与 Role 会话复用。`judgeRole` 同样不接受 `reuse`——Judge
   每个节点都是全新会话。
-- **`continuable` 的代价（为什么缺省不是它）**：整 Run 复用同一会话意味着历史持续
-  累积，每次派发新节点前都要先做一次节点边界 compact（cold materialize →
-  compactNow → dispose），带来派发前的时延；compact 失败是 fail-closed——Run 进入
-  BLOCK 等 Manager `node_resume` 重试（风险面见 issue #55）。只有确实需要 Role 跨
-  节点带着历史继续工作时才选 `continuable`；同节点内的复用/返工 `node` 已覆盖。
+- **`continuable` 的代价与选型**：单一权威说明在 `docs/user-guide.md` §3.1
+  「会话复用粒度 `reuse`」——边界 compact 的派发前时延、compact 失败 fail-closed
+  BLOCK（风险面见 issue #55）与何时该选它。
 
 ## Judge 工具面（Issue #25）
 

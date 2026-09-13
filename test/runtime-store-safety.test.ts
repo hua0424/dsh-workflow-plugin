@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { StateStore, stateDbPath } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
+import { authorizeToolCall } from '../src/tools/authz.ts'
 import { EVENT_TYPES, type ClaimCaller, type WorkflowConfig } from '../src/types.ts'
 
 const config: WorkflowConfig = {
@@ -23,6 +24,24 @@ async function fixture(roleReview = false) {
   const home = mkdtempSync(join(tmpdir(), 'workflow-store-safety-'))
   const store = new StateStore(home)
   let message = 0
+  const roleDrains: string[] = []
+  let raceAdvance = false
+  const stateHost = makeStateHost(store)
+  const put = stateHost.put
+  // F3 探针：在 Role 离开节点的提交点先让另一写入者抢先提交，制造真实 CAS 版本冲突。
+  stateHost.put = async (ws, run, expectedVersion, changes) => {
+    if (raceAdvance && changes.some(change => change.events.includes('exited'))) {
+      raceAdvance = false
+      const rival = new StateStore(home)
+      try {
+        const current = (await rival.get(ws))!
+        const drift = structuredClone(current.run)
+        drift.modelOverrides.judge = { provider: 'rival', modelId: 'winner' }
+        await rival.updateRow(ws, drift, current.stateVersion, [])
+      } finally { rival.close() }
+    }
+    return put(ws, run, expectedVersion, changes)
+  }
   const engine = new WorkflowEngine({
     async steerManager() { return { messageId: `actor-message-${++message}` } },
     async sendRoleActor() { throw new Error('unexpected Role') },
@@ -31,9 +50,9 @@ async function fixture(roleReview = false) {
     async ensureRoleActor(_run, role) { return { childId: `role-${role}`, messageId: `actor-message-${++message}` } },
     async startJudge(_run, input) { return { judgeSessionId: input.judgeSessionId, messageId: 'judge-message-1' } },
     async followupJudge() { return { messageId: `judge-followup-${++message}` } }, async judgeSessionAvailability() { return 'available' as const }, async roleSessionAvailability() { return 'available' as const },
-    async retireJudge() {}, async drainJudge() {}, async drainRoleActor() {}, async compactRoleActor() { return { ok: true } },
+    async retireJudge() {}, async drainJudge() {}, async drainRoleActor(run, role) { roleDrains.push(run.roleActors[role]!) }, async compactRoleActor() { return { ok: true } },
     async safeToInspect() { return true },
-  }, { async run() { throw new Error('unexpected Program') } }, makeStateHost(store))
+  }, { async run() { throw new Error('unexpected Program') } }, stateHost)
   engine.cwdResolver = async () => home
   const definition = structuredClone(config)
   if (roleReview) {
@@ -44,7 +63,8 @@ async function fixture(roleReview = false) {
   await engine.startRun('ws', run, undefined, 'root request')
   const sql = new DatabaseSync(stateDbPath(home))
   const actor: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
-  return { home, store, engine, sql, actor,
+  return { home, store, engine, sql, actor, roleDrains,
+    setRaceAdvance(value: boolean) { raceAdvance = value },
     cleanup() { sql.close(); store.close(); rmSync(home, { recursive: true, force: true }) },
   }
 }
@@ -127,6 +147,45 @@ test('Manager controls Role BLOCK, but sibling mapping drift cannot impersonate 
     assert.equal(blocked.run.status, 'blocked')
     assert.equal(blocked.execution.blockReason, 'Manager pause')
     assert.equal(blocked.execution.dispatch?.sessionId, 'role-reviewer')
+  } finally { f.cleanup() }
+})
+
+// deferred F3 入口 1：drain 先于 state.put，用真实 CAS 冲突固定提交失败时的持久层行为。
+test('Role 离开节点的提交遇 CAS 冲突：映射保持原值、会话仍授权、无半提交', async () => {
+  const f = await fixture(true)
+  try {
+    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan artifact' }, f.actor)
+    await f.engine.handleTurnEnded('ws', f.actor)
+    let row = (await f.store.get('ws'))!
+    const planJudge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
+    await f.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified', planJudge)
+    await f.engine.handleTurnEnded('ws', planJudge)
+    row = (await f.store.get('ws'))!
+    assert.equal(row.execution.dispatch?.sessionId, 'role-reviewer', '缺省 reuse=node 的 Role 已派发')
+
+    const reviewer: ClaimCaller = { sessionId: 'role-reviewer', turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
+    assert.equal((await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'review artifact' }, reviewer)).ok, true)
+    await f.engine.handleTurnEnded('ws', reviewer)
+    const before = (await f.store.get('ws'))!
+    const history = await f.store.events('ws', before.execution.executionId)
+    const judge: ClaimCaller = { sessionId: before.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
+
+    f.setRaceAdvance(true)
+    await assert.rejects(f.engine.handleJudgeClaim('ws', before.execution.nodeToken, 'ACCEPT', 'verified', judge), /state version mismatch/)
+
+    const after = (await f.store.get('ws'))!
+    assert.equal(after.run.roleActors.reviewer, 'role-reviewer', '提交失败时映射保持原值（未持久删除）')
+    assert.deepEqual(after.execution, before.execution, '无半提交：工作单未推进')
+    assert.deepEqual(await f.store.events('ws', before.execution.executionId), history, '无半提交：事件未追加')
+    assert.deepEqual(f.roleDrains, ['role-reviewer'], 'drain 先于提交：会话已被释放')
+    assert.equal(authorizeToolCall({
+      run: after.run, sessionId: 'role-reviewer', knownRoleOfSession: 'reviewer', isJudgeSession: false, toolName: 'node_claim',
+    }).allow, true, '映射未删，该会话仍持 workflow 工具授权')
+
+    assert.equal((await f.engine.handleJudgeClaim('ws', after.execution.nodeToken, 'ACCEPT', 'verified', judge)).ok, true, '冲突后同一 Judge 可重试')
+    const completed = (await f.store.get('ws'))!
+    assert.equal(completed.run.status, 'completed')
+    assert.equal(completed.run.roleActors.reviewer, undefined, '重试提交成功后才删映射')
   } finally { f.cleanup() }
 })
 
