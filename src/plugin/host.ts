@@ -284,7 +284,15 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
   }
 }
 
-export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { provider?: string; model?: string }): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+/**
+ * #91: 默认路由的读取点是**本 Run 自己**的冻结值（`engine.startRun` 写入并随
+ * State row 持久化）。`frozenRoute` 回调只作为旧 Run（无该字段）的兜底——旧 Run
+ * 不推测历史事实，交给宿主 spawn 的正式继承语义解析。因此同一插件实例里多个
+ * workspace 交错运行时，谁都不会读到别人的路由。
+ */
+export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { provider?: string; model?: string }): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+  /** #91: 本 Run 冻结值优先；旧 Run 无冻结信息时才走兜底回调。 */
+  const frozenRoute = (run: RunState): { provider?: string; model?: string } => run.delegationRoute ?? legacyRoute()
   // ponytail: plugin-lifetime保留当代Agent/祖先/unsafe证据；若长期进程的Session churn实测成问题，再随Run完成/Reset显式清理。
   const observed = new Map<string, Agent>()
   const parents = new Map<string, string>()
@@ -418,7 +426,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const roleDef = run.definitionSnapshot.roles[roleKey]
       if (roleDef === undefined) throw new WorkflowError(`unknown role "${roleKey}"`)
-      const route = resolveRoleModel(run, roleKey, frozenRoute())
+      const route = resolveRoleModel(run, roleKey, frozenRoute(run))
       const deny = roleDenyList(run, roleKey)
       const started = await startContinuableWithin(adapters.ctx.subagents, {
         provider: 'spawn',
@@ -443,7 +451,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async startJudge(run, input) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      const plan = judgeSpawnPlan(run, frozenRoute())
+      const plan = judgeSpawnPlan(run, frozenRoute(run))
 
       // 首次、followup 与 respawn 都从同一当前工作单材料重建完整 packet。
       const prompt = await judgePrompt(run, input)
@@ -542,7 +550,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async compactRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
-      return await compactWithRetry(adapters, frozenRoute, run, roleKey, childId)
+      return await compactWithRetry(adapters, frozenRoute(run), run, roleKey, childId)
     },
   }
 }
@@ -554,7 +562,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
  */
 async function compactWithRetry(
   adapters: HostAdapters,
-  frozenRoute: () => { provider?: string; model?: string },
+  frozenRoute: { provider?: string; model?: string },
   run: RunState,
   roleKey: string,
   childId: string,
@@ -580,7 +588,7 @@ async function compactWithRetry(
  */
 async function compactOnce(
   adapters: HostAdapters,
-  frozenRoute: () => { provider?: string; model?: string },
+  frozenRoute: { provider?: string; model?: string },
   run: RunState,
   roleKey: string,
   childId: string,
@@ -609,7 +617,7 @@ async function compactOnce(
       return { ok: false, detail: compactErrorDetail(error), retryable: true }
     }
   }
-  const route = resolveRoleModel(run, roleKey, frozenRoute())
+  const route = resolveRoleModel(run, roleKey, frozenRoute)
   const manager = adapters.managerAgentOf(run)
   const resuming = adapters.ctx.agents.resume({
       resumeSessionId: childId as SessionId,

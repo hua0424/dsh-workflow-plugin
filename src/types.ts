@@ -54,6 +54,12 @@ export interface RoleModel {
 }
 
 /**
+ * A partially-known model route: the components a caller may supply for a Role,
+ * Judge, or frozen default. Resolution fills the gaps from the next source.
+ */
+export type DelegationRoute = Partial<RoleModel>
+
+/**
  * Issue #41：catalog def 层 → 角色 route 的共享单源（`'judge'` 固定取
  * judgeRole，其余取 roles[roleKey]）。`checkCatalogProviders`、start 前置
  * 检查与 `resolveRoleModel` 的 def 分支三方共用；签名不依赖 RunState。
@@ -219,6 +225,15 @@ export interface RunState {
    * never workflow state.
    */
   traceLogPath?: string
+  /**
+   * #91: 本 Run 启动时冻结的默认模型路由（来源=Manager 的
+   * `parentAgentOptionsForDelegation` 语义：最新 request header 优先、创建
+   * options 兜底）。Role/Judge 未显式配模型时从这里解析默认路由，不再读
+   * Engine 实例级共享值——既不会跨 workspace 串用，也能在 Store 重开后稳定。
+   * 旧 Run 无该字段：不推测原始值，fresh 派发交回宿主
+   * `resolveChildAgentOptions` 的继承语义（仍只从本 Run 自己的 Manager 解析）。
+   */
+  delegationRoute?: DelegationRoute
 }
 
 /** 派发意图先存；messageId 只由真实 Host 返回，不能由模型填写。 */
