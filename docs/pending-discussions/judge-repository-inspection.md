@@ -10,7 +10,7 @@ milestone-delivery 的实现、决策和合并节点需要查询 PR base/head、
 
 - ~~`src/roles/roles.ts` 的 JUDGE_ALLOW 为固定白名单，没有 shell、任意 HTTP 或 gh 工具。~~ 已由 #25 解除：`JUDGE_ALLOW` 白名单替换为默认 deny 清单（`JUDGE_DEFAULT_DENY`，定义在 `src/roles/roles.ts`），Judge 继承全量工具目录。
 - `src/tools/tools.ts` / `src/index.ts` 的 inspection 只有 Git status/branch/remote/top-level 和 GitHub milestones/issues/milestone-issues。
-- 当前 GitHub inspection 列表仅取 per_page=100 的一页，不能据此证明大集合完整性。
+- 当前 GitHub inspection 列表仅取 per_page=100 的一页，不能据此证明大集合完整性。（**Issue #92 已修**：inspection 与两个固定 Program 共用分页读取层，逐页取全并在失败/超上限时报错，不再有"只取一页"的完整性缺口；本文件其余 typed 扩展项仍按上述 #25 状态处理。）
 - ~~`judgeRole` 的严格 schema 不接受 tools 配置；改 YAML/persona 或换模型不能提供这些能力。~~ 已由 #25 解除：`judgeRole.tools.deny` 可配置（只收不能放），默认清单之外的查询工具默认可见。
 
 ## 待实施范围

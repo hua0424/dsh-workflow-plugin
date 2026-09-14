@@ -1,12 +1,19 @@
 /**
  * Builtin program catalog (design §10.1/§10.2): fixed id → implementation map.
  * Two programs in v1, both operating on the CURRENT workspace repository.
+ *
+ * 读取合同（Issue #92）：两个 Program 只经 repository 只读事实层取事实，事实不可靠
+ * （读取失败、结构不符、分页不完整）一律 ERROR（Runtime 转 BLOCK），绝不当成
+ * 空集合 / clean / "不存在"；写动作只在依赖的读取事实全部可靠后才执行。
  */
-import { inspectGit, parseOriginRepo, ghApi, runProgram } from './runner.ts'
+import { gitLocalBranch, gitRemoteBranch, gitStatusShort, realRepositoryAdapter, type RepositoryAdapter } from './runner.ts'
+import { listIssues, listMilestones, repositoryIdentity } from './repository.ts'
 import type { ProgramResult } from '../types.ts'
 
 export interface ProgramContext {
   cwd: string
+  /** 受控进程适配器（测试注入）；缺省走真实 git/gh 子进程。 */
+  adapter?: RepositoryAdapter
 }
 
 export interface ProgramDefinition {
@@ -22,48 +29,53 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
   const branchName = parameters['branchName']
   if (typeof title !== 'string' || title.trim() === '') return { kind: 'ERROR', reason: 'title is required' }
   if (typeof branchName !== 'string' || branchName.trim() === '') return { kind: 'ERROR', reason: 'branchName is required' }
+  const adapter = ctx.adapter ?? realRepositoryAdapter
 
-  const git = inspectGit(ctx.cwd)
-  if (!git.inRepo) return { kind: 'ERROR', reason: 'workspace is not a git repository' }
-  if (git.originUrl === undefined || git.originUrl === '') return { kind: 'ERROR', reason: 'no origin remote found' }
-  const parsed = parseOriginRepo(git.originUrl)
-  if (parsed === undefined) return { kind: 'ERROR', reason: `origin remote is not a GitHub repository: ${git.originUrl}` }
-  const { owner, repo } = parsed
+  const identity = repositoryIdentity(adapter, ctx.cwd)
+  if (identity.kind === 'ERROR') return identity
+  const { owner, repo } = identity.value
 
-  // 1. Inspect-first: milestone already exists?
-  const listResult = ghApi({ cwd: ctx.cwd, method: 'GET', path: `repos/${owner}/${repo}/milestones`, query: 'state=all&per_page=100' })
-  if (listResult.kind === 'ERROR') return listResult
-  const milestones = Array.isArray(listResult.details) ? listResult.details as Array<{ number: number; title: string; state: string }> : []
-  const existing = milestones.find(m => m.title === title.trim())
+  // 预检（只读）：任一事实读取失败就 ERROR，绝不带着未知事实进入写动作。
+  const milestones = listMilestones(adapter, ctx.cwd, owner, repo)
+  if (milestones.kind === 'ERROR') return milestones
+  const existing = milestones.value.find(m => m.title === title.trim())
+  if (existing !== undefined && existing.state !== 'open') {
+    return { kind: 'FAIL', reason: `milestone "${title}" exists but is ${existing.state}` }
+  }
+  const local = gitLocalBranch(adapter, ctx.cwd, branchName)
+  if (local.kind === 'error') return { kind: 'ERROR', reason: `cannot read local branch ${branchName}: ${local.reason}` }
+  const remote = gitRemoteBranch(adapter, ctx.cwd, branchName)
+  if (remote.kind === 'error') return { kind: 'ERROR', reason: `cannot read remote branch ${branchName}: ${remote.reason}` }
+  const createLocal = local.kind === 'none'
+  if (createLocal) {
+    const status = gitStatusShort(adapter, ctx.cwd)
+    if (status.kind !== 'value') return { kind: 'ERROR', reason: `cannot read workspace status: ${status.reason}` }
+    if (status.value !== '') return { kind: 'ERROR', reason: 'working tree is dirty; cannot create a milestone branch' }
+  }
+
+  // 写动作：事实已确认可靠后按依赖顺序执行（外部动作非事务，不做自动回滚）。
   let milestoneNumber: number
   if (existing !== undefined) {
-    if (existing.state !== 'open') return { kind: 'FAIL', reason: `milestone "${title}" exists but is ${existing.state}` }
     milestoneNumber = existing.number
   } else {
-    const create = ghApi({
+    const create = adapter.gh({
       cwd: ctx.cwd, method: 'POST', path: `repos/${owner}/${repo}/milestones`,
       input: { title: title.trim(), state: 'open' },
     })
     if (create.kind === 'ERROR') return create
-    const created = create.details as { number?: number }
-    if (typeof created.number !== 'number') return { kind: 'ERROR', reason: 'milestone create response has no number' }
+    const created = create.details as { number?: unknown }
+    if (typeof created?.number !== 'number' || !Number.isSafeInteger(created.number)) {
+      return { kind: 'ERROR', reason: 'milestone create response has no number' }
+    }
     milestoneNumber = created.number
   }
 
-  // 2. Local branch: create if absent (must start from a clean tree)
-  const local = runProgram('git', ['rev-parse', '--verify', `refs/heads/${branchName}`], { cwd: ctx.cwd })
-  const branchExists = local.exitCode === 0
-  if (!branchExists) {
-    if ((git.statusShort ?? '') !== '') return { kind: 'ERROR', reason: 'working tree is dirty; cannot create a milestone branch' }
-    const created = runProgram('git', ['checkout', '-b', branchName], { cwd: ctx.cwd })
+  if (createLocal) {
+    const created = adapter.git(['checkout', '-b', branchName], ctx.cwd)
     if (created.exitCode !== 0) return { kind: 'ERROR', reason: `git checkout -b failed: ${created.stderr.trim().slice(0, 300)}` }
   }
-
-  // 3. Remote branch: push if absent
-  const remote = runProgram('git', ['ls-remote', '--heads', 'origin', branchName], { cwd: ctx.cwd })
-  const remoteExists = remote.exitCode === 0 && remote.stdout.trim() !== ''
-  if (!remoteExists) {
-    const push = runProgram('git', ['push', '-u', 'origin', branchName], { cwd: ctx.cwd, timeoutMs: 120_000 })
+  if (remote.kind === 'none') {
+    const push = adapter.git(['push', '-u', 'origin', branchName], ctx.cwd)
     if (push.exitCode !== 0) return { kind: 'ERROR', reason: `git push failed: ${push.stderr.trim().slice(0, 300)}` }
   }
 
@@ -78,29 +90,28 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
 async function allMilestoneIssuesComplete(ctx: ProgramContext, parameters: Record<string, unknown>): Promise<ProgramResult> {
   const raw = parameters['milestoneNumber']
   if (typeof raw !== 'number' || !Number.isSafeInteger(raw)) return { kind: 'ERROR', reason: 'milestoneNumber must be an integer' }
+  const adapter = ctx.adapter ?? realRepositoryAdapter
 
-  const git = inspectGit(ctx.cwd)
-  if (!git.inRepo) return { kind: 'ERROR', reason: 'workspace is not a git repository' }
-  if (git.originUrl === undefined || git.originUrl === '') return { kind: 'ERROR', reason: 'no origin remote found' }
-  const parsed = parseOriginRepo(git.originUrl)
-  if (parsed === undefined) return { kind: 'ERROR', reason: `origin remote is not a GitHub repository: ${git.originUrl}` }
-  const { owner, repo } = parsed
+  const identity = repositoryIdentity(adapter, ctx.cwd)
+  if (identity.kind === 'ERROR') return identity
+  const { owner, repo } = identity.value
 
-  // state=all + milestone filter + per_page; exclude pull requests.
-  const result = ghApi({
-    cwd: ctx.cwd, method: 'GET', path: `repos/${owner}/${repo}/issues`,
-    query: `state=all&milestone=${raw}&per_page=100`,
-  })
-  if (result.kind === 'ERROR') return result
-  const issues = Array.isArray(result.details)
-    ? (result.details as Array<{ number: number; state: string; pull_request?: unknown }>).filter(i => i.pull_request === undefined)
-    : []
-  const open = issues.filter(i => i.state === 'open')
-  const closed = issues.filter(i => i.state === 'closed')
-  if (issues.length === 0 || open.length > 0) {
-    return { kind: 'FAIL', reason: `${open.length} open of ${issues.length} milestone issues`, handoff: `Milestone #${raw} has ${open.length} open of ${issues.length} issues.` }
+  // 分页取全 + 结构校验 + PR 排除都在共享读取层完成；失败即 ERROR，不降级成空集合。
+  const listed = listIssues(adapter, ctx.cwd, owner, repo, raw)
+  if (listed.kind === 'ERROR') return listed
+  const open = listed.value.filter(i => i.state === 'open')
+  if (listed.value.length === 0 || open.length > 0) {
+    return {
+      kind: 'FAIL',
+      reason: `${open.length} open of ${listed.value.length} milestone issues`,
+      handoff: `Milestone #${raw} has ${open.length} open of ${listed.value.length} issues.`,
+    }
   }
-  return { kind: 'PASS', handoff: `Milestone #${raw} has ${closed.length} closed issues and no open issues.`, details: { total: issues.length, open: 0, closed: closed.length } }
+  return {
+    kind: 'PASS',
+    handoff: `Milestone #${raw} has ${listed.value.length} closed issues and no open issues.`,
+    details: { total: listed.value.length, open: 0, closed: listed.value.length },
+  }
 }
 
 export const BUILTIN_PROGRAMS: Record<string, ProgramDefinition> = {
