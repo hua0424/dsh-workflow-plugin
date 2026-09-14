@@ -85,7 +85,6 @@ export class WorkflowEngine {
   cwdResolver: (run: RunState) => Promise<string> = async () => { throw new WorkflowError('cwd resolver is not wired') }
   actorActivity: (sessionId: string) => Promise<'active' | 'idle' | 'unknown'> = async () => 'unknown'
   managerRoute: (sessionId: string) => Promise<{ provider?: string; model?: string }> = async () => ({})
-  frozenRoute: { provider?: string; model?: string } = {}
   traceWarn: ((message: string) => void) | undefined
   private readonly targets: DispatchTargets
   private readonly subagents: SubagentHost
@@ -222,7 +221,14 @@ export class WorkflowEngine {
         }
       }
     }
-    this.frozenRoute = await this.managerRoute(run.managerSessionId)
+    // #91: 默认路由按 Run 冻结，且在创建/hash/首次派发之前写入——冻结只影响之后
+    // 创建的 Role/Judge（已有 descriptor 继续用自己的路由），也不改写用户显式配置。
+    // 解析不出值（Manager 不在场）时不猜：保持 undefined，由宿主 spawn 的正式继承
+    // 语义从本 Run 自己的 Manager 兜底，绝不借其他 Run 的值。
+    const frozen = await this.managerRoute(run.managerSessionId)
+    if (frozen.provider !== undefined || frozen.model !== undefined) {
+      run.delegationRoute = { ...(frozen.provider === undefined ? {} : { provider: frozen.provider }), ...(frozen.model === undefined ? {} : { modelId: frozen.model }) }
+    }
     if (configPath) {
       const path = createRunLog(configPath, run.catalogWorkflowId, run.runId)
       if (path) run.traceLogPath = path

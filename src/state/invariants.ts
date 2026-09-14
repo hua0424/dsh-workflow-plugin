@@ -17,6 +17,8 @@ const runSchema = z.object({
   definitionSnapshot: workflowConfigSchema, status: z.enum(['running', 'blocked', 'completed', 'terminated']),
   callStack: z.array(frame), roleActors: z.record(z.string(), text), modelOverrides: z.record(z.string(), model),
   blockReason: text.nullable(), currentExecutionId: text, traceLogPath: text.optional(),
+  // #91: 启动时冻结的默认模型路由；旧 Run 无该字段（不得由运行时补造）。
+  delegationRoute: z.object({ provider: text.optional(), modelId: text.optional() }).strict().optional(),
 }).strict()
 const executionSchema = z.object({
   executionId: text, runId: text, workflowId: text, nodeId: text, nodeToken: z.uuid(),

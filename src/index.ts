@@ -7,6 +7,7 @@
  */
 import { Context } from '@deepseek-ai/cordis'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
@@ -143,7 +144,10 @@ export function apply(ctx: Context) {
     return ctx.agents.currentInitiator()
   }
 
-  const subagentHost = makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute)
+  // #91: 兜底回调只服务旧 Run（无 `delegationRoute` 的 v9 行）：不推测历史值，
+  // 也不借其他 Run 的值——留空即让宿主 spawn 的正式继承语义从本 Run 自己的
+  // Manager 解析。新 Run 一律读 Run row 上的冻结值。
+  const subagentHost = makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => ({}))
   const engine: WorkflowEngine = new WorkflowEngine(
     makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
     subagentHost,
@@ -151,11 +155,14 @@ export function apply(ctx: Context) {
     makeStateHost(store),
   )
   engine.cwdResolver = cwdOf
-  // F22: freeze the Manager route at Run start (read from the live agent).
+  // F22 / #91：Run 启动时冻结 Manager 的默认路由，冻结值随 Run row 持久化。
+  // 取源走 DSH 固定版本的正式委派 helper——最新 request header 拥有 provider/model，
+  // 创建该会话时的 options 兜底——这样冻结值与新建子会话真正会继承到的路由一致。
   engine.managerRoute = async (managerSessionId: string) => {
     const agent = ctx.agents.get(managerSessionId as SessionId)
     if (agent === undefined) return {}
-    return { provider: agent.options.provider, model: agent.options.model }
+    const options = parentAgentOptionsForDelegation(agent)
+    return { provider: options.provider, model: options.model }
   }
   // F13: actor-activity oracle for resume/model-switch checks.
   engine.actorActivity = async (actorSessionId: string) => {

@@ -64,6 +64,27 @@ worker Role 可选 `reuse: node | continuable`，决定该 Role 的会话在节�
 - 取值在 Run 启动时随 `definitionSnapshot` 冻结，Run 中途改 YAML 只影响下一个 Run。
   配置细节见 `docs/example/README.md`「会话复用粒度」。
 
+### 3.2 默认模型路由按 Run 冻结（Issue #91 起）
+
+同一个插件实例会同时服务多个 workspace，而**默认模型路由**（既没有
+`workflow_set_role_model` 的 override、也没有 catalog 里 `model: { provider, modelId }`
+时用的那条）自 #91 起**在 Run 启动时冻结一次、写进该 Run 自己的状态行**，之后不再
+跟随外部变化：
+
+- **新 Run**：`/dsh-flow start` 时按 DSH 正式的委派语义取源——Manager 会话最新
+  request header 的 provider/model 优先，创建该会话时的 options 兜底——冻结值随
+  Run 一起持久化，宿主重启后照旧生效。此后为该 Run 新建的 Role Actor、Judge 会话，
+  以及 `reuse: continuable` 的跨节点边界 compact fallback，一律只读这条冻结值。
+- **优先级不变**：`workflow_set_role_model` 的 override > catalog 中 Role/Judge 的
+  `model:` 块 > 本 Run 的冻结值 > 宿主 spawn 时按 Manager 继承。
+- **不追溯已有会话**：冻结只影响之后创建的会话；Run 中途 Manager 会话换了模型，
+  不会改写已存在 Role/Judge 会话自己的路由，也不会把它们算到别的 Run 上。
+- **旧 Run**（升级前已存在、状态行里没有该字段）：不推测历史值，也**不借用**其他
+  workspace/Run 的当前路由——新建会话交回宿主的正式继承语义（仍只从本 Run 自己的
+  Manager 解析），边界 compact fallback 保持不注入。因此升级**不需要清空或迁移**
+  `${DSH_HOME}/workflows/state.sqlite3`：旧 Run 照旧跑到结束，新 Run 从一开始就
+  带着冻结值。
+
 ## 4. 提交协议单源化：旧 catalog 迁移指引
 
 提交协议只有引擎一个来源：每次派发末尾的 `[提交要求]` 段（含

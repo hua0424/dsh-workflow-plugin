@@ -307,7 +307,7 @@ test('cold actor: dispose failure fail-closes (a leaked resident agent would bre
 test('cold actor with no role model and no frozen route resumes with undefined agentOptions', async () => {
   const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
   const { host } = makeHost({ ...f, compactResult: null })
-  // reviewer has no model in the config; frozenRoute is () => ({}) in makeHost.
+  // reviewer has no model in the config; the legacy fallback is () => ({}) in makeHost.
   const result = await host.compactRoleActor({ ...makeRun('sess-rev'), roleActors: { reviewer: 'sess-rev' } } as RunState, 'reviewer')
   assert.deepEqual(result, { ok: true, detail: 'cold: no compactable range' })
   assert.equal(f.resumes[0]!.agentOptions, undefined)

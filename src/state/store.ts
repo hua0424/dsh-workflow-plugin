@@ -268,7 +268,8 @@ export class StateStore {
       const current = this.decode(row)
       if (row.state_version !== expectedVersion) throw new StateVersionError(workspaceKey, row.state_version, expectedVersion)
       if (current.run.status === 'completed' || current.run.status === 'terminated') throw new Error(`${current.run.status} run is immutable`)
-      for (const key of ['runId', 'managerSessionId', 'catalogWorkflowId', 'definitionHash', 'definitionSnapshot'] as const) {
+      // #91: `delegationRoute` 与 Snapshot 同为启动期冻结事实，运行期不可改写。
+      for (const key of ['runId', 'managerSessionId', 'catalogWorkflowId', 'definitionHash', 'definitionSnapshot', 'delegationRoute'] as const) {
         if (!isDeepStrictEqual(current.run[key], savedRun[key])) throw new Error(`${key} is immutable`)
       }
       assertValid(checkStateInvariants(savedRun))
