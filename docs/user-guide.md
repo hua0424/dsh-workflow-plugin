@@ -157,6 +157,17 @@ REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona`
 所有工具调用都会校验调用者身份（authz）：以 `workflow_status` 返回的最新
 nodeToken 为准，不要缓存旧 token。
 
+**只读 repository 事实的失败语义（Issue #92 起）**：`workflow_inspect_git` /
+`workflow_inspect_github` 与两个 builtin program（`github.initialize-milestone`、
+`github.all-milestone-issues-complete`）共用同一套 repository 识别、分页与过滤结果——
+GitHub 列表按 `per_page=100` 翻页取全、PR 从 issues 结果中排除；无效 JSON、非数组、缺关键
+字段、未知 issue/milestone 状态、后页读取失败、超出分页页数/时间上限都算**读取失败**，返回
+失败而不是空集合或截断后的"完整"结果。git 侧同样区分「事实不存在」与「读取失败」：不是仓库、
+无 origin、detached HEAD、分支不存在是事实；`git status` 读取失败不当 clean，`ls-remote`
+失败不当「远端分支不存在」（因此不会继续 push）。Program 的读取事实不可靠时一律 ERROR
+（Runtime 转 BLOCK），且写动作（创建 milestone / 建本地分支 / push）只在依赖的读取事实全部
+可靠后才执行。
+
 ## 7. 运行中会发生什么
 
 - 节点推进：Manager 派发 → Actor 工作 → `node_claim` → Judge 核验 →

@@ -233,49 +233,17 @@ export function apply(ctx: Context) {
     inspectGit: async (_ws, operation) => {
       const cwd = ambientAgent()?.session.header.cwd
       if (cwd === undefined) return { ok: false, reason: 'no cwd' }
-      const { inspectGit } = await import('./programs/runner.ts')
-      const facts = inspectGit(cwd)
-      switch (operation) {
-        case 'status': return { ok: true, value: facts.statusShort ?? null }
-        case 'branch': return { ok: true, value: facts.branch ?? (facts.detached ? '(detached)' : null) }
-        case 'remote': return { ok: true, value: facts.originUrl ?? null }
-        case 'top-level': return { ok: true, value: facts.topLevel ?? null }
-        default: return { ok: false, reason: `unknown operation ${String(operation)}` }
-      }
+      // 与固定 Program 共用同一只读事实层（repository.ts）；失败返回 ok:false，不当 null/clean。
+      const { inspectGitFact } = await import('./programs/repository.ts')
+      const { realRepositoryAdapter } = await import('./programs/runner.ts')
+      return inspectGitFact(realRepositoryAdapter, cwd, operation)
     },
     inspectGithub: async (_ws, operation, milestoneNumber) => {
       const cwd = ambientAgent()?.session.header.cwd
       if (cwd === undefined) return { ok: false, reason: 'no cwd' }
-      const { inspectGit, parseOriginRepo, ghApi } = await import('./programs/runner.ts')
-      const git = inspectGit(cwd)
-      if (!git.inRepo || git.originUrl === undefined || git.originUrl === '') return { ok: false, reason: 'not a git repository with origin' }
-      const parsed = parseOriginRepo(git.originUrl)
-      if (parsed === undefined) return { ok: false, reason: `origin is not a GitHub repo: ${git.originUrl}` }
-      const base = `repos/${parsed.owner}/${parsed.repo}`
-      switch (operation) {
-        case 'milestones': {
-          const r = ghApi({ cwd, method: 'GET', path: `${base}/milestones`, query: 'state=all&per_page=100' })
-          return r.kind === 'PASS' ? { ok: true, value: r.details } : { ok: false, reason: r.reason }
-        }
-        case 'issues': {
-          const r = ghApi({ cwd, method: 'GET', path: `${base}/issues`, query: 'state=all&per_page=100' })
-          if (r.kind !== 'PASS') return { ok: false, reason: r.reason }
-          const issues = Array.isArray(r.details)
-            ? (r.details as Array<{ number: number; title: string; state: string; pull_request?: unknown; milestone: { number: number } | null }>).filter(i => i.pull_request === undefined)
-            : []
-          return { ok: true, value: issues }
-        }
-        case 'milestone-issues': {
-          if (milestoneNumber === undefined) return { ok: false, reason: 'milestoneNumber is required for milestone-issues' }
-          const r = ghApi({ cwd, method: 'GET', path: `${base}/issues`, query: `state=all&milestone=${milestoneNumber}&per_page=100` })
-          if (r.kind !== 'PASS') return { ok: false, reason: r.reason }
-          const issues = Array.isArray(r.details)
-            ? (r.details as Array<{ number: number; title: string; state: string; pull_request?: unknown }>).filter(i => i.pull_request === undefined)
-            : []
-          return { ok: true, value: issues }
-        }
-        default: return { ok: false, reason: `unknown operation ${String(operation)}` }
-      }
+      const { inspectGithubFacts } = await import('./programs/repository.ts')
+      const { realRepositoryAdapter } = await import('./programs/runner.ts')
+      return inspectGithubFacts(realRepositoryAdapter, cwd, operation, milestoneNumber)
     },
   }
 
