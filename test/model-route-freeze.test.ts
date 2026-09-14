@@ -17,8 +17,9 @@ import { deliverSubagentPrompt, type HostPromptDeliverer } from '@deepseek-ai/ds
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
-import { WorkflowEngine, type SubagentHost } from '../src/engine/engine.ts'
+import { WorkflowEngine, type JudgeSpawnInput, type SubagentHost } from '../src/engine/engine.ts'
 import { makeStateHost, makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
+import { JUDGE_REQUIRED_TOOLS } from '../src/roles/roles.ts'
 import { StateStore } from '../src/state/store.ts'
 import type { RunState, WorkflowConfig } from '../src/types.ts'
 
@@ -47,7 +48,7 @@ function managerAgent(sessionId: string, provider: string, model: string): Agent
   return {
     id: sessionId,
     options: { provider, model },
-    session: { id: sessionId, header: {}, requestHeader: () => undefined },
+    session: { id: sessionId, header: {}, requestHeader: () => undefined, snapshotEvents: () => [] },
   } as unknown as Agent
 }
 
@@ -215,6 +216,26 @@ test('旧 Run 无冻结信息时不借其他 Run 的值；无法解析时 fail-c
   } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
 })
 
+test('冻结是启动期事实：随 Run 创建一起持久化，运行期不可改写', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-route-freeze-immutable-'))
+  const managers = new Map<string, Agent>([['manager-a', managerAgent('manager-a', 'provider-a', 'model-a')]])
+  const spawns: Spawn[] = []
+  const store = new StateStore(home)
+  const engine = engineFor(store, managers, spawns)
+  try {
+    assert.equal((await startRun(engine, 'ws', 'manager-a')).ok, true)
+    // 冻结必须早于 state.create：startRun 返回时还没有任何 claim/put，持久化行里
+    // 就已经是冻结值——把冻结挪到 create 之后，首次新建会话前 Store 里就没有它。
+    const row = (await store.get('ws'))!
+    assert.deepEqual(row.run.delegationRoute, { provider: 'provider-a', modelId: 'model-a' }, '冻结值必须与 Run 创建同时落库')
+    // 与 definitionSnapshot 同级：运行期改写被拒。
+    const altered = structuredClone(row.run)
+    altered.delegationRoute = { provider: 'provider-b', modelId: 'model-b' }
+    await assert.rejects(store.updateRow('ws', altered, row.stateVersion, []), /delegationRoute is immutable/)
+    assert.deepEqual((await store.get('ws'))!.run.delegationRoute, { provider: 'provider-a', modelId: 'model-a' })
+  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+})
+
 test('正式 helper：requestHeader.config 与创建 options 不同时以 header 为准', () => {
   const agent = {
     id: 'manager',
@@ -227,46 +248,126 @@ test('正式 helper：requestHeader.config 与创建 options 不同时以 header
   assert.equal(options.reasoningEffort, 'high')
 })
 
-test('host 侧 spawn 使用本 Run 冻结的路由（不读其他 Run 的当前 Manager）', async () => {
-  const spawns: Array<{ childId: string; agentOptions: unknown }> = []
-  const starts: Array<{ label: string; childId: string }> = []
+/** host 级用例的 Run：`delegationRoute` 缺省即模拟旧 v9 Run。 */
+function hostRun(managerSessionId: string, delegationRoute?: RunState['delegationRoute']): RunState {
+  return {
+    runId: `run-${managerSessionId}`, managerSessionId, catalogWorkflowId: 'model-route-freeze',
+    definitionHash: 'hash', definitionSnapshot: CONFIG, status: 'running',
+    callStack: [{ workflowId: 'model-route-freeze', nodeId: 'work', nodeToken: crypto.randomUUID(), executionId: 'execution' }],
+    roleActors: {}, modelOverrides: {}, blockReason: null, currentExecutionId: 'execution',
+    ...(delegationRoute === undefined ? {} : { delegationRoute }),
+  }
+}
+
+function judgeInput(run: RunState, judgeSessionId: string): JudgeSpawnInput {
+  return {
+    nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
+    boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
+    cwd: '.', judgeSessionId,
+  }
+}
+
+/**
+ * 真实 `makeSubagentHost` 的受控 ctx：捕获 spawn（`startContinuable`）与 compact
+ * fallback（`agents.resume`）边界实际收到的 agentOptions，并让 Judge spawn 的
+ * fail-closed 工具面断言可以通过。`legacyRoute` 默认与生产装配一致（恒空）。
+ */
+function realHost(
+  managers: Map<string, Agent>,
+  options: { judgeSessionId?: string; legacyRoute?: () => { provider?: string; model?: string } } = {},
+): {
+  host: ReturnType<typeof makeSubagentHost>
+  spawns: Array<{ label: string; agentOptions: { provider?: string; model?: string } | undefined }>
+  resumes: Array<{ resumeSessionId: string; agentOptions: unknown }>
+} {
+  const judgeSessionId = options.judgeSessionId ?? 'judge-child'
+  const spawns: Array<{ label: string; agentOptions: { provider?: string; model?: string } | undefined }> = []
+  const resumes: Array<{ resumeSessionId: string; agentOptions: unknown }> = []
+  const visible = JUDGE_REQUIRED_TOOLS.map(name => ({ name }))
+  const judgeChild = { id: judgeSessionId, ctx: { tools: { schemas: () => visible } } } as unknown as Agent
   const queue: HostPromptDeliverer = {
     async [deliverSubagentPrompt]() { return MessageId('dispatch-queued') },
   }
-  const subagents = {
-    queue,
-    starts,
-    async startContinuable(spec: { label: string; request: { agentOptions?: unknown } }) {
-      starts.push({ label: spec.label, childId: 'unused' })
-      spawns.push({ childId: spec.label, agentOptions: spec.request.agentOptions })
-      return { childId: 'child-1', messageId: 'message-1' }
+  const ctx = {
+    subagents: {
+      queue,
+      async startContinuable(spec: { label: string; childId?: unknown; request: { agentOptions?: { provider?: string; model?: string } } }) {
+        spawns.push({ label: spec.label, agentOptions: spec.request.agentOptions })
+        return { childId: spec.childId === undefined ? 'child-1' : String(spec.childId), messageId: 'message-1' }
+      },
+      async drainContinuableChildren() {},
     },
-    async drainContinuableChildren() {},
-  }
-  const managers = new Map<string, Agent>([
-    ['manager-a', managerAgent('manager-a', 'provider-a', 'model-a')],
-    ['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')],
-  ])
+    agents: {
+      get: (id: unknown) => (String(id) === judgeSessionId ? judgeChild : undefined),
+      resume: async (call: { resumeSessionId: unknown; agentOptions?: unknown }) => {
+        resumes.push({ resumeSessionId: String(call.resumeSessionId), agentOptions: call.agentOptions })
+        return { agent: { id: String(call.resumeSessionId) } as unknown as Agent, dispose: async () => {} }
+      },
+    },
+    tools: { schemas: () => visible },
+    get: () => undefined,
+    logger: { warn: () => {} },
+    jobs: { onJobDone: () => () => {} },
+    effect: () => {},
+  } as unknown as Context
   const adapters: HostAdapters = {
-    ctx: { subagents, tools: { schemas: () => [] }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
+    ctx,
     managerAgentOf: run => managers.get(run.managerSessionId),
     cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
+  return { host: makeSubagentHost(adapters, options.legacyRoute ?? (() => ({}))), spawns, resumes }
+}
+
+test('host 侧 Role 派发使用本 Run 冻结的路由（不读其他 Run 的当前 Manager）', async () => {
+  const managers = new Map<string, Agent>([
+    ['manager-a', managerAgent('manager-a', 'provider-a', 'model-a')],
+    ['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')],
+  ])
   // 第三个参数即"当前 Manager 的实时路由"：本 Run 已冻结时必须不参与决策。
-  const host = makeSubagentHost(adapters, () => ({ provider: 'provider-b', model: 'model-b' }))
-  const runA: RunState = {
-    runId: 'run-a', managerSessionId: 'manager-a', catalogWorkflowId: 'model-route-freeze',
-    definitionHash: 'hash', definitionSnapshot: CONFIG, status: 'running',
-    callStack: [{ workflowId: 'model-route-freeze', nodeId: 'work', nodeToken: crypto.randomUUID(), executionId: 'execution-a' }],
-    roleActors: {}, modelOverrides: {}, blockReason: null, currentExecutionId: 'execution-a',
-    delegationRoute: { provider: 'provider-a', modelId: 'model-a' },
-  }
-  const runB: RunState = { ...runA, runId: 'run-b', managerSessionId: 'manager-b', delegationRoute: { provider: 'provider-b', modelId: 'model-b' } }
-  await host.ensureRoleActor(runA, 'worker', 'first dispatch')
-  await host.ensureRoleActor(runB, 'worker', 'first dispatch')
+  const { host, spawns } = realHost(managers, { legacyRoute: () => ({ provider: 'provider-b', model: 'model-b' }) })
+  await host.ensureRoleActor(hostRun('manager-a', { provider: 'provider-a', modelId: 'model-a' }), 'worker', 'first dispatch')
+  await host.ensureRoleActor(hostRun('manager-b', { provider: 'provider-b', modelId: 'model-b' }), 'worker', 'first dispatch')
   assert.deepEqual(spawns.map(s => s.agentOptions), [
     { provider: 'provider-a', model: 'model-a' },
     { provider: 'provider-b', model: 'model-b' },
   ])
+})
+
+test('host 侧 Judge spawn 使用本 Run 冻结的路由（不读其他 Run 的当前 Manager）', async () => {
+  const managers = new Map<string, Agent>([
+    ['manager-a', managerAgent('manager-a', 'provider-a', 'model-a')],
+    ['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')],
+  ])
+  const { host, spawns } = realHost(managers, { judgeSessionId: 'judge-a', legacyRoute: () => ({ provider: 'provider-b', model: 'model-b' }) })
+  const run = hostRun('manager-a', { provider: 'provider-a', modelId: 'model-a' })
+  assert.deepEqual(await host.startJudge(run, judgeInput(run, 'judge-a')), { judgeSessionId: 'judge-a', messageId: 'message-1' })
+  assert.deepEqual(spawns, [{ label: 'workflow-judge:work', agentOptions: { provider: 'provider-a', model: 'model-a' } }],
+    'Judge 拿本 Run 的冻结值，而不是另一个 Run 的当前 Manager 路由')
+})
+
+test('host 侧 compact fallback 使用本 Run 冻结的路由', async () => {
+  const managers = new Map<string, Agent>([['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')]])
+  const { host, resumes } = realHost(managers, { legacyRoute: () => ({ provider: 'provider-b', model: 'model-b' }) })
+  const run = { ...hostRun('manager-b', { provider: 'provider-a', modelId: 'model-a' }), roleActors: { worker: 'sess-worker' } }
+  assert.deepEqual(await host.compactRoleActor(run, 'worker'), { ok: true, detail: 'no compaction backend; boundary compact skipped' })
+  assert.deepEqual(resumes, [{ resumeSessionId: 'sess-worker', agentOptions: { provider: 'provider-a', model: 'model-a' } }],
+    'cold compact 的 resume 走本 Run 冻结值')
+})
+
+test('旧 Run（无冻结值）+ 两个 Run 的 Manager 都在场：派发与 compact 都不借别人的路由', async () => {
+  const managers = new Map<string, Agent>([
+    ['manager-a', managerAgent('manager-a', 'provider-a', 'model-a')],
+    ['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')],
+  ])
+  const { host, spawns, resumes } = realHost(managers, { judgeSessionId: 'judge-legacy' })
+  const legacy = hostRun('manager-a')
+  assert.equal(legacy.delegationRoute, undefined)
+  await host.ensureRoleActor(legacy, 'worker', 'first dispatch')
+  await host.startJudge(legacy, judgeInput(legacy, 'judge-legacy'))
+  assert.deepEqual(spawns.map(s => s.agentOptions), [undefined, undefined],
+    '旧 Run 不注入路由：交回宿主 spawn 的继承语义，绝不借在场 manager-b 的值')
+  assert.deepEqual(await host.compactRoleActor({ ...legacy, roleActors: { worker: 'sess-worker' } }, 'worker'),
+    { ok: true, detail: 'no compaction backend; boundary compact skipped' })
+  assert.deepEqual(resumes, [{ resumeSessionId: 'sess-worker', agentOptions: undefined }], '旧 Run 的 compact fallback 保持不注入')
 })

@@ -155,10 +155,9 @@ export function apply(ctx: Context) {
     makeStateHost(store),
   )
   engine.cwdResolver = cwdOf
-  // F22 / #91: freeze the Manager route per Run at start (the frozen value rides
-  // the Run row). The route is read through the DSH-fixed formal delegation
-  // helper — latest request header owns provider/model, creation options are the
-  // fallback — so the freeze matches what a fresh child would actually inherit.
+  // F22 / #91：Run 启动时冻结 Manager 的默认路由，冻结值随 Run row 持久化。
+  // 取源走 DSH 固定版本的正式委派 helper——最新 request header 拥有 provider/model，
+  // 创建该会话时的 options 兜底——这样冻结值与新建子会话真正会继承到的路由一致。
   engine.managerRoute = async (managerSessionId: string) => {
     const agent = ctx.agents.get(managerSessionId as SessionId)
     if (agent === undefined) return {}

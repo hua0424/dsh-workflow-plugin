@@ -54,8 +54,8 @@ export interface RoleModel {
 }
 
 /**
- * A partially-known model route: the components a caller may supply for a Role,
- * Judge, or frozen default. Resolution fills the gaps from the next source.
+ * 只知部分的模型路由：调用方为 Role、Judge 或冻结默认值提供其中任一（或两个）
+ * 分量，解析时由下一个来源补齐缺口。
  */
 export type DelegationRoute = Partial<RoleModel>
 
