@@ -1,10 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { workflowTools, setToolHost, type ToolHost } from '../src/tools/tools.ts'
-import { makeDshFlowCommand, type CommandHost } from '../src/commands/dsh-flow.ts'
+import { makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from '../src/commands/dsh-flow.ts'
 import { randomUUID } from 'node:crypto'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 
 /** Find a registered tool by name. */
 function findTool(name: string) {
@@ -349,4 +349,121 @@ test('dsh-flow unknown verb returns usage', async () => {
   const result = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'frobnicate', attachments: [], signal: new AbortController().signal })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /未知子命令/)
+})
+
+// ---- #85 blank-session activation ----
+
+/** 让 setTimeout(0) 的激活投递跑完。 */
+const tick = () => new Promise(resolve => setTimeout(resolve, 0))
+
+function invocation(agent: unknown, rawInput: string) {
+  return { commandId: 'x' as never, agent: agent as never, rawInput, attachments: [], signal: new AbortController().signal }
+}
+
+/** root 会话 + 记录 followup 的 Agent 替身。 */
+function fakeRootAgent(session: Session) {
+  const sent: UserMessage[] = []
+  const agent = { session, followup: (message: UserMessage) => { sent.push(message) } }
+  return { agent, sent }
+}
+
+const textOf = (message: UserMessage) => message.content.map(block => block.type === 'text' ? block.text : '').join('')
+
+/** 宿主 session-controller 的 blank 投影服务替身（cachedSnapshot 只读 cell）。 */
+function projectionWith(blank: boolean | undefined) {
+  return { cachedSnapshot: () => blank === undefined ? undefined : { asOfSeq: 0, values: { sessionListMetadata: { blank } } } }
+}
+
+function ctxWith(registry: unknown) {
+  const warnings: string[] = []
+  return { ctx: { get: () => registry, logger: { warn: (message: string) => { warnings.push(message) } } }, warnings }
+}
+
+/** 模拟宿主：handler 执行前已追加 command/run，全新空白会话此刻 seq === 1。 */
+function blankSession(id: string): Session {
+  const session = Session.create(SessionId(id))
+  session.append('command/run', { commandId: 'c1', name: 'dsh-flow', args: 'list', source: { kind: 'user' } } as never)
+  return session
+}
+
+test('#85: a blank root session gets one plugin/notice followup after the handler returns', async () => {
+  const { agent, sent } = fakeRootAgent(blankSession('blank-root'))
+  const { ctx } = ctxWith(projectionWith(true))
+  const cmd = makeDshFlowCommand(makeCommandHost(), makeBlankSessionActivator(ctx as never))
+  const result = await cmd.handler(invocation(agent, 'list'))
+  assert.equal(result.kind, 'success')
+  assert.equal(sent.length, 0) // 投递发生在 handler 返回之后
+  await tick()
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0]!.source.kind, 'plugin')
+  assert.equal((sent[0]!.source as { form?: string }).form, 'notice')
+  assert.match(textOf(sent[0]!), /- a/) // 结果文本进了转述内容
+  assert.match(textOf(sent[0]!), /不要调用任何工具/)
+})
+
+test('#85: a blank root session also gets an error result delivered', async () => {
+  const { agent, sent } = fakeRootAgent(blankSession('blank-root-error'))
+  const { ctx } = ctxWith(projectionWith(true))
+  const cmd = makeDshFlowCommand(makeCommandHost(), makeBlankSessionActivator(ctx as never))
+  const result = await cmd.handler(invocation(agent, 'frobnicate'))
+  assert.equal(result.kind, 'error')
+  await tick()
+  assert.equal(sent.length, 1)
+  assert.match(textOf(sent[0]!), /未知子命令/)
+})
+
+test('#85: a non-blank session is never activated, even at seq 1', async () => {
+  const { agent, sent } = fakeRootAgent(blankSession('already-open'))
+  const { ctx } = ctxWith(projectionWith(false))
+  const cmd = makeDshFlowCommand(makeCommandHost(), makeBlankSessionActivator(ctx as never))
+  await cmd.handler(invocation(agent, 'list'))
+  await tick()
+  assert.equal(sent.length, 0)
+})
+
+test('#85: projection absent falls back to seq — fresh session activates, later session does not', async () => {
+  const fresh = fakeRootAgent(blankSession('fresh'))
+  const later = fakeRootAgent(blankSession('later'))
+  later.agent.session.append('command/done', { commandId: 'c1', kind: 'success' } as never)
+  const { ctx } = ctxWith(undefined) // 无 sessionProjections 服务
+  const cmd = makeDshFlowCommand(makeCommandHost(), makeBlankSessionActivator(ctx as never))
+  await cmd.handler(invocation(fresh.agent, 'list'))
+  await cmd.handler(invocation(later.agent, 'list'))
+  await tick()
+  assert.equal(fresh.sent.length, 1)
+  assert.equal(later.sent.length, 0)
+})
+
+test('#85: a subagent-shaped invoker never reaches the activator', async () => {
+  const calls: unknown[] = []
+  const cmd = makeDshFlowCommand(makeCommandHost(), agent => { calls.push(agent) })
+  const child = { session: { header: { parentSession: 'root', origin: 'subagent' } } }
+  const result = await cmd.handler(invocation(child, 'list'))
+  await tick()
+  assert.equal(result.kind, 'success')
+  assert.deepEqual(calls, [])
+})
+
+test('#85: a throwing activator leaves the command result untouched', async () => {
+  const { agent } = fakeRootAgent(blankSession('throwing'))
+  const cmd = makeDshFlowCommand(makeCommandHost(), () => { throw new Error('boom') })
+  const result = await cmd.handler(invocation(agent, 'list'))
+  await tick()
+  assert.equal(result.kind, 'success')
+  assert.match(result.text ?? '', /- a/)
+})
+
+test('#85: a failing activation is swallowed with a warn', async () => {
+  const { agent, sent } = fakeRootAgent(blankSession('failing'))
+  const { ctx, warnings } = ctxWith(undefined)
+  const cmd = makeDshFlowCommand(makeCommandHost(), makeBlankSessionActivator({
+    get: () => { throw new Error('no service plane') },
+    logger: ctx.logger,
+  } as never))
+  const result = await cmd.handler(invocation(agent, 'list'))
+  await tick()
+  assert.equal(result.kind, 'success')
+  assert.equal(sent.length, 0)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0]!, /activation skipped: Error: no service plane/)
 })
