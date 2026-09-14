@@ -19,6 +19,8 @@ const NOT_A_REPO = 'fatal: not a git repository (or any of the parent directorie
 interface Fake {
   adapter: RepositoryAdapter
   gitCalls: string[][]
+  /** 每次 git 调用携带的超时预算（未传即 undefined，走默认 30s）；#107 的 push 预算断言据此。 */
+  gitTimeouts: Array<number | undefined>
   ghCalls: GhCall[]
   writes: () => number
 }
@@ -28,13 +30,15 @@ function fakeAdapter(handlers: {
   gh?: (call: GhCall) => { kind: 'PASS'; details: unknown } | { kind: 'ERROR'; reason: string }
 }): Fake {
   const gitCalls: string[][] = []
+  const gitTimeouts: Array<number | undefined> = []
   const ghCalls: GhCall[] = []
   return {
     gitCalls,
+    gitTimeouts,
     ghCalls,
     writes: () => ghCalls.filter(c => c.method !== 'GET').length + gitCalls.filter(a => a[0] === 'push' || a[0] === 'checkout').length,
     adapter: {
-      git: (args) => { gitCalls.push(args); return handlers.git?.(args) ?? failOut(128, `unexpected git call: ${args.join(' ')}`) },
+      git: (args, _cwd, opts) => { gitCalls.push(args); gitTimeouts.push(opts?.timeoutMs); return handlers.git?.(args) ?? failOut(128, `unexpected git call: ${args.join(' ')}`) },
       gh: (call) => { ghCalls.push(call); return handlers.gh?.(call) ?? { kind: 'ERROR', reason: `unexpected gh call: ${call.method} ${call.path}` } },
     },
   }
@@ -340,7 +344,11 @@ test('initialize-milestone：事实可读时正常创建 milestone + 本地/远�
   assert.equal(result.kind, 'PASS')
   assert.equal(result.kind === 'PASS' ? (result.details as { milestoneNumber: number }).milestoneNumber : 0, 42)
   // 先取全只读事实，再按依赖顺序写：milestone → 本地分支 → 远端分支。
-  assert.deepEqual(fake.gitCalls.map(args => args[0]), ['rev-parse', 'remote', 'for-each-ref', 'ls-remote', 'status', 'checkout', 'push'])
+  // #107（集成 r001-F1）：只有建远端分支的 push 携带显式 120s 预算（基线值），其余调用不传预算（默认为 30s）。
+  assert.deepEqual(
+    fake.gitCalls.map((args, i) => [args[0], fake.gitTimeouts[i]]),
+    [['rev-parse', undefined], ['remote', undefined], ['for-each-ref', undefined], ['ls-remote', undefined], ['status', undefined], ['checkout', undefined], ['push', 120_000]],
+  )
   assert.deepEqual(fake.ghCalls.map(call => call.method), ['GET', 'POST'])
 })
 

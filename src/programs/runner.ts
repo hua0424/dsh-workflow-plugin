@@ -31,12 +31,12 @@ export type GhApiOutcome = { kind: 'PASS'; details: unknown } | { kind: 'ERROR';
  * 不在测试里真的 spawn（受限沙箱捕获子进程管道会 EPERM）。
  */
 export interface RepositoryAdapter {
-  git(args: string[], cwd: string): RunOutcome
+  git(args: string[], cwd: string, opts?: { timeoutMs?: number }): RunOutcome
   gh(call: GhCall): GhApiOutcome
 }
 
 export const realRepositoryAdapter: RepositoryAdapter = {
-  git: (args, cwd) => runProgram('git', args, { cwd }),
+  git: (args, cwd, opts) => runProgram('git', args, { cwd, ...opts }),
   gh: call => ghApi(call),
 }
 

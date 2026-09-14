@@ -75,7 +75,8 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
     if (created.exitCode !== 0) return { kind: 'ERROR', reason: `git checkout -b failed: ${created.stderr.trim().slice(0, 300)}` }
   }
   if (remote.kind === 'none') {
-    const push = adapter.git(['push', '-u', 'origin', branchName], ctx.cwd)
+    // push 需要认证握手 + 传输，基线即显式给 120s 预算（同处其余 git 调用走默认 30s）。
+    const push = adapter.git(['push', '-u', 'origin', branchName], ctx.cwd, { timeoutMs: 120_000 })
     if (push.exitCode !== 0) return { kind: 'ERROR', reason: `git push failed: ${push.stderr.trim().slice(0, 300)}` }
   }
 
