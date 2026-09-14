@@ -1,20 +1,21 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { workflowTools, setToolHost, type ToolHost } from '../src/tools/tools.ts'
+import { makeWorkflowTools, type ToolHost } from '../src/tools/tools.ts'
+import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from '../src/commands/dsh-flow.ts'
 import { randomUUID } from 'node:crypto'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { createUserMessage, type UserMessage } from '@deepseek-ai/dsh-llm'
 
-/** Find a registered tool by name. */
-function findTool(name: string) {
-  const def = workflowTools.find(t => t.name === name)
+/** Find a tool by name inside ONE instance's bound tool set (#94: no module-level set). */
+function findTool(host: { tools: ToolDefinition[] }, name: string) {
+  const def = host.tools.find(t => t.name === name)
   assert.ok(def, `tool ${name} should be registered`)
   return def!
 }
 
-/** A tiny host double that records engine mutations. */
-function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Array<{ name: string; args: unknown }> } {
+/** A tiny host double that records engine mutations; `tools` are bound to THIS host (#94). */
+function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Array<{ name: string; args: unknown }>; tools: ToolDefinition[] } {
   const calls: Array<{ name: string; args: unknown }> = []
   const host: ToolHost = {
     async authorize(toolName) {
@@ -34,8 +35,7 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
     inspectGithub: async (_ws, operation, milestoneNumber) => ({ ok: true, value: `gh:${operation}:${milestoneNumber ?? ''}` }),
     ...overrides,
   }
-  setToolHost(host)
-  return { ...host, calls }
+  return { ...host, calls, tools: makeWorkflowTools(host) }
 }
 
 const EXEC = {
@@ -50,7 +50,7 @@ const EXEC = {
 }
 
 test('eleven workflow tools + judge_claim/judge_respawn are registered', () => {
-  const names = workflowTools.map(t => t.name).sort()
+  const names = makeToolHost().tools.map(t => t.name).sort()
   assert.deepEqual(names, [
     'judge_claim',
     'judge_respawn',
@@ -68,7 +68,7 @@ test('eleven workflow tools + judge_claim/judge_respawn are registered', () => {
 
 test('node_claim routes to host.claim and concludes the turn on success', async () => {
   const host = makeToolHost()
-  const tool = findTool('node_claim')
+  const tool = findTool(host, 'node_claim')
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
   const result = await tool.execute(
@@ -84,7 +84,7 @@ test('node_claim routes to host.claim and concludes the turn on success', async 
 
 test('node_block routes to host.block and concludes the turn on success', async () => {
   const host = makeToolHost()
-  const tool = findTool('node_block')
+  const tool = findTool(host, 'node_block')
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
   const token = randomUUID()
@@ -95,7 +95,7 @@ test('node_block routes to host.block and concludes the turn on success', async 
 
 test('node_resume routes to host.resume', async () => {
   const host = makeToolHost()
-  const tool = findTool('node_resume')
+  const tool = findTool(host, 'node_resume')
   const token = randomUUID()
   await tool.execute({ nodeToken: token, resolutionContext: 'fixed it', target: 'judge' }, EXEC as never)
   assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'fixed it', target: 'judge' } })
@@ -104,7 +104,7 @@ test('node_resume routes to host.resume', async () => {
 
 test('node_run_program routes to host.runProgram', async () => {
   const host = makeToolHost()
-  const tool = findTool('node_run_program')
+  const tool = findTool(host, 'node_run_program')
   const token = randomUUID()
   await tool.execute({ nodeToken: token, parameters: { title: 'M1' } }, EXEC as never)
   assert.deepEqual(host.calls[0], { name: 'runProgram', args: { ws: 'ws-1', nodeToken: token, parameters: { title: 'M1' } } })
@@ -112,7 +112,7 @@ test('node_run_program routes to host.runProgram', async () => {
 
 test('node_resolve_program routes to host.resolveProgram', async () => {
   const host = makeToolHost()
-  const tool = findTool('node_resolve_program')
+  const tool = findTool(host, 'node_resolve_program')
   const token = randomUUID()
   await tool.execute({ nodeToken: token, result: 'PASS', reason: 'verified by hand' }, EXEC as never)
   assert.deepEqual(host.calls[0], { name: 'resolveProgram', args: { ws: 'ws-1', nodeToken: token, result: 'PASS', reason: 'verified by hand' } })
@@ -120,14 +120,14 @@ test('node_resolve_program routes to host.resolveProgram', async () => {
 
 test('workflow_set_role_model routes to host.setRoleModel', async () => {
   const host = makeToolHost()
-  const tool = findTool('workflow_set_role_model')
+  const tool = findTool(host, 'workflow_set_role_model')
   await tool.execute({ roleKey: 'developer', provider: 'p', modelId: 'm' }, EXEC as never)
   assert.deepEqual(host.calls[0], { name: 'setRoleModel', args: { ws: 'ws-1', roleKey: 'developer', provider: 'p', modelId: 'm' } })
 })
 
 test('workflow_status renders host status', async () => {
   const host = makeToolHost()
-  const tool = findTool('workflow_status')
+  const tool = findTool(host, 'workflow_status')
   const result = await tool.execute({}, EXEC as never)
   assert.match(result as string, /r1/)
   assert.ok(host.calls.length === 0)
@@ -135,8 +135,8 @@ test('workflow_status renders host status', async () => {
 
 test('workflow_status forwards explicit history paging and rejects open-root extras or invalid combinations', async () => {
   const calls: unknown[] = []
-  makeToolHost({ status: async (...args: unknown[]) => { calls.push(args); return { ok: true, status: { history: [] } } } })
-  const tool = findTool('workflow_status')
+  const host = makeToolHost({ status: async (...args: unknown[]) => { calls.push(args); return { ok: true, status: { history: [] } } } })
+  const tool = findTool(host, 'workflow_status')
   const agent = { session: { id: 'manager' } }
   await tool.execute({ executionId: 'execution-1', after: 4, limit: 10 }, { ...EXEC, agent } as never)
   assert.deepEqual(calls, [['ws-1', 'manager', { executionId: 'execution-1', after: 4, limit: 10 }]])
@@ -147,7 +147,7 @@ test('workflow_status forwards explicit history paging and rejects open-root ext
 
 test('judge_claim routes to host.judgeClaim and concludes the turn on success', async () => {
   const host = makeToolHost()
-  const tool = findTool('judge_claim')
+  const tool = findTool(host, 'judge_claim')
   assert.match(tool.description, /REJECT 仅用于 claim 与既有 criteria 或可验证事实冲突/)
   const resultDescription = (tool.parameters as { properties: { result: { description: string } } }).properties.result.description
   assert.match(resultDescription, /NEED_CONTEXT=信息不足或要求不清/)
@@ -162,9 +162,9 @@ test('judge_claim routes to host.judgeClaim and concludes the turn on success', 
 
 test('trim-bounded payloads reach the host trimmed — a whitespace bomb never lands (A1 review fix)', async () => {
   const host = makeToolHost()
-  const nodeClaim = findTool('node_claim')
-  const judgeClaim = findTool('judge_claim')
-  const nodeBlock = findTool('node_block')
+  const nodeClaim = findTool(host, 'node_claim')
+  const judgeClaim = findTool(host, 'judge_claim')
+  const nodeBlock = findTool(host, 'node_block')
   const padded = ' '.repeat(10_000) + 'x'
   await nodeClaim.execute({ outcome: 'completed', handoff: padded }, EXEC as never)
   await judgeClaim.execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: padded }, EXEC as never)
@@ -176,7 +176,7 @@ test('trim-bounded payloads reach the host trimmed — a whitespace bomb never l
 
 test('T2 public schema rejects legacy fields and invalid handoff symmetrically', async () => {
   const host = makeToolHost()
-  const tool = findTool('node_claim')
+  const tool = findTool(host, 'node_claim')
   for (const outcome of ['completed', 'failed']) {
     for (const args of [
       { outcome }, { outcome, handoff: 42 },
@@ -198,7 +198,7 @@ test('T2 public schema rejects legacy fields and invalid handoff symmetrically',
 
 test('judge_respawn routes to host.respawnJudge', async () => {
   const host = makeToolHost()
-  const tool = findTool('judge_respawn')
+  const tool = findTool(host, 'judge_respawn')
   const token = randomUUID()
   await tool.execute({ nodeToken: token, reason: 'model swap' }, EXEC as never)
   assert.deepEqual(host.calls[0], { name: 'respawnJudge', args: { ws: 'ws-1', nodeToken: token, reason: 'model swap', caller: '' } })
@@ -209,7 +209,7 @@ test('inspection wrappers reject when authorize fails', async () => {
   const host = makeToolHost({
     authorize: async () => ({ workspaceKey: null, reason: 'judge only' }),
   })
-  const tool = findTool('workflow_inspect_git')
+  const tool = findTool(host, 'workflow_inspect_git')
   const result = await tool.execute({ operation: 'status' }, EXEC as never)
   assert.match(result as string, /拒绝：judge only/)
 })
@@ -218,7 +218,7 @@ test('authorize denial surfaces in control tools', async () => {
   const host = makeToolHost({
     authorize: async () => ({ workspaceKey: null, reason: 'only manager' }),
   })
-  const tool = findTool('node_claim')
+  const tool = findTool(host, 'node_claim')
   const result = await tool.execute({ outcome: 'completed', handoff: 's' }, EXEC as never)
   assert.match(result as string, /拒绝：only manager/)
 })
@@ -234,13 +234,13 @@ test('target host Session snapshot binds native claim to its dispatch, excluding
   session.append('turn/end', { turn: 1, reason: { kind: 'completed' } } as never)
   session.append('turn/start', { turn: 2 } as never)
   session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'new work' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
-  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'done' }, {
+  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'done' }, {
     ...EXEC, agent: { session }, callId: 'native-claim', rootCallId: 'native-claim',
   } as never)
   assert.deepEqual((host.calls[0]!.args as { caller: unknown }).caller, {
     sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
   })
-  await findTool('judge_claim').execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: 'verified' }, {
+  await findTool(host, 'judge_claim').execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: 'verified' }, {
     ...EXEC, agent: { session }, callId: 'judge-call', rootCallId: 'judge-call',
   } as never)
   assert.deepEqual((host.calls[1]!.args as { caller: unknown }).caller, {
@@ -256,21 +256,82 @@ test('target host Code Mode snapshot binds claim/block only with the real root a
   session.append('tool/call', { turn: 1, step: 1, callId: 'root', name: 'run_code', arguments: '{}' } as never)
   session.append('tool/code-dispatch-start', { rootCallId: 'root', parentCallId: 'root', subCallId: 'root:code:1', name: 'node_claim', arguments: {} } as never)
   const callers: unknown[] = []
-  makeToolHost({
+  const host = makeToolHost({
     claim: async (_ws, _claim, caller) => { callers.push(caller); return { ok: true } },
     block: async (_ws, _token, _reason, caller) => { callers.push(caller); return { ok: true } },
   })
   const exec = { ...EXEC, agent: { session }, callId: 'root:code:1', rootCallId: 'root' }
-  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'done' }, exec as never)
-  await findTool('node_block').execute({ nodeToken: randomUUID(), reason: 'pause' }, exec as never)
-  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'forged root' }, { ...exec, rootCallId: 'other-root' } as never)
-  await findTool('node_claim').execute({ outcome: 'completed', handoff: 'forged subcall' }, { ...exec, callId: 'root:code:2' } as never)
+  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'done' }, exec as never)
+  await findTool(host, 'node_block').execute({ nodeToken: randomUUID(), reason: 'pause' }, exec as never)
+  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'forged root' }, { ...exec, rootCallId: 'other-root' } as never)
+  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'forged subcall' }, { ...exec, callId: 'root:code:2' } as never)
   assert.deepEqual(callers, [
     { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
     { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
     { sessionId: 'code-caller', turnUserMessageIds: new Set() },
     { sessionId: 'code-caller', turnUserMessageIds: new Set() },
   ])
+})
+
+// ---- #94 按插件实例绑定 Host（无模块级可变引用） ----
+
+/** 工具注册表替身：register 返回只撤销本次注册的 dispose（对应 ctx.tools.register）。 */
+function makeRegistry() {
+  const registered = new Map<string, ToolDefinition>()
+  return {
+    registered,
+    register(def: ToolDefinition) {
+      registered.set(def.name, def)
+      return () => { registered.delete(def.name) }
+    },
+    async execute(name: string, args: unknown) {
+      const def = registered.get(name)
+      assert.ok(def, `tool ${name} should be registered`)
+      return def!.execute(args as never, EXEC as never)
+    },
+  }
+}
+
+test('#94: two instances each route their own tools to their own host', async () => {
+  const a = makeToolHost({ authorize: async () => ({ workspaceKey: 'ws-A' }) })
+  const b = makeToolHost({ authorize: async () => ({ workspaceKey: 'ws-B' }) })
+  await findTool(a, 'node_block').execute({ nodeToken: 't1', reason: 'from A' }, EXEC as never)
+  await findTool(b, 'node_block').execute({ nodeToken: 't2', reason: 'from B' }, EXEC as never)
+  assert.deepEqual(a.calls, [{ name: 'block', args: { ws: 'ws-A', nodeToken: 't1', reason: 'from A' } }])
+  assert.deepEqual(b.calls, [{ name: 'block', args: { ws: 'ws-B', nodeToken: 't2', reason: 'from B' } }])
+})
+
+test('#94: an authorize still suspended while another instance is assembled mutates its OWN host', async () => {
+  let releaseA: () => void = () => {}
+  const gate = new Promise<void>(resolve => { releaseA = resolve })
+  const a = makeToolHost({ authorize: async () => { await gate; return { workspaceKey: 'ws-A' } } })
+  const pending = findTool(a, 'node_block').execute({ nodeToken: 't1', reason: 'A after suspend' }, EXEC as never)
+  // A 的 authorize 挂起期间，B 完成装配并注册同名工具。
+  const b = makeToolHost({ authorize: async () => ({ workspaceKey: 'ws-B' }) })
+  await findTool(b, 'node_block').execute({ nodeToken: 't2', reason: 'B' }, EXEC as never)
+  releaseA()
+  await pending
+  assert.deepEqual(a.calls, [{ name: 'block', args: { ws: 'ws-A', nodeToken: 't1', reason: 'A after suspend' } }])
+  assert.deepEqual(b.calls, [{ name: 'block', args: { ws: 'ws-B', nodeToken: 't2', reason: 'B' } }])
+})
+
+test('#94: disposing one instance leaves the other instance registered and routing', async () => {
+  const a = makeToolHost()
+  const b = makeToolHost({ authorize: async () => ({ workspaceKey: 'ws-B' }) })
+  // 两个实例各自建集：共享同一份工具对象就会让「按实例绑定 Host」失效。
+  assert.notStrictEqual(a.tools, b.tools)
+  assert.notStrictEqual(a.tools[0], b.tools[0])
+  const registryA = makeRegistry()
+  const registryB = makeRegistry()
+  const disposeA = a.tools.map(def => registryA.register(def))
+  for (const def of b.tools) registryB.register(def)
+  assert.deepEqual([...registryA.registered.keys()].sort(), [...registryB.registered.keys()].sort())
+  for (const dispose of disposeA) dispose()
+  // A 卸载后自身注册表为空（无引用已关闭 Store 的遗留注册），B 的注册与路由不受影响。
+  assert.equal(registryA.registered.size, 0)
+  assert.equal(registryB.registered.size, b.tools.length)
+  assert.equal(await registryB.execute('node_resume', { nodeToken: 't2', resolutionContext: 'still alive' }), 'resumed')
+  assert.deepEqual(b.calls, [{ name: 'resume', args: { ws: 'ws-B', nodeToken: 't2', resolutionContext: 'still alive', target: 'auto' } }])
 })
 
 // ---- command tests ----

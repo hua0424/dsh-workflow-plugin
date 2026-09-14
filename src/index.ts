@@ -18,7 +18,7 @@ import { checkCatalogProviders, renderProviderCheckReport, renderStartProviderBl
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
 import type { RunState } from './types.ts'
-import { setToolHost, workflowTools, type ToolHost } from './tools/tools.ts'
+import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
@@ -252,8 +252,6 @@ export function apply(ctx: Context) {
     return { ok: true, message: o.message }
   }
 
-  setToolHost(toolHost)
-
   // ---- Role-actor session mapping maintenance ----
   // Every continuable child created for a role records (sessionId, workspace,
   // roleKey). We learn the child id from `subagent/start` (local children) and
@@ -361,6 +359,8 @@ export function apply(ctx: Context) {
   // ---- Register command + tools ----
   // #85：空白会话的激活投递需要 ctx（读宿主 blank 投影）——在这里组装，命令层只接收回调。
   const disposeCommand = ctx.commands.register(makeDshFlowCommand(commandHost, makeBlankSessionActivator(ctx)))
+  // #94：工具集在本实例装配时绑定本实例的 toolHost，dispose 只撤销本实例的注册。
+  const workflowTools = makeWorkflowTools(toolHost)
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
 
   // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。
