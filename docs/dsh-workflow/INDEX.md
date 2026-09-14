@@ -108,6 +108,9 @@ code-reviewer 写 review，review-judger 写 decision。即使报告很短，也
 - REST 过滤 `gh api "issues?milestone=<N>&state=all"` 在部分环境返回空数组（工具怪癖，非数据缺失）；用 `gh issue list --milestone <标题>` 或 search API 双路补偿后再下完整性结论。
 - sub-issue API（`POST issues/<parent>/sub_issues`、`GET .../sub_issues`）响应体是**数组**；`--jq '.[].number'` 对空数组返回空而非错误，勿据单次输出误判挂载失败，需 GET 复核。
 - 无 CI 仓库的合并前检查证据：`gh pr checks <n>` 无 checks + 分支保护 404 + `/rulesets` 空，配合在批准 head 上实跑回归，即构成"无适用检查"的明确依据。
+- DSH 沙箱下 `git push` 会因 named pipe 限制挂掉 credential helper（`failed to execute prompt script (exit code 66)` / `couldn't create signal pipe, Win32 error 5`）。等效替代通道：`gh api --method POST repos/<owner>/<repo>/git/refs -f ref=refs/heads/<branch> -f sha=<确切SHA>` 创建远端分支，再 `git fetch origin <branch>` + `git branch --set-upstream-to=origin/<branch> <branch>` 绑定；语义与推送一致，`git ls-remote` 复核 SHA。
+- 禁止 `https://x-access-token:<token>@github.com/...` URL 注入式推送：凭据会进入 URL、进程参数或远端 config，有泄露面。统一用上一条的三段式，不为省事绕路（反例：run 20260913-114026 的 #54/#55 推送）。
+- 沙箱下经 `gh api` Git Data 发布**提交**（上两条只覆盖建分支）的五个坑：①blob 内容必须取 git 对象（`git show <sha>:<path>`），不取工作树字节——行尾规范化会致 SHA 不符；②含子目录的改动须自底向上递归建 tree；③`POST /git/trees` 省略 `base_tree`、提交完整条目表——带 `base_tree` 且 path 含斜杠会生成顶层扁平条目；④commit 的 parents 必须取远端 head，否则 `Update is not a fast forward`；⑤`gh api --input` 传多行 message 用 `` -join "`n" `` 构造。先例：run 20260913-205854 的 issues/24、issues/30 delivery.md。
 
 ## 当前已知插件限制
 
