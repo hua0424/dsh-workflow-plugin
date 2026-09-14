@@ -263,6 +263,9 @@ test('cold actor: materialize → compactNow → dispose, role route passed to r
   assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
   assert.equal(f.resumes.length, 1)
   assert.equal(f.resumes[0]!.resumeSessionId, 'sess-dev')
+  // #93 改造方法第 4 条：冷维护物化必须保持 no-prompt 语义——带 prompt 的 resume 会真的开一个 turn，
+  // 破坏「物化不开 turn、只压不派」的前提（src/plugin/host.ts compactOnce 注释），并让维护窗口撞 busy。
+  assert.equal('prompt' in f.resumes[0]!, false, 'cold maintenance resume must not carry a prompt')
   assert.equal(f.resumes[0]!.signal?.aborted, false, '本次 attempt 的 signal 直达 resume，且此刻仍可用')
   assert.deepEqual(f.resumes[0]!.agentOptions, { provider: 'p1', model: 'm1' })
   assert.equal(f.compacts[0]!.agent, materialized)
@@ -464,6 +467,8 @@ test('cold maintenance resume carries no setup when the manager is not live', as
   const { host } = makeHost({ ...f, compactResult: null })
   await host.compactRoleActor(makeRun('sess-dev'), 'developer')
   assert.equal(f.resumes[0]!.setup, undefined)
+  // 同 #93 改造方法第 4 条：没有 preset-join setup 的冷维护同样不得携带 prompt。
+  assert.equal('prompt' in f.resumes[0]!, false, 'cold maintenance resume must not carry a prompt')
   assert.equal(f.resumes[0]!.signal?.aborted, false, '没有 setup 也必须带 signal：取消覆盖整个 load/setup 窗口')
 })
 
