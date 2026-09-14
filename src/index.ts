@@ -19,7 +19,7 @@ import { WorkflowError } from './types.ts'
 import type { RunState } from './types.ts'
 import { setToolHost, workflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
-import { isRootCommandAgent, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
+import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
 
 export const name = 'dsh-agent-team-workflow'
@@ -384,7 +384,8 @@ export function apply(ctx: Context) {
   }
 
   // ---- Register command + tools ----
-  const disposeCommand = ctx.commands.register(makeDshFlowCommand(commandHost))
+  // #85：空白会话的激活投递需要 ctx（读宿主 blank 投影）——在这里组装，命令层只接收回调。
+  const disposeCommand = ctx.commands.register(makeDshFlowCommand(commandHost, makeBlankSessionActivator(ctx)))
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
 
   // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。
