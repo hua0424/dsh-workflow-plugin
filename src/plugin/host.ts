@@ -73,14 +73,15 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   const persistence = sessionPersistence(ctx)
   if (persistence === undefined) return undefined
   const controller = new AbortController()
+  // #93：open 的 promise 由本函数持有：open 的 signal 只保证后端"开工前"观察取消
+  // （SessionPersistenceOpenOptions），开工后 resolve 的句柄仍归调用方释放。
+  const opening = persistence.open(SessionId(sessionId), 'read', { signal: controller.signal })
   let handle: SessionHandle | undefined
   try {
     // #32 D-002：controller 必须真正接线，超时即 abort —— 否则留下一个永不中断的
     // 只读观察者。0.1.5 起持久化改为 SessionHandle：open('read') 不取写所有权，
-    // read 的 signal 直达后端读（旧 prepareCore 不转发 signal 的缺陷随之消失）；
-    // finally 中的 close 保证超时后迟到的读也不泄漏句柄。
-    handle = await withTimeout(persistence.open(SessionId(sessionId), 'read', { signal: controller.signal }),
-      DISPATCH_TIMEOUTS.availability, 'availability', controller)
+    // read 的 signal 直达后端读（旧 prepareCore 不转发 signal 的缺陷随之消失）。
+    handle = await withTimeout(opening, DISPATCH_TIMEOUTS.availability, 'availability', controller)
     const result = await withTimeout(handle.read(0, undefined, { signal: controller.signal }),
       DISPATCH_TIMEOUTS.availability, 'availability read', controller)
     const events = result.events.slice()
@@ -94,7 +95,11 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
     const detail = error instanceof Error ? error.message : String(error)
     throw new WorkflowError(`actor session projection failed: ${detail}`)
   } finally {
-    await handle?.close().catch(() => {})
+    // 唯一所有者：handle 已赋值就是本函数的（finally 释放一次）；超时/抛错时它尚未
+    // 赋值，改由迟到分支释放那个之后才 resolve 的句柄，否则它会无人持有地泄漏。
+    // close() 幂等且不可取消，两条路径互斥，不会清理两次出次生错误。
+    if (handle !== undefined) await handle.close().catch(() => {})
+    else void opening.then(late => late.close().catch(() => {}), () => {})
   }
 }
 
@@ -621,6 +626,11 @@ async function compactOnce(
   const manager = adapters.managerAgentOf(run)
   const resuming = adapters.ctx.agents.resume({
       resumeSessionId: childId as SessionId,
+      // #93：本次 attempt 的 signal 直达 resume 的持久化 load/setup 窗口
+      // （ResumeAgentOptions.signal 只在创建期有效、返回前脱离），超时 abort 因此
+      // 是真实中断源：尊重它的宿主自己回滚事务（不发布 agent、不留 live 注册）。
+      // 忽略 signal 的迟到 handle 仍有下方兜底 dispose。
+      signal,
       // Mirrors the agentOptions the continuation manager re-applies when
       // IT cold-resumes this child. This is only the summarizer's LAST
       // fallback (compaction summarization* config > the session's own
