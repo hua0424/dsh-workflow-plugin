@@ -64,6 +64,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   let boundaryPersistEntered: (() => void) | undefined
   let roleSendFailure: Error | undefined
   let followupFailure: Error | undefined
+  let judgeFailure: Error | undefined
   let drainFailure: Error | undefined
   let drainGate: Promise<void> | undefined
   let drainEntered: (() => void) | undefined
@@ -93,7 +94,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   }, {
     // 每次 fresh spawn 都是新 child：节点级复用（reuse: node）的「再次进入节点」必须可区分。
     async ensureRoleActor(_run, _role, text) { const childId = roleSerial++ === 0 ? 'worker-session' : `worker-session-${roleSerial}`; return { ...send(childId, text), childId } },
-    async startJudge(_run, input) { judges.push(input); lastJudgeSession = input.judgeSessionId; return { ...send(input.judgeSessionId, 'Judge'), judgeSessionId: input.judgeSessionId } },
+    async startJudge(_run, input) { judges.push(input); lastJudgeSession = input.judgeSessionId; if (judgeFailure) throw judgeFailure; return { ...send(input.judgeSessionId, 'Judge'), judgeSessionId: input.judgeSessionId } },
     async safeToInspect(sessionId) { lifecycle.push(`safe:${sessionId}`); if (safetyGate && gatedSession === sessionId) await safetyGate; if (sessionSafety) return sessionSafety; return safe && !unsafeSessions.has(sessionId) ? 'safe' : 'unsafe' },
     async retireJudge() {}, async drainJudge(_run, judgeSessionId) { drains.push(judgeSessionId); drainEntered?.(); if (drainGate) await drainGate; if (drainFailure) throw drainFailure },
     async drainRoleActor(run, role) { roleDrains.push(run.roleActors[role]!); lifecycle.push(`drain:${role}`); if (roleDrainFailure) throw roleDrainFailure },
@@ -114,6 +115,7 @@ function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
     setRoleSendFailure(error: Error | undefined) { roleSendFailure = error },
     setRoleDrainFailure(error: Error | undefined) { roleDrainFailure = error },
     setFollowupFailure(error: Error | undefined) { followupFailure = error },
+    setJudgeFailure(error: Error | undefined) { judgeFailure = error },
     setDrainFailure(error: Error | undefined) { drainFailure = error },
     setDrainGate(gate: Promise<void> | undefined, onEntered?: () => void) { drainGate = gate; drainEntered = onEntered },
     setSafetyGate(sessionId: string, gate: Promise<void> | undefined) { gatedSession = sessionId; safetyGate = gate },
@@ -946,6 +948,36 @@ test('Judge drain failure BLOCKs before fresh spawn and preserves respawn materi
     assert.deepEqual(h.drains.slice(-2), [oldJudge!.sessionId, oldJudge!.sessionId])
     assert.equal(h.judges.length, spawnsBefore + 1)
     assert.equal((await h.row()).execution.resolution?.decision, 'retry replacement')
+  } finally { h.close() }
+})
+
+test('#98: Judge respawn dispatches through the driver and never reports success on a spawn fault', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    let row = await h.row()
+    await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'replace me', h.caller(row.execution.judge!))
+    row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    h.setJudgeFailure(new Error('host spawn rejected'))
+    const failed = await h.engine.handleRespawnJudge('ws', row.execution.nodeToken, 'replace Judge', 'manager')
+    assert.equal(failed.ok, false)
+    assert.match(failed.reason!, /host spawn rejected/)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked', 'spawn fault must surface as a durable BLOCK, not a claimed success')
+    assert.equal(blocked.execution.judge?.messageId, undefined, 'no messageId may be published to the new arrangement')
+    assert.equal(blocked.execution.claim?.handoff, 'candidate')
+    assert.equal(blocked.execution.resolution?.decision, 'replace Judge')
+    h.setJudgeFailure(undefined)
+    assert.equal((await h.engine.handleRespawnJudge('ws', blocked.execution.nodeToken, 'retry replacement', 'manager')).ok, true)
+    const respawned = await h.row()
+    assert.equal(respawned.run.status, 'running')
+    assert.notEqual(respawned.execution.judge?.messageId, undefined)
+    assert.equal(h.judges.length, 3, '首次派发 + 失败的 spawn 尝试 + 重试')
+    assert.equal(h.judges.at(-1)!.judgeSessionId, respawned.execution.judge?.sessionId)
   } finally { h.close() }
 })
 
