@@ -23,11 +23,11 @@ export interface RepositoryIdentity {
   topLevel: string
 }
 
-export function repositoryIdentity(adapter: RepositoryAdapter, cwd: string): RepoRead<RepositoryIdentity> {
-  const top = gitTopLevel(adapter, cwd)
+export async function repositoryIdentity(adapter: RepositoryAdapter, cwd: string): Promise<RepoRead<RepositoryIdentity>> {
+  const top = await gitTopLevel(adapter, cwd)
   if (top.kind === 'error') return { kind: 'ERROR', reason: `workspace git facts unreadable: ${top.reason}` }
   if (top.kind === 'none') return { kind: 'ERROR', reason: 'workspace is not a git repository' }
-  const url = gitOriginUrl(adapter, cwd)
+  const url = await gitOriginUrl(adapter, cwd)
   if (url.kind === 'error') return { kind: 'ERROR', reason: `origin remote unreadable: ${url.reason}` }
   if (url.kind === 'none') return { kind: 'ERROR', reason: 'no origin remote found' }
   const parsed = parseOriginRepo(url.value)
@@ -55,8 +55,8 @@ const asRecord = (raw: unknown): Record<string, unknown> | undefined =>
 const brief = (raw: unknown): string => JSON.stringify(raw)?.slice(0, 120) ?? String(raw)
 
 /** 分页取全仓库 milestones（state=all）并校验结构；任一页失败或结构不符 → ERROR。 */
-export function listMilestones(adapter: RepositoryAdapter, cwd: string, owner: string, repo: string): RepoRead<Milestone[]> {
-  const listed = ghApiList({ adapter, cwd, path: `repos/${owner}/${repo}/milestones`, query: 'state=all' })
+export async function listMilestones(adapter: RepositoryAdapter, cwd: string, owner: string, repo: string): Promise<RepoRead<Milestone[]>> {
+  const listed = await ghApiList({ adapter, cwd, path: `repos/${owner}/${repo}/milestones`, query: 'state=all' })
   if (listed.kind === 'ERROR') return listed
   const milestones: Milestone[] = []
   for (const raw of listed.items) {
@@ -73,9 +73,9 @@ export function listMilestones(adapter: RepositoryAdapter, cwd: string, owner: s
 }
 
 /** 分页取全仓库 issues（state=all，可选 milestone 过滤）；先排除 PR，再校验结构。 */
-export function listIssues(adapter: RepositoryAdapter, cwd: string, owner: string, repo: string, milestoneNumber?: number): RepoRead<RepoIssue[]> {
+export async function listIssues(adapter: RepositoryAdapter, cwd: string, owner: string, repo: string, milestoneNumber?: number): Promise<RepoRead<RepoIssue[]>> {
   const query = milestoneNumber === undefined ? 'state=all' : `state=all&milestone=${milestoneNumber}`
-  const listed = ghApiList({ adapter, cwd, path: `repos/${owner}/${repo}/issues`, query })
+  const listed = await ghApiList({ adapter, cwd, path: `repos/${owner}/${repo}/issues`, query })
   if (listed.kind === 'ERROR') return listed
   const issues: RepoIssue[] = []
   for (const raw of listed.items) {
@@ -105,13 +105,13 @@ const factValue = (fact: Fact<unknown>): InspectResult =>
   fact.kind === 'error' ? { ok: false, reason: fact.reason } : { ok: true, value: fact.kind === 'value' ? fact.value : null }
 
 /** Judge 只读 inspection：git 单个事实；按 operation 只读该事实，不附带其他查询。 */
-export function inspectGitFact(adapter: RepositoryAdapter, cwd: string, operation: GitInspectOperation): InspectResult {
+export async function inspectGitFact(adapter: RepositoryAdapter, cwd: string, operation: GitInspectOperation): Promise<InspectResult> {
   switch (operation) {
-    case 'status': return factValue(gitStatusShort(adapter, cwd))
-    case 'remote': return factValue(gitOriginUrl(adapter, cwd))
-    case 'top-level': return factValue(gitTopLevel(adapter, cwd))
+    case 'status': return factValue(await gitStatusShort(adapter, cwd))
+    case 'remote': return factValue(await gitOriginUrl(adapter, cwd))
+    case 'top-level': return factValue(await gitTopLevel(adapter, cwd))
     case 'branch': {
-      const head = gitHead(adapter, cwd)
+      const head = await gitHead(adapter, cwd)
       if (head.kind === 'error') return { ok: false, reason: head.reason }
       return { ok: true, value: head.kind === 'value' ? head.value ?? '(detached)' : null }
     }
@@ -119,19 +119,19 @@ export function inspectGitFact(adapter: RepositoryAdapter, cwd: string, operatio
 }
 
 /** Judge 只读 inspection：GitHub 列表；与 Program 共用同一 repository 识别、分页与过滤结果。 */
-export function inspectGithubFacts(adapter: RepositoryAdapter, cwd: string, operation: GithubInspectOperation, milestoneNumber?: number): InspectResult {
-  const identity = repositoryIdentity(adapter, cwd)
+export async function inspectGithubFacts(adapter: RepositoryAdapter, cwd: string, operation: GithubInspectOperation, milestoneNumber?: number): Promise<InspectResult> {
+  const identity = await repositoryIdentity(adapter, cwd)
   if (identity.kind === 'ERROR') return { ok: false, reason: identity.reason }
   const { owner, repo } = identity.value
   if (operation === 'milestones') {
-    const listed = listMilestones(adapter, cwd, owner, repo)
+    const listed = await listMilestones(adapter, cwd, owner, repo)
     return listed.kind === 'ERROR' ? { ok: false, reason: listed.reason } : { ok: true, value: listed.value }
   }
   if (operation === 'issues') {
-    const listed = listIssues(adapter, cwd, owner, repo)
+    const listed = await listIssues(adapter, cwd, owner, repo)
     return listed.kind === 'ERROR' ? { ok: false, reason: listed.reason } : { ok: true, value: listed.value }
   }
   if (milestoneNumber === undefined) return { ok: false, reason: 'milestoneNumber is required for milestone-issues' }
-  const listed = listIssues(adapter, cwd, owner, repo, milestoneNumber)
+  const listed = await listIssues(adapter, cwd, owner, repo, milestoneNumber)
   return listed.kind === 'ERROR' ? { ok: false, reason: listed.reason } : { ok: true, value: listed.value }
 }
