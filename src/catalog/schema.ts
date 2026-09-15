@@ -88,8 +88,6 @@ const checkerRef = z
   })
   .strict()
 
-const endTarget = z.literal('END')
-
 const actorTaskNode = z
   .object({
     execution: actorTaskExecution,
@@ -132,8 +130,6 @@ export const workflowConfigSchema = z
     childWorkflows: z.record(z.string(), workflowDef).optional(),
   })
   .strict()
-
-export type WorkflowConfigRaw = z.infer<typeof workflowConfigSchema>
 
 export class CatalogSchemaError extends Error {
   readonly issues: z.core.$ZodIssue[]

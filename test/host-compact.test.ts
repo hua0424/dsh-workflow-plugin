@@ -64,7 +64,6 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
   const adapters: HostAdapters = {
     ctx: { subagents: queue, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
-    cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
   const run = makeRun('sess-dev')
@@ -97,7 +96,6 @@ test('Judge drain propagates missing Manager and host drain failures', async () 
   const adapters: HostAdapters = {
     ctx: { subagents: { drainContinuableChildren: async () => { throw new Error('drain failed') } }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
-    cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
   const host = makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx))
@@ -121,7 +119,6 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
     const adapters: HostAdapters = {
       ctx: { subagents, tools: { schemas: () => [] }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
-      cwdOfManager: async () => undefined,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
     const host = makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx))
@@ -145,7 +142,6 @@ test('drain seam: a hanging drainContinuableChildren fails closed instead of pen
     const adapters: HostAdapters = {
       ctx: { subagents: { drainContinuableChildren: async () => new Promise<never>(() => {}) }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
-      cwdOfManager: async () => undefined,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
     await assert.rejects(makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx)).drainJudge(makeRun(undefined), 'judge-old'),
@@ -248,7 +244,6 @@ function makeHost(options: {
   const adapters = {
     ctx: fakeCtx as unknown as Context,
     managerAgentOf: () => options.manager,
-    cwdOfManager: async () => undefined,
     registerJudgeSession: () => {},
     revokeJudgeSession: () => {},
     registerRoleActorSession: () => {},
@@ -563,7 +558,6 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
     const adapters: HostAdapters = {
       ctx: { subagents: queue, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
-      cwdOfManager: async () => undefined,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
     const run = makeRun('sess-dev')
@@ -650,7 +644,7 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
     jobs: { onJobDone: () => () => {} }, effect: () => {},
   } as unknown as Context
   const host = makeSubagentHost({
-    ctx, managerAgentOf: () => undefined, cwdOfManager: async () => undefined,
+    ctx, managerAgentOf: () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }, () => ({}), testParticipants(ctx))
   assert.equal(await host.roleSessionAvailability('live-session'), 'available')
@@ -659,7 +653,7 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
   assert.equal(await host.judgeSessionAvailability('broken-session'), 'unknown')
   const noService = makeSubagentHost({
     ...({ ctx: { ...ctx, get: () => undefined } as unknown as Context } as HostAdapters),
-    managerAgentOf: () => undefined, cwdOfManager: async () => undefined,
+    managerAgentOf: () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }, () => ({}), testParticipants(ctx))
   assert.equal(await noService.roleSessionAvailability('cold-session'), 'unknown')

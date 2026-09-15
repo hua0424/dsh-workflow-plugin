@@ -5,6 +5,8 @@
  */
 import { createHash } from 'node:crypto'
 import { ID_PATTERN, LIMITS, RESERVED_ROLE_KEYS, roleReuseMode, type CheckerRef, type NodeDef, type WorkflowConfig, type WorkflowDef } from '../types.ts'
+// #100：固定 program id 名单从 Program 元数据单源派生，不在这里另维护一份。
+import { BUILTIN_PROGRAM_IDS } from '../programs/metadata.ts'
 
 export class CatalogValidationError extends Error {
   readonly problems: string[]
@@ -14,12 +16,6 @@ export class CatalogValidationError extends Error {
     this.problems = problems
   }
 }
-
-/** Builtin program ids known to this plugin version (design §10.1). */
-export const BUILTIN_PROGRAM_IDS = new Set([
-  'github.initialize-milestone',
-  'github.all-milestone-issues-complete',
-])
 
 /** Builtin checker ids known to this plugin version (design §3; A1 v2 rename). */
 export const BUILTIN_CHECKER_IDS = new Set(['judge.claim-correct'])

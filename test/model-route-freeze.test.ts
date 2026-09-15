@@ -314,7 +314,6 @@ function realHost(
   const adapters: HostAdapters = {
     ctx,
     managerAgentOf: run => managers.get(run.managerSessionId),
-    cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
   return { host: makeSubagentHost(adapters, options.legacyRoute ?? (() => ({})), testParticipants(ctx)), spawns, resumes }
