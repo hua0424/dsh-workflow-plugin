@@ -6,10 +6,13 @@
  *
  * 三类证据的寿命（#99 改造方法 3/4）：
  * 1. 精确 Agent 引用（`exact`）：强引用，只在该 Session **自己**的 turn/end 结算窗口
- *    内保留，且必须由内存路由或工作单行证明它是参与者；一次无法证明参与的结算
- *    （无关 Session churn）立即释放完整 Agent，只留 id 级事实——不靠 TTL 洗白。
+ *    内保留，且必须由**参与证明路由**或工作单行证明它是参与者；一次无法证明参与的
+ *    结算（无关 Session churn）立即释放完整 Agent，只留 id 级事实——不靠 TTL 洗白。
  * 2. 历史路由（`workspaces` / `roles` / `judgeAdmissions`）：id 级字符串，宿主重启后的
- *    授权修复要用；成本与见过的 Session 数同阶，与是否还持有精确引用无关。
+ *    授权修复要用；成本与见过的 Session 数同阶，与是否还持有精确引用无关。其中
+ *    `workspaces` 带 `proof` 标记：**探测**写入（工具调用探 cwd、父会话继承）只用来
+ *    定位 workspace，不构成参与证据（#99 M-1）；只有派发/准入/角色注册/工作单行修复
+ *    这类写入才是证明。
  * 3. unsafe/orphan tombstone（`unsafe`）与祖先关系（`parents`）：job 行消失、descriptor
  *    被清空都不能洗白（#54），只在插件卸载时清空。
  *
@@ -141,12 +144,22 @@ export interface ParticipantStats {
   realpathCalls: number
 }
 
+/** 路由写入来源（#99 M-1）：`participation` 是本 Run 记下的参与事实，`probe` 只为定位 workspace。 */
+export type RouteSource = 'participation' | 'probe'
+
 export interface ParticipantIndex {
-  /** 记录/覆盖一个 Session 的 workspace 路由（Manager 启动、子会话创建、cold 修复）。 */
-  rememberWorkspace(sessionId: string, workspaceKey: string): void
-  /** 记录 Role Actor 身份（+ 可选 workspace 路由）。 */
+  /**
+   * 记录/覆盖一个 Session 的 workspace 路由。`source` 决定它能否**单独构成参与证据**
+   * （#99 M-1）：`probe`（工具调用探 cwd、父会话继承）只能定位 workspace，结算时仍要
+   * 按工作单行判定；`participation`（Manager 启动、角色注册、准入、工作单行修复）可直接确认。
+   */
+  rememberWorkspace(sessionId: string, workspaceKey: string, source: RouteSource): void
+  /** 记录 Role Actor 身份（+ 可选 workspace 路由）；注册即参与事实。 */
   rememberRole(sessionId: string, roleKey: string, workspaceKey?: string): void
-  /** Judge 准入：同时记准入 workspace 与路由；无 workspace 时只表明"本 Run 派发过它"。 */
+  /**
+   * Judge 准入：记准入 workspace 与参与证明路由；`workspaceKey === undefined` 时不记录
+   * 任何内容（该情形由 `judgeAuthorized` 的工作单行修复路径兜底）。
+   */
   admitJudge(sessionId: string, workspaceKey?: string): void
   /** 撤权只删准入映射，历史路由保留（授权只认当前工作单）。 */
   revokeJudge(sessionId: string): void
@@ -158,9 +171,10 @@ export interface ParticipantIndex {
   /** 同步事实捕获：记录该 Session 的**当代** Agent 与祖先关系，不做任何判定。 */
   observeTurnEnd(sessionId: string): void
   /**
-   * 一次 turn/end 的归属判定：内存路由优先；未命中才探一次工作单（单行读 + realpath，
-   * 推导不出时兜底扫一次），并按结果确认（保留）或释放观察引用。返回该 Turn 归属的
-   * workspace；`undefined` = 连 workspace 都推导不出来，没有可结算的工作单。
+   * 一次 turn/end 的归属判定：参与证明路由优先；探测路由只用来定位 workspace（省掉
+   * realpath），是否参与仍按工作单行判定；两者都没有才 realpath，推导不出时兜底扫一次。
+   * 按判定结果确认（保留）或释放观察引用。返回该 Turn 归属的 workspace；`undefined` =
+   * 连 workspace 都推导不出来，没有可结算的工作单。
    */
   resolveTurn(sessionId: string, cwd: string | undefined): Promise<string | undefined>
   safeToInspect(sessionId: string): Promise<SafeInspection>
@@ -173,8 +187,8 @@ export function participantServicesOf(host: ParticipantServices): ParticipantSer
 }
 
 export function makeParticipantIndex(services: ParticipantServices, workOrder: WorkOrderPort): ParticipantIndex {
-  /** 历史路由（id 级）：授权修复与 turn/end 归属判定用。 */
-  const workspaces = new Map<string, string>()
+  /** 历史路由（id 级）：授权修复与 turn/end 归属**定位**用；`proof` 见 `rememberWorkspace`。 */
+  const workspaces = new Map<string, { key: string; proof: boolean }>()
   const roles = new Map<string, string>()
   const judgeAdmissions = new Map<string, string>()
   /** 精确 Agent 引用：只在本 Session 自己的结算窗口内保留。 */
@@ -235,26 +249,34 @@ export function makeParticipantIndex(services: ParticipantServices, workOrder: W
     return await workOrder.facts(workspaceKey)
   }
 
+  /**
+   * 写路由：`proof` 单调不回退——探测写入可以补位置，但抹不掉已经记下的参与事实
+   * （角色注册与 `subagent/start` 的到达顺序不保证；抹掉只会白白多探一次工作单）。
+   */
+  const route = (sessionId: string, workspaceKey: string, proof: boolean): void => {
+    workspaces.set(sessionId, { key: workspaceKey, proof: proof || workspaces.get(sessionId)?.proof === true })
+  }
+
   const adopt = (sessionId: string, workspaceKey: string, admission: ParticipantAdmission): void => {
-    workspaces.set(sessionId, workspaceKey)
+    route(sessionId, workspaceKey, true)
     if (admission.kind === 'role') roles.set(sessionId, admission.roleKey)
     else if (admission.kind === 'judge') judgeAdmissions.set(sessionId, workspaceKey)
   }
 
   return {
-    rememberWorkspace(sessionId, workspaceKey) { workspaces.set(sessionId, workspaceKey) },
+    rememberWorkspace(sessionId, workspaceKey, source) { route(sessionId, workspaceKey, source === 'participation') },
     rememberRole(sessionId, roleKey, workspaceKey) {
       roles.set(sessionId, roleKey)
-      if (workspaceKey !== undefined) workspaces.set(sessionId, workspaceKey)
+      if (workspaceKey !== undefined) route(sessionId, workspaceKey, true)
     },
     admitJudge(sessionId, workspaceKey) {
       if (workspaceKey === undefined) return
       judgeAdmissions.set(sessionId, workspaceKey)
-      workspaces.set(sessionId, workspaceKey)
+      route(sessionId, workspaceKey, true)
     },
     revokeJudge(sessionId) { judgeAdmissions.delete(sessionId) },
     adopt,
-    workspaceOf(sessionId) { return workspaces.get(sessionId) },
+    workspaceOf(sessionId) { return workspaces.get(sessionId)?.key },
     roleOf(sessionId) { return roles.get(sessionId) },
     judgeWorkspaceOf(sessionId) { return judgeAdmissions.get(sessionId) },
 
@@ -268,14 +290,21 @@ export function makeParticipantIndex(services: ParticipantServices, workOrder: W
 
     async resolveTurn(sessionId, cwd) {
       const known = workspaces.get(sessionId)
-      if (known !== undefined) {
-        // 本 Run 自己记下的路由就是参与证据（派发/准入时写入），无需再探工作单。
+      if (known?.proof === true) {
+        // 本 Run 自己记下的参与证明路由（派发/准入/角色注册/工作单行修复），无需再探工作单。
         confirmObservation(sessionId)
-        return known
+        return known.key
       }
       try {
-        realpathCalls += 1
-        const workspaceKey = await workOrder.workspaceKeyOf(cwd)
+        // M-1：探测路由只用来定位 workspace（省掉一次 realpath），**不**充当参与证据——
+        // 是否参与仍由下面那行工作单事实判定，否则"调用过工具但被拒绝的无关 Session"
+        // 会整插件生命周期持有完整 Agent 引用（#99 AC1）。
+        let workspaceKey: string | undefined
+        if (known !== undefined) workspaceKey = known.key
+        else {
+          realpathCalls += 1
+          workspaceKey = await workOrder.workspaceKeyOf(cwd)
+        }
         if (workspaceKey !== undefined) {
           const facts = await probe(workspaceKey)
           if (facts !== undefined) {
@@ -288,7 +317,7 @@ export function makeParticipantIndex(services: ParticipantServices, workOrder: W
             confirmObservation(sessionId)
             return workspaceKey
           }
-          // cwd 能解析、但该 workspace 没有工作单行：参与者的 cwd 就是它 Run 的
+          // workspace 定位到了、但该 workspace 没有工作单行：参与者的 cwd 就是它 Run 的
           // workspace（Manager 在 start 处、子会话继承），所以它不可能属于别的
           // workspace —— 直接判定无关，不再兜底全表扫（#99 AC7）。
           releaseObservation(sessionId)

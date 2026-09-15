@@ -128,6 +128,57 @@ test('#99 AC7：内存路由命中的参与者不探工作单；无关 Session �
   assert.equal(other.index.stats().releaseUnrelated, 1)
 })
 
+test('#99 M-1：探测路由（工具调用探 cwd / 父会话继承）不单独构成参与证据', async () => {
+  // authorize() 的 workspace 探测与被拒调用者、父会话之子的继承路由都只是"位置"。
+  const h = harness([['C:/ws', facts({ roleActors: { worker: 'role-a' } })]])
+  for (let i = 0; i < 1000; i++) {
+    const id = `probe-${i}`
+    h.agents.set(id, mkAgent(id))
+    h.index.rememberWorkspace(id, 'C:/ws', 'probe')
+    h.index.observeTurnEnd(id)
+    assert.equal(h.index.stats().exactAgents, 1, '结算窗口内只持有当代引用')
+    assert.equal(await h.index.resolveTurn(id, undefined), 'C:/ws', '探测路由仍用来定位 workspace')
+    h.agents.delete(id)
+    assert.equal(h.index.stats().exactAgents, 0, '工作单不引用它 → 完整 Agent 引用立即释放')
+  }
+  const stats = h.index.stats()
+  assert.equal(stats.releaseUnrelated, 1000, '可复查计数：1000 次释放')
+  assert.equal(stats.retainDecisions, 0)
+  assert.equal(stats.exactAgents, 0)
+  assert.equal(stats.provisional, 0)
+  assert.equal(stats.routes, 1000, '路由仍按 id 级事实保留（授权修复用）')
+  assert.equal(stats.realpathCalls, 0, '探测路由定位 workspace，省掉 realpath')
+  assert.equal(stats.rowProbes, 1000, '每个 turn/end 仍只探一次单行工作单')
+  assert.equal(stats.scanFallbacks, 0)
+
+  // 同一批探测路由，一旦工作单行引用它就必须升级为参与证明并保留（反向判据）。
+  h.agents.set('role-a', mkAgent('role-a'))
+  h.index.rememberWorkspace('role-a', 'C:/ws', 'probe')
+  h.index.observeTurnEnd('role-a')
+  assert.equal(await h.index.resolveTurn('role-a', undefined), 'C:/ws')
+  assert.equal(h.index.stats().exactAgents, 1, '行引用它 → adopt 升级成参与证明')
+  assert.equal(h.index.roleOf('role-a'), 'worker')
+  assert.equal(h.index.stats().retainDecisions, 1)
+  h.index.observeTurnEnd('role-a')
+  await h.index.resolveTurn('role-a', undefined)
+  assert.equal(h.index.stats().rowProbes, 1001, '升级后不再重复探工作单')
+
+  // Manager 启动时记下的参与证明路由（commandHost.start 路径）同样不探工作单。
+  const mgr = harness([['C:/ws', facts({ managerSessionId: 'mgr' })]])
+  mgr.agents.set('mgr', mkAgent('mgr'))
+  mgr.index.rememberWorkspace('mgr', 'C:/ws', 'participation')
+  mgr.index.observeTurnEnd('mgr')
+  assert.equal(await mgr.index.resolveTurn('mgr', undefined), 'C:/ws')
+  assert.deepEqual(mgr.probes, [], '派发时记下的路由仍是参与证明')
+  assert.equal(mgr.index.stats().realpathCalls, 0)
+  assert.equal(mgr.index.stats().exactAgents, 1)
+  // 探测写入不回退已记下的参与证明（角色注册与 subagent/start 到达顺序不保证）。
+  mgr.index.rememberWorkspace('mgr', 'C:/ws', 'probe')
+  mgr.index.observeTurnEnd('mgr')
+  assert.equal(await mgr.index.resolveTurn('mgr', undefined), 'C:/ws')
+  assert.deepEqual(mgr.probes, [], '探测写入不会抹掉参与事实')
+})
+
 test('#99 AC3：异步注册竞态与冷恢复——cwd 推导不出时按 Session 兜底找到 Judge 行', async () => {
   // 冷恢复：内存路由为空（宿主重启），Judge 的 cwd 也读不出来 → 只能按行兜底。
   const h = harness([['C:/ws', facts({ judgeSessionId: 'judge-cold' })]])

@@ -127,7 +127,7 @@ export function apply(ctx: Context) {
     participants.rememberRole(sessionId, roleKey)
     if (cwd === undefined) return
     void workspaceKeyOf(cwd).then(ws => {
-      if (ws !== undefined) participants.rememberWorkspace(sessionId, ws)
+      if (ws !== undefined) participants.rememberWorkspace(sessionId, ws, 'participation')
     }).catch(() => {})
   }
 
@@ -189,7 +189,9 @@ export function apply(ctx: Context) {
     const agent = ctx.agents.get(sessionId as SessionId)
     if (agent === undefined) return undefined
     const ws = await workspaceKeyOf(agent.session.header.cwd)
-    if (ws !== undefined) participants.rememberWorkspace(sessionId, ws)
+    // #99 M-1：这里是**探测**（为后续调用定位 workspace），不证明参与——被拒绝的
+    // 无关 Session 也会走到这里，所以它不得单独让该 Session 的证据被保留。
+    if (ws !== undefined) participants.rememberWorkspace(sessionId, ws, 'probe')
     return ws
   }
 
@@ -274,7 +276,9 @@ export function apply(ctx: Context) {
     void (async () => {
       const ws = participants.workspaceOf(parentId)
       if (ws === undefined) return
-      participants.rememberWorkspace(info.id, ws)
+      // #99 M-1：子会话从父会话继承的只是**位置**（探测），不是参与证据——角色的
+      // 参与身份由下面的工作单行（或创建时的 registerRoleActorSession）证明。
+      participants.rememberWorkspace(info.id, ws, 'probe')
       const row = await store().get(ws)
       if (row === undefined) return
       const admission = participantInWorkOrder(workOrderFactsOf(row), info.id)
@@ -304,7 +308,8 @@ export function apply(ctx: Context) {
         const report = checkCatalogProviders(workflowId, entry.config, available)
         if (!report.ok) return { ok: false, reason: renderStartProviderBlock(report) }
         const run = engine.buildInitialRun(agent.session.id, workflowId, entry.config, entry.definitionHash)
-        participants.rememberWorkspace(agent.session.id, workspaceKey)
+        // Manager 启动：该 Session 就是本 Run 的 Manager（工作单行即将引用它），是参与事实。
+        participants.rememberWorkspace(agent.session.id, workspaceKey, 'participation')
         const outcome = await engine.startRun(workspaceKey, run, entry.path, extraText)
         if (!outcome.ok) return { ok: false, reason: outcome.reason }
         return { ok: true, message: `started ${workflowId} (run ${outcome.run?.runId})` }
