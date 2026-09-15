@@ -71,29 +71,34 @@ export interface ProjectedMessage {
  *   dispatch/handoff/resolution 仍受 message-id 边界约束（R6）。
  *   首次 `startContinuable` prompt 的来源仍是 `{kind:'user'}`。
  */
+function projectSurfaceEvent(event: SessionEvent, session: ProjectionSource, role: 'USER' | 'MANAGER' | 'ACTOR'): ProjectedMessage | undefined {
+  if (!isAppendSurfaceEvent(event)) return undefined
+  let message: ReturnType<typeof deriveEventMessage>
+  let entryRole = role
+  if (event.type === 'user/message') {
+    const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
+    if (source?.kind !== 'user' && !(role === 'ACTOR' && (source?.kind === 'coordinator'
+      || (source?.kind === 'plugin' && source.plugin === 'dsh-agent-team-workflow')))) return undefined
+    // A1 R3: keep the three-way attribution — a real human user message in
+    // the Manager session projects as USER, assistant output as MANAGER.
+    if (role === 'MANAGER' && source?.kind === 'user') entryRole = 'USER'
+    message = deriveEventMessage(event)
+  } else if (event.type === 'assistant/message') {
+    message = deriveEventMessage(event)
+  } else {
+    return undefined
+  }
+  const text = stripSubmissionConstraint(messageText(message)).trim()
+  if (text === '') return undefined
+  return { time: event.time, seq: event.seq, sessionId: session.id, role: entryRole, text }
+}
+
 export function projectSessionSurface(session: ProjectionSource, fromSeq: number, role: 'USER' | 'MANAGER' | 'ACTOR'): ProjectedMessage[] {
   const out: ProjectedMessage[] = []
   for (const event of session.snapshotEvents()) {
     if (event.seq < fromSeq) continue
-    if (!isAppendSurfaceEvent(event)) continue
-    let message: ReturnType<typeof deriveEventMessage>
-    let entryRole = role
-    if (event.type === 'user/message') {
-      const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
-      if (source?.kind !== 'user' && !(role === 'ACTOR' && (source?.kind === 'coordinator'
-        || (source?.kind === 'plugin' && source.plugin === 'dsh-agent-team-workflow')))) continue
-      // A1 R3: keep the three-way attribution — a real human user message in
-      // the Manager session projects as USER, assistant output as MANAGER.
-      if (role === 'MANAGER' && source?.kind === 'user') entryRole = 'USER'
-      message = deriveEventMessage(event)
-    } else if (event.type === 'assistant/message') {
-      message = deriveEventMessage(event)
-    } else {
-      continue
-    }
-    const text = stripSubmissionConstraint(messageText(message)).trim()
-    if (text === '') continue
-    out.push({ time: event.time, seq: event.seq, sessionId: session.id, role: entryRole, text })
+    const projected = projectSurfaceEvent(event, session, role)
+    if (projected !== undefined) out.push(projected)
   }
   return out
 }
@@ -126,22 +131,28 @@ export function compressDispatchToHandoff(text: string): string {
 }
 
 /**
- * Locate the first event seq of the executor's dispatch message: the message id
- * recorded in the boundary (A1 R2/R6) — the authoritative cursor. When the id
- * cannot be found, the actor surface contributes NOTHING (`session.seq` = next
- * unallocated seq): A1 R2 forbids time-based fallbacks ("不得仅依赖
- * event.time >= dispatchedAt 判断边界"), and failing closed loses one node's
- * actor context rather than leaking a previous node's history (AC2/AC3).
+ * #97：Actor 面的"定位首条 dispatch + 投影"合并为**单次顺序扫描**——旧路径
+ * 先全量扫一遍找 dispatch message id（executorFromSeq），再全量扫一遍投影。
+ * 事件按 seq 递增，dispatch 之前的事件 seq < from 必然被丢弃，可在同一次
+ * 遍历里边定位边投影。id 缺失或找不到时 Actor 面贡献 NOTHING（`session.seq`
+ * = 下一个未分配 seq）：A1 R2 禁止时间回退 fallback，fail-closed 只损失本
+ * Node 的 actor 上下文，不泄露上一 Node 的历史（AC2/AC3）。
  */
-function executorFromSeq(session: ProjectionSource, boundary: NodeContextBoundary): number {
+function projectActorSurface(session: ProjectionSource, boundary: NodeContextBoundary): { from: number; messages: ProjectedMessage[] } {
   const id = boundary.executorDispatchMessageId
-  if (id !== undefined) {
-    for (const event of session.snapshotEvents()) {
+  if (id === undefined) return { from: session.seq, messages: [] }
+  const messages: ProjectedMessage[] = []
+  let from: number | undefined
+  for (const event of session.snapshotEvents()) {
+    if (from === undefined) {
       const message = deriveEventMessage(event)
-      if (message !== null && message.id === id) return event.seq
+      if (message === null || message.id !== id) continue
+      from = event.seq
     }
+    const projected = projectSurfaceEvent(event, session, 'ACTOR')
+    if (projected !== undefined) messages.push(projected)
   }
-  return session.seq
+  return { from: from ?? session.seq, messages }
 }
 
 /** Stable per-session tie-break for equal event timestamps (A1 R3). */
@@ -179,8 +190,7 @@ export function projectNodeLocal(
   // (legacy coordinator history is also kept for the ACTOR role per A1 R6).
   let dispatch: ProjectedMessage | undefined
   if (actorSession !== undefined && boundary.executorSessionId !== undefined) {
-    const from = executorFromSeq(actorSession, boundary)
-    const scoped = projectSessionSurface(actorSession, from, 'ACTOR')
+    const { from, messages: scoped } = projectActorSurface(actorSession, boundary)
     // #44 P2: the executor's dispatch message (the boundary anchor at `from`)
     // keeps only [handoff] in the projection; later actor messages are untouched.
     const dispatchAt = scoped.findIndex(p => p.seq === from)
