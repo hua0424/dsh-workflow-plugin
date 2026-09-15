@@ -206,6 +206,23 @@ test('projectNodeLocal excludes pre-boundary actor history via the dispatch mess
   assert.doesNotMatch(text, /old actor reply/)
 })
 
+test('#97: long pre-dispatch actor history keeps the projection verbatim-identical to the noise-free log', () => {
+  // 收敛为单次扫描后，dispatch 定位与投影必须仍产出与旧双扫描完全一致的
+  // 结果：前置噪声一条不混入，dispatch 之后一条不丢。
+  const dispatch = { id: 'dispatch-97' as never, role: 'user' as const, content: [{ type: 'text' as const, text: '[handoff]\n#97 work' }], source: { kind: 'user' as const } }
+  const post = { turn: 9, step: 1, message: { id: 'a97' as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: 'actor did the work' }], source: { kind: 'model', model: 'm' } } }
+  const noise: Array<{ type: string; data: unknown; surfaceOp?: string }> = []
+  for (let i = 0; i < 500; i++) {
+    noise.push(i % 2 === 0
+      ? { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: `old node work ${i}` }], source: { kind: 'user' } }), surfaceOp: 'append' }
+      : { type: 'assistant/message', data: { turn: 1, step: 1, message: { id: `old-a-${i}` as never, role: 'assistant' as const, content: [{ type: 'text' as const, text: `old actor reply ${i}` }], source: { kind: 'model', model: 'm' } } }, surfaceOp: 'append' })
+  }
+  const noisy = makeSession([...noise, { type: 'user/message', data: dispatch, surfaceOp: 'append' }, { type: 'assistant/message', data: post, surfaceOp: 'append' }])
+  const clean = makeSession([{ type: 'user/message', data: dispatch, surfaceOp: 'append' }, { type: 'assistant/message', data: post, surfaceOp: 'append' }])
+  const boundary = { dispatchedAt: 0, managerFromSeq: 0, executorSessionId: 'actor', executorDispatchMessageId: 'dispatch-97' }
+  assert.equal(projectNodeLocal(makeSession([]), boundary, noisy), projectNodeLocal(makeSession([]), boundary, clean))
+})
+
 test('projectNodeLocal fails CLOSED when the dispatch message id is missing (A1 R2: no time fallback)', () => {
   const actor = makeSession([
     { type: 'user/message', data: createUserMessage({ content: [{ type: 'text', text: 'old node work' }], source: { kind: 'user' } }), surfaceOp: 'append' },

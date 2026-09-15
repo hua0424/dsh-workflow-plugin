@@ -68,8 +68,13 @@ function sessionPersistence(ctx: Context): SessionPersistence | undefined {
  * R12 "Session/持久化/读取异常"): it throws so the engine fail-closes into a
  * `judge fault: <detail>` BLOCK instead of judging from a silently truncated
  * packet.
+ *
+ * #97：`limit` 限定读取的事件条数。投影传 undefined（全量）；availability 传 0
+ * ——后端 read 总是先整体验证存储再切片（JSONL 0.1.5 readCurrent 先解析并
+ * validateStoredEvents 整个日志），所以 0 条读取的 typed NotFound / 损坏日志
+ * 抛错分类与全量读完全一致，只是不再把整个事件数组复制出来。
  */
-async function inspectPersistedSession(ctx: Context, sessionId: string): Promise<ProjectionSource | undefined> {
+async function inspectPersistedSession(ctx: Context, sessionId: string, limit?: number): Promise<ProjectionSource | undefined> {
   const persistence = sessionPersistence(ctx)
   if (persistence === undefined) return undefined
   const controller = new AbortController()
@@ -82,7 +87,7 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
     // 只读观察者。0.1.5 起持久化改为 SessionHandle：open('read') 不取写所有权，
     // read 的 signal 直达后端读（旧 prepareCore 不转发 signal 的缺陷随之消失）。
     handle = await withTimeout(opening, DISPATCH_TIMEOUTS.availability, 'availability', controller)
-    const result = await withTimeout(handle.read(0, undefined, { signal: controller.signal }),
+    const result = await withTimeout(handle.read(0, limit, { signal: controller.signal }),
       DISPATCH_TIMEOUTS.availability, 'availability read', controller)
     const events = result.events.slice()
     return {
@@ -109,7 +114,10 @@ async function sessionAvailability(ctx: Context, sessionId: string): Promise<imp
   const persistence = sessionPersistence(ctx)
   if (persistence === undefined) return 'unknown'
   try {
-    const source = await inspectPersistedSession(ctx, sessionId)
+    // #97：只读 0 条事件判存在性——分类语义与全量读一致（见上方注释），但不
+    // 再复制完整日志。不得退化为 stat：stat 无法区分损坏日志，会把 unknown
+    // 误升级为 available（票面第 4 条）。
+    const source = await inspectPersistedSession(ctx, sessionId, 0)
     return source?.id === sessionId ? 'available' : 'unknown'
   } catch (error) {
     return error instanceof SessionPersistenceNotFoundError ? 'missing' : 'unknown'
