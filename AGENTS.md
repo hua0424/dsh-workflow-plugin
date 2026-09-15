@@ -49,10 +49,13 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 
 ## Commands
 
-- Build / typecheck: `pnpm run build` (tsc → `lib/`；无独立 lint script，tsc 即类型检查).
-- Unit tests: `pnpm test` — node:test over `test/*.test.ts`，直接跑 `.ts` 源码，无需先 build.
-- E2e smoke: `pnpm run test:e2e` — 真实 engine + SQLite + catalog loader，仅 stub 模型派发；使用隔离的临时 DSH home，绝不触碰真实 `~/.dsh`.
-- Dev deploy: `pnpm run build && node scripts/deploy-web.mjs` → 部署到 `~/.dsh/profiles/web/wfdev`；bundle 成员变更后需重启 DSH（`dsh web`）.
+- 验收单入口: `pnpm run verify` = `typecheck` + `test:suite` + `test:smoke`（现行口径与 skip 规则见 `docs/testing/runtime-refact-test-migration.md`）.
+- Build / typecheck: `pnpm run build` / `pnpm run typecheck`（脚本显式调用 `node node_modules/typescript/bin/tsc`——`.bin` 链接未物化时 `tsc` 不在 PATH；无独立 lint script，tsc 即类型检查）.
+- Unit tests: `pnpm test` — node:test over `test/*.test.ts`，直接跑 `.ts` 源码，无需先 build；禁派生进程的受限环境（`spawn EPERM`）用 `pnpm run test:suite`（`--test-isolation=none`）等价取全量结果.
+- Controlled smoke: `pnpm run test:smoke` = `t3-smoke.mjs`（`reuse: continuable`：跨节点复用 + 边界 compact + END + 关库重开）+ `e2e-smoke.mjs`（缺省 `reuse: node`：REJECT 修正/failed onFail 自环/drain 换代/trace）；单跑用 `test:t3` / `test:e2e`. 真实 engine + SQLite + catalog loader，仅 stub 模型派发，隔离临时 DSH home，绝不触碰真实 `~/.dsh`.
+- Real Host: `pnpm run test:real-host` — exact 0.1.5-rc.2 真实 Host 组合（`node test/runtime-real-host.test.ts` 单文件直跑，不派生 runner 子进程）；与受控 smoke 分开报告，不得混称.
+- State 诊断: `node scripts/check-state-rows.mjs <state.sqlite3 路径>` — 只读、显式路径、快照副本上诊断，不创建/改写目标库，也不默认真实 home.
+- Dev deploy: `pnpm run build && node scripts/deploy-web.mjs` → 部署到 `~/.dsh/profiles/web/wfdev`（需显式授权）；仅验证产物用 `node scripts/deploy-web.mjs --out <临时目录>`（bundle 元数据取自 `package.json`，宿主包保持 devDependencies；`--out` 缺值 = 用法错误 exit 2，绝不回落到 profile 目标）；bundle 成员变更后需重启 DSH（`dsh web`）.
 
 ## Architecture boundaries
 
@@ -77,12 +80,12 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 
 ## Docs to read first
 
-- 工单实施/审查先读 `docs/agents/issue-tracker.md` 和 `docs/work-plans/runtime-refact.md`，获取实际工单依赖、完成状态与用户改动保护范围。
-- `refact` 分支的重构开发/评审先读 `docs/design/node-execution-runtime.md` 与 `docs/specs/node-execution-runtime.md`：三表工作单、outcome+handoff 单文本、Role 复用/compact、BLOCK 争议处理的目标基线；旧 PRD/Issue #6 已被替代。未实现前，以下领域文档仍用于理解当前代码。
+- 工单实施/审查先读 `docs/agents/issue-tracker.md` 和 `docs/work-plans/runtime-refact.md`（T1–T9 历史台账），获取实际工单依赖、完成状态与用户改动保护范围。
+- Node Execution Runtime（现行实现）：先读 `docs/design/node-execution-runtime.md` 与 `docs/specs/node-execution-runtime.md`（三表工作单、outcome+handoff 单文本、Role 复用/compact、BLOCK 争议处理），验收入口与 skip 口径见 `docs/testing/runtime-refact-test-migration.md`，冻结证据见 `docs/testing/node-execution-runtime-acceptance.md`。
 - `CONTEXT.md` — 领域术语表（Manager、Role Actor、Judge、Run Frame、nodeToken、BLOCK、pendingClaim、Handoff Context 等含义精确，代码/文档中使用原词）.
 - `docs/user-guide.md` — 面向使用者/运维者的操作手册（命令、工具、部署、故障排查）.
 - `docs/design/configurable-agent-workflow-graph.md` — v1 权威设计.
-- `docs/testing/acceptance-test-plan.md` / `acceptance-report.md` — 冻结的验收标准与现状.
+- `docs/testing/acceptance-test-plan.md` / `acceptance-report.md` — 原单表实现的历史验收资料（带版本标记，不代表当前实现）；现行入口见上一条.
 - `docs/prd/<YYYYMMDD-topic>/` — 每轮修复/加固的 PRD；`docs/test-reports/` — 每个_issue 的测试报告；`docs/pending-discussions/` — 已记录的前提结论.
 
 ## Conventions

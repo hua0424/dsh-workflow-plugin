@@ -1,5 +1,10 @@
 # 验收报告（阶段性）
 
+> **历史记录（适用版本：原单表实现 T1–T2 阶段，2026-09-02）。** 其中的 `test/state.test.ts`、`test/engine.test.ts`
+> 已在 T9 随旧 Runtime 删除，计数与"未完成项"均不代表当前实现。**现行验收入口**见
+> [`runtime-refact-test-migration.md`](runtime-refact-test-migration.md)（`pnpm run verify`）与
+> [`node-execution-runtime-acceptance.md`](node-execution-runtime-acceptance.md)（A01–A30）。本文件只作为当时现场的事故与结论留档。
+
 - 生成时间：实现完成、经过两轮对抗性审查修复、等待真实 GUI e2e 重启期间
 - 验收依据：`docs/testing/acceptance-test-plan.md`（A-J 九组标准）
 - 当前结论：**离线可验证项全部通过；唯一剩余项 = 真实模型 Web GUI e2e（需用户重启 DSH）**

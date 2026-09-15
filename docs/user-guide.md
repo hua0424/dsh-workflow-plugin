@@ -17,15 +17,19 @@
 
 ## 2. 安装 / 部署 / 升级
 
-插件以 dev bundle（`wfdev`）形式部署在 web profile：
+插件以 dev bundle（`wfdev`）形式部署在 web profile。**部署是需你显式授权的动作**；只想核对产物时用隔离生成（`--out`，不写 `~/.dsh`）：
 
 ```bash
-pnpm run build                 # tsc 编译到 lib/（部署前必须）
-node scripts/deploy-web.mjs    # 部署到 ~/.dsh/profiles/web/wfdev
+pnpm run build                              # tsc 编译到 lib/（部署前必须）
+node scripts/deploy-web.mjs --out /tmp/wfdev-check   # 隔离生成产物并核对版本/依赖（不部署）
+node scripts/deploy-web.mjs                 # 部署到 ~/.dsh/profiles/web/wfdev（需授权）
 # 重启 DSH（dsh web）生效
 ```
 
-注意：每次 build 后都要重跑 deploy；bundle 成员变更后必须重启 DSH。
+bundle `package.json` 的必要字段（version / dependencies / dsh / main / type / license）全部取自本仓库
+`package.json`，不再手抄一份；`@deepseek-ai/*` 宿主包只留在 devDependencies，出现在 dependencies 会让
+生成步骤直接失败。`--out` 必须带目录值：漏写（`--out` 为末位）只打印用法并以 2 退出，**不会**回落到
+`~/.dsh` 的真实部署目标。注意：每次 build 后都要重跑 deploy；bundle 成员变更后必须重启 DSH。
 
 **版本兼容提示**：dsh ≥ 0.1.1-rc.7 起 `compaction` 服务不再挂载在宿主平面，
 插件已改为运行期按 agent 解析（`host.ts` 的 `compactionFor`），不要在模块级
@@ -217,7 +221,19 @@ dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿�
 什么时候**不要**直接重置：如果旧 Run 的 `snapshot_json` 里有必须续跑的
 现场——先用 sqlite 备份文件把 handoff/claim 文本取出来存档，再重置。
 
-### 8.3 其他常见信息
+### 8.3 想看某个状态库到底装了什么（只读诊断）
+
+```bash
+node scripts/check-state-rows.mjs <state.sqlite3 的路径>      # 例：只查一个临时 fixture
+node scripts/check-state-rows.mjs <path> --json              # 机器可读
+```
+
+- **必须显式给路径**：脚本没有默认目标，不会去读你的真实 `~/.dsh`；缺参数只打印用法并以 2 退出。
+- **零副作用**：先复制成临时快照再以只读方式打开副本，被诊断的库与所在目录（含 WAL/shm 索引）都不被创建或改写；路径不存在按 `missing` 报告，不是"空库"。
+- **格式识别**：`user_version=9` 且恰好 `runs` / `node_executions` / `node_execution_events` 三表 → 列出每个 Run 的 status/workflow/stateVersion/currentExecution；旧单表 `workflow_state` → 提示它是被 fail-closed 拒绝的旧格式与 `reset --incompatible-store` 退出路径；其它未知布局 / 坏库 → 明确诊断，不猜成空结果。
+- 退出码：`0` 当前 v9 格式；`1` 有诊断（missing/legacy/unknown/corrupt）；`2` 用法错误。
+
+### 8.4 其他常见信息
 
 以下三条只与 `reuse: continuable` 的 Role 有关——缺省 `node` 的 Role 不做节点边界
 压缩（见 §3.1）。
@@ -233,11 +249,18 @@ dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿�
 ## 9. 开发者快速参考
 
 ```bash
-pnpm test            # 单测（node:test，直接跑 .ts 源码）
-pnpm run test:e2e    # 隔离 e2e 冒烟（真实 engine + SQLite + stub 模型）
-pnpm run build       # tsc 类型检查 + 编译
-node scripts/deploy-web.mjs   # 部署（build 之后）
+pnpm run verify       # 现行验收单入口：typecheck + 全量 suite + 两套受控 smoke
+pnpm run typecheck    # tsc --noEmit（脚本显式调用 node_modules/typescript/bin/tsc）
+pnpm test             # 全量 node:test（标准入口，按文件隔离子进程）
+pnpm run test:suite   # 同一全量套件，--test-isolation=none（禁派生进程的受限环境用）
+pnpm run test:smoke   # 统一受控 smoke：t3（reuse: continuable）+ e2e（缺省 reuse: node）
+pnpm run test:real-host  # exact 0.1.5-rc.2 真实 Host 组合（单文件直跑；与受控 smoke 分开报告）
+pnpm run build        # tsc 编译到 lib/
+node scripts/deploy-web.mjs --out <目录>   # 隔离生成部署产物（不部署）
+node scripts/deploy-web.mjs                # 部署（build 之后，需授权）
+node scripts/check-state-rows.mjs <path>   # 只读诊断指定状态库
 ```
 
+- 计数口径：0 fail；skip 只允许环境条件（`test/programs.test.ts` 两条真实 spawn 用例在禁派生进程的环境按 EPERM 探测跳过，逻辑由受控适配器用例覆盖）。逐项替代映射见 `docs/testing/runtime-refact-test-migration.md`。
 - 工单/进度：`docs/agents/issue-tracker.md`、`docs/work-plans/runtime-refact.md`
 - 测试报告：`docs/test-reports/`；历史修复背景：`docs/prd/`

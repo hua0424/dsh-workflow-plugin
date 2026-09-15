@@ -1,6 +1,6 @@
 # T9 / A30：隔离真实宿主验收预检
 
-状态：预检已转为 `test/runtime-real-host.test.ts` 的可重复组合验收；A30 主流程已通过，最终命令与边界见 `node-execution-runtime-acceptance.md`。未部署、未操作真实 Run。
+状态：预检已转为 `test/runtime-real-host.test.ts` 的可重复组合验收；A30 主流程已通过，最终命令与边界见 `node-execution-runtime-acceptance.md`。未部署、未操作真实 Run（本记录适用版本：DSH `0.1.2-rc.1`；现行运行基线 `0.1.5-rc.2`，见根目录 `AGENTS.md`）。
 
 ## 目标与证据边界
 
