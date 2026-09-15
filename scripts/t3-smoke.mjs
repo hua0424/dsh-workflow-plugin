@@ -1,5 +1,11 @@
-/** T3隔离烟测：真实 Catalog/Runtime/SQLite + 受控派发；不代表真实DSH宿主E2E。
- * 原e2e-smoke.mjs的REJECT/resume/旧trace全流程保留待T4–T9迁移，不隐藏其失败。
+/** T3 隔离烟测（受控 Host，不代表真实 DSH 宿主 E2E）：
+ * 真实 Catalog/Runtime/SQLite + 显式 `reuse: continuable` 的 Role —— 覆盖 e2e-smoke
+ * 不覆盖的那一半角色生命周期：Manager 节点 → Role 跨节点复用（节点边界 compact）
+ * → END → SQLite 关库重开；e2e-smoke.mjs 覆盖缺省 `reuse: node` 的 REJECT 修正、
+ * failed onFail 自环、离开节点 drain 与新 visit 新会话。两者合起来是 `pnpm run test:smoke`。
+ * 全部使用独立临时 home，绝不读写真实 ~/.dsh；Adapter 必须跟随当前 Host 合同
+ * （`safeToInspect` 返回 'safe'|'unsafe'，不是 boolean——旧 boolean 断言会把
+ * continuable 复用误判成 "Judge/known tools not safely closed" 的假失败）。
  */
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
@@ -16,7 +22,7 @@ mkdirSync(cwd)
 mkdirSync(join(home, 'workflows'))
 writeFileSync(join(home, 'workflows', 'smoke.yaml'), `schemaVersion: agent-workflow/v2
 roles:
-  worker: { persona: Work only on the isolated artifact. }
+  worker: { persona: Work only on the isolated artifact., reuse: continuable }
 judgeRole: { persona: Read only verification. }
 workflow:
   startNode: plan
@@ -52,7 +58,7 @@ try {
   }, {
     async ensureRoleActor(_run, _role, text) { rolesCreated++; return { ...send(text), childId: 'worker' } },
     async startJudge(_run, input) { packets.push(input); return { judgeSessionId: input.judgeSessionId, messageId: `smoke-message-${++sequence}` } },
-    async retireJudge() {}, async safeToInspect() { return true },
+    async retireJudge() {}, async safeToInspect() { return 'safe' },
     async compactRoleActor() { compacts++; return { ok: true, detail: 'controlled no-op' } },
   }, {}, makeStateHost(store))
   engine.cwdResolver = async () => cwd
