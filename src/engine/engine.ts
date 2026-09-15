@@ -353,11 +353,10 @@ export class WorkflowEngine {
     try {
       const cwd = await this.cwdResolver(run)
       if (!await this.stillCurrent(ws, e, version)) return
-      // #98：`continuationSessionId` 是纯同步派生，其上不再重复一次 freshness 读；
-      // 跨 await（cwd/packet/spawn）的 CAS 复查保持原样。
+      // #98：`continuationSessionId` 是纯同步派生，与上一次 freshness 读（355 行）之间没有 await，
+      // 故这里不再重复一次读；跨 await（cwd/packet/spawn）的 CAS 复查保持原样。
       const continuationSessionId = e.resolution?.target === 'judge' && e.resolution.judgeMode === 'followup'
         ? e.resolution.judgeSessionId : undefined
-      if (!await this.stillCurrent(ws, e, version)) return
       if (!e.judge) {
         e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
         await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
@@ -854,7 +853,8 @@ export class WorkflowEngine {
     const oldJudge = e.judge
     let arrangedId = ''
     try {
-      // 派发前的准入检查：cwd/Manager 不可用时在 drain 与落库之前失败，状态零变更。
+      // 派发前的准入检查：cwd 不可用时在 drain 与安排落库之前失败（不 drain、不提交新安排）；
+      // 失败仍按既有 dispatchFault → BLOCK 落库，不是"状态零变更"。
       await this.cwdResolver(run)
       const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
       if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale respawn request after Judge drain')
@@ -877,7 +877,8 @@ export class WorkflowEngine {
       run.blockReason = null
       await this.state.put(ws, run, version, [change(e, 'judge-respawned', 'judge-arranged')])
     } catch (error) {
-      // 派发已移交 driver，本段只可能在这两处（cwd / drain）失败——都发生在任何提交之前。
+      // 本段失败点都在派发移交 driver 之前：cwd 准入、drain、安排落库（state.put）；
+      // 三者失败均交给 dispatchFault → BLOCK，版本未推进故语义与移除自建派发前一致。
       await this.dispatchFault(ws, e, error, version)
       return rejected(`Judge respawn failed: ${error instanceof Error ? error.message : String(error)}`)
     }
