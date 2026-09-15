@@ -60,7 +60,7 @@ node scripts/deploy-web.mjs --out <临时目录>         # 隔离生成部署产
 node scripts/check-state-rows.mjs <state.sqlite3 路径>  # 需要时只读诊断指定库（显式路径，不触碰真实 home）
 ```
 
-- 受限环境（禁派生进程，例如 DSH agent node 沙箱）：`pnpm test` 会因 `spawn EPERM` 失败，用 `pnpm run test:suite`（`--test-isolation=none`）等价取全量结果，并如实登记环境限制。
+- 受限环境（禁派生进程，例如 DSH agent node 沙箱）：`pnpm test`（test runner 按文件派生子进程）会因 `spawn EPERM` 失败，用 `pnpm run test:suite`（`--test-isolation=none`）等价取全量结果，并如实登记环境限制。`test:smoke`、`test:real-host`、诊断与隔离部署命令都不派生 runner 子进程，在受限环境下照常有效。
 - 冻结时（`0.1.2-rc.1`）记录的历史顺序为 `pnpm install --frozen-lockfile` → `pnpm run build` → `pnpm test` → `node scripts/t3-smoke.mjs` → `pnpm run test:e2e` → `pnpm run test:real-host`；现行入口以上表为准。
 
 本账本不包含 Standards/Spec 终审结论；T1–T9 的终审与提交已由父代理完成并合入 `main`，本账本作为冻结证据保留。

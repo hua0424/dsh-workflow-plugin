@@ -253,7 +253,7 @@ pnpm run typecheck    # tsc --noEmit（脚本显式调用 node_modules/typescrip
 pnpm test             # 全量 node:test（标准入口，按文件隔离子进程）
 pnpm run test:suite   # 同一全量套件，--test-isolation=none（禁派生进程的受限环境用）
 pnpm run test:smoke   # 统一受控 smoke：t3（reuse: continuable）+ e2e（缺省 reuse: node）
-pnpm run test:real-host  # exact 0.1.5-rc.2 真实 Host 组合（与受控 smoke 分开报告）
+pnpm run test:real-host  # exact 0.1.5-rc.2 真实 Host 组合（单文件直跑；与受控 smoke 分开报告）
 pnpm run build        # tsc 编译到 lib/
 node scripts/deploy-web.mjs --out <目录>   # 隔离生成部署产物（不部署）
 node scripts/deploy-web.mjs                # 部署（build 之后，需授权）

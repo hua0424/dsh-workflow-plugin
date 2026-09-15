@@ -23,7 +23,7 @@
     "typecheck": "node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
     "test": "node --test \"test/*.test.ts\"",
     "test:suite": "node --test --test-isolation=none \"test/*.test.ts\"",
-    "test:real-host": "node --test test/runtime-real-host.test.ts",
+    "test:real-host": "node test/runtime-real-host.test.ts",
     "test:t3": "node scripts/t3-smoke.mjs",
     "test:e2e": "node scripts/e2e-smoke.mjs",
     "test:smoke": "node scripts/t3-smoke.mjs && node scripts/e2e-smoke.mjs",

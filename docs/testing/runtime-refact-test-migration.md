@@ -10,7 +10,7 @@ pnpm run typecheck     # node node_modules/typescript/bin/tsc -p tsconfig.json -
 pnpm run test:suite    # node --test --test-isolation=none "test/*.test.ts"（受限环境等价全量入口）
 pnpm test              # 同一全量套件，标准按文件隔离子进程写法（Node 22.x 无法用 --test-isolation 时用它）
 pnpm run test:smoke    # 统一受控 smoke 入口 = scripts/t3-smoke.mjs && scripts/e2e-smoke.mjs
-pnpm run test:real-host  # exact 0.1.5-rc.2 真实 Host 组合（与上面两类 controlled smoke 分开报告）
+pnpm run test:real-host  # node test/runtime-real-host.test.ts（exact 0.1.5-rc.2 真实 Host，单文件直跑；与受控 smoke 分开报告）
 ```
 
 两套受控 smoke 的分工（合起来才是完整受控闭环，任一单独跑都不完整）：

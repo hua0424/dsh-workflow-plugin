@@ -66,7 +66,7 @@ cordis.patch.yml      profile-bundle patch (inserts the plugin row)
   - `pnpm test` — 全量 node:test（标准入口，按文件隔离子进程）。
   - `pnpm run test:suite` — 同样全量、`--test-isolation=none`：受限沙箱禁止派生进程（`spawn EPERM`）时的等价入口；Node 22.x 该 flag 名为 `--experimental-test-isolation=none`。
   - `pnpm run test:smoke` — 统一受控 smoke 入口 = `node scripts/t3-smoke.mjs`（`reuse: continuable`：Role 跨节点复用 + 节点边界 compact + END + 关库重开）&& `node scripts/e2e-smoke.mjs`（缺省 `reuse: node`：REJECT 修正 + failed onFail 自环 + 离开节点 drain + trace）。二者都只用独立临时 home，不读写真实 `~/.dsh`。
-  - `pnpm run test:real-host` — 单独运行 exact 0.1.5-rc.2 真实 Host 组合；与上面两类 controlled smoke 分开报告，三者不得混称。
+  - `pnpm run test:real-host` — 单独运行 exact 0.1.5-rc.2 真实 Host 组合（单文件直跑，不派生 test runner 子进程）；与上面两类 controlled smoke 分开报告，三者不得混称。
   - 计数口径：0 fail；仅允许**环境条件**跳过的用例（`test/programs.test.ts` 两条真实 spawn 用例在禁派生进程的环境按 EPERM 探测跳过，其逻辑由受控适配器用例覆盖）——不靠隐藏失败换取 0 skip，逐项替代见迁移账本。
 - 诊断工具：`node scripts/check-state-rows.mjs <state.sqlite3 路径>` 只读诊断指定库（显式路径、不默认真实 home、复制成临时快照后只读打开，不改写目标库）；当前 v9 / 旧单表 / 未知布局 / 坏库分别给诊断，退出码 0/1/2。
 - Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.1.5-rc.2` types and are required Host services, not plugin runtime dependencies.
