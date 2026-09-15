@@ -351,9 +351,10 @@ export class WorkflowEngine {
     // checking 不等于Judge已经运行：只有精确 Actor 收口入口能置settled。
     let committedVersion = version
     try {
-      const node = this.nodeAt(run, topFrame(run))!
       const cwd = await this.cwdResolver(run)
       if (!await this.stillCurrent(ws, e, version)) return
+      // #98：`continuationSessionId` 是纯同步派生，其上不再重复一次 freshness 读；
+      // 跨 await（cwd/packet/spawn）的 CAS 复查保持原样。
       const continuationSessionId = e.resolution?.target === 'judge' && e.resolution.judgeMode === 'followup'
         ? e.resolution.judgeSessionId : undefined
       if (!await this.stillCurrent(ws, e, version)) return
@@ -851,9 +852,10 @@ export class WorkflowEngine {
     if (this.nodeAt(run, topFrame(run))?.execution.type !== 'actor-task' || e.phase !== 'checking' || !e.claim
       || !e.dispatch?.settled || e.judgment?.result === 'ACCEPT') return rejected('judge_respawn requires an effective settled claim without a business conclusion')
     const oldJudge = e.judge
-    let committedVersion = version
+    let arrangedId = ''
     try {
-      const cwd = await this.cwdResolver(run)
+      // 派发前的准入检查：cwd/Manager 不可用时在 drain 与落库之前失败，状态零变更。
+      await this.cwdResolver(run)
       const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
       if (!await this.drainJudgeAndRevalidate(ws, row, judgeToDrain)) return rejected('stale respawn request after Judge drain')
       const currentFeedback = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
@@ -867,24 +869,33 @@ export class WorkflowEngine {
         decision: reason || 'Manager requested Judge respawn',
       }
       e.restartPending = false
-      e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+      const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+      arrangedId = arranged.id
+      e.judge = arranged
       e.blockReason = null
       run.status = 'running'
       run.blockReason = null
       await this.state.put(ws, run, version, [change(e, 'judge-respawned', 'judge-arranged')])
-      committedVersion = version + 1
-      if (!await this.stillCurrent(ws, e, committedVersion)) return rejected('stale respawn request')
-      const sent = await this.subagents.startJudge(run, this.judgePacket(run, e, cwd))
-      const fresh = await this.stillCurrent(ws, e, committedVersion)
-      if (!fresh) { await this.subagents.retireJudge(run, sent.judgeSessionId).catch(() => {}); return rejected('stale respawn result') }
-      if (fresh.execution.judge?.id !== e.judge.id || sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
-      fresh.execution.judge.messageId = sent.messageId
-      await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
-      return { ok: true, run: fresh.run, message: `Judge respawn committed${reason ? `: ${reason}` : ''}` }
     } catch (error) {
-      await this.dispatchFault(ws, e, error, committedVersion)
+      // 派发已移交 driver，本段只可能在这两处（cwd / drain）失败——都发生在任何提交之前。
+      await this.dispatchFault(ws, e, error, version)
       return rejected(`Judge respawn failed: ${error instanceof Error ? error.message : String(error)}`)
     }
+    // #98：派发执行统一进入唯一 driver（首次/resume-followup/respawn 同一实现）；
+    // driver 是 void + 持久 BLOCK 的，不能机械当成功返回——按落库结果回报：
+    // 已发布 messageId 才算提交成功，BLOCK 与 CAS 丢失都要让 Manager 看得见。
+    await this.drive(ws)
+    const after = await this.state.get(ws)
+    if (after === undefined || after.run.runId !== run.runId || after.execution.executionId !== e.executionId) {
+      return rejected('stale respawn request after dispatch')
+    }
+    const published = after.execution.judge
+    if (published === undefined || published.id !== arrangedId) return rejected('stale respawn request after dispatch')
+    if (after.run.status !== 'running') {
+      return rejected(`Judge respawn failed: ${after.run.blockReason ?? after.execution.blockReason ?? 'run is no longer running'}`)
+    }
+    if (!published.messageId) return rejected('stale respawn result')
+    return { ok: true, run: after.run, message: `Judge respawn committed${reason ? `: ${reason}` : ''}` }
   }
   async handleRunProgram(ws: string, token: string, supplied: Record<string, unknown>, caller: string): Promise<EngineOutcome> {
     const row = await this.state.get(ws)
