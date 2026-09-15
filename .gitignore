@@ -21,3 +21,5 @@ review-*.txt
 # Local workflow run artifacts; keep docs/dsh-workflow/INDEX.md versioned
 /docs/dsh-workflow/runs/
 /docs/dsh-workflow/issues/
+
+.scratch

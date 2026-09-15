@@ -111,6 +111,7 @@ code-reviewer 写 review，review-judger 写 decision。即使报告很短，也
 - DSH 沙箱下 `git push` 会因 named pipe 限制挂掉 credential helper（`failed to execute prompt script (exit code 66)` / `couldn't create signal pipe, Win32 error 5`）。等效替代通道：`gh api --method POST repos/<owner>/<repo>/git/refs -f ref=refs/heads/<branch> -f sha=<确切SHA>` 创建远端分支，再 `git fetch origin <branch>` + `git branch --set-upstream-to=origin/<branch> <branch>` 绑定；语义与推送一致，`git ls-remote` 复核 SHA。
 - 禁止 `https://x-access-token:<token>@github.com/...` URL 注入式推送：凭据会进入 URL、进程参数或远端 config，有泄露面。统一用上一条的三段式，不为省事绕路（反例：run 20260913-114026 的 #54/#55 推送）。
 - 沙箱下经 `gh api` Git Data 发布**提交**（上两条只覆盖建分支）的五个坑：①blob 内容必须取 git 对象（`git show <sha>:<path>`），不取工作树字节——行尾规范化会致 SHA 不符；②含子目录的改动须自底向上递归建 tree；③`POST /git/trees` 省略 `base_tree`、提交完整条目表——带 `base_tree` 且 path 含斜杠会生成顶层扁平条目；④commit 的 parents 必须取远端 head，否则 `Update is not a fast forward`；⑤`gh api --input` 传多行 message 用 `` -join "`n" `` 构造。先例：run 20260913-205854 的 issues/24、issues/30 delivery.md。
+- gh api 发布会产出与本地提交**同 tree 不同 SHA** 的孪生 commit；本地分支不回齐就会永远显示为"未合并"（幻影分支）。核验 `git diff --quiet origin/<branch> HEAD` exit 0 后必须 `git fetch origin <branch>` + `git reset --hard origin/<branch>` 回齐（tree 等价护航，零内容风险）。反例：run 20260913-205854 遗留的本地 54900af/dc2fdce/a40706a。
 
 ## 当前已知插件限制
 
