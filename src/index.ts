@@ -7,6 +7,7 @@
  */
 import { Context } from '@deepseek-ai/cordis'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
@@ -17,7 +18,7 @@ import { checkCatalogProviders, renderProviderCheckReport, renderStartProviderBl
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
 import type { RunState } from './types.ts'
-import { setToolHost, workflowTools, type ToolHost } from './tools/tools.ts'
+import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
@@ -143,7 +144,10 @@ export function apply(ctx: Context) {
     return ctx.agents.currentInitiator()
   }
 
-  const subagentHost = makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => engine.frozenRoute)
+  // #91: 兜底回调只服务旧 Run（无 `delegationRoute` 的 v9 行）：不推测历史值，
+  // 也不借其他 Run 的值——留空即让宿主 spawn 的正式继承语义从本 Run 自己的
+  // Manager 解析。新 Run 一律读 Run row 上的冻结值。
+  const subagentHost = makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => ({}))
   const engine: WorkflowEngine = new WorkflowEngine(
     makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
     subagentHost,
@@ -151,11 +155,14 @@ export function apply(ctx: Context) {
     makeStateHost(store),
   )
   engine.cwdResolver = cwdOf
-  // F22: freeze the Manager route at Run start (read from the live agent).
+  // F22 / #91：Run 启动时冻结 Manager 的默认路由，冻结值随 Run row 持久化。
+  // 取源走 DSH 固定版本的正式委派 helper——最新 request header 拥有 provider/model，
+  // 创建该会话时的 options 兜底——这样冻结值与新建子会话真正会继承到的路由一致。
   engine.managerRoute = async (managerSessionId: string) => {
     const agent = ctx.agents.get(managerSessionId as SessionId)
     if (agent === undefined) return {}
-    return { provider: agent.options.provider, model: agent.options.model }
+    const options = parentAgentOptionsForDelegation(agent)
+    return { provider: options.provider, model: options.model }
   }
   // F13: actor-activity oracle for resume/model-switch checks.
   engine.actorActivity = async (actorSessionId: string) => {
@@ -226,49 +233,17 @@ export function apply(ctx: Context) {
     inspectGit: async (_ws, operation) => {
       const cwd = ambientAgent()?.session.header.cwd
       if (cwd === undefined) return { ok: false, reason: 'no cwd' }
-      const { inspectGit } = await import('./programs/runner.ts')
-      const facts = inspectGit(cwd)
-      switch (operation) {
-        case 'status': return { ok: true, value: facts.statusShort ?? null }
-        case 'branch': return { ok: true, value: facts.branch ?? (facts.detached ? '(detached)' : null) }
-        case 'remote': return { ok: true, value: facts.originUrl ?? null }
-        case 'top-level': return { ok: true, value: facts.topLevel ?? null }
-        default: return { ok: false, reason: `unknown operation ${String(operation)}` }
-      }
+      // 与固定 Program 共用同一只读事实层（repository.ts）；失败返回 ok:false，不当 null/clean。
+      const { inspectGitFact } = await import('./programs/repository.ts')
+      const { realRepositoryAdapter } = await import('./programs/runner.ts')
+      return inspectGitFact(realRepositoryAdapter, cwd, operation)
     },
     inspectGithub: async (_ws, operation, milestoneNumber) => {
       const cwd = ambientAgent()?.session.header.cwd
       if (cwd === undefined) return { ok: false, reason: 'no cwd' }
-      const { inspectGit, parseOriginRepo, ghApi } = await import('./programs/runner.ts')
-      const git = inspectGit(cwd)
-      if (!git.inRepo || git.originUrl === undefined || git.originUrl === '') return { ok: false, reason: 'not a git repository with origin' }
-      const parsed = parseOriginRepo(git.originUrl)
-      if (parsed === undefined) return { ok: false, reason: `origin is not a GitHub repo: ${git.originUrl}` }
-      const base = `repos/${parsed.owner}/${parsed.repo}`
-      switch (operation) {
-        case 'milestones': {
-          const r = ghApi({ cwd, method: 'GET', path: `${base}/milestones`, query: 'state=all&per_page=100' })
-          return r.kind === 'PASS' ? { ok: true, value: r.details } : { ok: false, reason: r.reason }
-        }
-        case 'issues': {
-          const r = ghApi({ cwd, method: 'GET', path: `${base}/issues`, query: 'state=all&per_page=100' })
-          if (r.kind !== 'PASS') return { ok: false, reason: r.reason }
-          const issues = Array.isArray(r.details)
-            ? (r.details as Array<{ number: number; title: string; state: string; pull_request?: unknown; milestone: { number: number } | null }>).filter(i => i.pull_request === undefined)
-            : []
-          return { ok: true, value: issues }
-        }
-        case 'milestone-issues': {
-          if (milestoneNumber === undefined) return { ok: false, reason: 'milestoneNumber is required for milestone-issues' }
-          const r = ghApi({ cwd, method: 'GET', path: `${base}/issues`, query: `state=all&milestone=${milestoneNumber}&per_page=100` })
-          if (r.kind !== 'PASS') return { ok: false, reason: r.reason }
-          const issues = Array.isArray(r.details)
-            ? (r.details as Array<{ number: number; title: string; state: string; pull_request?: unknown }>).filter(i => i.pull_request === undefined)
-            : []
-          return { ok: true, value: issues }
-        }
-        default: return { ok: false, reason: `unknown operation ${String(operation)}` }
-      }
+      const { inspectGithubFacts } = await import('./programs/repository.ts')
+      const { realRepositoryAdapter } = await import('./programs/runner.ts')
+      return inspectGithubFacts(realRepositoryAdapter, cwd, operation, milestoneNumber)
     },
   }
 
@@ -276,8 +251,6 @@ export function apply(ctx: Context) {
     if (!o.ok) return { ok: false, reason: o.reason ?? 'engine rejected the mutation' }
     return { ok: true, message: o.message }
   }
-
-  setToolHost(toolHost)
 
   // ---- Role-actor session mapping maintenance ----
   // Every continuable child created for a role records (sessionId, workspace,
@@ -386,6 +359,8 @@ export function apply(ctx: Context) {
   // ---- Register command + tools ----
   // #85：空白会话的激活投递需要 ctx（读宿主 blank 投影）——在这里组装，命令层只接收回调。
   const disposeCommand = ctx.commands.register(makeDshFlowCommand(commandHost, makeBlankSessionActivator(ctx)))
+  // #94：工具集在本实例装配时绑定本实例的 toolHost，dispose 只撤销本实例的注册。
+  const workflowTools = makeWorkflowTools(toolHost)
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
 
   // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。

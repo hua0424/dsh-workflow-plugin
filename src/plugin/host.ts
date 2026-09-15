@@ -73,14 +73,15 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
   const persistence = sessionPersistence(ctx)
   if (persistence === undefined) return undefined
   const controller = new AbortController()
+  // #93：open 的 promise 由本函数持有：open 的 signal 只保证后端"开工前"观察取消
+  // （SessionPersistenceOpenOptions），开工后 resolve 的句柄仍归调用方释放。
+  const opening = persistence.open(SessionId(sessionId), 'read', { signal: controller.signal })
   let handle: SessionHandle | undefined
   try {
     // #32 D-002：controller 必须真正接线，超时即 abort —— 否则留下一个永不中断的
     // 只读观察者。0.1.5 起持久化改为 SessionHandle：open('read') 不取写所有权，
-    // read 的 signal 直达后端读（旧 prepareCore 不转发 signal 的缺陷随之消失）；
-    // finally 中的 close 保证超时后迟到的读也不泄漏句柄。
-    handle = await withTimeout(persistence.open(SessionId(sessionId), 'read', { signal: controller.signal }),
-      DISPATCH_TIMEOUTS.availability, 'availability', controller)
+    // read 的 signal 直达后端读（旧 prepareCore 不转发 signal 的缺陷随之消失）。
+    handle = await withTimeout(opening, DISPATCH_TIMEOUTS.availability, 'availability', controller)
     const result = await withTimeout(handle.read(0, undefined, { signal: controller.signal }),
       DISPATCH_TIMEOUTS.availability, 'availability read', controller)
     const events = result.events.slice()
@@ -94,7 +95,11 @@ async function inspectPersistedSession(ctx: Context, sessionId: string): Promise
     const detail = error instanceof Error ? error.message : String(error)
     throw new WorkflowError(`actor session projection failed: ${detail}`)
   } finally {
-    await handle?.close().catch(() => {})
+    // 唯一所有者：handle 已赋值就是本函数的（finally 释放一次）；超时/抛错时它尚未
+    // 赋值，改由迟到分支释放那个之后才 resolve 的句柄，否则它会无人持有地泄漏。
+    // close() 幂等且不可取消，两条路径互斥，不会清理两次出次生错误。
+    if (handle !== undefined) await handle.close().catch(() => {})
+    else void opening.then(late => late.close().catch(() => {}), () => {})
   }
 }
 
@@ -284,7 +289,15 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
   }
 }
 
-export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { provider?: string; model?: string }): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+/**
+ * #91: 默认路由的读取点是**本 Run 自己**的冻结值（`engine.startRun` 写入并随
+ * State row 持久化）。`legacyRoute` 回调只作为旧 Run（无该字段）的兜底——旧 Run
+ * 不推测历史事实，交给宿主 spawn 的正式继承语义解析。因此同一插件实例里多个
+ * workspace 交错运行时，谁都不会读到别人的路由。
+ */
+export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { provider?: string; model?: string }): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+  /** #91: 本 Run 冻结值优先；旧 Run 无冻结信息时才走兜底回调。 */
+  const routeOf = (run: RunState): { provider?: string; model?: string } => run.delegationRoute ?? legacyRoute()
   // ponytail: plugin-lifetime保留当代Agent/祖先/unsafe证据；若长期进程的Session churn实测成问题，再随Run完成/Reset显式清理。
   const observed = new Map<string, Agent>()
   const parents = new Map<string, string>()
@@ -418,7 +431,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const roleDef = run.definitionSnapshot.roles[roleKey]
       if (roleDef === undefined) throw new WorkflowError(`unknown role "${roleKey}"`)
-      const route = resolveRoleModel(run, roleKey, frozenRoute())
+      const route = resolveRoleModel(run, roleKey, routeOf(run))
       const deny = roleDenyList(run, roleKey)
       const started = await startContinuableWithin(adapters.ctx.subagents, {
         provider: 'spawn',
@@ -443,7 +456,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async startJudge(run, input) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      const plan = judgeSpawnPlan(run, frozenRoute())
+      const plan = judgeSpawnPlan(run, routeOf(run))
 
       // 首次、followup 与 respawn 都从同一当前工作单材料重建完整 packet。
       const prompt = await judgePrompt(run, input)
@@ -542,7 +555,7 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
     async compactRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return { ok: true, detail: 'no actor mapped' }
-      return await compactWithRetry(adapters, frozenRoute, run, roleKey, childId)
+      return await compactWithRetry(adapters, routeOf(run), run, roleKey, childId)
     },
   }
 }
@@ -554,14 +567,14 @@ export function makeSubagentHost(adapters: HostAdapters, frozenRoute: () => { pr
  */
 async function compactWithRetry(
   adapters: HostAdapters,
-  frozenRoute: () => { provider?: string; model?: string },
+  runRoute: { provider?: string; model?: string },
   run: RunState,
   roleKey: string,
   childId: string,
 ): Promise<{ ok: boolean; detail: string }> {
   let last: { ok: false; detail: string } = { ok: false, detail: 'compact was never attempted' }
   for (let attempt = 1; attempt <= COMPACT_MAX_ATTEMPTS; attempt++) {
-    const outcome = await compactOnce(adapters, frozenRoute, run, roleKey, childId)
+    const outcome = await compactOnce(adapters, runRoute, run, roleKey, childId)
     if (outcome.ok) return { ok: true, detail: outcome.detail }
     last = { ok: false, detail: outcome.detail }
     // 不可重试的失败（物化/拆卸）立即交回引擎，不再白跑一轮真实模型调用。
@@ -580,7 +593,7 @@ async function compactWithRetry(
  */
 async function compactOnce(
   adapters: HostAdapters,
-  frozenRoute: () => { provider?: string; model?: string },
+  runRoute: { provider?: string; model?: string },
   run: RunState,
   roleKey: string,
   childId: string,
@@ -609,10 +622,15 @@ async function compactOnce(
       return { ok: false, detail: compactErrorDetail(error), retryable: true }
     }
   }
-  const route = resolveRoleModel(run, roleKey, frozenRoute())
+  const route = resolveRoleModel(run, roleKey, runRoute)
   const manager = adapters.managerAgentOf(run)
   const resuming = adapters.ctx.agents.resume({
       resumeSessionId: childId as SessionId,
+      // #93：本次 attempt 的 signal 直达 resume 的持久化 load/setup 窗口
+      // （ResumeAgentOptions.signal 只在创建期有效、返回前脱离），超时 abort 因此
+      // 是真实中断源：尊重它的宿主自己回滚事务（不发布 agent、不留 live 注册）。
+      // 忽略 signal 的迟到 handle 仍有下方兜底 dispose。
+      signal,
       // Mirrors the agentOptions the continuation manager re-applies when
       // IT cold-resumes this child. This is only the summarizer's LAST
       // fallback (compaction summarization* config > the session's own

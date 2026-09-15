@@ -11,7 +11,7 @@
  * The three enforcement layers (spawn filter here, spawn assertion in host.ts,
  * runtime gate in tools/authz.ts) all derive from this one source.
  */
-import { readRoleDefModel, type RunState } from '../types.ts'
+import { readRoleDefModel, type DelegationRoute, type RunState } from '../types.ts'
 
 /**
  * Tools the Judge must always have: the `judge_claim` protocol tool (A1 R9)
@@ -82,13 +82,13 @@ export function judgeLabel(nodeId: string): string {
 }
 
 /** Resolve a Role's effective model route: override > role def > frozen Manager route. def 分支走共享单源。 */
-export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: { provider?: string; model?: string }): { provider?: string; model?: string } {
+export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: DelegationRoute): { provider?: string; model?: string } {
   const override = run.modelOverrides[roleKey]
   if (override !== undefined) return { provider: override.provider, model: override.modelId }
   const def = readRoleDefModel(run.definitionSnapshot, roleKey)
   if (def !== undefined) return { provider: def.provider, model: def.modelId }
-  if (frozen !== undefined && (frozen.provider !== undefined || frozen.model !== undefined)) {
-    return { provider: frozen.provider, model: frozen.model }
+  if (frozen !== undefined && (frozen.provider !== undefined || frozen.modelId !== undefined)) {
+    return { provider: frozen.provider, model: frozen.modelId }
   }
   return {} // inherit the Manager route at spawn time
 }
@@ -105,7 +105,7 @@ export function roleDenyList(run: RunState, roleKey: string): string[] {
  * child's final visible schema contains no denied tool before dispatching
  * (design E2); this function returns the intended plan.
  */
-export function judgeSpawnPlan(run: RunState, frozen?: { provider?: string; model?: string }): {
+export function judgeSpawnPlan(run: RunState, frozen?: DelegationRoute): {
   persona: string
   toolFilter: { deny: readonly string[] }
   agentOptions: { provider?: string; model?: string }

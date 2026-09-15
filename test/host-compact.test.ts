@@ -157,7 +157,7 @@ function manualError(code: ManualCompactionErrorCode, message: string): ManualCo
 }
 
 interface CompactCall { agent: Agent; }
-interface ResumeCall { resumeSessionId: unknown; agentOptions: unknown; setup?: unknown }
+interface ResumeCall { resumeSessionId: unknown; agentOptions: unknown; setup?: unknown; signal?: AbortSignal; abortedAtCall?: boolean }
 
 /**
  * compactRoleActor 测试 Host：compaction 经 `ctx.get('compaction')` 解析
@@ -168,6 +168,8 @@ function makeHost(options: {
   manager?: Agent
   resumeResult?: { handle?: AgentHandle; error?: Error }
   resumeHangs?: boolean
+  /** #93：尊重 ResumeAgentOptions.signal 的宿主——abort 即回滚，永不发布 agent。 */
+  resumeRespectsSignal?: boolean
   resumeLateMs?: number
   compactResult?: { shadowedSeqs: number[]; shadowedTokenCount: number } | null
   compactError?: Error
@@ -215,8 +217,18 @@ function makeHost(options: {
     agents: {
       get: (id: unknown) => (options.resident !== undefined && id === 'sess-dev' ? options.resident : undefined),
       resume: async (call: ResumeCall) => {
+        call.abortedAtCall = call.signal?.aborted ?? false
         options.resumes.push(call)
         options.events.push('resume')
+        if (options.resumeRespectsSignal === true) {
+          // 真实宿主在这里 raceAbort：abort 后整个 load/setup 事务回滚，既没有 handle
+          // 可以 dispose，也没有 id 被发布。测试 seam 至少复刻"拒绝而不发布"。
+          await new Promise<never>((_resolve, reject) => {
+            const abort = () => { options.events.push('resume-aborted'); reject(new Error('resume aborted by the caller signal')) }
+            if (call.signal?.aborted === true) return abort()
+            call.signal?.addEventListener('abort', abort, { once: true })
+          })
+        }
         if (options.resumeHangs === true) return hang()
         if (options.resumeLateMs !== undefined) await delay(options.resumeLateMs)
         if (options.resumeResult?.error !== undefined) throw options.resumeResult.error
@@ -251,7 +263,10 @@ test('cold actor: materialize → compactNow → dispose, role route passed to r
   assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
   assert.equal(f.resumes.length, 1)
   assert.equal(f.resumes[0]!.resumeSessionId, 'sess-dev')
-  assert.deepEqual(Object.keys(f.resumes[0]!).sort(), ['agentOptions', 'resumeSessionId'], 'cold maintenance resume carries no prompt')
+  // #93 改造方法第 4 条：冷维护物化必须保持 no-prompt 语义——带 prompt 的 resume 会真的开一个 turn，
+  // 破坏「物化不开 turn、只压不派」的前提（src/plugin/host.ts compactOnce 注释），并让维护窗口撞 busy。
+  assert.equal('prompt' in f.resumes[0]!, false, 'cold maintenance resume must not carry a prompt')
+  assert.equal(f.resumes[0]!.signal?.aborted, false, '本次 attempt 的 signal 直达 resume，且此刻仍可用')
   assert.deepEqual(f.resumes[0]!.agentOptions, { provider: 'p1', model: 'm1' })
   assert.equal(f.compacts[0]!.agent, materialized)
 })
@@ -307,7 +322,7 @@ test('cold actor: dispose failure fail-closes (a leaked resident agent would bre
 test('cold actor with no role model and no frozen route resumes with undefined agentOptions', async () => {
   const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
   const { host } = makeHost({ ...f, compactResult: null })
-  // reviewer has no model in the config; frozenRoute is () => ({}) in makeHost.
+  // reviewer has no model in the config; the legacy fallback is () => ({}) in makeHost.
   const result = await host.compactRoleActor({ ...makeRun('sess-rev'), roleActors: { reviewer: 'sess-rev' } } as RunState, 'reviewer')
   assert.deepEqual(result, { ok: true, detail: 'cold: no compactable range' })
   assert.equal(f.resumes[0]!.agentOptions, undefined)
@@ -452,7 +467,9 @@ test('cold maintenance resume carries no setup when the manager is not live', as
   const { host } = makeHost({ ...f, compactResult: null })
   await host.compactRoleActor(makeRun('sess-dev'), 'developer')
   assert.equal(f.resumes[0]!.setup, undefined)
-  assert.deepEqual(Object.keys(f.resumes[0]!).sort(), ['agentOptions', 'resumeSessionId'])
+  // 同 #93 改造方法第 4 条：没有 preset-join setup 的冷维护同样不得携带 prompt。
+  assert.equal('prompt' in f.resumes[0]!, false, 'cold maintenance resume must not carry a prompt')
+  assert.equal(f.resumes[0]!.signal?.aborted, false, '没有 setup 也必须带 signal：取消覆盖整个 load/setup 窗口')
 })
 
 // #21 F1 故障注入：派发/恢复链上 seam 挂起时必须超时降级为携带阶段名的结果，
@@ -495,6 +512,40 @@ test('cold maintenance: a materialization that lands after the timeout is still 
     await delay(80)
     assert.deepEqual(f.events, ['resume', 'dispose'], 'a late resident agent must not leak into the next cold resume')
     assert.deepEqual(f.compacts, [])
+  })
+})
+
+// #93 AC1：signal 必须真的进到 resume（而只挂在 compactNow 上），这样"尊重 signal"的
+// 宿主会自己回滚 —— 没有 handle、没有 live 注册，也就没有多余的 dispose。
+test('cold maintenance: the attempt signal reaches resume, and a signal-respecting host rolls back without a live residue', async () => {
+  await withShortTimeouts({ coldMaterialize: 20 }, async () => {
+    const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[] }
+    const { host } = makeHost({ ...f, resumeRespectsSignal: true })
+    const result = await host.compactRoleActor(makeRun('sess-dev'), 'developer')
+    assert.equal(result.ok, false)
+    assert.match(result.detail!, /^cold materialize failed: /)
+    assert.equal(f.resumes.length, 1)
+    assert.equal(f.resumes[0]!.abortedAtCall, false, 'resume 拿到的 signal 在调用时尚未 abort')
+    assert.equal(f.resumes[0]!.signal?.aborted, true, 'coldMaterialize 超时必须 abort 交给 resume 的那个 signal')
+    assert.deepEqual(f.events, ['resume', 'resume-aborted'],
+      '宿主按 signal 回滚：没有 handle 可 dispose，因此也不该出现任何清理调用')
+    assert.deepEqual(f.compacts, [], 'abort 之后不得再跑 compactNow')
+  })
+})
+
+// #93 AC4：重试各自持有 controller —— 上一轮 abort 过的 signal 绝不复用。
+test('cold maintenance retries own independent signals: an aborted attempt never poisons the next one', async () => {
+  await withShortTimeouts({ coldMaterialize: 20, compactNow: 20 }, async () => {
+    const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], signals: [] as AbortSignal[] }
+    const { host } = makeHost({ ...f, compactHangs: true })
+    assert.deepEqual(await withFastCompactRetry(() => host.compactRoleActor(makeRun('sess-dev'), 'developer')),
+      { ok: false, detail: 'timeout after 20ms at stage "compactNow"' })
+    assert.equal(f.resumes.length, 2, '每次 attempt 自己物化一次')
+    assert.notEqual(f.resumes[0]!.signal, f.resumes[1]!.signal, '每次 attempt 自己 owned 一个 controller')
+    assert.deepEqual(f.resumes.map(call => call.abortedAtCall), [false, false],
+      '第二次 resume 不得拿到第一轮已 abort 的 signal')
+    assert.deepEqual(f.resumes.map(call => call.signal!.aborted), [true, true],
+      '每次超时只 abort 自己那一个 signal')
   })
 })
 
@@ -548,6 +599,40 @@ test('availability seam: a hanging persistence probe degrades to unknown and abo
     assert.equal(await host.judgeSessionAvailability('slow-session'), 'unknown')
     assert.deepEqual(signals.map(signal => signal?.aborted), [true, true])
   })
+})
+
+// #93 AC2：open 的取消只保证"开工前"被观察，开工后迟到 resolve 的句柄仍归调用方。
+// 旧 finally 只看已赋值的 handle，这类句柄会无人持有地泄漏。
+test('availability seam: a persistence handle that lands after the timeout is still closed exactly once', async () => {
+  await withShortTimeouts({ availability: 20 }, async () => {
+    const closes: string[] = []
+    const host = makeHost({
+      events: [], resumes: [], compacts: [],
+      persistence: {
+        open: async () => {
+          await delay(60)
+          return { header: { id: 'slow-session' }, read: async () => ({ events: [] }), close: async () => { closes.push('slow-session') } }
+        },
+      },
+    }).host
+    assert.equal(await host.roleSessionAvailability('slow-session'), 'unknown')
+    assert.deepEqual(closes, [], '超时结论先返回，句柄还没落地')
+    await delay(80)
+    assert.deepEqual(closes, ['slow-session'], '迟到的 open 句柄必须被 close，且只 close 一次')
+  })
+})
+
+test('availability seam: the normal path closes its handle exactly once (no duplicate late cleanup)', async () => {
+  const closes: string[] = []
+  const host = makeHost({
+    events: [], resumes: [], compacts: [],
+    persistence: {
+      open: async () => ({ header: { id: 'durable-session' }, read: async () => ({ events: [] }), close: async () => { closes.push('durable-session') } }),
+    },
+  }).host
+  assert.equal(await host.roleSessionAvailability('durable-session'), 'available')
+  await delay(20)
+  assert.deepEqual(closes, ['durable-session'], '正常路径只由 finally 释放一次，迟到分支不得再清理一遍')
 })
 
 test('Role/Judge Session availability distinguishes durable absence from unreadable persistence', async () => {
