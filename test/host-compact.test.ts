@@ -6,6 +6,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
 import { makeDispatchTargets, makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
+import { testParticipants } from './helpers/participants.ts'
 import { deliverSubagentPrompt, type HostPromptDeliverer } from '@deepseek-ai/dsh-subagent/internal'
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { ManualCompactionError, type ManualCompactionErrorCode } from '@deepseek-ai/dsh-compaction'
@@ -68,7 +69,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
   }
   const run = makeRun('sess-dev')
   const dispatch = makeDispatchTargets(adapters)
-  const host = makeSubagentHost(adapters, () => ({}))
+  const host = makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx))
   assert.deepEqual(await dispatch.sendRoleActor(run, 'developer', 'next node'), { messageId: 'dispatch-1' })
   assert.deepEqual(await host.ensureRoleActor(run, 'developer', 'resume node'), { childId: 'sess-dev', messageId: 'dispatch-2' })
   assert.deepEqual(await host.followupJudge(run, 'sess-judge', {
@@ -99,7 +100,7 @@ test('Judge drain propagates missing Manager and host drain failures', async () 
     cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
-  const host = makeSubagentHost(adapters, () => ({}))
+  const host = makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx))
   await assert.rejects(host.drainJudge(makeRun(undefined), 'judge-old'), /drain failed/)
   adapters.managerAgentOf = () => undefined
   await assert.rejects(host.drainJudge(makeRun(undefined), 'judge-old'), /manager agent is not live/)
@@ -123,7 +124,7 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
       cwdOfManager: async () => undefined,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
-    const host = makeSubagentHost(adapters, () => ({}))
+    const host = makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx))
     const run = makeRun(undefined)
     await assert.rejects(host.ensureRoleActor(run, 'developer', 'first dispatch'),
       /timeout after 20ms at stage "spawn role developer"/)
@@ -147,7 +148,7 @@ test('drain seam: a hanging drainContinuableChildren fails closed instead of pen
       cwdOfManager: async () => undefined,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
-    await assert.rejects(makeSubagentHost(adapters, () => ({})).drainJudge(makeRun(undefined), 'judge-old'),
+    await assert.rejects(makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx)).drainJudge(makeRun(undefined), 'judge-old'),
       /timeout after 20ms at stage "drain"/)
   })
 })
@@ -252,7 +253,7 @@ function makeHost(options: {
     revokeJudgeSession: () => {},
     registerRoleActorSession: () => {},
   }
-  return { host: makeSubagentHost(adapters, () => ({})), materialized }
+  return { host: makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx)), materialized }
 }
 
 test('cold actor: materialize → compactNow → dispose, role route passed to resume', async () => {
@@ -568,7 +569,7 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
     const run = makeRun('sess-dev')
     await assert.rejects(makeDispatchTargets(adapters).sendRoleActor(run, 'developer', 'next node'),
       /timeout after 20ms at stage "send"/)
-    await assert.rejects(makeSubagentHost(adapters, () => ({})).followupJudge(run, 'sess-judge', {
+    await assert.rejects(makeSubagentHost(adapters, () => ({}), testParticipants(adapters.ctx)).followupJudge(run, 'sess-judge', {
       nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
       boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
       cwd: '.', judgeSessionId: 'sess-judge',
@@ -651,7 +652,7 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
   const host = makeSubagentHost({
     ctx, managerAgentOf: () => undefined, cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
-  }, () => ({}))
+  }, () => ({}), testParticipants(ctx))
   assert.equal(await host.roleSessionAvailability('live-session'), 'available')
   assert.equal(await host.roleSessionAvailability('durable-session'), 'available')
   assert.equal(await host.roleSessionAvailability('missing-session'), 'missing')
@@ -660,6 +661,6 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
     ...({ ctx: { ...ctx, get: () => undefined } as unknown as Context } as HostAdapters),
     managerAgentOf: () => undefined, cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
-  }, () => ({}))
+  }, () => ({}), testParticipants(ctx))
   assert.equal(await noService.roleSessionAvailability('cold-session'), 'unknown')
 })

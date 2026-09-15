@@ -19,6 +19,7 @@ import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
 import { WorkflowEngine, type JudgeSpawnInput, type SubagentHost } from '../src/engine/engine.ts'
 import { makeStateHost, makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
+import { testParticipants } from './helpers/participants.ts'
 import { JUDGE_REQUIRED_TOOLS } from '../src/roles/roles.ts'
 import { StateStore } from '../src/state/store.ts'
 import type { RunState, WorkflowConfig } from '../src/types.ts'
@@ -316,7 +317,7 @@ function realHost(
     cwdOfManager: async () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
-  return { host: makeSubagentHost(adapters, options.legacyRoute ?? (() => ({}))), spawns, resumes }
+  return { host: makeSubagentHost(adapters, options.legacyRoute ?? (() => ({})), testParticipants(ctx)), spawns, resumes }
 }
 
 test('host 侧 Role 派发使用本 Run 冻结的路由（不读其他 Run 的当前 Manager）', async () => {
