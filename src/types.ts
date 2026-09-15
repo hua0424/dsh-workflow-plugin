@@ -6,7 +6,6 @@
 
 export const SCHEMA_VERSION = 'agent-workflow/v2' as const
 export const STATE_FORMAT_VERSION = 'agent-workflow-state/v9' as const
-export const STATE_TABLE_NAME = 'runs' as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
 

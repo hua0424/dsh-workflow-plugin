@@ -9,7 +9,8 @@
  * 任意程序。
  */
 
-export interface ProgramParameterSpec {
+/** 参数分量的类型/必填/说明；只经 `ProgramMetadata` 暴露，不单独构成导出面。 */
+interface ProgramParameterSpec {
   type: 'string' | 'number'
   required: boolean
   description: string
