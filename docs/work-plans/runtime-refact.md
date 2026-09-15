@@ -1,5 +1,9 @@
 # refact 执行索引
 
+> **历史台账（T1–T9 已全部完成并合入 `main`）**：本文件的授权、基线与命令均属当时现场。**现行验收入口与 skip 口径**见
+> [`docs/testing/runtime-refact-test-migration.md`](../testing/runtime-refact-test-migration.md)（`pnpm run verify`），逐项冻结证据见
+> [`docs/testing/node-execution-runtime-acceptance.md`](../testing/node-execution-runtime-acceptance.md)。
+
 总规格：[Issue #7](https://github.com/hua0424/dsh-workflow-plugin/issues/7)。设计与规格已提交：`d816aacf9037f5741469e49a76d70480c8b254c3`。用户已确认以下拆分并授权按依赖实施、审查和本地提交；没有 push、部署或操作真实 Run 的授权。
 
 ## 工单与依赖

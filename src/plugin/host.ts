@@ -10,7 +10,6 @@ import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-c
 // 经 DSH 安装解析；roster 缺席（base-only profile / 旧版 dsh）时 get 返回
 // undefined，走宿主平面回退——与 dsh-subagent/child-agent.ts 的用法一致。
 import type {} from '@deepseek-ai/dsh-agent-presets'
-import type { JobStatus } from '@deepseek-ai/dsh-jobs'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import type { ContinuableStartSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -26,35 +25,7 @@ import { topFrame } from '../state/invariants.ts'
 import { DISPATCH_TIMEOUTS, withTimeout } from '../engine/timeouts.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
-
-const TERMINAL_JOB_STATUSES = new Set<JobStatus>(['completed', 'failed', 'killed'])
-
-/** 0.1.5 起 Inbox 公共接口移除 hasPending：两个 pending 队列均为空即无待处理输入。 */
-function inboxEmpty(agent: Agent): boolean {
-  return agent.inbox.nextTurn.length === 0 && agent.inbox.nextStep.length === 0
-}
-
-/** 从 durable 根集合按 parentSession 线性补齐 live 后代。 */
-function liveDescendantIds(seedIds: Iterable<string>, agents: readonly Agent[]): Set<string> {
-  const ids = new Set(seedIds)
-  const childrenByParent = new Map<string, Agent[]>()
-  for (const agent of agents) {
-    const parent = agent.session.header.parentSession
-    if (!parent) continue
-    const children = childrenByParent.get(parent) ?? []
-    children.push(agent)
-    childrenByParent.set(parent, children)
-  }
-  const queue = [...ids]
-  for (let index = 0; index < queue.length; index++) {
-    for (const child of childrenByParent.get(queue[index]!) ?? []) {
-      if (ids.has(child.id)) continue
-      ids.add(child.id)
-      queue.push(child.id)
-    }
-  }
-  return ids
-}
+import type { ParticipantIndex } from './participants.ts'
 
 /** Optional Host service used by the continuation manager for cold Session reads. */
 function sessionPersistence(ctx: Context): SessionPersistence | undefined {
@@ -257,7 +228,6 @@ export function makeStateHost(source: StateStore | (() => StateStore)): StateHos
 export interface HostAdapters {
   ctx: Context
   managerAgentOf(run: RunState): Agent | undefined
-  cwdOfManager(run: RunState): Promise<string | undefined>
   /** Register a fresh Judge session so the plugin can authorize its inspection + judge_claim calls. */
   registerJudgeSession(sessionId: string, cwd: string | undefined): void
   /** Revoke a Judge session's authorization (A1 R11). */
@@ -303,35 +273,9 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
  * 不推测历史事实，交给宿主 spawn 的正式继承语义解析。因此同一插件实例里多个
  * workspace 交错运行时，谁都不会读到别人的路由。
  */
-export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { provider?: string; model?: string }): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { provider?: string; model?: string }, participants: ParticipantIndex): SubagentHost {
   /** #91: 本 Run 冻结值优先；旧 Run 无冻结信息时才走兜底回调。 */
   const routeOf = (run: RunState): { provider?: string; model?: string } => run.delegationRoute ?? legacyRoute()
-  // ponytail: plugin-lifetime保留当代Agent/祖先/unsafe证据；若长期进程的Session churn实测成问题，再随Run完成/Reset显式清理。
-  const observed = new Map<string, Agent>()
-  const parents = new Map<string, string>()
-  const unsafe = new Set<string>()
-  const recordParentSession = (agent: Agent): void => {
-    const parentId = agent.session.header.parentSession
-    if (parentId !== undefined) parents.set(agent.id, parentId)
-  }
-  const stopObservingJobs = adapters.ctx.jobs.onJobDone((job, owner) => {
-    if (!owner || !job.detail?.includes('work may be orphaned')) return
-    recordParentSession(owner)
-    // 保留 exact owner 与当时已知祖先；descriptor 消失不能洗白父 Role。
-    const seen = new Set<string>()
-    for (let id: string | undefined = owner.id; id !== undefined && !seen.has(id); id = parents.get(id)) {
-      seen.add(id)
-      unsafe.add(id)
-      const agent = observed.get(id) ?? adapters.ctx.agents.get(SessionId(id))
-      if (agent !== undefined) recordParentSession(agent)
-    }
-  })
-  adapters.ctx.effect(() => () => {
-    stopObservingJobs()
-    observed.clear()
-    parents.clear()
-    unsafe.clear()
-  })
   async function judgePrompt(run: RunState, input: import('../engine/engine.ts').JudgeSpawnInput): Promise<string> {
     const manager = adapters.managerAgentOf(run)
     if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
@@ -354,77 +298,8 @@ export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { pr
     })
   }
   return {
-    observeTurnEnd(sessionId) {
-      const agent = adapters.ctx.agents.get(SessionId(sessionId))
-      if (agent) {
-        observed.set(sessionId, agent)
-        recordParentSession(agent)
-      }
-    },
-    async safeToInspect(sessionId) {
-      // #54：`waiting` 只在"唯一阻碍是仍在跑的已知后代"时返回；其余一律 fail-closed。
-      // 该会话的 turn 结束没有 claim，只说明它在等并行子代理，不是异常闭合。
-      let waiting = false
-      const agent = observed.get(sessionId) ?? adapters.ctx.agents.get(SessionId(sessionId))
-      if (!agent || unsafe.has(sessionId)) return 'unsafe'
-      try {
-        await agent.whenIdle()
-        const descendants = await adapters.ctx.subagents.listDescendants(SessionId(sessionId))
-        if (descendants.some(child => child.kind === 'diagnostic')) return 'unsafe'
-        for (const child of descendants) parents.set(String(child.id), String(child.parentId))
-        const durableIds = new Set([sessionId, ...descendants.map(child => String(child.id))])
-        if ([...durableIds].some(id => unsafe.has(id))) return 'unsafe'
-        const requiredIds = new Set([sessionId, ...descendants
-          .filter(child => child.kind === 'child' && child.activity === 'running')
-          .map(child => String(child.id))])
-        for (const id of durableIds) if (observed.has(id)) requiredIds.add(id)
-
-        // Durable inactive 后代没有 Activation；registry 补齐 descriptor
-        // 发布窗口中的 live 后代，以及 cold parent 之下的 live 后代。
-        const live = adapters.ctx.agents.list()
-        for (const candidate of live) recordParentSession(candidate)
-        const treeIds = liveDescendantIds(durableIds, live)
-        for (const child of live) if (treeIds.has(child.id)) requiredIds.add(child.id)
-
-        const agents: Agent[] = []
-        // #54：只有 `kind: 'child'` 的 durable 后代才是并行子代理的等待对象。
-        // tree/observed 补齐的会话（例如 Manager 自己的 Session）属于同一收口
-        // closure，非 idle 时仍是 fail-closed，不能算"等待"。
-        const waitableIds = new Set(descendants
-          .filter(child => child.kind === 'child')
-          .map(child => String(child.id)))
-        for (const id of requiredIds) {
-          const candidate = observed.get(id) ?? adapters.ctx.agents.get(SessionId(id))
-          if (!candidate || unsafe.has(id)) return 'unsafe'
-          if (candidate.status !== 'idle' || !inboxEmpty(candidate)) {
-            // #54：非 waitable 的 busy 成员（会话自身、tree/observed 补齐的会话、
-            // descriptor 发布窗口期的 live 后代）仍属"收口未知"，必须 fail-closed。
-            if (!waitableIds.has(id)) return 'unsafe'
-            waiting = true
-            continue
-          }
-          agents.push(candidate)
-        }
-        await Promise.all(agents.map(candidate => candidate.whenIdle()))
-
-        const currentDescendants = await adapters.ctx.subagents.listDescendants(SessionId(sessionId))
-        for (const child of currentDescendants) parents.set(String(child.id), String(child.parentId))
-        if (currentDescendants.some(child => child.kind === 'diagnostic'
-          || unsafe.has(String(child.id))
-          || (child.activity === 'running' && !requiredIds.has(String(child.id))))) return 'unsafe'
-        const currentLive = adapters.ctx.agents.list()
-        for (const candidate of currentLive) recordParentSession(candidate)
-        const currentTreeIds = liveDescendantIds([sessionId, ...currentDescendants.map(child => String(child.id))], currentLive)
-        if (currentLive.some(child => currentTreeIds.has(child.id) && !requiredIds.has(child.id))) return 'unsafe'
-        const settled = agents.every(candidate => {
-          const current = adapters.ctx.agents.get(candidate.id)
-          return (current === undefined || current === candidate) && candidate.status === 'idle' && inboxEmpty(candidate) && !unsafe.has(candidate.id)
-            && adapters.ctx.jobs.list(candidate).filter(job => job.ownerSession === candidate.id)
-              .every(job => TERMINAL_JOB_STATUSES.has(job.status) && !job.detail?.includes('work may be orphaned'))
-        })
-        return settled ? (waiting ? 'waiting' : 'safe') : 'unsafe'
-      } catch { return 'unsafe' }
-    },
+    // #99：观察与收口证据的寿命由参与者索引统一持有（src/plugin/participants.ts）。
+    safeToInspect: sessionId => participants.safeToInspect(sessionId),
     async ensureRoleActor(run, roleKey, initialText) {
       const existing = run.roleActors[roleKey]
       if (existing !== undefined) {
@@ -697,12 +572,14 @@ async function compactOnce(
   return outcome
 }
 
-export function makeProgramHost(adapters: HostAdapters): ProgramHost {
-  return {
-    async run(_run, programId, parameters, cwd) {
-      const def = BUILTIN_PROGRAMS[programId]
-      if (def === undefined) return { kind: 'ERROR', reason: `unknown program ${programId}` }
-      return def.run({ cwd }, parameters)
-    },
-  }
+/**
+ * #100：Program 执行只经固定映射（`BUILTIN_PROGRAMS`）——不需要任何 Host 依赖，
+ * 因此不再是带无用 adapters 参数的 maker，而是一个常量 Seam（engine 的 ProgramHost）。
+ */
+export const programHost: ProgramHost = {
+  async run(_run, programId, parameters, cwd) {
+    const def = BUILTIN_PROGRAMS[programId]
+    if (def === undefined) return { kind: 'ERROR', reason: `unknown program ${programId}` }
+    return def.run({ cwd }, parameters)
+  },
 }

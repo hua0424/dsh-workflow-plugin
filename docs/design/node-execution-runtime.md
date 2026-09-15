@@ -1,7 +1,7 @@
 # Node Execution Runtime：工作单驱动的串行 Workflow
 
-- 状态：T6–T9 实现与 A01–A30 自动化验收已冻结，待父代理最终 Standards/Spec 审查和 commit；未部署。验收证据见 [`node-execution-runtime-acceptance.md`](../testing/node-execution-runtime-acceptance.md)。
-- 运行基线：DSH `0.1.2-rc.1`；源码与索引位置见根目录 `AGENTS.md`。
+- 状态：T1–T9 实现与 A01–A30 自动化验收已完成、终审并合入 `main`（`refact` 分支为历史）。验收证据见 [`node-execution-runtime-acceptance.md`](../testing/node-execution-runtime-acceptance.md)；现行收口入口见 [`runtime-refact-test-migration.md`](../testing/runtime-refact-test-migration.md)。部署需用户显式授权。
+- 运行基线：DSH `0.1.5-rc.2`（本设计冻结时的基线为 `0.1.2-rc.1`，2026-09-11 升级，见 issue #37 / PR #38）；源码与索引位置、升级实测记录见根目录 `AGENTS.md`。
 - 开发规格与实施切片：[node-execution-runtime spec](../specs/node-execution-runtime.md)；开发入口：[Issue #7](https://github.com/hua0424/dsh-workflow-plugin/issues/7)。
 - 替代关系：本设计及对应 spec 替代 [旧 PRD](../prd/20260907-node-execution-simplification/requirements.md) / [Issue #6](https://github.com/hua0424/dsh-workflow-plugin/issues/6) 的开发入口。旧 PRD 保留为历史，不再独立派发开发。
 

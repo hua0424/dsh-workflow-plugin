@@ -8,6 +8,7 @@
  */
 import { gitLocalBranch, gitRemoteBranch, gitStatusShort, realRepositoryAdapter, type RepositoryAdapter } from './runner.ts'
 import { listIssues, listMilestones, repositoryIdentity } from './repository.ts'
+import { BUILTIN_PROGRAM_METADATA, type ProgramMetadata } from './metadata.ts'
 import type { ProgramResult } from '../types.ts'
 
 export interface ProgramContext {
@@ -16,10 +17,8 @@ export interface ProgramContext {
   adapter?: RepositoryAdapter
 }
 
-export interface ProgramDefinition {
-  programId: string
-  description: string
-  parameters: Record<string, { type: 'string' | 'number'; required: boolean; description: string }>
+/** 固定 id 的**执行实现**挂载：元数据（id/描述/参数合同）来自 `./metadata.ts` 单源。 */
+export interface ProgramDefinition extends ProgramMetadata {
   run: (ctx: ProgramContext, parameters: Record<string, unknown>) => Promise<ProgramResult>
 }
 
@@ -118,19 +117,12 @@ async function allMilestoneIssuesComplete(ctx: ProgramContext, parameters: Recor
 export const BUILTIN_PROGRAMS: Record<string, ProgramDefinition> = {
   'github.initialize-milestone': {
     programId: 'github.initialize-milestone',
-    description: 'Create or verify the Milestone and the exact local+remote branch for the current workspace repository.',
-    parameters: {
-      title: { type: 'string', required: true, description: 'Milestone title' },
-      branchName: { type: 'string', required: true, description: 'Branch name for the milestone work' },
-    },
+    ...BUILTIN_PROGRAM_METADATA['github.initialize-milestone'],
     run: initializeMilestone,
   },
   'github.all-milestone-issues-complete': {
     programId: 'github.all-milestone-issues-complete',
-    description: 'Check whether every issue in the milestone is closed.',
-    parameters: {
-      milestoneNumber: { type: 'number', required: true, description: 'Milestone number (from initialize-milestone or the GitHub UI)' },
-    },
+    ...BUILTIN_PROGRAM_METADATA['github.all-milestone-issues-complete'],
     run: allMilestoneIssuesComplete,
   },
 }

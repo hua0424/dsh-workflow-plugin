@@ -8,21 +8,13 @@
  * Graph verdict (PASS/FAIL) is derived from the claim outcome, never from the
  * Judge. This module owns only the packet text; the persona is delivered via
  * the spawn's `persona` option.
+ *
+ * #100：`judge_claim` 的参数合同只有生产路径一处——工具层 `judge_claim` 的
+ * parameters/enum + `tools.ts` 的长度校验，引擎 `handleJudgeClaim` 再做授权与
+ * 边界判定（旧的自证 validator 已删除，不再有第二份需要同步的校验）。
  */
-import type { JudgeResult, NodeClaim } from '../types.ts'
-import { LIMITS } from '../types.ts'
+import type { NodeClaim } from '../types.ts'
 import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
-
-/** Validate a parsed judge_claim argument into a JudgeResult (A1 v2). */
-export function parseJudgeClaim(args: unknown): JudgeResult | undefined {
-  if (typeof args !== 'object' || args === null) return undefined
-  const record = args as Record<string, unknown>
-  const result = record['result']
-  if (result !== 'ACCEPT' && result !== 'REJECT' && result !== 'NEED_CONTEXT') return undefined
-  const reason = record['reason']
-  if (typeof reason !== 'string' || reason.trim().length < LIMITS.reasonMin || reason.trim().length > LIMITS.reasonMax) return undefined
-  return { result, reason: reason.trim() }
-}
 
 export interface JudgePromptInput {
   nodeToken: string

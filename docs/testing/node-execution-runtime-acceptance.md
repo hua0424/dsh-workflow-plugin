@@ -2,7 +2,8 @@
 
 - 依据：`docs/specs/node-execution-runtime.md` T2。
 - 状态词仅使用 `PASS` / `NOT RUN` / `BLOCKED`。静态 grep 只用于 A29 删除证明，不冒充 Host 行为。
-- `controlled seam` = 真实 Workflow Runtime + 临时真实 SQLite + 受控 Host Adapter；`real Host` = DSH `0.1.2-rc.1` 已发布包组成的真实 Cordis/AgentLoop/Session/Tool/Subagent/JSONL/Compaction 栈，只有 LLM 文本、tool choice 与 usage 是脚本化的。
+- `controlled seam` = 真实 Workflow Runtime + 临时真实 SQLite + 受控 Host Adapter；`real Host` = DSH 已发布包组成的真实 Cordis/AgentLoop/Session/Tool/Subagent/JSONL/Compaction 栈，只有 LLM 文本、tool choice 与 usage 是脚本化的。**本账本 A01–A30 冻结时的运行基线是 `0.1.2-rc.1`**；其后运行基线于 2026-09-11 升级为 `0.1.5-rc.2`（issue #37 / PR #38），`pnpm run test:real-host` 现在执行的是 exact `0.1.5-rc.2` 组合。
+- 现行收口入口（#101 起）：`pnpm run verify`；受限环境的等价全量入口、skip 口径与删除/替代映射见 [`runtime-refact-test-migration.md`](runtime-refact-test-migration.md)。
 
 | ID | 状态 | 证据（测试名 / 命令） | 边界 |
 |---|---|---|---|
@@ -39,7 +40,7 @@
 
 ## A30 真实 Host 边界
 
-`runtime-real-host.test.ts` 使用 exact `0.1.2-rc.1` 的 AgentLoop、Session、AgentRegistry、ToolRuntime、SubagentRuntime、in-process Spawn、JSONL persistence、SQLite SessionQuery、JobsLocal、SessionProjection、TokenMeter、`BasicCompactionEngine({auto:false})` 与本插件 `apply()`。测试通过真实 `/dsh-flow start` 与 Host Queue 执行：
+`runtime-real-host.test.ts` 使用 exact `0.1.2-rc.1`（冻结时版本；现行为 `0.1.5-rc.2`）的 AgentLoop、Session、AgentRegistry、ToolRuntime、SubagentRuntime、in-process Spawn、JSONL persistence、SQLite SessionQuery、JobsLocal、SessionProjection、TokenMeter、`BasicCompactionEngine({auto:false})` 与本插件 `apply()`。测试通过真实 `/dsh-flow start` 与 Host Queue 执行：
 
 1. Manager 与 Role 的 `workflow_status` / `node_claim`、Judge 的 `judge_claim` 都由脚本 LLM 选择、真实 ToolRuntime 执行；没有直接写 Workflow SQLite 或 mock Host Adapter。
 2. Role 第一次 Activation 的 `subagent/start` / `subagent/end` 按 runId 配对，并在 end 回调同步确认 registry 已释放；这是 **Activation cold continuation**，不是整个进程重启。
@@ -49,17 +50,17 @@
 
 进程级 Host 重启没有在 A30 fixture 中冒充；T6 的进程恢复由真实 SQLite close/reopen 测试证明。完整宿主进程重启组合、外部效果 exactly-once 等长尾见 `docs/pending-discussions/runtime-refact-long-tail.md`。
 
-## 冻结命令
-
-最终冻结时执行并记录：
+## 收口命令（现行，#101 起）
 
 ```text
-pnpm install --frozen-lockfile
-pnpm run build
-pnpm test
-node scripts/t3-smoke.mjs
-pnpm run test:e2e
-pnpm run test:real-host
+pnpm install --frozen-lockfile                     # 若 node_modules/.bin 未物化，先做一次
+pnpm run verify                                    # = typecheck + 全量 suite + 两套受控 smoke
+pnpm run test:real-host                            # exact 0.1.5-rc.2 真实 Host 组合（与 smoke 分开报告）
+node scripts/deploy-web.mjs --out <临时目录>         # 隔离生成部署产物并核对版本/依赖（不实际部署）
+node scripts/check-state-rows.mjs <state.sqlite3 路径>  # 需要时只读诊断指定库（显式路径，不触碰真实 home）
 ```
 
-本账本不包含 Standards/Spec 终审结论；该 review 与 commit 由父代理在实现冻结后执行。
+- 受限环境（禁派生进程，例如 DSH agent node 沙箱）：`pnpm test`（test runner 按文件派生子进程）会因 `spawn EPERM` 失败，用 `pnpm run test:suite`（`--test-isolation=none`）等价取全量结果，并如实登记环境限制。`test:smoke`、`test:real-host`、诊断与隔离部署命令都不派生 runner 子进程，在受限环境下照常有效。
+- 冻结时（`0.1.2-rc.1`）记录的历史顺序为 `pnpm install --frozen-lockfile` → `pnpm run build` → `pnpm test` → `node scripts/t3-smoke.mjs` → `pnpm run test:e2e` → `pnpm run test:real-host`；现行入口以上表为准。
+
+本账本不包含 Standards/Spec 终审结论；T1–T9 的终审与提交已由父代理完成并合入 `main`，本账本作为冻结证据保留。
