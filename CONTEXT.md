@@ -1,6 +1,6 @@
 # Domain Glossary
 
-> `refact` 当前为 T6–T9 实现与整体验收冻结、待父代理最终 Standards/Spec 审查和提交的集成态，未部署。目标架构见 `docs/design/node-execution-runtime.md`，A01–A30 证据见 `docs/testing/node-execution-runtime-acceptance.md`；不能据此操作真实 Run。
+> 当前实现已随 T1–T9 重构合入 `main` 并结算（`refact` 分支为历史）；目标架构见 `docs/design/node-execution-runtime.md`，A01–A30 证据见 `docs/testing/node-execution-runtime-acceptance.md`。本文件描述**当前**合同；验收运行不得操作真实 Run（正式使用需用户显式授权）。
 
 ## Agent Team Workflow / Manager
 
@@ -104,6 +104,6 @@ trace 是派生产物，不是业务 events。Runtime 保留 trace helper 的转
 
 ## 测试与交付
 
-最高 controlled seam 是真实 Workflow Runtime + 临时 SQLite（恢复、Program、嵌套 Child 与 Reset/升级测试真实关闭重开）+ 受控 Host Adapter；关键来源测试使用精确派发 ID 集合。`scripts/t3-smoke.mjs` 保留 ACCEPT 基线，`scripts/e2e-smoke.mjs` 覆盖 REJECT/failed-onFail/修正闭环；二者都使用独立临时 home，不操作真实 Run。
+最高 controlled seam 是真实 Workflow Runtime + 临时 SQLite（恢复、Program、嵌套 Child 与 Reset/升级测试真实关闭重开）+ 受控 Host Adapter；关键来源测试使用精确派发 ID 集合。受控 smoke 单入口为 `pnpm run test:smoke`：`scripts/t3-smoke.mjs` 保留 `reuse: continuable` 的 ACCEPT 基线（Role 跨节点复用 + 节点边界 compact + END + 关库重开），`scripts/e2e-smoke.mjs` 覆盖缺省 `reuse: node`（REJECT/failed-onFail/离开节点 drain 与会话换代/修正闭环）；二者都使用独立临时 home，不操作真实 Run。
 
-T9 已按 `docs/testing/runtime-refact-test-migration.md` 删除旧 MemState/单表结构测试并以新 seam 动态证据替代，full suite 必须 0 fail/0 skip。`test/runtime-real-host.test.ts` 另以 exact DSH 0.1.5-rc.2 真实 Host 组合覆盖 A30 的 Role Activation cold continuation、真实 Basic compact、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume；它使用脚本 LLM，不冒充外部模型质量或完整进程重启。
+T9 已按 `docs/testing/runtime-refact-test-migration.md` 删除旧 MemState/单表结构测试并以新 seam 动态证据替代，现行门槛是 `pnpm run verify`（typecheck + 全量 suite + 两套受控 smoke）= **0 fail**；skip **只允许环境条件**：`test/programs.test.ts` 两条真实 spawn 用例在禁派生进程的环境按 EPERM 探测跳过，其真实 spawn/ENOENT 逻辑由受控进程适配器用例覆盖——不得靠隐藏失败换取 0 skip。`test/runtime-real-host.test.ts`（`pnpm run test:real-host`）另以 exact DSH 0.1.5-rc.2 真实 Host 组合覆盖 A30 的 Role Activation cold continuation、真实 Basic compact、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume；它使用脚本 LLM，不冒充外部模型质量或完整进程重启。

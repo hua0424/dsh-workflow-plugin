@@ -1,6 +1,6 @@
 # Spec：工作单驱动的 Workflow Runtime 重构
 
-- 状态：`refact` 实现与 A01–A30 自动化验收已冻结，待父代理最终 Standards/Spec 审查和 commit；未部署。逐项证据见 [`node-execution-runtime-acceptance.md`](../testing/node-execution-runtime-acceptance.md)。
+- 状态：本 spec 覆盖的 T1–T9 实现与 A01–A30 自动化验收已完成、终审并合入 `main`（`refact` 分支为历史）；逐项证据见 [`node-execution-runtime-acceptance.md`](../testing/node-execution-runtime-acceptance.md)，现行收口入口与 skip 口径见 [`runtime-refact-test-migration.md`](../testing/runtime-refact-test-migration.md)。部署仍是需用户显式授权的独立动作。
 - 跟踪 Issue：[hua0424/dsh-workflow-plugin#7](https://github.com/hua0424/dsh-workflow-plugin/issues/7)，标签 `ready-for-agent`。
 - 仓库文档：`docs/specs/node-execution-runtime.md`；架构依据：`docs/design/node-execution-runtime.md`。机制与职责以设计为准，本文补齐工具合同、验收与实施计划；二者如有冲突，应先统一文档而非自行择一。
 - 替代：旧 PRD `docs/prd/20260907-node-execution-simplification/requirements.md` / [Issue #6](https://github.com/hua0424/dsh-workflow-plugin/issues/6)。旧 Issue 关闭不代表其方案已实现。
@@ -129,7 +129,7 @@ status 默认只展示当前工作单、有效结果、最近判定及 handoff �
 
 新 State format 显式升级，不把旧行强转成新工作单。不强制精确迁移旧活动 Run或长期双引擎：新版发现不兼容活动数据应停止、说明、保留原材料，提供授权后的备份/导出与 Reset 退出路径；迁移失败不部分切换，不为恢复失败创建空库掩盖旧库问题。
 
-Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须写升级说明。DSH 类型依赖对齐目标宿主 0.1.2-rc.1 的实际可用包版本，先核实发布/源码类型，不假定每个包版本号必然相同。宿主包保持 devDependencies，运行由安装宿主提供。
+Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须写升级说明。DSH 类型依赖对齐目标宿主 0.1.2-rc.1（冻结时基线；现行为 0.1.5-rc.2）的实际可用包版本，先核实发布/源码类型，不假定每个包版本号必然相同。宿主包保持 devDependencies，运行由安装宿主提供。
 
 ### I14. 简化交付门槛
 
@@ -176,7 +176,7 @@ Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须�
 | A27 | 未提交结果且 Turn 已结束形成可见暂停，不静默悬挂；事件回调不重入 append，Judge 不自我 drain |
 | A28 | 旧 State format 有明确诊断与授权备份/Reset 路径，不覆盖、不自动迁移活动执行、不部分切换；坏库不被空库伪装为恢复成功 |
 | A29 | 实施删除旧 pending 权威来源、summary 双文本和重复恢复分支；保留 Role 复用/compact、身份校验与 Judge 隔离 |
-| A30 | 目标 DSH 0.1.2-rc.1 下隔离验证 Role cold continuation、compact、claim/turn 安全收口及一个中断后的继续链路；stub smoke 与真实宿主证据分开报告 |
+| A30 | 目标 DSH 0.1.2-rc.1（本 spec 冻结时的运行基线；2026-09-11 起运行基线升级为 0.1.5-rc.2，见 issue #37 / PR #38）下隔离验证 Role cold continuation、compact、claim/turn 安全收口及一个中断后的继续链路；stub smoke 与真实宿主证据分开报告 |
 
 ### T3. 故障注入与完成证据
 
@@ -220,9 +220,9 @@ Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须�
 - claim schema/身份与统一提示：`src/tools/tools.ts`、`src/tools/authz.ts`、`src/engine/texts.ts`、`src/plugin/turnbind.ts`。
 - Runtime/Graph/恢复与宿主事件：`src/engine/engine.ts`、`src/index.ts`。
 - Role/compact/Judge：`src/plugin/host.ts`、`src/roles/roles.ts`、`src/judge/checker.ts`、`src/judge/projection.ts`。
-- 测试复用：`test/engine.test.ts`、`test/state.test.ts`、`test/host-compact.test.ts`、`scripts/e2e-smoke.mjs`。按已存在职责补充测试，不假定必须新建同名架构文件。
+- 测试复用：`test/runtime-work-order.test.ts`、`test/runtime-store-safety.test.ts`、`test/runtime-program-child-fail.test.ts`、`test/runtime-upgrade-reset.test.ts`、`test/host-compact.test.ts`、`scripts/e2e-smoke.mjs`、`scripts/t3-smoke.mjs`。按已存在职责补充测试，不假定必须新建同名架构文件。（T9 已删除旧的 `test/engine.test.ts`、`test/state.test.ts`，替代映射见迁移账本。）
 
-T9 已将所需 DSH Host 测试包按已发布 exact `0.1.2-rc.1` 固定为 devDependencies，并通过包 exports 组成真实 Host fixture；插件运行依赖仍只有 `yaml` 与 `zod`，没有为类型缺口增加兼容 shim。
+T9 已将所需 DSH Host 测试包按已发布 exact `0.1.2-rc.1`（当前为 `0.1.5-rc.2`，见根目录 `AGENTS.md`「DSH 运行基线」）固定为 devDependencies，并通过包 exports 组成真实 Host fixture；插件运行依赖仍只有 `yaml` 与 `zod`，没有为类型缺口增加兼容 shim。
 
 ### F3. 文档、Issue 与升级说明
 

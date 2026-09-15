@@ -1,6 +1,33 @@
 # Runtime 重构旧测试迁移账本
 
-本账本记录 T9 删除旧 `MemState` / 单表合同测试前的行为替代证据。迁移原则：只删除实现耦合 fixture；仍有效而未覆盖的行为必须先进入真实 Runtime + 临时 SQLite seam。所有 replacement 都由 `pnpm test` 收集，测试不得 skip。
+本账本记录 T9 删除旧 `MemState` / 单表合同测试前的行为替代证据，并（#101 起）作为**现行验收入口与删除/替代映射**的权威入口。迁移原则：只删除实现耦合 fixture；仍有效而未覆盖的行为必须先进入真实 Runtime + 临时 SQLite seam。所有 replacement 都由全量 suite 收集。
+
+## 现行验收入口（#101 收敛）
+
+```text
+pnpm run verify        # 单入口 = typecheck + test:suite + test:smoke（下列三段的串联）
+pnpm run typecheck     # node node_modules/typescript/bin/tsc -p tsconfig.json --noEmit
+pnpm run test:suite    # node --test --test-isolation=none "test/*.test.ts"（受限环境等价全量入口）
+pnpm test              # 同一全量套件，标准按文件隔离子进程写法（Node 22.x 无法用 --test-isolation 时用它）
+pnpm run test:smoke    # 统一受控 smoke 入口 = scripts/t3-smoke.mjs && scripts/e2e-smoke.mjs
+pnpm run test:real-host  # exact 0.1.5-rc.2 真实 Host 组合（与上面两类 controlled smoke 分开报告）
+```
+
+两套受控 smoke 的分工（合起来才是完整受控闭环，任一单独跑都不完整）：
+
+| 脚本 | 角色生命周期合同 | 独有断言 |
+|---|---|---|
+| `scripts/t3-smoke.mjs` | 显式 `reuse: continuable`（旧行为基线） | Role 跨节点复用（`rolesCreated=1`）、节点边界 compact（`compacts=1`）、三节点 → END、关库重开后的终局 handoff 与事件顺序 |
+| `scripts/e2e-smoke.mjs` | 缺省 `reuse: node`（现行缺省） | REJECT 修正环路、failed onFail 自环、离开节点 drain + 新 visit 新会话、旧会话迟到 claim 失权、`#59` 警告型 catalog 可加载、`fmt=3` trace |
+
+**skip 口径（AC2）**：0 fail 必须无条件成立；skip 只允许**环境条件**，且不得把失败藏成 skip。当前唯一两处是 `test/programs.test.ts` 的 `runProgram captures output of a real command` 与 `runProgram reports ENOENT for missing commands`——它们在启动时探测 `spawn(..., {stdio:['ignore','pipe','pipe']})`，只有探测到沙箱 `EPERM` 才带原因跳过；`runProgram`/`spawnCollect` 的同一逻辑由受控进程适配器与受控 `SpawnDriver` 用例覆盖（Issue #92/#95），因此受限环境下跳过的是"真实子进程可跑性"，不是未被验证的行为。
+
+## 本轮（工作流优化 C）删除测试的现行替代
+
+| 删除项 | 出处 | 现行替代 |
+|---|---|---|
+| `test/judge.test.ts` 两条 `parseJudgeClaim` 自证用例 | #100（删除仅测试引用的旧 validator） | 生产合同单源仍在工具层 `judge_claim` 的 parameters/enum + `tools.ts` 长度校验 + `engine.handleJudgeClaim`；路由与 reason 边界由 `test/tools.test.ts`（judge_claim 分组）与 `test/judge-surface.test.ts` 覆盖 |
+| `judgeSessions` 相关无测试的 write-only 状态 | #99 | 无测试删除（该项本无测试）；参与者证据寿命由 `test/participants.test.ts` 9 例覆盖 |
 
 ## `test/engine.test.ts`（91 项，整文件删除）
 
@@ -41,6 +68,6 @@
 
 ## 删除后的门槛
 
-- `pnpm test` 必须 `0 fail / 0 skipped`。
-- `node scripts/t3-smoke.mjs` 与 `pnpm run test:e2e` 必须通过；二者是 controlled Host，不冒充 A30 真实 Host。
+- 现行单入口 `pnpm run verify` 必须 exit 0：typecheck 干净、全量 suite **0 fail**（skip 仅限上面登记的环境条件）、两套受控 smoke 均 PASS。受限环境之外的等价入口是 `pnpm test`。
+- `node scripts/t3-smoke.mjs` 与 `pnpm run test:e2e`（合称 `pnpm run test:smoke`）必须通过；二者是 controlled Host，不冒充 A30 真实 Host。
 - A01–A30 的最终证据另见 `docs/testing/node-execution-runtime-acceptance.md`。

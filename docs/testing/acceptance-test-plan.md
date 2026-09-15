@@ -1,5 +1,10 @@
 # 验收标准与测试计划
 
+> **历史基线（适用版本：`agent-workflow/v1` 单表实现、宿主 DSH `0.1.1-rc.2`，开发启动前冻结）。** 其中的单表
+> `workflow_state`、命令面与 GUI 验收要求描述的是当时实现；**现行入口**见
+> [`runtime-refact-test-migration.md`](runtime-refact-test-migration.md) 与 [`node-execution-runtime-acceptance.md`](node-execution-runtime-acceptance.md)。
+> 本文件按"冻结后须经用户确认才能改"的约定保留原文。
+
 - 状态：开发启动前冻结；实现过程中如需调整，须经用户确认后修改本文件
 - 依据：`docs/design/configurable-agent-workflow-graph.md`（agent-workflow/v1）
 - 环境事实（已核查）：宿主 DSH `0.1.1-rc.2`、Node `v24.16.0`（`node:sqlite` 可用）、

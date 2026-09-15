@@ -3,7 +3,7 @@
 DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
 workflows (`agent-workflow/v2`).
 
-**当前 `refact` 已完成 T6–T9 实现与 A01–A30 自动化验收冻结，仍未部署；最终 Standards/Spec 审查与 commit 由父代理执行。**
+**当前状态：T1–T9 的 Node Execution Runtime 重构已实现、审查并合入 `main`，A01–A30 自动化验收账本见 [`docs/testing/node-execution-runtime-acceptance.md`](docs/testing/node-execution-runtime-acceptance.md)；本仓库不自动部署——部署是需用户显式授权的独立动作（见「Installation」）。验收基线宿主为 exact DSH `0.1.5-rc.2`（对齐记录见根目录 `AGENTS.md`）。现行验收入口是一条命令 `pnpm run verify`（typecheck + 全量 suite + 两套受控 smoke），逐项口径见 [`docs/testing/runtime-refact-test-migration.md`](docs/testing/runtime-refact-test-migration.md)。**
 三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT、Manager 定向 resume/Judge respawn、争议协议、Manager-only 有界历史，以及关闭重开后的统一恢复。Role Actor 在新 visit（含自环）前安全收口并 compact 后续接同一 continuable Session；同 execution 返工/resume 不做 Node 边界 compact，持久 Session 确认不存在时由 fresh replacement 接手完整材料。
 
 受控 Runtime/SQLite smoke 与 exact DSH `0.1.5-rc.2` 真实 Host 组合分开报告：[`A01–A30 验收账本`](docs/testing/node-execution-runtime-acceptance.md)记录 Role Activation cold continuation、真实 Basic compaction、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume。脚本 LLM 不代表外部模型质量，Activation cold 也不冒充完整进程重启。
@@ -34,9 +34,9 @@ fail-closed，不静默迁移。只有 root 人类显式执行 `/dsh-flow reset 
 - [`docs/design/node-execution-runtime.md`](docs/design/node-execution-runtime.md) / [`spec`](docs/specs/node-execution-runtime.md) — refact 权威设计与验收基线。
 - [`A01–A30 验收账本`](docs/testing/node-execution-runtime-acceptance.md) / [`旧测试迁移`](docs/testing/runtime-refact-test-migration.md) — 动态证据、真实 Host 边界与删除映射。
 - [`长尾讨论`](docs/pending-discussions/runtime-refact-long-tail.md) — 不阻塞本次主要流程的后续边界。
-- [`docs/work-plans/runtime-refact.md`](docs/work-plans/runtime-refact.md) — 工单依赖、当前进度与分票证据。
+- [`docs/work-plans/runtime-refact.md`](docs/work-plans/runtime-refact.md) — T1–T9 历史工单依赖与分票证据（已完成并合入）。
 - [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — 旧版设计参考，不覆盖 refact 新规格。
-- [`docs/testing/acceptance-test-plan.md`](docs/testing/acceptance-test-plan.md) / [`report`](docs/testing/acceptance-report.md) — 原实现验收资料，不表示当前重构已通过。
+- [`docs/testing/acceptance-test-plan.md`](docs/testing/acceptance-test-plan.md) / [`report`](docs/testing/acceptance-report.md) — 原单表实现的历史验收资料（带版本标记，保留适用版本；不代表当前实现），现行入口见 [`旧测试迁移/现行验收入口`](docs/testing/runtime-refact-test-migration.md)。
 - [`docs/example/`](docs/example/) — copyable workflow config template (`workflow-template.yaml`) + config/model reference for new workflows.
 
 Superseded `feature-delivery/v1` designs remain available in Git history.
@@ -61,13 +61,19 @@ cordis.patch.yml      profile-bundle patch (inserts the plugin row)
 
 ## Development
 
-- Build: `pnpm run build` (tsc → `lib/`). The profile bundle loads `lib/index.js`; Node refuses to strip `.ts` inside node_modules, so the compiled output is the runtime artifact.
-- Test: `pnpm test`（全部 node:test，要求 0 fail/0 skip）；`pnpm run test:real-host` 单独运行 exact 0.1.5-rc.2 真实 Host 组合；`node scripts/t3-smoke.mjs` / `pnpm run test:e2e` 运行两套隔离 controlled smoke。
+- Build: `pnpm run build` (tsc → `lib/`). The profile bundle loads `lib/index.js`; Node refuses to strip `.ts` inside node_modules, so the compiled output is the runtime artifact. 脚本用 `node node_modules/typescript/bin/tsc` 显式调用编译器：`.bin` 链接缺失（pnpm install 未物化 bin）时 `tsc` 不在 PATH，文档命令仍必须可直接跑通。
+- 验收（现行单入口）：`pnpm run verify` = `typecheck`（`tsc --noEmit`）+ `test:suite`（全量 suite）+ `test:smoke`（两套受控 smoke）。逐项：
+  - `pnpm test` — 全量 node:test（标准入口，按文件隔离子进程）。
+  - `pnpm run test:suite` — 同样全量、`--test-isolation=none`：受限沙箱禁止派生进程（`spawn EPERM`）时的等价入口；Node 22.x 该 flag 名为 `--experimental-test-isolation=none`。
+  - `pnpm run test:smoke` — 统一受控 smoke 入口 = `node scripts/t3-smoke.mjs`（`reuse: continuable`：Role 跨节点复用 + 节点边界 compact + END + 关库重开）&& `node scripts/e2e-smoke.mjs`（缺省 `reuse: node`：REJECT 修正 + failed onFail 自环 + 离开节点 drain + trace）。二者都只用独立临时 home，不读写真实 `~/.dsh`。
+  - `pnpm run test:real-host` — 单独运行 exact 0.1.5-rc.2 真实 Host 组合；与上面两类 controlled smoke 分开报告，三者不得混称。
+  - 计数口径：0 fail；仅允许**环境条件**跳过的用例（`test/programs.test.ts` 两条真实 spawn 用例在禁派生进程的环境按 EPERM 探测跳过，其逻辑由受控适配器用例覆盖）——不靠隐藏失败换取 0 skip，逐项替代见迁移账本。
+- 诊断工具：`node scripts/check-state-rows.mjs <state.sqlite3 路径>` 只读诊断指定库（显式路径、不默认真实 home、复制成临时快照后只读打开，不改写目标库）；当前 v9 / 旧单表 / 未知布局 / 坏库分别给诊断，退出码 0/1/2。
 - Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.1.5-rc.2` types and are required Host services, not plugin runtime dependencies.
 
 ## Installation (development)
 
-下列仅是后续获得部署授权后的流程；本轮没有部署，也没有操作真实 Run。
+下列流程需要**用户显式授权**：本轮验收只生成隔离产物（`--out`），不写 `~/.dsh`、不影响任何真实 Run。
 
 The plugin is a DSH Profile Bundle, deployed wfgate-style into a local bundle
 directory under the web profile (the same layout the shipped bundles use, so
@@ -75,7 +81,10 @@ directory under the web profile (the same layout the shipped bundles use, so
 
 1. `pnpm run build` — compile `lib/`.
 2. `node scripts/deploy-web.mjs` — copies `lib/`, `cordis.patch.yml`, and a
-   bundle `package.json` into `~/.dsh/profiles/web/wfdev`.
+   bundle `package.json` (version/dependencies 取自本仓库 `package.json`，宿主包
+   `@deepseek-ai/*` 只留在 devDependencies，出现在 dependencies 即 fail-closed)
+   into `~/.dsh/profiles/web/wfdev`。隔离产物验证用
+   `node scripts/deploy-web.mjs --out <临时目录>`：只生成、不触碰 profile。
 3. Ensure `"dsh-agent-team-workflow": "file:wfdev"` is in
    `~/.dsh/profiles/web/package.json` dependencies and the name is listed in
    `dsh.profile.bundles` (both set up once; `pnpm install` reconciles).
@@ -96,8 +105,11 @@ Trace 是便于人工排障的派生产物，关键业务历史以 SQLite `node_
 - **一致性**：业务状态与事件同事务提交；trace 只在提交后追加，失败不阻断 Run，首次失败每 Run 最多告警一次。
 - **限制**：trace 不保存 reasoning、完整工具 transcript 或 Program 参数，也不是 secret scanner。长期细粒度可观测性取舍见 `docs/pending-discussions/runtime-refact-long-tail.md`。
 
-The e2e smoke (`pnpm run test:e2e`) drives the full v2 loop on production code
-paths — wrong work → claim → async REJECT → correction re-dispatch → corrected
-work → re-claim → ACCEPT → next node — for BOTH a Manager node and a Role node
-(embedded v2 catalog, isolated temporary DSH home; the real `~/.dsh` is never
-touched).
+The controlled smokes (`pnpm run test:smoke` = `t3-smoke.mjs` && `e2e-smoke.mjs`) drive the full
+v2 loop on production code paths. `e2e-smoke.mjs`（`pnpm run test:e2e`）覆盖缺省 `reuse: node`：
+wrong work → claim → async REJECT → correction re-dispatch → corrected
+work → re-claim → ACCEPT → next node — for BOTH a Manager node and a Role node，
+外加 failed onFail 自环、离开节点 drain + 新 visit 新会话、迟到旧 Judge 失权与 `fmt=3` trace；
+`t3-smoke.mjs`（`pnpm run test:t3`）覆盖 `reuse: continuable` 的另一半：Role 跨节点复用 +
+节点边界 compact + END + SQLite 关库重开。两者都用 embedded v2 catalog 与隔离临时 DSH home，
+真实 `~/.dsh` 绝不被触碰，且都不冒充真实宿主 E2E。
