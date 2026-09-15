@@ -3,10 +3,12 @@
  * - `scripts/check-state-rows.mjs`：显式路径 + 真只读 + 当前/旧/未知/坏库分别诊断，
  *   不创建缺失的库、不改写字节，也不把坏库读成空库。
  * - `scripts/deploy-web.mjs`：隔离 bundle 产物元数据取自 package.json，DSH 宿主包
- *   留在 devDependencies（出现在 dependencies 即 fail-closed）。
+ *   留在 devDependencies（出现在 dependencies 即 fail-closed）；`--out` 缺值 fail-closed
+ *   （CLI 层实测非零退出、不写 profile 目标）。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -15,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { StateStore } from '../src/state/store.ts'
 import { inspectStateDb, parseDiagnosticArgs } from '../scripts/check-state-rows.mjs'
-import { bundlePackageJson, deployBundle } from '../scripts/deploy-web.mjs'
+import { bundlePackageJson, deployBundle, parseDeployArgs } from '../scripts/deploy-web.mjs'
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 const repoPackage = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'))
@@ -127,5 +129,32 @@ test('#101 隔离 bundle：deployBundle 只写隔离目标，产物版本/依赖
     assert.equal(existsSync(join(target, 'lib', 'nested', 'x.js')), true)
     assert.match(readFileSync(join(target, 'cordis.patch.yml'), 'utf8'), /dsh-agent-team-workflow/)
     assert.throws(() => deployBundle({ repoRoot: join(dir, 'empty'), target }), /lib\/index\.js missing/)
+  } finally { cleanup() }
+})
+
+test('#101 部署参数：--out 缺值是用法错误，只有无 --out 才走默认目标', () => {
+  assert.deepEqual(parseDeployArgs([]), { out: undefined }, '不带 --out 才是部署到 profile 默认目标')
+  assert.deepEqual(parseDeployArgs(['--out', 'D:\\tmp\\bundle']), { out: 'D:\\tmp\\bundle' })
+  for (const argv of [['--out'], ['--out', ''], ['--out', '--json']]) {
+    assert.throws(() => parseDeployArgs(argv), /--out 缺少目录参数[\s\S]*用法/, `缺值必须 fail-closed：${JSON.stringify(argv)}`)
+  }
+})
+
+test('#101 部署 CLI：--out 缺值非零退出，且不创建默认 profile 目标（不碰真实 home）', () => {
+  const { dir, cleanup } = tempDir('wf101-deploy-fakehome-')
+  try {
+    // 把 home 指向一次性临时目录：缺值一旦回落默认目标就会在这里留下产物，从而被抓到
+    const fakeHome = join(dir, 'fakehome')
+    mkdirSync(fakeHome)
+    const run = argv => spawnSync(process.execPath, [join(repoRoot, 'scripts', 'deploy-web.mjs'), ...argv],
+      { cwd: repoRoot, stdio: 'ignore', env: { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome } })
+    const target = join(fakeHome, '.dsh', 'profiles', 'web', 'wfdev')
+    const missing = run(['--out'])
+    assert.equal(missing.status, 2, '--out 缺值必须以用法错误退出')
+    assert.equal(existsSync(target), false, '--out 缺值不得回落到 profile 目标并写产物')
+    assert.deepEqual(readdirSync(fakeHome), [], '--out 缺值不得产生任何文件系统写入')
+    const flagged = run(['--out', '--force'])
+    assert.equal(flagged.status, 2, '--out 后面跟的是另一个开关时同样按缺值处理')
+    assert.equal(existsSync(target), false)
   } finally { cleanup() }
 })

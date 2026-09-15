@@ -7,6 +7,10 @@
  *   node scripts/deploy-web.mjs                 # 部署到 ~/.dsh/profiles/web/wfdev（需用户授权）
  *   node scripts/deploy-web.mjs --out <目录>    # 只在隔离目录生成产物，用于验收（不碰 profile）
  *
+ * `--out` 给了但缺目录（末尾漏写、变量展开为空等）是**用法错误**：只打印用法并以 2 退出，
+ * 在任何文件系统写操作之前返回，绝不静默回落到 `~/.dsh/profiles/web/wfdev` 的真实部署路径
+ * （Issue #101 M-1）。
+ *
  * 元数据单源（Issue #101 AC4）：bundle `package.json` 的必要字段全部从仓库
  * `package.json` 选取，不再手抄一份；`@deepseek-ai/*` 宿主包只允许留在
  * devDependencies（Dependencies 里出现即 fail-closed），运行依赖仍只有 yaml/zod。
@@ -49,11 +53,33 @@ export function deployBundle({ repoRoot, target }) {
   return { target, manifest }
 }
 
+export const DEPLOY_USAGE = '用法：node scripts/deploy-web.mjs [--out <目录>]\n'
+  + '不带 --out 时部署到 ~/.dsh/profiles/web/wfdev（需用户显式授权）；'
+  + '带 --out 时只在给定目录生成产物，不碰 profile。'
+
+/**
+ * 解析 CLI 参数：只有 `--out` 后面跟着真实目录值时才是隔离生成模式。
+ * `--out` 出现但缺值一律抛错（fail-closed）——缺值不是"没给 --out"，不得回落到真实部署目标。
+ */
+export function parseDeployArgs(argv) {
+  const outIndex = argv.indexOf('--out')
+  if (outIndex === -1) return { out: undefined }
+  const value = argv[outIndex + 1]
+  if (value === undefined || value === '' || value.startsWith('-')) {
+    throw new Error(`--out 缺少目录参数\n${DEPLOY_USAGE}`)
+  }
+  return { out: value }
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-  const args = process.argv.slice(2)
-  const outIndex = args.indexOf('--out')
-  const out = outIndex === -1 ? undefined : args[outIndex + 1]
+  let out
+  try {
+    out = parseDeployArgs(process.argv.slice(2)).out
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error))
+    process.exit(2)
+  }
   const defaultTarget = join(homedir(), '.dsh', 'profiles', 'web', 'wfdev')
   const target = out === undefined ? defaultTarget : resolve(out)
   const { manifest } = deployBundle({ repoRoot, target })
