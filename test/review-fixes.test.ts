@@ -22,8 +22,8 @@ test('buildGhArgs never emits jq pipelines and encodes the query', async () => {
   assert.ok(!all.includes('--jq') && !all.includes('-q'))
 })
 
-test('ghApi FAIL paths return ERROR not a malformed pipeline', () => {
-  const result = ghApi({ cwd: 'C:\\nonexistent', method: 'GET', path: 'x', timeoutMs: 1000 })
+test('ghApi FAIL paths return ERROR not a malformed pipeline', async () => {
+  const result = await ghApi({ cwd: 'C:\\nonexistent', method: 'GET', path: 'x', timeoutMs: 1000 })
   assert.equal(result.kind, 'ERROR')
 })
 

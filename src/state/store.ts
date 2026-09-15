@@ -174,23 +174,33 @@ export class StateStore {
     return this.db.prepare('SELECT r.* FROM runs r JOIN node_executions e ON e.run_id = r.run_id WHERE r.workspace_key = ? AND e.execution_id = ?').get(workspaceKey, executionId) as RunRow | undefined
   }
 
-  private readExecution(run: RunState, executionId: string): NodeExecution | undefined {
+  /** #96: validate=false 时跳过 Execution 单独校验，供调用方随后用一次 checkStateInvariants(run, execution) 复用同一材料收敛重复校验。 */
+  private readExecution(run: RunState, executionId: string, validate = true): NodeExecution | undefined {
     const row = this.db.prepare('SELECT * FROM node_executions WHERE run_id = ? AND execution_id = ?').get(run.runId, executionId) as ExecutionRow | undefined
     if (!row) return undefined
     const execution = parse<NodeExecution>(row.snapshot_json)
-    assertValid(checkExecutionInvariants(run, execution))
+    if (validate) assertValid(checkExecutionInvariants(run, execution))
     if (execution.executionId !== row.execution_id || execution.runId !== row.run_id || execution.visit !== row.visit || execution.revision !== row.revision) throw new Error('corrupt execution columns/snapshot mismatch')
     return execution
+  }
+
+  /** Run 形状/定义 hash 单次校验；供只需要 Run 的读取（history/execution/events owner）复用。 */
+  private decodeRun(row: RunRow): RunState {
+    if (row.format_version !== STATE_FORMAT_VERSION) throw new Error('incompatible state format; original data retained')
+    const run = parse<RunState>(row.snapshot_json)
+    assertValid(checkStateInvariants(run))
+    if (run.runId !== row.run_id || run.status !== row.status || run.currentExecutionId !== row.current_execution_id || !Number.isSafeInteger(row.state_version) || row.state_version < 1) throw new Error('corrupt run columns/snapshot mismatch')
+    return run
   }
 
   private decode(row: RunRow): StateRow {
     if (row.format_version !== STATE_FORMAT_VERSION) throw new Error('incompatible state format; original data retained')
     const run = parse<RunState>(row.snapshot_json)
-    assertValid(checkStateInvariants(run))
-    if (run.runId !== row.run_id || run.status !== row.status || run.currentExecutionId !== row.current_execution_id || !Number.isSafeInteger(row.state_version) || row.state_version < 1) throw new Error('corrupt run columns/snapshot mismatch')
-    const execution = this.readExecution(run, run.currentExecutionId)
+    const execution = this.readExecution(run, row.current_execution_id, false)
     if (!execution) throw new Error('corrupt run: current execution is missing')
+    // 单次合并校验已包含 Run schema/hash 与 Execution 及二者关联（#96 收敛）。
     assertValid(checkStateInvariants(run, execution))
+    if (run.runId !== row.run_id || run.status !== row.status || run.currentExecutionId !== row.current_execution_id || !Number.isSafeInteger(row.state_version) || row.state_version < 1) throw new Error('corrupt run columns/snapshot mismatch')
     return { workspaceKey: row.workspace_key, formatVersion: STATE_FORMAT_VERSION, stateVersion: row.state_version, run, execution, updatedAt: row.updated_at }
   }
 
@@ -207,7 +217,8 @@ export class StateStore {
     return this.enqueue(() => {
       const row = this.runRowForExecution(workspaceKey, executionId)
       if (!row) return undefined
-      return this.readExecution(this.decode(row).run, executionId)
+      const run = this.decodeRun(row)
+      return this.readExecution(run, executionId)
     })
   }
 
@@ -215,7 +226,7 @@ export class StateStore {
     return this.enqueue(() => {
       const row = this.runRowForExecution(workspaceKey, executionId)
       if (!row) return undefined
-      const run = this.decode(row).run
+      const run = this.decodeRun(row)
       return { runId: run.runId, managerSessionId: run.managerSessionId }
     })
   }
@@ -226,7 +237,7 @@ export class StateStore {
       if (!Number.isSafeInteger(after) || after < 0 || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error('events requires after >= 0 and limit 1..50')
       const row = this.runRowForExecution(workspaceKey, executionId)
       if (!row) throw new Error('execution is not in the current run or workspace history')
-      const run = this.decode(row).run
+      const run = this.decodeRun(row)
       const execution = this.readExecution(run, executionId)
       if (!execution) throw new Error('execution is not in this workspace history')
       const rows = this.db.prepare('SELECT * FROM node_execution_events WHERE execution_id = ? AND sequence > ? ORDER BY sequence LIMIT ?').all(executionId, after, limit) as { execution_id: string; sequence: number; type: NodeExecutionEvent['type']; at: string; snapshot_json: string }[]
@@ -241,7 +252,8 @@ export class StateStore {
 
   createRow(workspaceKey: string, run: RunState, execution: NodeExecution): Promise<StateRow> {
     // Detach before queueing: caller mutations cannot change pending transaction inputs.
-    const savedRun = parse<RunState>(json(run))
+    const savedRunJson = json(run)
+    const savedRun = parse<RunState>(savedRunJson)
     const savedExecution = parse<NodeExecution>(json(execution))
     return this.enqueue(() => {
       if (!workspaceKey.trim()) throw new Error('workspace key is required')
@@ -253,14 +265,19 @@ export class StateStore {
       assertValid(checkStateInvariants(savedRun, savedExecution))
       if (savedExecution.revision !== 0 || savedExecution.phase !== 'ready' || savedExecution.predecessorId || savedRun.status !== 'running') throw new Error('new run requires a ready revision-0 initial execution')
       const at = new Date().toISOString()
-      this.db.prepare('INSERT INTO runs (run_id, workspace_key, format_version, state_version, status, current_execution_id, snapshot_json, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?)').run(savedRun.runId, workspaceKey, STATE_FORMAT_VERSION, savedRun.status, savedRun.currentExecutionId, json(savedRun), at)
+      this.db.prepare('INSERT INTO runs (run_id, workspace_key, format_version, state_version, status, current_execution_id, snapshot_json, updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?)').run(savedRun.runId, workspaceKey, STATE_FORMAT_VERSION, savedRun.status, savedRun.currentExecutionId, savedRunJson, at)
       this.writeExecution(savedRun, { execution: savedExecution, expectedRevision: null, events: ['entered'] }, at)
-      return this.decode(this.latest(workspaceKey)!)
+      // #96: 写后不再完整 decode；提交信息由事务内已验证材料直接构造。
+      const committed = this.readExecution(savedRun, savedRun.currentExecutionId, false)
+      if (!committed) throw new Error('current execution is missing')
+      assertValid(checkStateInvariants(savedRun, committed))
+      return { workspaceKey, formatVersion: STATE_FORMAT_VERSION, stateVersion: 1, run: savedRun, execution: committed, updatedAt: at }
     }, true)
   }
 
   updateRow(workspaceKey: string, run: RunState, expectedVersion: number, changes: ExecutionChange[]): Promise<StateRow> {
-    const savedRun = parse<RunState>(json(run))
+    const savedRunJson = json(run)
+    const savedRun = parse<RunState>(savedRunJson)
     const savedChanges = JSON.parse(json(changes)) as ExecutionChange[]
     return this.enqueue(() => {
       const row = this.latest(workspaceKey)
@@ -276,12 +293,13 @@ export class StateStore {
       if (new Set(savedChanges.map(change => change.execution.executionId)).size !== savedChanges.length) throw new Error('duplicate execution change')
       const at = new Date().toISOString()
       for (const change of savedChanges) this.writeExecution(savedRun, change, at)
-      const execution = this.readExecution(savedRun, savedRun.currentExecutionId)
+      // #96: 事务内已验证材料直接构造提交信息；不再写后完整 decode。
+      const execution = this.readExecution(savedRun, savedRun.currentExecutionId, false)
       if (!execution) throw new Error('current execution is missing')
       assertValid(checkStateInvariants(savedRun, execution))
-      const result = this.db.prepare('UPDATE runs SET state_version = state_version + 1, status = ?, current_execution_id = ?, snapshot_json = ?, updated_at = ? WHERE run_id = ? AND state_version = ?').run(savedRun.status, savedRun.currentExecutionId, json(savedRun), at, savedRun.runId, expectedVersion)
+      const result = this.db.prepare('UPDATE runs SET state_version = state_version + 1, status = ?, current_execution_id = ?, snapshot_json = ?, updated_at = ? WHERE run_id = ? AND state_version = ?').run(savedRun.status, savedRun.currentExecutionId, savedRunJson, at, savedRun.runId, expectedVersion)
       if (result.changes !== 1) throw new StateVersionError(workspaceKey, row.state_version, expectedVersion)
-      return this.decode(this.latest(workspaceKey)!)
+      return { workspaceKey, formatVersion: STATE_FORMAT_VERSION, stateVersion: expectedVersion + 1, run: savedRun, execution, updatedAt: at }
     }, true)
   }
 
@@ -306,15 +324,18 @@ export class StateStore {
       if (events.includes('entered')) throw new Error('entered event is only valid for new execution')
     }
     const saved = { ...execution, revision: (expectedRevision ?? 0) + 1 }
+    // #96: 同一快照字符串只确定一次，表写与全部事件行共用。
+    const savedJson = json(saved)
     if (expectedRevision === null) {
-      this.db.prepare('INSERT INTO node_executions (execution_id, run_id, visit, revision, snapshot_json) VALUES (?, ?, ?, ?, ?)').run(saved.executionId, saved.runId, saved.visit, saved.revision, json(saved))
+      this.db.prepare('INSERT INTO node_executions (execution_id, run_id, visit, revision, snapshot_json) VALUES (?, ?, ?, ?, ?)').run(saved.executionId, saved.runId, saved.visit, saved.revision, savedJson)
     } else {
-      const result = this.db.prepare('UPDATE node_executions SET revision = ?, snapshot_json = ? WHERE execution_id = ? AND run_id = ? AND revision = ?').run(saved.revision, json(saved), saved.executionId, saved.runId, expectedRevision)
+      const result = this.db.prepare('UPDATE node_executions SET revision = ?, snapshot_json = ? WHERE execution_id = ? AND run_id = ? AND revision = ?').run(saved.revision, savedJson, saved.executionId, saved.runId, expectedRevision)
       if (result.changes !== 1) throw new StateVersionError(saved.executionId, existing!.revision, expectedRevision)
     }
+    if (events.length === 0) return // #96: 空 events 不取 MAX(sequence)
     const last = this.db.prepare('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM node_execution_events WHERE execution_id = ?').get(saved.executionId) as { sequence: number }
     let sequence = last.sequence
-    for (const type of events) this.db.prepare('INSERT INTO node_execution_events (execution_id, sequence, type, at, snapshot_json) VALUES (?, ?, ?, ?, ?)').run(saved.executionId, ++sequence, type, at, json(saved))
+    for (const type of events) this.db.prepare('INSERT INTO node_execution_events (execution_id, sequence, type, at, snapshot_json) VALUES (?, ?, ?, ?, ?)').run(saved.executionId, ++sequence, type, at, savedJson)
   }
 
   close(): void { if (!this.closed) { this.closed = true; this.db.close() } }

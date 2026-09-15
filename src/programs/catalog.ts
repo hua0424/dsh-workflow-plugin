@@ -31,24 +31,24 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
   if (typeof branchName !== 'string' || branchName.trim() === '') return { kind: 'ERROR', reason: 'branchName is required' }
   const adapter = ctx.adapter ?? realRepositoryAdapter
 
-  const identity = repositoryIdentity(adapter, ctx.cwd)
+  const identity = await repositoryIdentity(adapter, ctx.cwd)
   if (identity.kind === 'ERROR') return identity
   const { owner, repo } = identity.value
 
   // 预检（只读）：任一事实读取失败就 ERROR，绝不带着未知事实进入写动作。
-  const milestones = listMilestones(adapter, ctx.cwd, owner, repo)
+  const milestones = await listMilestones(adapter, ctx.cwd, owner, repo)
   if (milestones.kind === 'ERROR') return milestones
   const existing = milestones.value.find(m => m.title === title.trim())
   if (existing !== undefined && existing.state !== 'open') {
     return { kind: 'FAIL', reason: `milestone "${title}" exists but is ${existing.state}` }
   }
-  const local = gitLocalBranch(adapter, ctx.cwd, branchName)
+  const local = await gitLocalBranch(adapter, ctx.cwd, branchName)
   if (local.kind === 'error') return { kind: 'ERROR', reason: `cannot read local branch ${branchName}: ${local.reason}` }
-  const remote = gitRemoteBranch(adapter, ctx.cwd, branchName)
+  const remote = await gitRemoteBranch(adapter, ctx.cwd, branchName)
   if (remote.kind === 'error') return { kind: 'ERROR', reason: `cannot read remote branch ${branchName}: ${remote.reason}` }
   const createLocal = local.kind === 'none'
   if (createLocal) {
-    const status = gitStatusShort(adapter, ctx.cwd)
+    const status = await gitStatusShort(adapter, ctx.cwd)
     if (status.kind !== 'value') return { kind: 'ERROR', reason: `cannot read workspace status: ${status.reason}` }
     if (status.value !== '') return { kind: 'ERROR', reason: 'working tree is dirty; cannot create a milestone branch' }
   }
@@ -58,7 +58,7 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
   if (existing !== undefined) {
     milestoneNumber = existing.number
   } else {
-    const create = adapter.gh({
+    const create = await adapter.gh({
       cwd: ctx.cwd, method: 'POST', path: `repos/${owner}/${repo}/milestones`,
       input: { title: title.trim(), state: 'open' },
     })
@@ -71,12 +71,12 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
   }
 
   if (createLocal) {
-    const created = adapter.git(['checkout', '-b', branchName], ctx.cwd)
+    const created = await adapter.git(['checkout', '-b', branchName], ctx.cwd)
     if (created.exitCode !== 0) return { kind: 'ERROR', reason: `git checkout -b failed: ${created.stderr.trim().slice(0, 300)}` }
   }
   if (remote.kind === 'none') {
     // push 需要认证握手 + 传输，基线即显式给 120s 预算（同处其余 git 调用走默认 30s）。
-    const push = adapter.git(['push', '-u', 'origin', branchName], ctx.cwd, { timeoutMs: 120_000 })
+    const push = await adapter.git(['push', '-u', 'origin', branchName], ctx.cwd, { timeoutMs: 120_000 })
     if (push.exitCode !== 0) return { kind: 'ERROR', reason: `git push failed: ${push.stderr.trim().slice(0, 300)}` }
   }
 
@@ -93,12 +93,12 @@ async function allMilestoneIssuesComplete(ctx: ProgramContext, parameters: Recor
   if (typeof raw !== 'number' || !Number.isSafeInteger(raw)) return { kind: 'ERROR', reason: 'milestoneNumber must be an integer' }
   const adapter = ctx.adapter ?? realRepositoryAdapter
 
-  const identity = repositoryIdentity(adapter, ctx.cwd)
+  const identity = await repositoryIdentity(adapter, ctx.cwd)
   if (identity.kind === 'ERROR') return identity
   const { owner, repo } = identity.value
 
   // 分页取全 + 结构校验 + PR 排除都在共享读取层完成；失败即 ERROR，不降级成空集合。
-  const listed = listIssues(adapter, ctx.cwd, owner, repo, raw)
+  const listed = await listIssues(adapter, ctx.cwd, owner, repo, raw)
   if (listed.kind === 'ERROR') return listed
   const open = listed.value.filter(i => i.state === 'open')
   if (listed.value.length === 0 || open.length > 0) {

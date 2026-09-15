@@ -1,9 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
+import { spawn } from 'node:child_process'
 import {
-  GH_PAGE_SIZE, ghApiList, gitHead, gitLocalBranch, gitOriginUrl, gitRemoteBranch, gitStatusShort, gitTopLevel,
-  parseOriginRepo, runProgram, shapeGhOutcome,
-  type GhCall, type RepositoryAdapter, type RunOutcome,
+  GIT_OUTPUT_LIMIT, GH_PAGE_SIZE, ghApiList, gitHead, gitLocalBranch, gitOriginUrl, gitRemoteBranch, gitStatusShort, gitTopLevel,
+  parseOriginRepo, runProgram, shapeGhOutcome, spawnCollect,
+  type GhCall, type RepositoryAdapter, type RunOutcome, type SpawnDriver,
 } from '../src/programs/runner.ts'
 import {
   inspectGithubFacts, inspectGitFact, listIssues, listMilestones, repositoryIdentity,
@@ -26,8 +28,8 @@ interface Fake {
 }
 
 function fakeAdapter(handlers: {
-  git?: (args: string[]) => RunOutcome
-  gh?: (call: GhCall) => { kind: 'PASS'; details: unknown } | { kind: 'ERROR'; reason: string }
+  git?: (args: string[]) => RunOutcome | Promise<RunOutcome>
+  gh?: (call: GhCall) => { kind: 'PASS'; details: unknown } | { kind: 'ERROR'; reason: string } | Promise<{ kind: 'PASS'; details: unknown } | { kind: 'ERROR'; reason: string }>
 }): Fake {
   const gitCalls: string[][] = []
   const gitTimeouts: Array<number | undefined> = []
@@ -38,8 +40,8 @@ function fakeAdapter(handlers: {
     ghCalls,
     writes: () => ghCalls.filter(c => c.method !== 'GET').length + gitCalls.filter(a => a[0] === 'push' || a[0] === 'checkout').length,
     adapter: {
-      git: (args, _cwd, opts) => { gitCalls.push(args); gitTimeouts.push(opts?.timeoutMs); return handlers.git?.(args) ?? failOut(128, `unexpected git call: ${args.join(' ')}`) },
-      gh: (call) => { ghCalls.push(call); return handlers.gh?.(call) ?? { kind: 'ERROR', reason: `unexpected gh call: ${call.method} ${call.path}` } },
+      git: async (args, _cwd, opts) => { gitCalls.push(args); gitTimeouts.push(opts?.timeoutMs); return handlers.git?.(args) ?? failOut(128, `unexpected git call: ${args.join(' ')}`) },
+      gh: async (call) => { ghCalls.push(call); return handlers.gh?.(call) ?? { kind: 'ERROR', reason: `unexpected gh call: ${call.method} ${call.path}` } },
     },
   }
 }
@@ -50,54 +52,54 @@ function gitRoutes(routes: Record<string, RunOutcome>): (args: string[]) => RunO
 }
 
 // ---- 只读 git 事实：存在 / 不存在 / 读取失败三态，失败绝不当"不存在" ----
-test('gitTopLevel 区分「不是仓库」与「读取失败」', () => {
+test('gitTopLevel 区分「不是仓库」与「读取失败」', async () => {
   const notRepo = fakeAdapter({ git: gitRoutes({ 'rev-parse': failOut(128, NOT_A_REPO) }) })
-  assert.equal(gitTopLevel(notRepo.adapter, 'ws').kind, 'none')
+  assert.equal((await gitTopLevel(notRepo.adapter, 'ws')).kind, 'none')
   const broken = fakeAdapter({ git: () => spawnFailOut() })
-  const failed = gitTopLevel(broken.adapter, 'ws')
+  const failed = await gitTopLevel(broken.adapter, 'ws')
   assert.equal(failed.kind, 'error')
   if (failed.kind === 'error') assert.match(failed.reason, /EPERM/)
   const inside = fakeAdapter({ git: gitRoutes({ 'rev-parse': okOut('D:/repo\n') }) })
-  assert.deepEqual(gitTopLevel(inside.adapter, 'ws'), { kind: 'value', value: 'D:/repo' })
+  assert.deepEqual(await gitTopLevel(inside.adapter, 'ws'), { kind: 'value', value: 'D:/repo' })
 })
 
-test('gitHead 区分分支 / detached / 读取失败', () => {
+test('gitHead 区分分支 / detached / 读取失败', async () => {
   const onBranch = fakeAdapter({ git: gitRoutes({ 'rev-parse': okOut('feat/92-x\n') }) })
-  assert.deepEqual(gitHead(onBranch.adapter, 'ws'), { kind: 'value', value: 'feat/92-x' })
+  assert.deepEqual(await gitHead(onBranch.adapter, 'ws'), { kind: 'value', value: 'feat/92-x' })
   const detached = fakeAdapter({ git: gitRoutes({ 'rev-parse': okOut('HEAD\n') }) })
-  assert.deepEqual(gitHead(detached.adapter, 'ws'), { kind: 'value', value: null })
+  assert.deepEqual(await gitHead(detached.adapter, 'ws'), { kind: 'value', value: null })
   const broken = fakeAdapter({ git: gitRoutes({ 'rev-parse': failOut(128, 'fatal: bad object HEAD') }) })
-  assert.equal(gitHead(broken.adapter, 'ws').kind, 'error')
+  assert.equal((await gitHead(broken.adapter, 'ws')).kind, 'error')
 })
 
-test('gitOriginUrl 无 origin 是 none，读取失败是 error', () => {
+test('gitOriginUrl 无 origin 是 none，读取失败是 error', async () => {
   const noOrigin = fakeAdapter({ git: gitRoutes({ 'remote': failOut(2, "error: No such remote 'origin'") }) })
-  assert.equal(gitOriginUrl(noOrigin.adapter, 'ws').kind, 'none')
+  assert.equal((await gitOriginUrl(noOrigin.adapter, 'ws')).kind, 'none')
   const broken = fakeAdapter({ git: gitRoutes({ 'remote': spawnFailOut() }) })
-  assert.equal(gitOriginUrl(broken.adapter, 'ws').kind, 'error')
+  assert.equal((await gitOriginUrl(broken.adapter, 'ws')).kind, 'error')
   const has = fakeAdapter({ git: gitRoutes({ 'remote': okOut('git@github.com:acme/server.git\n') }) })
-  assert.deepEqual(gitOriginUrl(has.adapter, 'ws'), { kind: 'value', value: 'git@github.com:acme/server.git' })
+  assert.deepEqual(await gitOriginUrl(has.adapter, 'ws'), { kind: 'value', value: 'git@github.com:acme/server.git' })
 })
 
-test('gitStatusShort 读取失败不会当 clean', () => {
+test('gitStatusShort 读取失败不会当 clean', async () => {
   const broken = fakeAdapter({ git: gitRoutes({ status: failOut(128, 'fatal: index.lock exists') }) })
-  assert.equal(gitStatusShort(broken.adapter, 'ws').kind, 'error')
+  assert.equal((await gitStatusShort(broken.adapter, 'ws')).kind, 'error')
   const clean = fakeAdapter({ git: gitRoutes({ status: okOut('') }) })
-  assert.deepEqual(gitStatusShort(clean.adapter, 'ws'), { kind: 'value', value: '' })
+  assert.deepEqual(await gitStatusShort(clean.adapter, 'ws'), { kind: 'value', value: '' })
   const dirty = fakeAdapter({ git: gitRoutes({ status: okOut(' M a.ts\n') }) })
-  assert.deepEqual(gitStatusShort(dirty.adapter, 'ws'), { kind: 'value', value: ' M a.ts\n' })
+  assert.deepEqual(await gitStatusShort(dirty.adapter, 'ws'), { kind: 'value', value: ' M a.ts\n' })
 })
 
-test('本地/远端分支查询：不存在是 none，查询失败是 error（不是「不存在」）', () => {
+test('本地/远端分支查询：不存在是 none，查询失败是 error（不是「不存在」）', async () => {
   const absent = fakeAdapter({ git: gitRoutes({ 'for-each-ref': okOut(''), 'ls-remote': okOut('') }) })
-  assert.equal(gitLocalBranch(absent.adapter, 'ws', 'feat/92-x').kind, 'none')
-  assert.equal(gitRemoteBranch(absent.adapter, 'ws', 'feat/92-x').kind, 'none')
+  assert.equal((await gitLocalBranch(absent.adapter, 'ws', 'feat/92-x')).kind, 'none')
+  assert.equal((await gitRemoteBranch(absent.adapter, 'ws', 'feat/92-x')).kind, 'none')
   const present = fakeAdapter({ git: gitRoutes({ 'for-each-ref': okOut('refs/heads/feat/92-x\n'), 'ls-remote': okOut('ce19871\trefs/heads/feat/92-x\n') }) })
-  assert.deepEqual(gitLocalBranch(present.adapter, 'ws', 'feat/92-x'), { kind: 'value', value: 'refs/heads/feat/92-x' })
-  assert.equal(gitRemoteBranch(present.adapter, 'ws', 'feat/92-x').kind, 'value')
+  assert.deepEqual(await gitLocalBranch(present.adapter, 'ws', 'feat/92-x'), { kind: 'value', value: 'refs/heads/feat/92-x' })
+  assert.equal((await gitRemoteBranch(present.adapter, 'ws', 'feat/92-x')).kind, 'value')
   const broken = fakeAdapter({ git: gitRoutes({ 'for-each-ref': spawnFailOut(), 'ls-remote': failOut(128, 'fatal: could not read from remote') }) })
-  assert.equal(gitLocalBranch(broken.adapter, 'ws', 'feat/92-x').kind, 'error')
-  assert.equal(gitRemoteBranch(broken.adapter, 'ws', 'feat/92-x').kind, 'error')
+  assert.equal((await gitLocalBranch(broken.adapter, 'ws', 'feat/92-x')).kind, 'error')
+  assert.equal((await gitRemoteBranch(broken.adapter, 'ws', 'feat/92-x')).kind, 'error')
 })
 
 // ---- gh 读取：严格 JSON + 完整分页，失败不降级成空集合 ----
@@ -122,11 +124,11 @@ function pagedGh(pages: Array<unknown[] | { error: string }>): (call: GhCall) =>
   }
 }
 
-test('ghApiList 至少跨两页取全，满页继续、短页终止', () => {
+test('ghApiList 至少跨两页取全，满页继续、短页终止', async () => {
   const page1 = Array.from({ length: GH_PAGE_SIZE }, (_, i) => ({ number: i + 1 }))
   const page2 = [{ number: 101 }, { number: 102 }]
   const fake = fakeAdapter({ gh: pagedGh([page1, page2]) })
-  const result = ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all' })
+  const result = await ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all' })
   assert.equal(result.kind, 'PASS')
   assert.equal(result.kind === 'PASS' ? result.items.length : 0, GH_PAGE_SIZE + 2)
   assert.deepEqual(fake.ghCalls.map(c => c.query), [
@@ -135,29 +137,29 @@ test('ghApiList 至少跨两页取全，满页继续、短页终止', () => {
   ])
 })
 
-test('ghApiList 首页空数组就是空集合（合法终止）', () => {
+test('ghApiList 首页空数组就是空集合（合法终止）', async () => {
   const fake = fakeAdapter({ gh: pagedGh([[]]) })
-  assert.deepEqual(ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/milestones', query: 'state=all' }), { kind: 'PASS', items: [] })
+  assert.deepEqual(await ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/milestones', query: 'state=all' }), { kind: 'PASS', items: [] })
 })
 
-test('ghApiList 后页失败 → ERROR，不带回已取到的部分当完整事实', () => {
+test('ghApiList 后页失败 → ERROR，不带回已取到的部分当完整事实', async () => {
   const page1 = Array.from({ length: GH_PAGE_SIZE }, (_, i) => ({ number: i + 1 }))
   const fake = fakeAdapter({ gh: pagedGh([page1, { error: 'gh api failed (1): HTTP 502' }]) })
-  const result = ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all' })
+  const result = await ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all' })
   assert.equal(result.kind, 'ERROR')
   assert.match(result.kind === 'ERROR' ? result.reason : '', /page 2/)
 })
 
-test('ghApiList 非数组响应 → ERROR，不当空列表', () => {
+test('ghApiList 非数组响应 → ERROR，不当空列表', async () => {
   const fake = fakeAdapter({ gh: () => ({ kind: 'PASS', details: { message: 'Not Found' } }) })
-  const result = ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all' })
+  const result = await ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all' })
   assert.equal(result.kind, 'ERROR')
 })
 
-test('ghApiList 超过页数上限 → ERROR，不截断后宣称完整', () => {
+test('ghApiList 超过页数上限 → ERROR，不截断后宣称完整', async () => {
   const full = Array.from({ length: GH_PAGE_SIZE }, (_, i) => ({ number: i + 1 }))
   const fake = fakeAdapter({ gh: () => ({ kind: 'PASS', details: full }) })
-  const result = ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all', maxPages: 3 })
+  const result = await ghApiList({ adapter: fake.adapter, cwd: 'ws', path: 'repos/a/b/issues', query: 'state=all', maxPages: 3 })
   assert.equal(result.kind, 'ERROR')
   assert.equal(fake.ghCalls.length, 3)
 })
@@ -197,75 +199,75 @@ function repoFake(overrides: { git?: Record<string, RunOutcome>; gh?: (call: GhC
   })
 }
 
-test('repositoryIdentity：不是仓库 / 无 origin / 非 GitHub 远端都 ERROR，不当空身份', () => {
+test('repositoryIdentity：不是仓库 / 无 origin / 非 GitHub 远端都 ERROR，不当空身份', async () => {
   const notRepo = fakeAdapter({ git: gitRoutes({ 'rev-parse': failOut(128, NOT_A_REPO) }) })
-  assert.equal(repositoryIdentity(notRepo.adapter, 'ws').kind, 'ERROR')
+  assert.equal((await repositoryIdentity(notRepo.adapter, 'ws')).kind, 'ERROR')
   const noOrigin = repoFake({ git: { 'remote': failOut(2, "error: No such remote 'origin'") } })
-  assert.equal(repositoryIdentity(noOrigin.adapter, 'ws').kind, 'ERROR')
+  assert.equal((await repositoryIdentity(noOrigin.adapter, 'ws')).kind, 'ERROR')
   const otherHost = repoFake({ git: { 'remote': okOut('git@gitlab.com:acme/server.git\n') } })
-  assert.equal(repositoryIdentity(otherHost.adapter, 'ws').kind, 'ERROR')
-  const ok = repositoryIdentity(repoFake().adapter, 'ws')
+  assert.equal((await repositoryIdentity(otherHost.adapter, 'ws')).kind, 'ERROR')
+  const ok = await repositoryIdentity(repoFake().adapter, 'ws')
   assert.deepEqual(ok, { kind: 'PASS', value: { owner: 'acme', repo: 'server', topLevel: 'D:/repo' } })
 })
 
-test('listMilestones：分页取全并校验结构，缺字段 / 未知 state 都 ERROR', () => {
+test('listMilestones：分页取全并校验结构，缺字段 / 未知 state 都 ERROR', async () => {
   const page1 = Array.from({ length: GH_PAGE_SIZE }, (_, i) => ({ number: i + 1, title: `M${i + 1}`, state: 'closed' }))
   const page2 = [{ number: 101, title: 'target', state: 'open' }]
   const fake = repoFake({ gh: ghRouter([{ match: () => true, pages: [page1, page2] }]) })
-  const listed = listMilestones(fake.adapter, 'ws', 'acme', 'server')
+  const listed = await listMilestones(fake.adapter, 'ws', 'acme', 'server')
   assert.equal(listed.kind === 'PASS' ? listed.value.length : 0, GH_PAGE_SIZE + 1)
   assert.equal(listed.kind === 'PASS' ? listed.value.find(m => m.title === 'target')?.number : undefined, 101)
 
   const missingNumber = repoFake({ gh: ghRouter([{ match: () => true, pages: [[{ title: 'M', state: 'open' }]] }]) })
-  assert.equal(listMilestones(missingNumber.adapter, 'ws', 'acme', 'server').kind, 'ERROR')
+  assert.equal((await listMilestones(missingNumber.adapter, 'ws', 'acme', 'server')).kind, 'ERROR')
   const badState = repoFake({ gh: ghRouter([{ match: () => true, pages: [[{ number: 1, title: 'M', state: 'merged' }]] }]) })
-  assert.equal(listMilestones(badState.adapter, 'ws', 'acme', 'server').kind, 'ERROR')
+  assert.equal((await listMilestones(badState.adapter, 'ws', 'acme', 'server')).kind, 'ERROR')
   const brokenPage = repoFake({ gh: ghRouter([{ match: () => true, pages: [page1, { error: 'gh api failed (1): HTTP 502' }] }]) })
-  assert.equal(listMilestones(brokenPage.adapter, 'ws', 'acme', 'server').kind, 'ERROR')
+  assert.equal((await listMilestones(brokenPage.adapter, 'ws', 'acme', 'server')).kind, 'ERROR')
 })
 
-test('listIssues：排除 PR，未知 state / 缺字段 / 结构不符都 ERROR', () => {
+test('listIssues：排除 PR，未知 state / 缺字段 / 结构不符都 ERROR', async () => {
   const fake = repoFake({ gh: ghRouter([{ match: () => true, pages: [[issue(1), prEntry(2), issue(3, 'open')]] }]) })
-  const listed = listIssues(fake.adapter, 'ws', 'acme', 'server', 16)
+  const listed = await listIssues(fake.adapter, 'ws', 'acme', 'server', 16)
   assert.deepEqual(listed.kind === 'PASS' ? listed.value.map(i => i.number) : [], [1, 3])
   assert.match(fake.ghCalls[0]!.query ?? '', /state=all&milestone=16&per_page=/)
 
   const unknownState = repoFake({ gh: ghRouter([{ match: () => true, pages: [[{ number: 1, title: 'x', state: 'merged', milestone: null }]] }]) })
-  assert.equal(listIssues(unknownState.adapter, 'ws', 'acme', 'server').kind, 'ERROR')
+  assert.equal((await listIssues(unknownState.adapter, 'ws', 'acme', 'server')).kind, 'ERROR')
   const missingTitle = repoFake({ gh: ghRouter([{ match: () => true, pages: [[{ number: 1, state: 'open', milestone: null }]] }]) })
-  assert.equal(listIssues(missingTitle.adapter, 'ws', 'acme', 'server').kind, 'ERROR')
+  assert.equal((await listIssues(missingTitle.adapter, 'ws', 'acme', 'server')).kind, 'ERROR')
   const badMilestone = repoFake({ gh: ghRouter([{ match: () => true, pages: [[{ number: 1, title: 'x', state: 'open', milestone: { title: 'M' } }]] }]) })
-  assert.equal(listIssues(badMilestone.adapter, 'ws', 'acme', 'server').kind, 'ERROR')
+  assert.equal((await listIssues(badMilestone.adapter, 'ws', 'acme', 'server')).kind, 'ERROR')
   const notArray = repoFake({ gh: () => ({ kind: 'PASS', details: { message: 'Not Found' } }) })
-  assert.equal(listIssues(notArray.adapter, 'ws', 'acme', 'server').kind, 'ERROR')
+  assert.equal((await listIssues(notArray.adapter, 'ws', 'acme', 'server')).kind, 'ERROR')
 })
 
-test('inspectGithubFacts 与 Program 同源：多页取全、排除 PR、只读', () => {
+test('inspectGithubFacts 与 Program 同源：多页取全、排除 PR、只读', async () => {
   const page1 = [...Array.from({ length: 99 }, (_, i) => issue(i + 1)), prEntry(200)]
   const fake = repoFake({ gh: ghRouter([{ match: () => true, pages: [page1, [issue(101)]] }]) })
-  const result = inspectGithubFacts(fake.adapter, 'ws', 'issues')
+  const result = await inspectGithubFacts(fake.adapter, 'ws', 'issues')
   assert.equal(result.ok, true)
   assert.equal(Array.isArray(result.value) ? (result.value as unknown[]).length : -1, 100)
   assert.ok(fake.ghCalls.every(c => c.method === 'GET'))
   assert.equal(fake.writes(), 0)
-  const milestoneIssues = inspectGithubFacts(fake.adapter, 'ws', 'milestone-issues')
+  const milestoneIssues = await inspectGithubFacts(fake.adapter, 'ws', 'milestone-issues')
   assert.equal(milestoneIssues.ok, false)
   const broken = repoFake({ gh: ghRouter([{ match: () => true, pages: [{ error: 'gh api failed (1): HTTP 500' }] }]) })
-  const failed = inspectGithubFacts(broken.adapter, 'ws', 'milestones')
+  const failed = await inspectGithubFacts(broken.adapter, 'ws', 'milestones')
   assert.equal(failed.ok, false)
   assert.match(failed.ok ? '' : failed.reason, /HTTP 500/)
 })
 
-test('inspectGitFact：按 operation 只读必要事实，读取失败返回 ok:false 而不是 null', () => {
+test('inspectGitFact：按 operation 只读必要事实，读取失败返回 ok:false 而不是 null', async () => {
   const fake = repoFake()
-  assert.deepEqual(inspectGitFact(fake.adapter, 'ws', 'remote'), { ok: true, value: REPO_URL })
+  assert.deepEqual(await inspectGitFact(fake.adapter, 'ws', 'remote'), { ok: true, value: REPO_URL })
   assert.deepEqual(fake.gitCalls, [['remote', 'get-url', 'origin']])
   const statusFake = repoFake({ git: { 'status': failOut(128, 'fatal: index.lock exists') } })
-  assert.equal(inspectGitFact(statusFake.adapter, 'ws', 'status').ok, false)
+  assert.equal((await inspectGitFact(statusFake.adapter, 'ws', 'status')).ok, false)
   const dirtyFake = repoFake({ git: { 'status': okOut(' M a.ts\n') } })
-  assert.deepEqual(inspectGitFact(dirtyFake.adapter, 'ws', 'status'), { ok: true, value: ' M a.ts\n' })
+  assert.deepEqual(await inspectGitFact(dirtyFake.adapter, 'ws', 'status'), { ok: true, value: ' M a.ts\n' })
   const detachedFake = repoFake({ git: { 'rev-parse': okOut('HEAD\n') } })
-  assert.deepEqual(inspectGitFact(detachedFake.adapter, 'ws', 'branch'), { ok: true, value: '(detached)' })
+  assert.deepEqual(await inspectGitFact(detachedFake.adapter, 'ws', 'branch'), { ok: true, value: '(detached)' })
 })
 
 // ---- 固定 Program：读取事实不可靠时不产生任何写动作 ----
@@ -399,18 +401,119 @@ test('parseOriginRepo rejects non-github remotes', () => {
   assert.equal(parseOriginRepo('not a url'), undefined)
 })
 
-// 下面两个用例是唯一真的 spawn 子进程的用例（契约就是捕获真实输出与 ENOENT 映射）。
-// 受限沙箱禁止 node 打开捕获管道（`spawnSync git EPERM`），因此在本环境基线失败；
-// 非沙箱环境应通过。Issue #92 的其余用例一律走受控进程适配器，不依赖 spawn。
-test('runProgram captures output of a real command', () => {
-  const result = runProgram('git', ['--version'])
+// ---- Issue #95：异步受控进程（spawnCollect）——全部走注入的受控 SpawnDriver，不真的 spawn ----
+
+/** 受控子进程：EventEmitter 假体，按脚本推进 stdout/stderr/close/error，记录 kill。脚本里的
+ * 事件发射必须在 setImmediate/timer 回调里做——同步发射会在 spawnCollect 挂监听前丢失。 */
+function fakeChild(script: (child: { stdout: EventEmitter; stderr: EventEmitter; self: EventEmitter; killCount: () => number }) => void): { driver: SpawnDriver; killed: () => number } {
+  const self = new EventEmitter()
+  const stdout = new EventEmitter()
+  const stderr = new EventEmitter()
+  let kills = 0
+  const shaped = Object.assign(self, {
+    stdout, stderr,
+    // 模拟真实 kill：被杀后子进程异步 close（真实场景 kill 后 close 事件随之到来）。
+    kill: () => { kills++; setTimeout(() => self.emit('close', null), 0); return true },
+  })
+  script({ stdout, stderr, self, killCount: () => kills })
+  return { driver: () => shaped as never, killed: () => kills }
+}
+
+test('#95 长进程执行中宿主事件循环不被阻塞（heartbeat 推进）', async () => {
+  // 受控延时进程：300ms 后才给输出并 close；期间 10ms heartbeat timer 应多次推进。
+  const { driver } = fakeChild(({ stdout, self }) => {
+    setTimeout(() => { stdout.emit('data', 'git version 9.9.9'); self.emit('close', 0) }, 300)
+  })
+  let beats = 0
+  const beat = setInterval(() => { beats++ }, 10)
+  const started = Date.now()
+  const result = await spawnCollect(driver, { cmd: 'git', args: ['--version'], timeoutMs: 5_000, limit: GIT_OUTPUT_LIMIT })
+  clearInterval(beat)
   assert.equal(result.exitCode, 0)
   assert.match(result.stdout, /git version/)
   assert.equal(result.failedToStart, false)
+  // 300ms 的 10ms heartbeat 至少应推进十几次；若 spawn 阻塞事件循环，beats 会是 0~1。
+  assert.ok(beats >= 10, `heartbeat only beat ${beats} times in ${Date.now() - started}ms`)
 })
 
-test('runProgram reports ENOENT for missing commands', () => {
-  const result = runProgram('definitely-not-a-real-command-xyz', ['--x'])
+test('#95 timeout：到点 kill 子进程并按 timedOut 结算', async () => {
+  const { driver, killed } = fakeChild(() => { /* 永不 close：挂死子进程 */ })
+  const result = await spawnCollect(driver, { cmd: 'git', args: ['fetch'], timeoutMs: 50, limit: GIT_OUTPUT_LIMIT })
+  assert.equal(result.timedOut, true)
+  assert.equal(result.failedToStart, false)
+  assert.equal(killed(), 1)
+})
+
+test('#95 输出超限：kill 子进程并给出明确 ERROR 标记，不当成功', async () => {
+  const { driver, killed } = fakeChild(({ stdout, self }) => {
+    setImmediate(() => { stdout.emit('data', 'x'.repeat(2 * 1024 * 1024)); self.emit('close', 0) })
+  })
+  const result = await spawnCollect(driver, { cmd: 'git', args: ['log'], timeoutMs: 5_000, limit: GIT_OUTPUT_LIMIT })
+  assert.equal(result.timedOut, false)
+  assert.match(result.stderr, /output limit exceeded/)
+  assert.equal(killed(), 1)
+})
+
+test('#95 启动失败：ENOENT 映射为 command not found，与非零退出可区分', async () => {
+  const err = Object.assign(new Error('spawn nope ENOENT'), { code: 'ENOENT' })
+  const { driver } = fakeChild(({ self }) => {
+    setTimeout(() => self.emit('error', err), 0)
+  })
+  const result = await spawnCollect(driver, { cmd: 'nope', args: ['--x'], timeoutMs: 1_000, limit: GIT_OUTPUT_LIMIT })
+  assert.equal(result.failedToStart, true)
+  assert.match(result.stderr, /command not found: nope/)
+  // 非零退出：不是 failedToStart，exitCode 保留
+  const { driver: okDriver } = fakeChild(({ stderr, self }) => {
+    setImmediate(() => { stderr.emit('data', 'fatal: bad'); self.emit('close', 128) })
+  })
+  const failedExit = await spawnCollect(okDriver, { cmd: 'git', args: ['x'], timeoutMs: 1_000, limit: GIT_OUTPUT_LIMIT })
+  assert.equal(failedExit.failedToStart, false)
+  assert.equal(failedExit.exitCode, 128)
+  assert.match(failedExit.stderr, /fatal: bad/)
+})
+
+test('#95 stdin：input 写入后关闭，未传 input 不写', async () => {
+  const writes: string[] = []
+  const makeDriver = (withStdin: boolean): SpawnDriver => {
+    const self = new EventEmitter()
+    setTimeout(() => self.emit('close', 0), 0)
+    return () => Object.assign(self, {
+      stdout: new EventEmitter(), stderr: new EventEmitter(),
+      kill: () => true,
+      stdin: withStdin ? { on: () => undefined, end: (d?: string) => { writes.push(d ?? '') } } : undefined,
+    }) as never
+  }
+  const r1 = await spawnCollect(makeDriver(true), { cmd: 'gh', args: ['api'], timeoutMs: 500, limit: 1024, input: '{"title":"M"}' })
+  assert.deepEqual(writes, ['{"title":"M"}'])
+  assert.equal(r1.failedToStart, false)
+  // 未传 input：不触碰 stdin
+  await spawnCollect(makeDriver(false), { cmd: 'git', args: ['x'], timeoutMs: 500, limit: 1024 })
+  assert.equal(writes.length, 1)
+})
+
+// 下面两个用例是唯一真的 spawn 子进程的用例（契约就是捕获真实输出与 ENOENT 映射）。
+// 受限沙箱（DSH agent node 进程）禁止打开捕获管道，异步 spawn 同步抛 `spawn EPERM`
+// （由 spawnCollect 收敛为 failedToStart）；探测到该环境就跳过，非沙箱环境应通过。
+// Issue #92/#95 的其余用例一律走受控进程适配器/受控 SpawnDriver，不依赖真实 spawn。
+const canRealSpawn = await new Promise<boolean>(resolve => {
+  try {
+    const probe = spawn('node', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true })
+    probe.on('error', (e: NodeJS.ErrnoException) => resolve(e.code !== 'EPERM'))
+    probe.on('close', () => resolve(true))
+  } catch (error) {
+    resolve((error as NodeJS.ErrnoException).code !== 'EPERM')
+  }
+})
+
+test('runProgram captures output of a real command', { skip: canRealSpawn ? false : 'sandbox forbids piped spawn (EPERM)' }, async () => {
+  const result = await runProgram('git', ['--version'])
+  assert.equal(result.failedToStart, false)
+  assert.match(result.stdout, /git version/)
+  assert.equal(result.exitCode, 0)
+})
+
+test('runProgram reports ENOENT for missing commands', { skip: canRealSpawn ? false : 'sandbox forbids piped spawn (EPERM)' }, async () => {
+  const result = await runProgram('definitely-not-a-real-command-xyz', ['--x'])
   assert.equal(result.failedToStart, true)
   assert.match(result.stderr, /not found/i)
 })
