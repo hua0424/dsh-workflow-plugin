@@ -17,11 +17,15 @@ import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
 import { checkCatalogProviders, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
-import type { RunState } from './types.ts'
+import type { RunState, NodeExecution } from './types.ts'
 import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
+import {
+  judgeAdmissionInWorkOrder, makeParticipantIndex, participantInWorkOrder, participantServicesOf,
+  type WorkOrderFacts,
+} from './plugin/participants.ts'
 
 export const name = 'dsh-agent-team-workflow'
 // compaction 不可注入：dsh 0.1.1-rc.7 引入 agent presets 后，压缩后端移入每个
@@ -45,87 +49,86 @@ export function apply(ctx: Context) {
     'This does not cancel old external effects; inspect them before starting new work.',
   ].join('\n')
 
-  /** Live session → workspace key for every run participant (manager + role actors). */
-  const sessionWorkspaces = new Map<string, string>()
-  /** Live session → role key for authorization refinement (role actors only). */
-  const sessionRoles = new Map<string, string>()
-  /** Fresh Judge sessions (continuable); allowed to call judge_claim + the two inspection wrappers. */
-  const judgeSessions = new Set<string>()
-  /** Judge session id → workspace key (for authorization). */
-  const judgeWorkspaces = new Map<string, string>()
+  /**
+   * #99：参与者路由、重启修复与观察引用寿命全部收在同一个深 Module
+   * （`plugin/participants.ts`）。本文件只做两件事：把 Store 的**当前工作单**
+   * 投影成授权事实（唯一权威），以及把宿主 cwd/emitter 事实喂给它。
+   */
+  const participants = makeParticipantIndex(participantServicesOf(ctx), {
+    workspaceKeyOf,
+    facts: async workspaceKey => {
+      const row = await store().get(workspaceKey)
+      return row === undefined ? undefined : workOrderFactsOf(row)
+    },
+    // 冷恢复兜底：cwd 推导不出所属行时按 Session 找一次（不再是无条件全表扫）。
+    factsBySession: async sessionId => {
+      for (const row of await store().list()) {
+        if (row.execution.judge?.sessionId === sessionId) return { workspaceKey: row.workspaceKey, facts: workOrderFactsOf(row) }
+      }
+      return undefined
+    },
+  })
+
+  /** 当前工作单行 → 路由/授权事实。Store 行本身仍是唯一授权权威。 */
+  function workOrderFactsOf(row: { run: RunState; execution: NodeExecution }): WorkOrderFacts {
+    const execution = row.execution
+    const judgment = execution.judgment
+    return {
+      runStatus: row.run.status,
+      phase: execution.phase,
+      managerSessionId: row.run.managerSessionId,
+      roleActors: row.run.roleActors,
+      dispatchSessionId: execution.dispatch?.sessionId,
+      judgeSessionId: execution.judge?.sessionId,
+      judgeJudgedCurrentClaim: judgment !== undefined && judgment.claimId === execution.claim?.id
+        && judgment.inputVersion === execution.inputVersion,
+      predecessorSettlementPending: execution.phase === 'ready' && execution.predecessorId !== undefined,
+    }
+  }
 
   /** Register a fresh Judge session for inspection + judge_claim authorization. */
   function registerJudgeSession(sessionId: string, cwd: string | undefined): void {
-    judgeSessions.add(sessionId)
     // S3: store the CANONICAL workspace key (realpath), not the raw header cwd
     // — state rows are keyed by canonical path, and a mismatch would partition
     // the mutation queue and silently stall the run. If this async lookup fails
     // or races the Judge's first tool call, authorization falls through to the
-    // durable state row repair in isJudgeSessionOf (A1 R12 fail-closed).
-    if (cwd !== undefined) {
-      void workspaceKeyOf(cwd).then(ws => {
-        if (ws !== undefined) {
-          judgeWorkspaces.set(sessionId, ws)
-          sessionWorkspaces.set(sessionId, ws)
-        }
-      }).catch(() => {})
-    }
+    // durable state row repair in judgeAuthorized (A1 R12 fail-closed).
+    if (cwd === undefined) return
+    void workspaceKeyOf(cwd).then(ws => {
+      if (ws !== undefined) participants.admitJudge(sessionId, ws)
+    }).catch(() => {})
   }
 
   /** Revoke a Judge session's authorization (A1 R11). */
   function revokeJudgeSession(sessionId: string): void {
-    judgeSessions.delete(sessionId)
-    judgeWorkspaces.delete(sessionId)
+    participants.revokeJudge(sessionId)
     // 历史routing保留；授权只认当前工作单，不因撤权丢最后turn/end。
-  }
-
-  /**
-   * S1: durable Judge repair after a host restart. The in-memory Judge sets
-   * are empty, but running/blocked rows still carry `judgeSessionId`. A
-   * cold-resumed Judge is re-admitted as the current node's judge when its
-   * session id matches the durable row.
-   */
-  async function durableJudgeWorkspace(sessionId: string): Promise<string | undefined> {
-    for (const row of await store().list()) {
-      if (row.execution.judge?.sessionId === sessionId) return row.workspaceKey
-    }
-    return undefined
   }
 
   /**
    * Whether a session is authorized as the current node's Judge for one
    * workspace. The live registration is workspace-scoped: a Judge admission
    * (and its repair) always resolves through the workspace key recorded at
-   * registration time, never through the session id alone.
+   * registration time, never through the session id alone. Every call judges
+   * against the CURRENT work order row (#99 AC5).
    */
-  async function isJudgeSessionOf(sessionId: string, workspaceKey: string): Promise<boolean> {
-    const admittedWorkspace = judgeWorkspaces.get(sessionId)
+  function judgeAuthorized(sessionId: string, workspaceKey: string, row: { run: RunState; execution: NodeExecution }): boolean {
+    const admittedWorkspace = participants.judgeWorkspaceOf(sessionId)
     if (admittedWorkspace !== undefined && admittedWorkspace !== workspaceKey) return false
     // Missing mapping can be a registration race (async realpath) or a host
-    // restart. Fall back to the durable row in either case; a positive match
-    // repairs the live mappings.
-    const row = await store().get(workspaceKey)
-    const judgment = row?.execution.judgment
-    const currentJudged = judgment !== undefined && judgment.claimId === row?.execution.claim?.id
-      && judgment.inputVersion === row?.execution.inputVersion
-    if (row !== undefined && row.run.status === 'running' && row.execution.phase === 'checking'
-      && !currentJudged && row.execution.judge?.sessionId === sessionId) {
-      judgeSessions.add(sessionId)
-      judgeWorkspaces.set(sessionId, workspaceKey)
-      sessionWorkspaces.set(sessionId, workspaceKey)
-      return true
-    }
-    return false
+    // restart. The durable row repairs the live mappings on a positive match.
+    if (!judgeAdmissionInWorkOrder(workOrderFactsOf(row), sessionId)) return false
+    participants.adopt(sessionId, workspaceKey, { kind: 'judge' })
+    return true
   }
 
   /** Register a role-actor session mapping at creation time (host adapter). */
   function registerRoleActorSession(sessionId: string, roleKey: string, cwd: string | undefined): void {
-    if (cwd !== undefined) {
-      void workspaceKeyOf(cwd).then(ws => {
-        if (ws !== undefined) sessionWorkspaces.set(sessionId, ws)
-      }).catch(() => {})
-    }
-    sessionRoles.set(sessionId, roleKey)
+    participants.rememberRole(sessionId, roleKey)
+    if (cwd === undefined) return
+    void workspaceKeyOf(cwd).then(ws => {
+      if (ws !== undefined) participants.rememberWorkspace(sessionId, ws, 'participation')
+    }).catch(() => {})
   }
 
   function managerOf(run: RunState): Agent | undefined {
@@ -147,7 +150,10 @@ export function apply(ctx: Context) {
   // #91: 兜底回调只服务旧 Run（无 `delegationRoute` 的 v9 行）：不推测历史值，
   // 也不借其他 Run 的值——留空即让宿主 spawn 的正式继承语义从本 Run 自己的
   // Manager 解析。新 Run 一律读 Run row 上的冻结值。
-  const subagentHost = makeSubagentHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }, () => ({}))
+  const subagentHost = makeSubagentHost(
+    { ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession },
+    () => ({}),
+    participants)
   const engine: WorkflowEngine = new WorkflowEngine(
     makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
     subagentHost,
@@ -178,12 +184,14 @@ export function apply(ctx: Context) {
 
   /** Resolve one session's workspace: recorded mapping first, then cwd realpath. */
   async function workspaceOfSession(sessionId: string): Promise<string | undefined> {
-    const recorded = sessionWorkspaces.get(sessionId)
+    const recorded = participants.workspaceOf(sessionId)
     if (recorded !== undefined) return recorded
     const agent = ctx.agents.get(sessionId as SessionId)
     if (agent === undefined) return undefined
     const ws = await workspaceKeyOf(agent.session.header.cwd)
-    if (ws !== undefined) sessionWorkspaces.set(sessionId, ws)
+    // #99 M-1：这里是**探测**（为后续调用定位 workspace），不证明参与——被拒绝的
+    // 无关 Session 也会走到这里，所以它不得单独让该 Session 的证据被保留。
+    if (ws !== undefined) participants.rememberWorkspace(sessionId, ws, 'probe')
     return ws
   }
 
@@ -204,18 +212,20 @@ export function apply(ctx: Context) {
     if (row === undefined) return { workspaceKey: null, reason: 'no active run in this workspace' }
     // S1: a cold-resumed Judge is re-admitted when its id matches the durable
     // row's current judgeSessionId (host-restart repair).
-    const judge = await isJudgeSessionOf(sessionId, ws)
+    const judge = judgeAuthorized(sessionId, ws, row)
     const decision = authorizeToolCall({
       run: row.run,
       sessionId,
-      knownRoleOfSession: sessionRoles.get(sessionId),
+      knownRoleOfSession: participants.roleOf(sessionId),
       isJudgeSession: judge,
       toolName,
     })
     if (!decision.allow) return { workspaceKey: null, reason: decision.reason }
     // Repair live mappings learned from the durable tables (host restart /
     // cold-resumed actors): record and cache them for future calls.
-    if (decision.kind === 'role' && !sessionRoles.has(sessionId)) sessionRoles.set(sessionId, decision.roleKey)
+    if (decision.kind === 'role' && participants.roleOf(sessionId) === undefined) {
+      participants.rememberRole(sessionId, decision.roleKey)
+    }
     return { workspaceKey: ws }
   }
 
@@ -255,7 +265,8 @@ export function apply(ctx: Context) {
   // ---- Role-actor session mapping maintenance ----
   // Every continuable child created for a role records (sessionId, workspace,
   // roleKey). We learn the child id from `subagent/start` (local children) and
-  // join it with the run's roleActors mapping.
+  // join it with the run's roleActors/judge mapping — the restart repair path
+  // for a cold-resumed child (#99).
   ctx.on('subagent/start', (info) => {
     if (stateAccess.maintenanceDiagnostic()) return
     const agent = ctx.agents.get(info.id)
@@ -263,23 +274,15 @@ export function apply(ctx: Context) {
     const parentId = agent.session.header.parentSession
     if (parentId === undefined) return
     void (async () => {
-      const ws = sessionWorkspaces.get(parentId)
+      const ws = participants.workspaceOf(parentId)
       if (ws === undefined) return
-      sessionWorkspaces.set(info.id, ws)
+      // #99 M-1：子会话从父会话继承的只是**位置**（探测），不是参与证据——角色的
+      // 参与身份由下面的工作单行（或创建时的 registerRoleActorSession）证明。
+      participants.rememberWorkspace(info.id, ws, 'probe')
       const row = await store().get(ws)
       if (row === undefined) return
-      // S1: a cold-resumed JUDGE child re-registers via the durable row.
-      if (row.execution.judge?.sessionId === info.id) {
-        judgeSessions.add(info.id)
-        judgeWorkspaces.set(info.id, ws)
-        return
-      }
-      for (const [roleKey, actorId] of Object.entries(row.run.roleActors)) {
-        if (actorId === info.id) {
-          sessionRoles.set(info.id, roleKey)
-          return
-        }
-      }
+      const admission = participantInWorkOrder(workOrderFactsOf(row), info.id)
+      if (admission !== undefined) participants.adopt(info.id, ws, admission)
     })()
   })
 
@@ -305,7 +308,8 @@ export function apply(ctx: Context) {
         const report = checkCatalogProviders(workflowId, entry.config, available)
         if (!report.ok) return { ok: false, reason: renderStartProviderBlock(report) }
         const run = engine.buildInitialRun(agent.session.id, workflowId, entry.config, entry.definitionHash)
-        sessionWorkspaces.set(agent.session.id, workspaceKey)
+        // Manager 启动：该 Session 就是本 Run 的 Manager（工作单行即将引用它），是参与事实。
+        participants.rememberWorkspace(agent.session.id, workspaceKey, 'participation')
         const outcome = await engine.startRun(workspaceKey, run, entry.path, extraText)
         if (!outcome.ok) return { ok: false, reason: outcome.reason }
         return { ok: true, message: `started ${workflowId} (run ${outcome.run?.runId})` }
@@ -363,22 +367,33 @@ export function apply(ctx: Context) {
   const workflowTools = makeWorkflowTools(toolHost)
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
 
-  // append 内只读快照；setImmediate 后才触发可能追加消息的 Runtime。
+  // ---- Turn settlement ----
+  // 同步回调只捕获事实（#99 AC6）：路由已确定的参与者在这里立即定格该 Turn 的消息
+  // 集合与失败诊断；路由未定的 Session 推迟到 setImmediate 之后、由参与者索引做完
+  // 路由判定再定格——无关 Session 的 churn 因此既不再为每个 turn/end 复制整段日志，
+  // 也不再触发一次全表 Store.list（#99 AC7）。判定与推进都不在 append 回调内发生。
   ctx.on('session/event', (session, event) => {
     if (stateAccess.maintenanceDiagnostic() || event.type !== 'turn/end') return
-    const snapshot = session.snapshotEvents()
-    const ids = endedTurnUserMessageIds(snapshot, event)
-    if (ids === undefined) return
-    // #29：同一次读取里取该 Turn 的失败事实（正常结束为 undefined）。诊断在这里
-    // 定格，引擎只收到成品文本——它不需要理解 Host 的 TurnEndReason 形状。
-    const turnFailure = turnEndFailure(snapshot as ReadonlyArray<TurnEndFact>, event as TurnEndFact)
-    subagentHost.observeTurnEnd(session.id)
-    const caller = { sessionId: session.id, turnUserMessageIds: ids }
+    const capture = (): { caller: { sessionId: string; turnUserMessageIds: ReadonlySet<string> }; turnFailure: string | undefined } | undefined => {
+      const snapshot = session.snapshotEvents()
+      const ids = endedTurnUserMessageIds(snapshot, event)
+      if (ids === undefined) return undefined
+      // #29：同一次读取里取该 Turn 的失败事实（正常结束为 undefined）。诊断在这里
+      // 定格，引擎只收到成品文本——它不需要理解 Host 的 TurnEndReason 形状。
+      return {
+        caller: { sessionId: session.id, turnUserMessageIds: ids },
+        turnFailure: turnEndFailure(snapshot as ReadonlyArray<TurnEndFact>, event as TurnEndFact),
+      }
+    }
+    const captured = participants.workspaceOf(session.id) === undefined ? undefined : capture()
+    participants.observeTurnEnd(session.id)
     setImmediate(() => {
       void (async () => {
-        const ws = sessionWorkspaces.get(session.id) ?? await durableJudgeWorkspace(session.id)
-          ?? await workspaceKeyOf(session.header.cwd)
-        if (ws !== undefined) await engine.handleTurnEnded(ws, caller, turnFailure)
+        const ws = await participants.resolveTurn(session.id, session.header.cwd)
+        if (ws === undefined) return
+        const settled = captured ?? capture()
+        if (settled === undefined) return
+        await engine.handleTurnEnded(ws, settled.caller, settled.turnFailure)
       })().catch(error => ctx.logger.warn(`workflow turn settlement failed: ${String(error)}`))
     })
   })

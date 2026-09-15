@@ -3,12 +3,16 @@ import assert from 'node:assert/strict'
 import * as binding from '../src/plugin/turnbind.ts'
 import { makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
 import { inject } from '../src/index.ts'
+import { testParticipants } from './helpers/participants.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
 function makeSafetyHost(ctx: Context, manager: Agent) {
-  return makeSubagentHost({ ctx, managerAgentOf: () => manager, cwdOfManager: async () => undefined,
-    registerJudgeSession() {}, revokeJudgeSession() {}, registerRoleActorSession() {} } satisfies HostAdapters, () => ({}))
+  // #99：观察引用/祖先/orphan 证据由参与者索引持有，host 只做转发。
+  const participants = testParticipants(ctx)
+  const host = makeSubagentHost({ ctx, managerAgentOf: () => manager, cwdOfManager: async () => undefined,
+    registerJudgeSession() {}, revokeJudgeSession() {}, registerRoleActorSession() {} } satisfies HostAdapters, () => ({}), participants)
+  return Object.assign(host, { participants })
 }
 
 test('plugin injects the standard Web services but never compaction (preset-plane since dsh rc.7)', () => {
@@ -41,7 +45,7 @@ test('safe inspection rejects a different live Activation for the observed Sessi
     subagents: { listDescendants: async () => [] },
   } as unknown as Context
   const host = makeSafetyHost(ctx, oldActor)
-  host.observeTurnEnd('actor')
+  host.participants.observeTurnEnd('actor')
   current = replacement
   assert.equal(await host.safeToInspect('actor'), 'unsafe')
 })
@@ -158,7 +162,7 @@ test('safe inspection waits exact Agent, rejects job tail and retains cold/orpha
     subagents: { listDescendants: async () => [] },
   } as unknown as Context
   const host = makeSafetyHost(ctx, actor)
-  host.observeTurnEnd('actor')
+  host.participants.observeTurnEnd('actor')
   let settled = false
   const checking = host.safeToInspect('actor').then(result => { settled = true; return result })
   await Promise.resolve()
