@@ -228,7 +228,6 @@ export function makeStateHost(source: StateStore | (() => StateStore)): StateHos
 export interface HostAdapters {
   ctx: Context
   managerAgentOf(run: RunState): Agent | undefined
-  cwdOfManager(run: RunState): Promise<string | undefined>
   /** Register a fresh Judge session so the plugin can authorize its inspection + judge_claim calls. */
   registerJudgeSession(sessionId: string, cwd: string | undefined): void
   /** Revoke a Judge session's authorization (A1 R11). */
@@ -573,12 +572,14 @@ async function compactOnce(
   return outcome
 }
 
-export function makeProgramHost(adapters: HostAdapters): ProgramHost {
-  return {
-    async run(_run, programId, parameters, cwd) {
-      const def = BUILTIN_PROGRAMS[programId]
-      if (def === undefined) return { kind: 'ERROR', reason: `unknown program ${programId}` }
-      return def.run({ cwd }, parameters)
-    },
-  }
+/**
+ * #100：Program 执行只经固定映射（`BUILTIN_PROGRAMS`）——不需要任何 Host 依赖，
+ * 因此不再是带无用 adapters 参数的 maker，而是一个常量 Seam（engine 的 ProgramHost）。
+ */
+export const programHost: ProgramHost = {
+  async run(_run, programId, parameters, cwd) {
+    const def = BUILTIN_PROGRAMS[programId]
+    if (def === undefined) return { kind: 'ERROR', reason: `unknown program ${programId}` }
+    return def.run({ cwd }, parameters)
+  },
 }

@@ -21,7 +21,7 @@ import type { RunState, NodeExecution } from './types.ts'
 import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
-import { makeStateHost, makeDispatchTargets, makeSubagentHost, makeProgramHost } from './plugin/host.ts'
+import { makeStateHost, makeDispatchTargets, makeSubagentHost, programHost, type HostAdapters } from './plugin/host.ts'
 import {
   judgeAdmissionInWorkOrder, makeParticipantIndex, participantInWorkOrder, participantServicesOf,
   type WorkOrderFacts,
@@ -150,14 +150,14 @@ export function apply(ctx: Context) {
   // #91: 兜底回调只服务旧 Run（无 `delegationRoute` 的 v9 行）：不推测历史值，
   // 也不借其他 Run 的值——留空即让宿主 spawn 的正式继承语义从本 Run 自己的
   // Manager 解析。新 Run 一律读 Run row 上的冻结值。
-  const subagentHost = makeSubagentHost(
-    { ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession },
-    () => ({}),
-    participants)
+  // #100：HostAdapters 只保留适配层真正读取的 Seam（cwd 由 engine.cwdResolver 提供）；
+  // Program 执行不依赖 Host，直接用常量 programHost。
+  const adapters: HostAdapters = { ctx, managerAgentOf: managerOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }
+  const subagentHost = makeSubagentHost(adapters, () => ({}), participants)
   const engine: WorkflowEngine = new WorkflowEngine(
-    makeDispatchTargets({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
+    makeDispatchTargets(adapters),
     subagentHost,
-    makeProgramHost({ ctx, managerAgentOf: managerOf, cwdOfManager: cwdOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }),
+    programHost,
     makeStateHost(store),
   )
   engine.cwdResolver = cwdOf
