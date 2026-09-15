@@ -130,8 +130,6 @@ export interface CheckerRef {
   config: Record<string, unknown>
 }
 
-export type EndTarget = 'END'
-
 export interface ActorTaskNode {
   execution: ActorTaskExecution
   checker: CheckerRef

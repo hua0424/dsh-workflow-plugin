@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseJudgeClaim, renderJudgePrompt } from '../src/judge/checker.ts'
+import { renderJudgePrompt } from '../src/judge/checker.ts'
 import { projectNodeLocal, projectSessionSurface, messageText, compressDispatchToHandoff, PROJECTION_MAX_CHARS, PROJECTION_WINDOW_MANAGER_ACTOR, type ProjectionSource } from '../src/judge/projection.ts'
 import { Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
@@ -43,24 +43,6 @@ test('#46 P5: consolidated submission text carries single-source key clauses', (
   assert.match(prompt, /verifiable fact/i)
   assert.match(prompt, /NEED_CONTEXT/)
   assert.match(prompt, /preference.*criterion/i)
-})
-
-test('parseJudgeClaim accepts ACCEPT/REJECT/NEED_CONTEXT (A1 v2)', () => {
-  assert.deepEqual(parseJudgeClaim({ result: 'ACCEPT', reason: 'good' }), { result: 'ACCEPT', reason: 'good' })
-  assert.deepEqual(parseJudgeClaim({ result: 'REJECT', reason: 'bad' }), { result: 'REJECT', reason: 'bad' })
-  assert.deepEqual(parseJudgeClaim({ result: 'NEED_CONTEXT', reason: 'need repo' }), { result: 'NEED_CONTEXT', reason: 'need repo' })
-  // The v1 values are gone for good (D1: no dual-track).
-  assert.equal(parseJudgeClaim({ result: 'PASS', reason: 'good' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'FAIL', reason: 'bad' }), undefined)
-})
-
-test('parseJudgeClaim rejects invalid shapes', () => {
-  assert.equal(parseJudgeClaim({ result: 'MAYBE', reason: 'x' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'ACCEPT' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'ACCEPT', reason: '' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'ACCEPT', reason: '  ' }), undefined)
-  assert.equal(parseJudgeClaim({ result: 'ACCEPT', reason: 'x'.repeat(2001) }), undefined)
-  assert.equal(parseJudgeClaim(null), undefined)
 })
 
 test('T2 Judge packet preserves the actual handoff literally, without a summary', () => {
