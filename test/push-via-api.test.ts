@@ -27,8 +27,9 @@ function setup() {
   writeFileSync(join(work, 'src/lib/deep.txt'), 'deep v1\n');
   sh(work, 'git', 'add', '-A');
   sh(work, 'git', 'commit', '-m', 'base');
-  // 远端预置 base 提交（本地路径 push，无凭据交互）
+  // 远端预置 base 提交（本地路径 push，无凭据交互）；脚本 verify 经命名 remote fetch
   sh(work, 'git', 'push', bare, 'main:refs/heads/topic');
+  sh(work, 'git', 'remote', 'add', 'origin', bare);
   const baseSha = sh(work, 'git', 'rev-parse', 'HEAD').trim();
   // 本地新提交：修改 + 新增嵌套文件 + 删除 + 多行 message
   writeFileSync(join(work, 'a.txt'), 'hello v2\n');

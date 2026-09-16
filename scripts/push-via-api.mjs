@@ -167,8 +167,8 @@ if (dryRun) {
 if (dryRun || skipVerify) {
   console.log('[skip] 跳过 tree 级等价核验');
 } else {
-  const url = gh('repo', 'view', repo, '--json', 'sshUrl', '-q', '.sshUrl');
-  git('fetch', '--quiet', url, `refs/heads/${remoteRef}`);
+  // 经命名 remote（--remote，默认 origin）fetch 做等价核验：目标场景即受限网络，ssh 22 常被断
+  git('fetch', '--quiet', remote, `refs/heads/${remoteRef}`);
   git('diff', '--quiet', '--exit-code', 'FETCH_HEAD', localCommit); // 非零即内容不等价，抛错终止
   const remoteTree = git('rev-parse', 'FETCH_HEAD^{tree}');
   const localTree = git('rev-parse', `${localCommit}^{tree}`);

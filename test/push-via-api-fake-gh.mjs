@@ -76,6 +76,7 @@ if (method === 'POST' && path === 'repos/t/r/git/commits') {
 if (method === 'PATCH' && path.startsWith('repos/t/r/git/refs/heads/')) {
   const name = path.replace('repos/t/r/git/refs/heads/', '');
   const r = refs(); r[name] = readInput().sha; writeRefs(r);
+  git('', 'update-ref', `refs/heads/${name}`, r[name]); // 物化到 bare，脚本 verify 的 fetch 才能看到
   log({ kind: 'ref-update', ref: name, sha: r[name] });
   process.exit(0);
 }
@@ -83,6 +84,7 @@ if (method === 'POST' && path === 'repos/t/r/git/refs') {
   const { ref, sha } = readInput();
   const name = ref.replace('refs/heads/', '');
   const r = refs(); r[name] = sha; writeRefs(r);
+  git('', 'update-ref', `refs/heads/${name}`, sha);
   log({ kind: 'ref-create', ref: name, sha });
   process.exit(0);
 }
