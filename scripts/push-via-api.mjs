@@ -41,6 +41,12 @@ function run(cmd, cmdArgs, opts = {}) {
   return execFileSync(cmd, cmdArgs, { maxBuffer: 256 * 1024 * 1024, ...opts });
 }
 function git(...a) { return run('git', a).toString().trim(); }
+// 提交 message 取 commit 对象原文（首个空行之后的全部字节）：坑⑤要求孪生 commit 的 message 与本地一致，
+// 而 git() 的 trim 会丢掉末尾换行（git 生成的提交恒以 \n 结尾），发布出去即与本地 message 不逐字节等价。
+function commitMessage(sha) {
+  const raw = run('git', ['cat-file', 'commit', sha]).toString('utf8');
+  return raw.slice(raw.indexOf('\n\n') + 2);
+}
 // 测试 seam：PUSH_VIA_API_GH 指向替代 gh 的脚本（以 node 执行），生产恒为 'gh'
 function gh(...a) {
   const stub = process.env.PUSH_VIA_API_GH;
@@ -144,7 +150,7 @@ console.log(`tree: ${newTree}`);
 let newCommit = 'dry-run-commit';
 if (!dryRun) {
   newCommit = JSON.parse(ghApiJson('POST', `${api}/commits`, {
-    message: git('log', '-1', '--format=%B', localRef),
+    message: commitMessage(localCommit),
     tree: newTree,
     parents: [remoteHead],
   })).sha;
