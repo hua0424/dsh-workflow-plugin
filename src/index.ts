@@ -7,7 +7,6 @@
  */
 import { Context } from '@deepseek-ai/cordis'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
-import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
@@ -21,7 +20,7 @@ import type { RunState, NodeExecution } from './types.ts'
 import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
-import { makeStateHost, makeDispatchTargets, makeSubagentHost, programHost, type HostAdapters } from './plugin/host.ts'
+import { makeStateHost, makeDispatchTargets, makeSubagentHost, managerRouteOf, programHost, type HostAdapters } from './plugin/host.ts'
 import {
   judgeAdmissionInWorkOrder, makeParticipantIndex, participantInWorkOrder, participantServicesOf,
   type WorkOrderFacts,
@@ -147,13 +146,11 @@ export function apply(ctx: Context) {
     return ctx.agents.currentInitiator()
   }
 
-  // #91: 兜底回调只服务旧 Run（无 `delegationRoute` 的 v9 行）：不推测历史值，
-  // 也不借其他 Run 的值——留空即让宿主 spawn 的正式继承语义从本 Run 自己的
-  // Manager 解析。新 Run 一律读 Run row 上的冻结值。
   // #100：HostAdapters 只保留适配层真正读取的 Seam（cwd 由 engine.cwdResolver 提供）；
-  // Program 执行不依赖 Host，直接用常量 programHost。
+  // Program 执行不依赖 Host，直接用常量 programHost。#118 D-91-2：旧 Run 兜底回调
+  // 已裁掉——无 `delegationRoute` 的行读取侧显式落空（host.ts routeOf）。
   const adapters: HostAdapters = { ctx, managerAgentOf: managerOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }
-  const subagentHost = makeSubagentHost(adapters, () => ({}), participants)
+  const subagentHost = makeSubagentHost(adapters, participants)
   const engine: WorkflowEngine = new WorkflowEngine(
     makeDispatchTargets(adapters),
     subagentHost,
@@ -162,14 +159,8 @@ export function apply(ctx: Context) {
   )
   engine.cwdResolver = cwdOf
   // F22 / #91：Run 启动时冻结 Manager 的默认路由，冻结值随 Run row 持久化。
-  // 取源走 DSH 固定版本的正式委派 helper——最新 request header 拥有 provider/model，
-  // 创建该会话时的 options 兜底——这样冻结值与新建子会话真正会继承到的路由一致。
-  engine.managerRoute = async (managerSessionId: string) => {
-    const agent = ctx.agents.get(managerSessionId as SessionId)
-    if (agent === undefined) return {}
-    const options = parentAgentOptionsForDelegation(agent)
-    return { provider: options.provider, model: options.model }
-  }
+  // #118 D-91-3：取源语义唯一生产实现在 host.ts `managerRouteOf`，测试同源断言。
+  engine.managerRoute = async (managerSessionId: string) => managerRouteOf(ctx.agents.get(managerSessionId as SessionId))
   // F13: actor-activity oracle for resume/model-switch checks.
   engine.actorActivity = async (actorSessionId: string) => {
     const agent = ctx.agents.get(actorSessionId as SessionId)

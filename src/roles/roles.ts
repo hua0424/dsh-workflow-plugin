@@ -81,16 +81,17 @@ export function judgeLabel(nodeId: string): string {
   return `workflow-judge:${nodeId}`
 }
 
-/** Resolve a Role's effective model route: override > role def > frozen Manager route. def 分支走共享单源。 */
-export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: DelegationRoute): { provider?: string; model?: string } {
+/**
+ * Resolve a Role's effective model route: override > role def > frozen Manager
+ * route. def 分支走共享单源。#118 D-91-1：三条分支全是领域事实（`modelId`），
+ * 直接返回 `DelegationRoute`，交界处不再有逐字段的匿名形状转换。
+ */
+export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: DelegationRoute): DelegationRoute {
   const override = run.modelOverrides[roleKey]
-  if (override !== undefined) return { provider: override.provider, model: override.modelId }
+  if (override !== undefined) return override
   const def = readRoleDefModel(run.definitionSnapshot, roleKey)
-  if (def !== undefined) return { provider: def.provider, model: def.modelId }
-  if (frozen !== undefined && (frozen.provider !== undefined || frozen.modelId !== undefined)) {
-    return { provider: frozen.provider, model: frozen.modelId }
-  }
-  return {} // inherit the Manager route at spawn time
+  if (def !== undefined) return def
+  return frozen ?? {} // inherit the Manager route at spawn time
 }
 
 /** The deny list for a worker role (empty when none). */
@@ -108,7 +109,7 @@ export function roleDenyList(run: RunState, roleKey: string): string[] {
 export function judgeSpawnPlan(run: RunState, frozen?: DelegationRoute): {
   persona: string
   toolFilter: { deny: readonly string[] }
-  agentOptions: { provider?: string; model?: string }
+  agentOptions: DelegationRoute
 } {
   const route = resolveRoleModel(run, 'judge', frozen)
   return {

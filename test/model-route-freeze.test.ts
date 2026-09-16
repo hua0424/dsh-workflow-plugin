@@ -18,11 +18,11 @@ import { MessageId } from '@deepseek-ai/dsh-llm'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize } from '../src/catalog/validate.ts'
 import { WorkflowEngine, type JudgeSpawnInput, type SubagentHost } from '../src/engine/engine.ts'
-import { makeStateHost, makeSubagentHost, type HostAdapters } from '../src/plugin/host.ts'
+import { makeStateHost, makeSubagentHost, managerRouteOf, type HostAdapters } from '../src/plugin/host.ts'
 import { testParticipants } from './helpers/participants.ts'
-import { JUDGE_REQUIRED_TOOLS } from '../src/roles/roles.ts'
+import { judgeSpawnPlan, JUDGE_REQUIRED_TOOLS, resolveRoleModel } from '../src/roles/roles.ts'
+import { routeToAgentOptions, type RunState, type SpawnAgentOptions, type WorkflowConfig } from '../src/types.ts'
 import { StateStore } from '../src/state/store.ts'
-import type { RunState, WorkflowConfig } from '../src/types.ts'
 
 const CONFIG: WorkflowConfig = validateAndNormalize(parseCatalogConfig(`
 schemaVersion: agent-workflow/v2
@@ -55,19 +55,23 @@ function managerAgent(sessionId: string, provider: string, model: string): Agent
 
 interface Spawn {
   label: string
-  agentOptions: { provider?: string; model?: string } | undefined
+  agentOptions: SpawnAgentOptions | undefined
 }
 
-/** 记录每次真实 spawn 的 label 与 agentOptions。 */
-function recordingHost(managers: Map<string, Agent>, spawns: Spawn[]): SubagentHost & { observeTurnEnd(sessionId: string): void } {
+/**
+ * #118 D-91-3：替身不再复刻路由优先级——直接消费生产决策函数
+ * （`resolveRoleModel` / `judgeSpawnPlan`，即 `makeSubagentHost` 使用的同源），
+ * 只负责把每次 spawn 的 agentOptions 记录下来。
+ */
+function recordingHost(spawns: Spawn[]): SubagentHost & { observeTurnEnd(sessionId: string): void } {
   let serial = 0
   const base = {
     async ensureRoleActor(run: RunState, roleKey: string, _initialText: string) {
-      spawns.push({ label: `role:${roleKey}`, agentOptions: routeFor(run, managers) })
+      spawns.push({ label: `role:${roleKey}`, agentOptions: routeToAgentOptions(resolveRoleModel(run, roleKey, run.delegationRoute)) })
       return { childId: `child-${++serial}`, messageId: `message-${serial}` }
     },
     async startJudge(run: RunState, input: { judgeSessionId: string }) {
-      spawns.push({ label: 'judge', agentOptions: routeFor(run, managers) })
+      spawns.push({ label: 'judge', agentOptions: routeToAgentOptions(judgeSpawnPlan(run, run.delegationRoute).agentOptions) })
       return { judgeSessionId: input.judgeSessionId, messageId: `message-${++serial}` }
     },
   }
@@ -83,33 +87,16 @@ function recordingHost(managers: Map<string, Agent>, spawns: Spawn[]): SubagentH
   }
 }
 
-/**
- * 复刻正式 host 的默认路由优先级：modelOverrides > 显式 Role/Judge 配置 >
- * 本 Run 冻结默认值 > host 继承。这里只断言"默认值来自哪个 Run"。
- */
-function routeFor(run: RunState, managers: Map<string, Agent>): { provider?: string; model?: string } | undefined {
-  const frozen = run.delegationRoute
-  if (frozen !== undefined) return { provider: frozen.provider, model: frozen.modelId }
-  const manager = managers.get(run.managerSessionId)
-  if (manager === undefined) return undefined
-  const options = parentAgentOptionsForDelegation(manager)
-  return { provider: options.provider, model: options.model }
-}
-
 /** 真实插件形态：一个 Engine 实例 + 一个 Store；workspace 由 state row 区分。 */
 function engineFor(store: StateStore, managers: Map<string, Agent>, spawns: Spawn[]): WorkflowEngine {
   const engine = new WorkflowEngine({
     async steerManager() { return { messageId: 'manager-message' } },
     async sendRoleActor() { return { messageId: 'role-message' } },
     managerSessionSeq() { return 0 },
-  }, recordingHost(managers, spawns), { async run() { throw new Error('no programs') } }, makeStateHost(store))
+  }, recordingHost(spawns), { async run() { throw new Error('no programs') } }, makeStateHost(store))
   engine.cwdResolver = async () => 'cwd'
-  engine.managerRoute = async (managerSessionId: string) => {
-    const manager = managers.get(managerSessionId)
-    if (manager === undefined) return {}
-    const options = parentAgentOptionsForDelegation(manager)
-    return { provider: options.provider, model: options.model }
-  }
+  // 与生产装配同源（host.ts managerRouteOf），替身不复刻取源语义。
+  engine.managerRoute = async managerSessionId => managerRouteOf(managers.get(managerSessionId))
   return engine
 }
 
@@ -271,18 +258,18 @@ function judgeInput(run: RunState, judgeSessionId: string): JudgeSpawnInput {
 /**
  * 真实 `makeSubagentHost` 的受控 ctx：捕获 spawn（`startContinuable`）与 compact
  * fallback（`agents.resume`）边界实际收到的 agentOptions，并让 Judge spawn 的
- * fail-closed 工具面断言可以通过。`legacyRoute` 默认与生产装配一致（恒空）。
+ * fail-closed 工具面断言可以通过。#118 D-91-2：host 无 legacyRoute 兜底。
  */
 function realHost(
   managers: Map<string, Agent>,
-  options: { judgeSessionId?: string; legacyRoute?: () => { provider?: string; model?: string } } = {},
+  options: { judgeSessionId?: string } = {},
 ): {
   host: ReturnType<typeof makeSubagentHost>
-  spawns: Array<{ label: string; agentOptions: { provider?: string; model?: string } | undefined }>
+  spawns: Array<{ label: string; agentOptions: SpawnAgentOptions | undefined }>
   resumes: Array<{ resumeSessionId: string; agentOptions: unknown }>
 } {
   const judgeSessionId = options.judgeSessionId ?? 'judge-child'
-  const spawns: Array<{ label: string; agentOptions: { provider?: string; model?: string } | undefined }> = []
+  const spawns: Array<{ label: string; agentOptions: SpawnAgentOptions | undefined }> = []
   const resumes: Array<{ resumeSessionId: string; agentOptions: unknown }> = []
   const visible = JUDGE_REQUIRED_TOOLS.map(name => ({ name }))
   const judgeChild = { id: judgeSessionId, ctx: { tools: { schemas: () => visible } } } as unknown as Agent
@@ -316,16 +303,15 @@ function realHost(
     managerAgentOf: run => managers.get(run.managerSessionId),
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
-  return { host: makeSubagentHost(adapters, options.legacyRoute ?? (() => ({})), testParticipants(ctx)), spawns, resumes }
+  return { host: makeSubagentHost(adapters, testParticipants(ctx)), spawns, resumes }
 }
 
-test('host 侧 Role 派发使用本 Run 冻结的路由（不读其他 Run 的当前 Manager）', async () => {
+test('host 侧 Role 派发使用本 Run 冻结的路由', async () => {
   const managers = new Map<string, Agent>([
     ['manager-a', managerAgent('manager-a', 'provider-a', 'model-a')],
     ['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')],
   ])
-  // 第三个参数即"当前 Manager 的实时路由"：本 Run 已冻结时必须不参与决策。
-  const { host, spawns } = realHost(managers, { legacyRoute: () => ({ provider: 'provider-b', model: 'model-b' }) })
+  const { host, spawns } = realHost(managers)
   await host.ensureRoleActor(hostRun('manager-a', { provider: 'provider-a', modelId: 'model-a' }), 'worker', 'first dispatch')
   await host.ensureRoleActor(hostRun('manager-b', { provider: 'provider-b', modelId: 'model-b' }), 'worker', 'first dispatch')
   assert.deepEqual(spawns.map(s => s.agentOptions), [
@@ -334,12 +320,12 @@ test('host 侧 Role 派发使用本 Run 冻结的路由（不读其他 Run 的�
   ])
 })
 
-test('host 侧 Judge spawn 使用本 Run 冻结的路由（不读其他 Run 的当前 Manager）', async () => {
+test('host 侧 Judge spawn 使用本 Run 冻结的路由', async () => {
   const managers = new Map<string, Agent>([
     ['manager-a', managerAgent('manager-a', 'provider-a', 'model-a')],
     ['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')],
   ])
-  const { host, spawns } = realHost(managers, { judgeSessionId: 'judge-a', legacyRoute: () => ({ provider: 'provider-b', model: 'model-b' }) })
+  const { host, spawns } = realHost(managers, { judgeSessionId: 'judge-a' })
   const run = hostRun('manager-a', { provider: 'provider-a', modelId: 'model-a' })
   assert.deepEqual(await host.startJudge(run, judgeInput(run, 'judge-a')), { judgeSessionId: 'judge-a', messageId: 'message-1' })
   assert.deepEqual(spawns, [{ label: 'workflow-judge:work', agentOptions: { provider: 'provider-a', model: 'model-a' } }],
@@ -348,7 +334,7 @@ test('host 侧 Judge spawn 使用本 Run 冻结的路由（不读其他 Run 的�
 
 test('host 侧 compact fallback 使用本 Run 冻结的路由', async () => {
   const managers = new Map<string, Agent>([['manager-b', managerAgent('manager-b', 'provider-b', 'model-b')]])
-  const { host, resumes } = realHost(managers, { legacyRoute: () => ({ provider: 'provider-b', model: 'model-b' }) })
+  const { host, resumes } = realHost(managers)
   const run = { ...hostRun('manager-b', { provider: 'provider-a', modelId: 'model-a' }), roleActors: { worker: 'sess-worker' } }
   assert.deepEqual(await host.compactRoleActor(run, 'worker'), { ok: true, detail: 'no compaction backend; boundary compact skipped' })
   assert.deepEqual(resumes, [{ resumeSessionId: 'sess-worker', agentOptions: { provider: 'provider-a', model: 'model-a' } }],
