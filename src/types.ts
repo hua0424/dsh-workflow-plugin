@@ -59,6 +59,30 @@ export interface RoleModel {
 export type DelegationRoute = Partial<RoleModel>
 
 /**
+ * #118 D-91-1：DSH spawn/resume 边界的 agentOptions 形状——宿主 API 说 `model`，
+ * 领域事实说 `modelId`。两个方向各只保留**一个**命名交界函数（下方），除此之外
+ * 全仓库统一以 `DelegationRoute` 表达模型路由，不再出现散落的条件展开转换。
+ */
+export interface SpawnAgentOptions {
+  provider?: string
+  model?: string
+}
+
+/** 唯一的 modelId→model 交界：路由 → DSH agentOptions；两个分量都缺即 undefined（宿主继承）。 */
+export function routeToAgentOptions(route: DelegationRoute | undefined): SpawnAgentOptions | undefined {
+  if (route === undefined || (route.provider === undefined && route.modelId === undefined)) return undefined
+  return { provider: route.provider, model: route.modelId }
+}
+
+/** 唯一的 model→modelId 交界：DSH agentOptions → 冻结进 Run row 的路由。 */
+export function agentOptionsToRoute(options: SpawnAgentOptions): DelegationRoute {
+  const route: DelegationRoute = {}
+  if (options.provider !== undefined) route.provider = options.provider
+  if (options.model !== undefined) route.modelId = options.model
+  return route
+}
+
+/**
  * Issue #41：catalog def 层 → 角色 route 的共享单源（`'judge'` 固定取
  * judgeRole，其余取 roles[roleKey]）。`checkCatalogProviders`、start 前置
  * 检查与 `resolveRoleModel` 的 def 分支三方共用；签名不依赖 RunState。

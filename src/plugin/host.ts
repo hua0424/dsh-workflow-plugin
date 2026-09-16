@@ -10,14 +10,15 @@ import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-c
 // 经 DSH 安装解析；roster 缺席（base-only profile / 旧版 dsh）时 get 返回
 // undefined，走宿主平面回退——与 dsh-subagent/child-agent.ts 的用法一致。
 import type {} from '@deepseek-ai/dsh-agent-presets'
+import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import type { ContinuableStartSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError, type SessionHandle, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { StateStore } from '../state/store.ts'
-import type { RunState } from '../types.ts'
-import { WorkflowError } from '../types.ts'
+import type { DelegationRoute, RunState, SpawnAgentOptions } from '../types.ts'
+import { routeToAgentOptions, WorkflowError } from '../types.ts'
 import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { JUDGE_REQUIRED_TOOLS, JUDGE_DEFAULT_DENY, judgeLabel, judgeSpawnPlan, knownDenyList, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
@@ -268,14 +269,26 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
 }
 
 /**
- * #91: 默认路由的读取点是**本 Run 自己**的冻结值（`engine.startRun` 写入并随
- * State row 持久化）。`legacyRoute` 回调只作为旧 Run（无该字段）的兜底——旧 Run
- * 不推测历史事实，交给宿主 spawn 的正式继承语义解析。因此同一插件实例里多个
+ * #118 D-91-3：Manager 默认路由取源的唯一生产实现（`engine.managerRoute` 的
+ * 装配体与测试断言共用此处，替身不再复刻取源语义）。取源走 DSH 固定版本的
+ * 正式委派 helper——最新 request header 拥有 provider/model，创建该会话时的
+ * options 兜底——这样冻结值与新建子会话真正会继承到的路由一致。
+ */
+export function managerRouteOf(agent: Agent | undefined): SpawnAgentOptions {
+  if (agent === undefined) return {}
+  const options = parentAgentOptionsForDelegation(agent)
+  return { provider: options.provider, model: options.model }
+}
+
+/**
+ * #91/#118：默认路由的读取点是**本 Run 自己**的冻结值（`engine.startRun` 写入并随
+ * State row 持久化）。旧 Run（无该字段）读取侧显式落空为 `undefined`——不推测
+ * 历史事实，交给宿主 spawn 的正式继承语义解析。因此同一插件实例里多个
  * workspace 交错运行时，谁都不会读到别人的路由。
  */
-export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { provider?: string; model?: string }, participants: ParticipantIndex): SubagentHost {
-  /** #91: 本 Run 冻结值优先；旧 Run 无冻结信息时才走兜底回调。 */
-  const routeOf = (run: RunState): { provider?: string; model?: string } => run.delegationRoute ?? legacyRoute()
+export function makeSubagentHost(adapters: HostAdapters, participants: ParticipantIndex): SubagentHost {
+  /** #91: 本 Run 冻结值；旧 Run 无该字段即 undefined（宿主继承）。 */
+  const routeOf = (run: RunState): DelegationRoute | undefined => run.delegationRoute
   async function judgePrompt(run: RunState, input: import('../engine/engine.ts').JudgeSpawnInput): Promise<string> {
     const manager = adapters.managerAgentOf(run)
     if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
@@ -324,9 +337,7 @@ export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { pr
           parent: manager,
           persona: roleDef.persona,
           toolFilter: deny.length > 0 ? { deny } : undefined,
-          agentOptions: route.provider !== undefined || route.model !== undefined
-            ? { provider: route.provider, model: route.model }
-            : undefined,
+          agentOptions: routeToAgentOptions(route),
         },
       }, `spawn role ${roleKey}`)
       // Record the session mapping IMMEDIATELY at creation — the child's first
@@ -362,9 +373,7 @@ export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { pr
           parent: manager,
           persona: plan.persona,
           toolFilter: deny.length > 0 ? { deny } : undefined,
-          agentOptions: plan.agentOptions.provider !== undefined || plan.agentOptions.model !== undefined
-            ? { provider: plan.agentOptions.provider, model: plan.agentOptions.model }
-            : undefined,
+          agentOptions: routeToAgentOptions(plan.agentOptions),
         },
       }, 'spawn judge')
 
@@ -450,7 +459,7 @@ export function makeSubagentHost(adapters: HostAdapters, legacyRoute: () => { pr
  */
 async function compactWithRetry(
   adapters: HostAdapters,
-  runRoute: { provider?: string; model?: string },
+  runRoute: DelegationRoute | undefined,
   run: RunState,
   roleKey: string,
   childId: string,
@@ -476,7 +485,7 @@ async function compactWithRetry(
  */
 async function compactOnce(
   adapters: HostAdapters,
-  runRoute: { provider?: string; model?: string },
+  runRoute: DelegationRoute | undefined,
   run: RunState,
   roleKey: string,
   childId: string,
@@ -519,7 +528,7 @@ async function compactOnce(
       // fallback (compaction summarization* config > the session's own
       // latest routed request), so the summary model may differ from the
       // actor's model.
-      agentOptions: route.provider !== undefined || route.model !== undefined ? route : undefined,
+      agentOptions: routeToAgentOptions(route),
       // Maintenance materialization must join the parent preset too: the
       // compaction backend (and every model-facing row) lives in the
       // preset's isolate domain, and an unjoined agent resolves no backend

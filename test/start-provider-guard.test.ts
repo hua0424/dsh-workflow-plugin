@@ -172,12 +172,12 @@ test('三方共用同一 def 读取单源：override > def > frozen 不变', () 
   assert.deepEqual(readRoleDefModel(run.definitionSnapshot, 'judge'), { provider: 'good-provider', modelId: 'jm' })
   assert.equal(readRoleDefModel(run.definitionSnapshot, 'plain'), undefined)
   assert.equal(readRoleDefModel(run.definitionSnapshot, 'nobody'), undefined)
-  // resolveRoleModel：def 分支委托单源，优先级不变
-  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'good-provider', model: 'm1' })
+  // resolveRoleModel：def 分支委托单源，优先级不变；三条分支统一返回 DelegationRoute
+  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'good-provider', modelId: 'm1' })
   assert.deepEqual(resolveRoleModel(run, 'plain'), {})
-  assert.deepEqual(resolveRoleModel(run, 'judge', { provider: 'frozen-p', modelId: 'frozen-m' }), { provider: 'good-provider', model: 'jm' })
+  assert.deepEqual(resolveRoleModel(run, 'judge', { provider: 'frozen-p', modelId: 'frozen-m' }), { provider: 'good-provider', modelId: 'jm' })
   const noJudgeModel = makeRun(validateAndNormalize(parseCatalogConfig(CATALOG.replace('  model: { provider: "good-provider", modelId: "jm" }', '  tools: { deny: [edit] }')), { workflowId: 'guard-me' }))
-  assert.deepEqual(resolveRoleModel(noJudgeModel, 'judge', { provider: 'frozen-p', modelId: 'frozen-m' }), { provider: 'frozen-p', model: 'frozen-m' })
+  assert.deepEqual(resolveRoleModel(noJudgeModel, 'judge', { provider: 'frozen-p', modelId: 'frozen-m' }), { provider: 'frozen-p', modelId: 'frozen-m' })
   run.modelOverrides['developer'] = { provider: 'p2', modelId: 'm2' }
-  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'p2', model: 'm2' })
+  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'p2', modelId: 'm2' })
 })
