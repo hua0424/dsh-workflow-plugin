@@ -158,18 +158,27 @@ export interface RepositoryAdapter {
   gh(call: GhCall): Promise<GhApiOutcome>
 }
 
-export const realRepositoryAdapter: RepositoryAdapter = {
-  git: (args, cwd, opts) => runProgram('git', args, { cwd, ...opts }),
-  gh: call => ghApi(call),
+/** 真实适配器；`driver` 可注入受控 SpawnDriver（#119：Program 层端到端用例走真实出口装配，不真 spawn）。 */
+export function repositoryAdapter(driver: SpawnDriver = realSpawn): RepositoryAdapter {
+  return {
+    git: (args, cwd, opts) => runProgram('git', args, { cwd, ...opts }, driver),
+    gh: call => ghApi(call, driver),
+  }
 }
 
-/** 只读事实三态：value=事实；none=事实明确不存在；error=读取失败（绝不能当成不存在/空集合/clean）。 */
-export type Fact<T> = { kind: 'value'; value: T } | { kind: 'none'; reason: string } | { kind: 'error'; reason: string }
+export const realRepositoryAdapter: RepositoryAdapter = repositoryAdapter()
+
+/**
+ * 只读事实三态：value=事实；none=事实明确不存在；error=读取失败（绝不能当成不存在/空集合/clean）。
+ * none 不携带原因（Issue #119 D-92-2）：调用点只按 kind 分派，原因字符串是无人读取的死载荷，
+ * 需要诊断时改由「none 即明确不存在」这一语义本身表达。
+ */
+export type Fact<T> = { kind: 'value'; value: T } | { kind: 'none' } | { kind: 'error'; reason: string }
 
 
 /** Run one program without a shell, capturing output with a timeout（Issue #95：异步受控进程，不阻塞宿主事件循环）. */
-export function runProgram(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: number } = {}): Promise<RunOutcome> {
-  return spawnCollect(realSpawn, { cmd, args, cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? 30_000, limit: GIT_OUTPUT_LIMIT })
+export function runProgram(cmd: string, args: string[], opts: { cwd?: string; timeoutMs?: number } = {}, driver: SpawnDriver = realSpawn): Promise<RunOutcome> {
+  return spawnCollect(driver, { cmd, args, cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? 30_000, limit: GIT_OUTPUT_LIMIT })
 }
 
 /** 读取失败的统一原因文本（判定"不存在"只用 git 自己的 absent 答复，不用任意非零码）。 */
@@ -179,13 +188,19 @@ function readFailed(out: RunOutcome, what: string): string {
   return `${what}: exit ${out.exitCode}${out.stderr.trim() === '' ? '' : ` (${out.stderr.trim().slice(0, 200)})`}`
 }
 
+/**
+ * ponytail: 只认 git 英文报文的「not a git repository」子串判定"不是仓库"。
+ * 天花板：git 输出本地化（LC_ALL/LANG）后该正则失配；方向安全——失配不会误判成"不存在"，
+ * 而是落到 error（fail-closed），代价是"不是仓库"降级成读取失败。
+ * 升级路径：`git rev-parse --is-inside-work-tree` 退出码判定，退出码与 locale 无关。
+ */
 const isNotARepo = (out: RunOutcome): boolean => /not a git repository/i.test(`${out.stderr}${out.stdout}`)
 
 /** 仓库根目录：value=路径；none=不是 git 仓库（事实）；error=读取失败。 */
 export async function gitTopLevel(adapter: RepositoryAdapter, cwd: string): Promise<Fact<string>> {
   const out = await adapter.git(['rev-parse', '--show-toplevel'], cwd)
   if (out.exitCode === 0 && out.stdout.trim() !== '') return { kind: 'value', value: out.stdout.trim() }
-  if (isNotARepo(out)) return { kind: 'none', reason: 'not a git repository' }
+  if (isNotARepo(out)) return { kind: 'none' }
   return { kind: 'error', reason: readFailed(out, 'git rev-parse --show-toplevel') }
 }
 
@@ -196,7 +211,7 @@ export async function gitHead(adapter: RepositoryAdapter, cwd: string): Promise<
     const name = out.stdout.trim()
     return { kind: 'value', value: name === '' || name === 'HEAD' ? null : name }
   }
-  if (isNotARepo(out)) return { kind: 'none', reason: 'not a git repository' }
+  if (isNotARepo(out)) return { kind: 'none' }
   return { kind: 'error', reason: readFailed(out, 'git rev-parse --abbrev-ref HEAD') }
 }
 
@@ -204,10 +219,10 @@ export async function gitHead(adapter: RepositoryAdapter, cwd: string): Promise<
 export async function gitOriginUrl(adapter: RepositoryAdapter, cwd: string): Promise<Fact<string>> {
   const out = await adapter.git(['remote', 'get-url', 'origin'], cwd)
   if (out.exitCode === 0) return out.stdout.trim() === ''
-    ? { kind: 'none', reason: 'no origin remote' }
+    ? { kind: 'none' }
     : { kind: 'value', value: out.stdout.trim() }
-  if (isNotARepo(out)) return { kind: 'none', reason: 'not a git repository' }
-  if (/no such remote/i.test(out.stderr)) return { kind: 'none', reason: 'no origin remote' }
+  if (isNotARepo(out)) return { kind: 'none' }
+  if (/no such remote/i.test(out.stderr)) return { kind: 'none' }
   return { kind: 'error', reason: readFailed(out, 'git remote get-url origin') }
 }
 
@@ -215,7 +230,7 @@ export async function gitOriginUrl(adapter: RepositoryAdapter, cwd: string): Pro
 export async function gitStatusShort(adapter: RepositoryAdapter, cwd: string): Promise<Fact<string>> {
   const out = await adapter.git(['status', '--porcelain=v1'], cwd)
   if (out.exitCode === 0) return { kind: 'value', value: out.stdout }
-  if (isNotARepo(out)) return { kind: 'none', reason: 'not a git repository' }
+  if (isNotARepo(out)) return { kind: 'none' }
   return { kind: 'error', reason: readFailed(out, 'git status --porcelain=v1') }
 }
 
@@ -225,7 +240,7 @@ export async function gitLocalBranch(adapter: RepositoryAdapter, cwd: string, br
   const out = await adapter.git(['for-each-ref', '--format=%(refname)', ref], cwd)
   if (out.exitCode !== 0) return { kind: 'error', reason: readFailed(out, `git for-each-ref ${ref}`) }
   const found = out.stdout.split('\n').map(line => line.trim()).find(line => line === ref)
-  return found === undefined ? { kind: 'none', reason: 'local branch does not exist' } : { kind: 'value', value: found }
+  return found === undefined ? { kind: 'none' } : { kind: 'value', value: found }
 }
 
 /** 远端分支：value=ls-remote 行；none=不存在；error=读取失败（失败不得当成"不存在"后继续 push）。 */
@@ -233,7 +248,7 @@ export async function gitRemoteBranch(adapter: RepositoryAdapter, cwd: string, b
   const out = await adapter.git(['ls-remote', '--heads', 'origin', branchName], cwd)
   if (out.exitCode !== 0) return { kind: 'error', reason: readFailed(out, `git ls-remote --heads origin ${branchName}`) }
   const lines = out.stdout.split('\n').map(line => line.trim()).filter(line => line !== '')
-  return lines.length === 0 ? { kind: 'none', reason: 'remote branch does not exist' } : { kind: 'value', value: lines[0]! }
+  return lines.length === 0 ? { kind: 'none' } : { kind: 'value', value: lines[0]! }
 }
 
 /** Parse an origin URL like git@github.com:owner/repo.git or https://github.com/owner/repo.git. */
@@ -273,10 +288,10 @@ export function shapeGhOutcome(out: RunOutcome): GhApiOutcome {
 }
 
 /** Run `gh api` with method/path/query; structured outcome (Issue #95：异步受控进程). */
-export async function ghApi(opts: GhCall): Promise<GhApiOutcome> {
+export async function ghApi(opts: GhCall, driver: SpawnDriver = realSpawn): Promise<GhApiOutcome> {
   const args = buildGhArgs(opts.path, opts.method, opts.query, opts.input)
   const input = opts.input === undefined ? undefined : JSON.stringify(opts.input)
-  const out = await spawnCollect(realSpawn, {
+  const out = await spawnCollect(driver, {
     cmd: 'gh', args, cwd: opts.cwd, timeoutMs: opts.timeoutMs ?? 60_000, limit: GH_OUTPUT_LIMIT, input,
   })
   if (out.failedToStart && out.stderr.includes('command not found')) {
@@ -295,6 +310,7 @@ export const GH_PAGE_BUDGET_MS = 120_000
 /**
  * 分页读取一个 GitHub 列表端点，返回**完整**数组。
  * 任一页失败、响应不是 JSON 数组、超页数或时间上限，都返回 ERROR；不返回部分结果。
+ * 无时间预算形参（Issue #119 D-INT-1）：`GH_PAGE_BUDGET_MS` 是全局完整性上限，不对外开可调口子。
  */
 export async function ghApiList(opts: {
   adapter: RepositoryAdapter
@@ -302,10 +318,9 @@ export async function ghApiList(opts: {
   path: string
   query?: string
   maxPages?: number
-  budgetMs?: number
 }): Promise<{ kind: 'PASS'; items: unknown[] } | { kind: 'ERROR'; reason: string }> {
   const maxPages = opts.maxPages ?? GH_MAX_PAGES
-  const budgetMs = opts.budgetMs ?? GH_PAGE_BUDGET_MS
+  const budgetMs = GH_PAGE_BUDGET_MS
   const started = Date.now()
   const items: unknown[] = []
   for (let page = 1; page <= maxPages; page++) {
