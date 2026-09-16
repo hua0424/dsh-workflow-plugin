@@ -48,7 +48,8 @@ async function initializeMilestone(ctx: ProgramContext, parameters: Record<strin
   const createLocal = local.kind === 'none'
   if (createLocal) {
     const status = await gitStatusShort(adapter, ctx.cwd)
-    if (status.kind !== 'value') return { kind: 'ERROR', reason: `cannot read workspace status: ${status.reason}` }
+    // none（不是仓库）与 error（读不到）都不能证明工作树干净，一律 ERROR。
+    if (status.kind !== 'value') return { kind: 'ERROR', reason: `cannot read workspace status: ${status.kind === 'none' ? 'not a git repository' : status.reason}` }
     if (status.value !== '') return { kind: 'ERROR', reason: 'working tree is dirty; cannot create a milestone branch' }
   }
 

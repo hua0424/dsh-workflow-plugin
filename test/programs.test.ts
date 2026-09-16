@@ -4,7 +4,7 @@ import { EventEmitter } from 'node:events'
 import { spawn } from 'node:child_process'
 import {
   GIT_OUTPUT_LIMIT, GH_PAGE_SIZE, ghApiList, gitHead, gitLocalBranch, gitOriginUrl, gitRemoteBranch, gitStatusShort, gitTopLevel,
-  parseOriginRepo, runProgram, shapeGhOutcome, spawnCollect,
+  parseOriginRepo, repositoryAdapter, runProgram, shapeGhOutcome, spawnCollect,
   type GhCall, type RepositoryAdapter, type RunOutcome, type SpawnDriver,
 } from '../src/programs/runner.ts'
 import {
@@ -384,6 +384,52 @@ test('all-milestone-issues-complete：无效 JSON / 未知 state / 后页失败�
   const page1 = Array.from({ length: GH_PAGE_SIZE }, (_, i) => issue(i + 1))
   const brokenPage = repoFake({ gh: pagesHandler([page1, { error: 'gh api failed (1): HTTP 502' }]) })
   assert.equal((await runComplete(brokenPage)).kind, 'ERROR')
+})
+
+// ---- #119 D-92-1：Program 层端到端——受控进程出口里的无效 JSON 一路走到 ERROR 三态 ----
+/**
+ * 真实适配器的受控出口：每个 spawn 拿一个独立假子进程，按 <cmd> <子命令> 取预置出口，
+ * 未登记的调用人为失败。走的是真实的 spawnCollect + shapeGhOutcome + repository 读取层。
+ */
+function outcomeDriver(routes: Record<string, RunOutcome>): SpawnDriver {
+  return (cmd, args) => {
+    const out = routes[`${cmd} ${args[0] ?? ''}`] ?? failOut(128, `unexpected ${cmd} call: ${args.join(' ')}`)
+    const self = new EventEmitter()
+    const stdout = new EventEmitter()
+    const stderr = new EventEmitter()
+    setImmediate(() => {
+      if (out.stdout !== '') stdout.emit('data', out.stdout)
+      if (out.stderr !== '') stderr.emit('data', out.stderr)
+      self.emit('close', out.exitCode)
+    })
+    return Object.assign(self, { stdout, stderr, kill: () => true }) as never
+  }
+}
+
+/** Program 层端到端基线：workspace 是 acme/server，milestone 查询走 gh 列表端点。 */
+const e2eRoutes = (ghStdout: string): Record<string, RunOutcome> => ({
+  'git rev-parse': okOut('D:/repo\n'),
+  'git remote': okOut(`${REPO_URL}\n`),
+  'gh api': okOut(ghStdout),
+})
+
+/** 经真实适配器装配（受控 SpawnDriver 出口）跑 all-milestone-issues-complete 全链路。 */
+const runCompleteWith = (routes: Record<string, RunOutcome>) =>
+  completeProgram.run({ cwd: 'ws', adapter: repositoryAdapter(outcomeDriver(routes)) }, { milestoneNumber: 16 })
+
+test('#119 D-92-1：受控出口返回无效 JSON → Program 端到端 ERROR（不降级成空集合/部分结果）', async () => {
+  const invalidJson = await runCompleteWith(e2eRoutes('<html>nope</html>'))
+  assert.equal(invalidJson.kind, 'ERROR')
+  assert.match(invalidJson.kind === 'ERROR' ? invalidJson.reason : '', /invalid JSON/)
+
+  // 同一条出口装配下合法 JSON 数组仍正常走完：证明 ERROR 来自 JSON 解析这一环，不是装配本身坏了。
+  const ok = await runCompleteWith(e2eRoutes(JSON.stringify([issue(1)])))
+  assert.deepEqual(ok.kind === 'PASS' ? ok.details : undefined, { total: 1, open: 0, closed: 1 })
+
+  // 非零退出同样端到端落到 ERROR，且不带回部分结果。
+  const failed = await runCompleteWith({ ...e2eRoutes('[]'), 'gh api': failOut(1, 'gh: Not Found (HTTP 404)') })
+  assert.equal(failed.kind, 'ERROR')
+  assert.match(failed.kind === 'ERROR' ? failed.reason : '', /404/)
 })
 
 test('parseOriginRepo handles git ssh form', () => {
