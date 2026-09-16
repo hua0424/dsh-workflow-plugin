@@ -115,22 +115,24 @@ for (const { status, path } of changed) {
 console.log(`blob 校验: ${blobChecks.length} 项全部匹配预期 SHA`);
 
 // ---------- 4. 自底向上递归建树（坑②③）----------
-function buildTree(paths) {
+// paths 为相对当前层 tree 的路径；entries 以仓库根全路径（prefix + p）为键
+function buildTree(paths, prefix = '') {
   const dirs = new Map();
   const files = [];
   for (const p of paths) {
     const slash = p.indexOf('/');
     if (slash === -1) files.push(p);
     else {
-      if (!dirs.has(p.slice(0, slash))) dirs.set(p.slice(0, slash), []);
-      dirs.get(p.slice(0, slash)).push(p.slice(slash + 1));
+      const dir = p.slice(0, slash);
+      if (!dirs.has(dir)) dirs.set(dir, []);
+      dirs.get(dir).push(p.slice(slash + 1));
     }
   }
   const tree = [];
-  for (const [name, sub] of dirs) tree.push({ path: name, mode: '040000', type: 'tree', sha: buildTree(sub) });
-  for (const name of files) {
-    const { mode, sha } = entries.get(name);
-    tree.push({ path: name, mode, type: 'blob', sha });
+  for (const [dir, sub] of dirs) tree.push({ path: dir, mode: '040000', type: 'tree', sha: buildTree(sub, `${prefix}${dir}/`) });
+  for (const p of files) {
+    const { mode, sha } = entries.get(prefix + p);
+    tree.push({ path: p, mode, type: 'blob', sha });
   }
   if (dryRun) return 'dry-run-tree';
   return JSON.parse(ghApiJson('POST', `${api}/trees`, { tree })).sha;

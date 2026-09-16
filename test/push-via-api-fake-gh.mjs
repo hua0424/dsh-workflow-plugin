@@ -33,7 +33,8 @@ if (args[0] === 'repo') {
   // repo view --json nameWithOwner / sshUrl
   const key = args.includes('sshUrl') ? 'sshUrl' : 'nameWithOwner';
   const val = key === 'sshUrl' ? process.env.FAKE_GIT_DIR.replace(/\\/g, '/') : 't/r';
-  console.log(key === 'sshUrl' ? val : JSON.stringify({ [key]: val }));
+  // 脚本带 -q '<key>'，jq 过滤后取原始值
+  console.log(val);
   process.exit(0);
 }
 if (path.startsWith('repos/t/r/git/ref/heads/')) {
