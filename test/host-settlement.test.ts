@@ -11,7 +11,7 @@ function makeSafetyHost(ctx: Context, manager: Agent) {
   // #99：观察引用/祖先/orphan 证据由参与者索引持有，host 只做转发。
   const participants = testParticipants(ctx)
   const host = makeSubagentHost({ ctx, managerAgentOf: () => manager,
-    registerJudgeSession() {}, revokeJudgeSession() {}, registerRoleActorSession() {} } satisfies HostAdapters, () => ({}), participants)
+    registerJudgeSession() {}, revokeJudgeSession() {}, registerRoleActorSession() {} } satisfies HostAdapters, participants)
   return Object.assign(host, { participants })
 }
 

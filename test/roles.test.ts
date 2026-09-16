@@ -44,17 +44,17 @@ function makeRun(): RunState {
 
 test('role model route resolves: override > def > inherit', () => {
   const run = makeRun()
-  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'p1', model: 'm1' })
+  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'p1', modelId: 'm1' })
   assert.deepEqual(resolveRoleModel(run, 'reviewer'), {})
   run.modelOverrides['developer'] = { provider: 'p2', modelId: 'm2' }
-  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'p2', model: 'm2' })
+  assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'p2', modelId: 'm2' })
 })
 
 test('judge route resolves: override > def > inherit', () => {
   const run = makeRun()
   assert.deepEqual(resolveRoleModel(run, 'judge'), {})
   run.modelOverrides['judge'] = { provider: 'p3', modelId: 'm3' }
-  assert.deepEqual(resolveRoleModel(run, 'judge'), { provider: 'p3', model: 'm3' })
+  assert.deepEqual(resolveRoleModel(run, 'judge'), { provider: 'p3', modelId: 'm3' })
 })
 
 test('role deny list', () => {
@@ -69,7 +69,7 @@ test('judge spawn plan: full catalog minus the deny list + persona + route', () 
   const plan = judgeSpawnPlan(run)
   assert.equal(plan.persona, 'Judge persona.')
   assert.deepEqual(plan.toolFilter.deny, [...JUDGE_DEFAULT_DENY])
-  assert.deepEqual(plan.agentOptions, { provider: 'jp', model: 'jm' })
+  assert.deepEqual(plan.agentOptions, { provider: 'jp', modelId: 'jm' })
 })
 
 test('judge label carries the current node id', () => {

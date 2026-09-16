@@ -1,6 +1,6 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
 import type { WorkflowConfig, NodeClaim, NodeDef, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
-import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim, roleReuseMode } from '../types.ts'
+import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
@@ -78,7 +78,7 @@ export const TERMINATED_REASON = 'terminated; external effects not cancelled'
 export class WorkflowEngine {
   cwdResolver: (run: RunState) => Promise<string> = async () => { throw new WorkflowError('cwd resolver is not wired') }
   actorActivity: (sessionId: string) => Promise<'active' | 'idle' | 'unknown'> = async () => 'unknown'
-  managerRoute: (sessionId: string) => Promise<{ provider?: string; model?: string }> = async () => ({})
+  managerRoute: (sessionId: string) => Promise<SpawnAgentOptions> = async () => ({})
   traceWarn: ((message: string) => void) | undefined
   private readonly targets: DispatchTargets
   private readonly subagents: SubagentHost
@@ -223,7 +223,7 @@ export class WorkflowEngine {
     // 语义从本 Run 自己的 Manager 兜底，绝不借其他 Run 的值。
     const frozen = await this.managerRoute(run.managerSessionId)
     if (frozen.provider !== undefined || frozen.model !== undefined) {
-      run.delegationRoute = { ...(frozen.provider === undefined ? {} : { provider: frozen.provider }), ...(frozen.model === undefined ? {} : { modelId: frozen.model }) }
+      run.delegationRoute = agentOptionsToRoute(frozen)
     }
     if (configPath) {
       const path = createRunLog(configPath, run.catalogWorkflowId, run.runId)
