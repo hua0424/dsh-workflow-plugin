@@ -2,10 +2,11 @@
 # 自 #130（T1）起运行时只接受 agent-workflow/v3：节点用命名结果 + 统一 Target，
 # 流程声明 returns，node_claim 只接受 { result, handoff }，不再有 outcome /
 # onPass / onFail / 裸 END；Child 调用节点改用 onReturn 显式映射（#131 T2 已接通
-# 执行路径）。本示例自身的迁移属于配置迁移 Issue #129，故此处保留 v2 原文，
+# 执行路径），Program 节点的 PASS/FAIL 也按统一 Target 路由（#132 T3 已接通，含
+# ERROR 的人工恢复）。本示例自身的迁移属于配置迁移 Issue #129，故此处保留 v2 原文，
 # 不伪改历史、也不在本票内半迁移成一份既非 v2 也非 v3 的中间态。
-# v3 的可加载示例见 test/v3-actor-root.test.ts、test/v3-child-returns.test.ts
-# 与 docs/specs/named-results-and-workflow-returns.md。
+# v3 的可加载示例见 test/v3-actor-root.test.ts、test/v3-child-returns.test.ts、
+# test/v3-program-targets.test.ts 与 docs/specs/named-results-and-workflow-returns.md。
 #
 # 加固版 milestone-delivery 配置（PRD 20260903-workflow-hardening A2，由 A1 迁移至 v2）。
 # A1（agent-workflow/v2）：Judge 通过 ACCEPT|REJECT|NEED_CONTEXT 确认 claim ——

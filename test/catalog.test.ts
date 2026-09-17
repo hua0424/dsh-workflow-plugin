@@ -497,6 +497,58 @@ workflow:
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /must declare results FAIL/)
 })
 
+test('#132: Program 结果固定为 PASS/FAIL 且各带统一 Target，错误目标/缺失业务边/ERROR 路由都在校验期拒绝', () => {
+  const withProgram = (programBody: string) => parseCatalogConfig(`
+schemaVersion: agent-workflow/v3
+roles: {}
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  returns: [done]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      results:
+        succeeded: { criteria: ok, target: { node: prog } }
+    prog:
+      execution: { type: builtin-program, programId: github.all-milestone-issues-complete }
+${programBody}
+`)
+  const accepted = withProgram(`      results:
+        PASS: { criteria: The program reported success., target: { return: done } }
+        FAIL: { criteria: The program reported failure., target: { node: plan } }
+`)
+  const normalized = validateAndNormalize(accepted, { workflowId: 'w' })
+  assert.deepEqual(normalized.workflow.nodes['prog']!.results, {
+    PASS: { criteria: 'The program reported success.', target: { return: 'done' } },
+    FAIL: { criteria: 'The program reported failure.', target: { node: 'plan' } },
+  })
+
+  const reject = (programBody: string, needle: RegExp) => {
+    assert.throws(() => validateAndNormalize(withProgram(programBody), { workflowId: 'w' }), CatalogValidationError, needle)
+  }
+  // ERROR 不是可路由的业务边：异常交 Manager 事实确认，不配置路由
+  reject(`      results:
+        PASS: { criteria: The program reported success., target: { return: done } }
+        FAIL: { criteria: The program reported failure., target: { node: plan } }
+        ERROR: { criteria: The program could not determine the state., target: { node: plan } }
+`, /declares unknown Program results ERROR/)
+  // 缺失业务边：PASS/FAIL 都必须在图上有静态目标
+  reject(`      results:
+        FAIL: { criteria: The program reported failure., target: { return: done } }
+`, /must declare results PASS/)
+  // 错误目标：不存在的节点 / 未声明的流程返回
+  reject(`      results:
+        PASS: { criteria: The program reported success., target: { node: nope } }
+        FAIL: { criteria: The program reported failure., target: { return: done } }
+`, /target node "nope" does not exist/)
+  reject(`      results:
+        PASS: { criteria: The program reported success., target: { return: nope } }
+        FAIL: { criteria: The program reported failure., target: { return: done } }
+`, /target return "nope" is not declared by this workflow/)
+})
+
 test('prototype-pollution role names are rejected (hasOwn checks)', () => {
   const config = parseCatalogConfig(configWith('        role: developer', '        role: constructor'))
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /unknown role/)
