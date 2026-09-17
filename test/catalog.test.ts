@@ -262,7 +262,7 @@ test('unreachable node is rejected', () => {
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /not reachable/)
 })
 
-test('#130: child-workflow nodes are rejected statically until T2 connects the path', () => {
+test('#131: a v3 Child caller is accepted once onReturn matches the called workflow returns', () => {
   const config = parseCatalogConfig(`
 schemaVersion: agent-workflow/v3
 roles: { developer: { persona: D } }
@@ -290,10 +290,68 @@ childWorkflows:
         results:
           succeeded: { criteria: ok, target: { return: finished } }
 `)
-  assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /does not execute yet \(T2\)/)
+  const normalized = validateAndNormalize(config, { workflowId: 'w' })
+  assert.deepEqual(normalized.workflow.nodes.call?.execution.type, 'child-workflow')
+  // onReturn 的值是本层 Target：未知节点/未声明返回仍静态拒绝
+  const unknownTarget = parseCatalogConfig(`
+schemaVersion: agent-workflow/v3
+roles: { developer: { persona: D } }
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  returns: [done]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      results:
+        succeeded: { criteria: ok, target: { node: call } }
+    call:
+      execution: { type: child-workflow, workflowId: child-a }
+      onReturn: { finished: { node: ghost } }
+childWorkflows:
+  child-a:
+    startNode: work
+    returns: [finished]
+    nodes:
+      work:
+        execution: { type: actor-task, role: developer, instruction: Work. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+        results:
+          succeeded: { criteria: ok, target: { return: finished } }
+`)
+  assert.throws(() => validateAndNormalize(unknownTarget, { workflowId: 'w' }), CatalogValidationError, /target node "ghost" does not exist/)
+  // v2 的 onPass 在 Child caller 上被严格拒绝
+  assert.throws(() => parseCatalogConfig(`
+schemaVersion: agent-workflow/v3
+roles: { developer: { persona: D } }
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  returns: [done]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Do. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      results:
+        succeeded: { criteria: ok, target: { node: call } }
+    call:
+      execution: { type: child-workflow, workflowId: child-a }
+      onPass: done
+childWorkflows:
+  child-a:
+    startNode: work
+    returns: [finished]
+    nodes:
+      work:
+        execution: { type: actor-task, role: developer, instruction: Work. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+        results:
+          succeeded: { criteria: ok, target: { return: finished } }
+`), CatalogSchemaError, /unrecognized keys: onPass/)
 })
 
-test('#130: onReturn must match the called workflow returns exactly', () => {
+test('#131: onReturn must match the called workflow returns exactly', () => {
   const config = parseCatalogConfig(`
 schemaVersion: agent-workflow/v3
 roles: { developer: { persona: D } }
@@ -327,7 +385,7 @@ childWorkflows:
 })
 
 test('child workflow cycle is rejected', () => {
-  // Child 执行路径本版本不可用，但递归引用仍必须在静态校验期被拒绝。
+  // 递归引用（直接或间接）必须在静态校验期被拒绝，不依赖运行期栈深度。
   const cyclic = {
     schemaVersion: 'agent-workflow/v3' as const,
     roles: { developer: { persona: 'D' } },

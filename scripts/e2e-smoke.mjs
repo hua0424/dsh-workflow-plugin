@@ -54,6 +54,36 @@ workflow:
         succeeded: { criteria: ok was said., target: { return: delivered } }
 `)
 
+// #131: real catalog with an explicit Child return (T2). The call layer dispatches no
+// model and no Judge; the child's named return maps to the Root business return.
+writeFileSync(join(home, 'workflows', 'child-smoke.yaml'), `schemaVersion: agent-workflow/v3
+roles:
+  worker: { persona: Work only in the isolated workspace. }
+judgeRole: { persona: Read-only verification. }
+workflow:
+  startNode: plan
+  returns: [delivered]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Plan the child delegation. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: The plan is complete. } }
+      results:
+        succeeded: { criteria: The plan is complete., target: { node: delegate } }
+    delegate:
+      execution: { type: child-workflow, workflowId: child-work }
+      onReturn: { finished: { return: delivered } }
+childWorkflows:
+  child-work:
+    startNode: work
+    returns: [finished]
+    nodes:
+      work:
+        execution: { type: actor-task, role: worker, instruction: Produce the child artifact. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: The child artifact exists. } }
+        results:
+          succeeded: { criteria: The child artifact exists., target: { return: finished } }
+`)
+
 let store = new StateStore(home)
 try {
   const ws = await workspaceKeyOf(cwd)
@@ -66,7 +96,7 @@ try {
   assert.ok(warned, '#59: persona 协议关键词只警告、不阻止加载')
   assert.equal(warned.config.roles.worker.persona, 'Report only through node_claim.')
   const catalog = await scanCatalog(home)
-  assert.deepEqual(catalog.entries.map(e => e.workflowId), ['smoke-test', 'warn-persona'])
+  assert.deepEqual(catalog.entries.map(e => e.workflowId), ['child-smoke', 'smoke-test', 'warn-persona'])
   assert.deepEqual(catalog.diagnostics.map(d => [d.workflowId, d.severity, /node_claim/.test(d.reason)]), [['warn-persona', 'warning', true]])
 
   let sequence = 0
@@ -99,7 +129,7 @@ try {
     async retireJudge() {}, async drainJudge() {}, async judgeSessionExists() { return true },
     async drainRoleActor(run, role) { drained.push(run.roleActors[role]) },
     async compactRoleActor(_run, role) { compacts.push(role); return { ok: true, detail: 'controlled no-op' } },
-  }, { async run() { throw new Error('no Program in this smoke') } }, makeStateHost(store))
+  }, { async run() { throw new Error('no Program in this smoke') } }, makeStateHost(() => store))
   engine.cwdResolver = async () => cwd
   const caller = dispatch => ({ sessionId: dispatch.sessionId, turnUserMessageIds: new Set([dispatch.messageId]) })
   const row = () => store.get(ws)
@@ -185,7 +215,54 @@ try {
   const trace = readFileSync(join(logDir, logs[0]), 'utf8')
   for (const marker of [' START ', ' CLAIM ', ' JUDGE ', ' result=REJECT ', ' result=ACCEPT ', ' ROUTE ']) assert.match(trace, new RegExp(marker))
 
-  console.log('E2E SMOKE PASS: REJECT correction + retry result self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen + #59 warned-persona catalog loadable')
+  // #131: 真实 catalog 的 Child 显式返回：调用层不派模型/Judge，子流程返回经 onReturn
+  // 映射到 Root 业务终局，重开后返回链与终局仍在。
+  const childEntry = await loadCatalogEntry(home, 'child-smoke')
+  assert.ok(childEntry, '#131: Child 调用 catalog 可加载')
+  const judgesBefore = judgePackets.length
+  assert.equal((await engine.startRun(ws, engine.buildInitialRun('manager', 'child-smoke', childEntry.config, childEntry.definitionHash), childEntry.path, 'child smoke request')).ok, true)
+  let childRow = await row()
+  assert.equal(childRow.execution.nodeId, 'plan')
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'plan ok' }, caller(childRow.execution.dispatch))).ok, true)
+  await engine.handleTurnEnded(ws, caller(childRow.execution.dispatch))
+  const planJudge = caller((await row()).execution.judge)
+  assert.equal((await engine.handleJudgeClaim(ws, (await row()).execution.nodeToken, 'ACCEPT', 'plan verified', planJudge)).ok, true)
+  await engine.handleTurnEnded(ws, planJudge)
+  childRow = await row()
+  assert.equal(childRow.execution.workflowId, 'child-work', '#131: 调用层直接进入子流程起点')
+  assert.equal(childRow.run.callStack.length, 2)
+  const callerExecutionId = childRow.run.callStack[0].executionId
+  const callerMaterials = await store.execution(ws, callerExecutionId)
+  assert.equal(callerMaterials.dispatch, undefined, '#131: 调用层不被派发（无额外模型/Judge）')
+  assert.equal(callerMaterials.judge, undefined)
+  assert.equal(callerMaterials.child.executionId, childRow.execution.executionId)
+  assert.equal(judgePackets.length, judgesBefore + 1, '#131: 至此只有子节点派了 Judge')
+
+  const leafExecutionId = childRow.execution.executionId
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'child artifact' }, caller(childRow.execution.dispatch))).ok, true)
+  await engine.handleTurnEnded(ws, caller(childRow.execution.dispatch))
+  const childJudge = caller((await row()).execution.judge)
+  assert.equal((await engine.handleJudgeClaim(ws, (await row()).execution.nodeToken, 'ACCEPT', 'child artifact verified', childJudge)).ok, true)
+  await engine.handleTurnEnded(ws, childJudge)
+  childRow = await row()
+  assert.equal(childRow.run.status, 'completed', '#131: 子流程返回经 onReturn 映射到 Root 业务终局')
+  assert.deepEqual(childRow.run.callStack, [])
+  assert.equal(childRow.execution.nodeId, 'delegate')
+  assert.deepEqual(childRow.run.businessReturn, { name: 'delivered', source: childRow.execution.executionId })
+  assert.deepEqual(childRow.execution.returned, { kind: 'return', name: 'delivered', source: childRow.execution.executionId })
+  assert.equal(judgePackets.length, judgesBefore + 2, '#131: 包装层不多派 Judge')
+
+  const mappedCaller = await store.execution(ws, callerExecutionId)
+  assert.deepEqual(mappedCaller.child.result, { terminalExecutionId: leafExecutionId, handoff: 'child artifact' })
+  assert.deepEqual(mappedCaller.returned, { kind: 'return', name: 'delivered', source: callerExecutionId })
+  const childEvents = await store.events(ws, callerExecutionId)
+  assert.equal(childEvents.filter(event => event.type === 'child-entered').length, 1)
+  assert.equal(childEvents.filter(event => event.type === 'child-returned').length, 1)
+
+  store.close(); store = new StateStore(home)
+  assert.deepEqual((await store.get(ws)).run.businessReturn, { name: 'delivered', source: childRow.execution.executionId })
+
+  console.log('E2E SMOKE PASS: REJECT correction + retry result self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen + #59 warned-persona catalog loadable + #131 Child explicit return mapped to the Root business return')
 } finally {
   store.close()
   rmSync(home, { recursive: true, force: true })

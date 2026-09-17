@@ -25,7 +25,7 @@ import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize, CatalogValidationError } from '../src/catalog/validate.ts'
-import type { WorkflowConfig } from '../src/types.ts'
+import { nodeOnReturn, type WorkflowConfig } from '../src/types.ts'
 
 type Config = WorkflowConfig
 
@@ -442,8 +442,8 @@ ${results}
   assert.deepEqual(ok.workflow.returns, ['approved', 'changes-required', 'disputed', 'abandoned'])
 })
 
-test('v3: 未接通的 Child 执行路径在 catalog 校验期被明确拒绝（T2 接通）', () => {
-  assert.throws(() => validateAndNormalize(parseCatalogConfig(`
+test('v3: Child caller 的 onReturn 与被调用流程 returns 精确相等时通过静态校验（执行路径由 #131/T2 接通）', () => {
+  const normalized = validateAndNormalize(parseCatalogConfig(`
 schemaVersion: agent-workflow/v3
 roles: {}
 judgeRole: { persona: J }
@@ -469,7 +469,8 @@ childWorkflows:
         checker: { checkerId: judge.claim-correct }
         results:
           succeeded: { criteria: ok, target: { return: finished } }
-`), { workflowId: 'w' }), CatalogValidationError, /does not execute yet \(T2\)/)
+`), { workflowId: 'w' })
+  assert.deepEqual(nodeOnReturn(normalized.workflow.nodes.call!), { finished: { return: 'done' } })
 })
 
 // ── F: 新状态格式与旧库的不兼容维护保护（A12 的维护子集） ────────────────────
