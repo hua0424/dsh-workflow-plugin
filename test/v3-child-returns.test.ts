@@ -62,6 +62,39 @@ function childConfig(): WorkflowConfig {
 }
 
 /**
+ * 同一个 Child 的两个声明返回分别进入**两个不同的父后继节点**（#133 收口 D-131-01）。
+ */
+function twoSuccessorConfig(): WorkflowConfig {
+  return {
+    schemaVersion: 'agent-workflow/v3',
+    roles: { worker: { persona: 'Worker' } },
+    judgeRole: { persona: 'Read only' },
+    workflow: {
+      startNode: 'plan',
+      returns: ['delivered', 'aborted'],
+      nodes: {
+        plan: actorNode('manager', 'Plan', { succeeded: { node: 'call-child' } }),
+        'call-child': {
+          execution: { type: 'child-workflow', workflowId: 'child-a' },
+          onReturn: { finished: { node: 'after' }, cancelled: { node: 'triage' } },
+        },
+        after: actorNode('manager', 'Continue', { succeeded: { return: 'delivered' } }),
+        triage: actorNode('manager', 'Triage the cancellation', { succeeded: { return: 'aborted' } }),
+      },
+    },
+    childWorkflows: {
+      'child-a': {
+        startNode: 'work',
+        returns: ['finished', 'cancelled'],
+        nodes: {
+          work: actorNode('worker', 'Child work', { succeeded: { return: 'finished' }, cancelled: { return: 'cancelled' } }),
+        },
+      },
+    },
+  }
+}
+
+/**
  * 两层 Child：root → outer（child-a）→ inner（child-b）→ work。
  * 返回沿两层 `onReturn` 逐层重命名：exhausted → stopped → 外层映射目标。
  */
@@ -184,9 +217,9 @@ function harness(config: WorkflowConfig) {
 
 const config = (value: WorkflowConfig) => validateAndNormalize(value, { workflowId: 'test' })
 
-// ── A: 两个 Child 返回进入不同父后继 / 父调用方直接返回本层流程 ───────────────
+// ── A: Child 返回进入父后继节点 / 父调用方直接返回本层流程 ───────────────────
 
-test('v3 Child: 不同返回进入不同父后继，调用层不派模型/Judge，返回来源与 handoff 正确', async () => {
+test('v3 Child: 一个返回进入父后继节点、另一个直接返回本层流程，调用层不派模型/Judge', async () => {
   const h = harness(config(childConfig()))
   try {
     await h.start('root request')
@@ -239,6 +272,59 @@ test('v3 Child: 不同返回进入不同父后继，调用层不派模型/Judge�
     assert.match(h.messages.at(-1)!.text, /业务终局：aborted/)
     assert.match(h.messages.at(-1)!.text, /child declared exhausted/)
   } finally { h.close() }
+})
+
+// ── A2: 同一 Child 的两个返回进入两个不同的父后继节点（D-131-01）─────────────
+
+test('v3 Child: 同一 Child 的两个返回分别进入两个不同的父后继节点，各创建一次且来源正确', async () => {
+  // 第一条：child-a 返回 finished → 父后继 after（不是 triage）
+  const first = harness(config(twoSuccessorConfig()))
+  try {
+    await first.start('first request')
+    await first.accept('succeeded', 'plan one')
+    let row = await first.row()
+    const callerId = row.run.callStack[0]!.executionId
+    const leafId = row.execution.executionId
+    const judgesBefore = first.judges.length
+    row = await first.accept('succeeded', 'first child artifact')
+    assert.equal(row.execution.nodeId, 'after', 'finished 走它自己的父后继')
+    assert.notEqual(row.execution.nodeId, 'triage')
+    assert.equal(first.judges.length, judgesBefore + 1, '只多派子节点的 Judge，调用层不追加')
+    const afterExecutionId = row.execution.executionId
+    const callerRow = (await first.store.execution('ws', callerId))!
+    assert.equal(callerRow.phase, 'exited')
+    assert.equal(callerRow.successorId, afterExecutionId)
+    assert.deepEqual(callerRow.child?.result, { terminalExecutionId: leafId, handoff: 'first child artifact' })
+    assert.deepEqual(callerRow.returned, { kind: 'result', name: 'finished', source: callerId })
+    // 后继的直接前驱是刚退出的 caller；控制上下文给出本层映射后的返回名与唯一 handoff 原文
+    assert.equal(row.execution.predecessorId, callerId)
+    assert.equal(row.execution.input, 'first child artifact')
+    assert.match(first.messages.at(-1)!.text, /\[直接前驱结果\]\n前驱节点 call-child 已确认结果：finished（kind: result）/)
+    assert.match(first.messages.at(-1)!.text, /\[handoff\]\nfirst child artifact/)
+    // 各自只创建一次：重复驱动不产生第二个后继，后继工作单只 entered 一次
+    await first.engine.drive('ws')
+    assert.equal((await first.row()).execution.executionId, afterExecutionId)
+    assert.equal((await first.store.events('ws', afterExecutionId)).filter(event => event.type === 'entered').length, 1)
+    assert.equal((await first.accept('succeeded', 'delivered')).run.businessReturn?.name, 'delivered')
+  } finally { first.close() }
+
+  // 第二条：同一个 Child 的另一个返回 cancelled → 另一个父后继 triage（不是 after）
+  const second = harness(config(twoSuccessorConfig()))
+  try {
+    await second.start('second request')
+    await second.accept('succeeded', 'plan two')
+    let row = await second.row()
+    const callerId = row.run.callStack[0]!.executionId
+    row = await second.accept('cancelled', 'second child artifact')
+    assert.equal(row.execution.nodeId, 'triage', 'cancelled 走另一个父后继')
+    assert.equal(row.execution.predecessorId, callerId)
+    assert.equal(row.execution.input, 'second child artifact')
+    assert.deepEqual((await second.store.execution('ws', callerId))!.returned, { kind: 'result', name: 'cancelled', source: callerId })
+    assert.match(second.messages.at(-1)!.text, /前驱节点 call-child 已确认结果：cancelled（kind: result）/)
+    assert.doesNotMatch(second.messages.at(-1)!.text, /finished/)
+    assert.equal((await second.store.events('ws', row.execution.executionId)).filter(event => event.type === 'entered').length, 1)
+    assert.equal((await second.accept('succeeded', 'aborted by triage')).run.businessReturn?.name, 'aborted')
+  } finally { second.close() }
 })
 
 // ── B: 两层 Child 逐层映射与重命名 ──────────────────────────────────────────

@@ -1,0 +1,106 @@
+# v3 完整组合示例（可加载、可复制到 %DSH_HOME%/workflows/ 后直接运行）。
+#
+# 覆盖（Issue #133 验收 AC3 / 父票 #128 A01）：
+#   - 多出口 Actor：review 三个互斥结果（approved / changes-required / disputed）
+#   - 单出口 Actor：plan、fix、escalate、triage、report、work、repair、deep
+#   - 同一个 Child 的两个返回进入两个不同的父后继节点：
+#       run-cycle.onReturn: done → run-nested，cancelled → triage
+#   - 两层 Child 嵌套返回并逐层重命名：
+#       inner(exhausted/waiting) → outer(stopped/skipped) → root(report / { return: no-change })
+#   - Program 在 Child 内结束：issue-cycle.check 的 PASS 直接 { return: done }
+#     （FAIL 留在子流程内回到 repair，ERROR 由 Manager 用 node_resolve_program 事实确认）
+#   - Root 三个不同业务终局：delivered / cancelled / no-change
+#
+# 说明：本文件是 v3 示例，不是 docs/example/workflow-template.yaml 的替代——那份
+# v2 模板的迁移属于配置迁移 Issue #129。定向验证见 test/v3-combined-example.test.ts。
+schemaVersion: agent-workflow/v3
+roles:
+  reviewer: { persona: Review the delivery and report one named result. }
+  worker: { persona: Do the assigned work and report one named result. }
+judgeRole: { persona: Read-only verification against the frozen exit contract. }
+workflow:
+  startNode: plan
+  returns: [delivered, cancelled, no-change]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Plan the delivery. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: The plan names the reviewed artifact. } }
+      results:
+        succeeded: { criteria: A plan exists., target: { node: review } }
+    review:
+      execution: { type: actor-task, role: reviewer, instruction: Review the planned delivery and report exactly one result. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: The report binds the current object and the exact revision. } }
+      results:
+        approved: { criteria: No unresolved dispute and no required change., target: { node: run-cycle } }
+        changes-required: { criteria: No unresolved dispute and a justified required-change list., target: { node: fix } }
+        disputed: { criteria: An evidenced unresolved business dispute., target: { node: escalate } }
+    fix:
+      execution: { type: actor-task, role: worker, instruction: Apply the required changes. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: Every required change is addressed. } }
+      results:
+        succeeded: { criteria: The required changes are applied., target: { node: review } }
+    escalate:
+      execution: { type: actor-task, role: manager, instruction: Adjudicate the dispute and return the case to review. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: The adjudication is recorded with its basis. } }
+      results:
+        succeeded: { criteria: The dispute is adjudicated., target: { node: review } }
+    run-cycle:
+      execution: { type: child-workflow, workflowId: issue-cycle }
+      onReturn:
+        done: { node: run-nested }
+        cancelled: { node: triage }
+    run-nested:
+      execution: { type: child-workflow, workflowId: outer }
+      onReturn:
+        stopped: { node: report }
+        skipped: { return: no-change }
+    triage:
+      execution: { type: actor-task, role: manager, instruction: Record why the cycle was cancelled. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: The cancellation cause is recorded. } }
+      results:
+        succeeded: { criteria: The cancellation cause is recorded., target: { return: cancelled } }
+    report:
+      execution: { type: actor-task, role: manager, instruction: Report the delivered result. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: The report matches the delivered artifact. } }
+      results:
+        succeeded: { criteria: The delivery is reported., target: { return: delivered } }
+childWorkflows:
+  issue-cycle:
+    startNode: work
+    returns: [done, cancelled]
+    nodes:
+      work:
+        execution: { type: actor-task, role: worker, instruction: Work the issue cycle. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: The work matches the planned scope. } }
+        results:
+          succeeded: { criteria: The work is complete., target: { node: check } }
+          blocked: { criteria: The work cannot proceed without a decision., target: { return: cancelled } }
+      check:
+        execution: { type: builtin-program, programId: github.all-milestone-issues-complete, instruction: Check whether the milestone is complete. }
+        results:
+          PASS: { criteria: The program reported the milestone complete., target: { return: done } }
+          FAIL: { criteria: The program reported the milestone incomplete., target: { node: repair } }
+      repair:
+        execution: { type: actor-task, role: worker, instruction: Repair what the milestone check reported missing. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: The reported gap is closed. } }
+        results:
+          succeeded: { criteria: The reported gap is closed., target: { node: check } }
+  outer:
+    startNode: call-inner
+    returns: [stopped, skipped]
+    nodes:
+      call-inner:
+        execution: { type: child-workflow, workflowId: inner }
+        onReturn:
+          exhausted: { return: stopped }
+          waiting: { return: skipped }
+  inner:
+    startNode: deep
+    returns: [exhausted, waiting]
+    nodes:
+      deep:
+        execution: { type: actor-task, role: worker, instruction: Do the deepest unit of work. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: The deepest unit of work is complete. } }
+        results:
+          succeeded: { criteria: The unit of work is complete., target: { return: exhausted } }
+          abandoned: { criteria: The unit of work was abandoned with a reason., target: { return: waiting } }

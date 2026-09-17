@@ -451,6 +451,81 @@ test('corrupt SQLite bytes stay diagnosable and are preserved as the raw backup 
   } finally { access.close(); rmSync(home, { recursive: true, force: true }) }
 })
 
+test('#133 AC1: 初始化失败不损坏原库——已归档文件还原、维护态保持、归档目录回滚', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-t4-init-failure-'))
+  let access: StateAccess | undefined
+  try {
+    new StateStore(home).close()
+    const raw = new DatabaseSync(stateDbPath(home))
+    raw.exec('PRAGMA user_version = 8')
+    raw.close()
+    const before = readFileSync(stateDbPath(home))
+    access = new StateAccess(home)
+    assert.equal(access.maintenanceDiagnostic()?.kind, 'incompatible')
+
+    await assert.rejects(
+      access.archiveIncompatible(undefined, () => { throw new Error('injected init failure') }),
+      /new state initialization failed; original store restored/,
+    )
+
+    // 原库字节、维护诊断与 fail-closed 行为原样回来；归档目录被回滚，不留半成品新库
+    assert.deepEqual(readFileSync(stateDbPath(home)), before)
+    assert.equal(access.maintenanceDiagnostic()?.kind, 'incompatible')
+    assert.equal(access.maintenanceDiagnostic()?.userVersion, 8)
+    assert.throws(() => access!.current(), /maintenance mode/)
+    const names = readdirSync(join(home, 'workflows'))
+    assert.deepEqual(names.filter(name => name.includes('.archive-')), [], '归档目录已还原')
+    // 备份发生在归档之前且成功，所以它留了下来——断言它是一份可读的切换前副本，而不是半成品
+    const backupName = names.find(name => name.includes('.backup-'))
+    assert.ok(backupName, '备份成功后的失败路径保留可读备份')
+    const copy = new DatabaseSync(join(home, 'workflows', backupName), { readOnly: true })
+    try { assert.equal((copy.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 8) }
+    finally { copy.close() }
+  } finally {
+    access?.close()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('#133 AC1: 归档故障不损坏原库——旧库文件搬不动时切换被拒且原字节不变', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-t4-archive-failure-'))
+  let access: StateAccess | undefined
+  let held: DatabaseSync | undefined
+  try {
+    new StateStore(home).close()
+    const raw = new DatabaseSync(stateDbPath(home))
+    raw.exec('PRAGMA user_version = 8')
+    raw.close()
+    // 另一个句柄仍持有旧库（诊断脚本/另一实例）。Windows 上 MoveFileEx 对没有
+    // FILE_SHARE_DELETE 的句柄返回 EBUSY，归档步骤因此失败；POSIX 允许重命名被打开的
+    // 文件，那时切换会成功。两条路径都断言「旧库不损坏、不出现半迁移」。
+    held = new DatabaseSync(stateDbPath(home), { readOnly: true })
+    const before = readFileSync(stateDbPath(home))
+    access = new StateAccess(home)
+    assert.equal(access.maintenanceDiagnostic()?.kind, 'incompatible')
+
+    const outcome = await access.archiveIncompatible().then(
+      value => ({ value }), error => ({ error: error as Error }),
+    )
+    if ('error' in outcome) {
+      assert.match(outcome.error.message, /state archive failed; original store restored/)
+      assert.deepEqual(readFileSync(stateDbPath(home)), before, '原库字节未变')
+      assert.equal(access.maintenanceDiagnostic()?.kind, 'incompatible')
+      assert.equal(access.maintenanceDiagnostic()?.userVersion, 8)
+      assert.throws(() => access!.current(), /maintenance mode/)
+      assert.deepEqual(readdirSync(join(home, 'workflows')).filter(name => name.includes('.archive-')), [])
+    } else {
+      assert.deepEqual(readFileSync(join(outcome.value.archivePath, 'state.sqlite3')), before, '旧字节完整归档')
+      assert.equal(access.maintenanceDiagnostic(), undefined)
+      assert.equal((await access.current().list()).length, 0)
+    }
+  } finally {
+    held?.close()
+    access?.close()
+    rmSync(home, { recursive: true, force: true })
+  }
+})
+
 test('incompatible reset flag is strict and only root command Agents qualify for cutover', async () => {
   const calls: unknown[][] = []
   const host: CommandHost = {
@@ -517,7 +592,7 @@ test('plugin apply stays active on an incompatible store and only root plus expl
 
     const cutover = await invoke(root, 'reset --incompatible-store')
     assert.equal(cutover.kind, 'success')
-    assert.match(cutover.text ?? '', /backed up.*empty v9.*External effects were not cancelled/i)
+    assert.match(cutover.text ?? '', /backed up.*empty current-format Store.*External effects were not cancelled/i)
     root.session.header.cwd = home
     const status = await invoke(root, 'status')
     assert.equal(status.kind, 'success')

@@ -549,6 +549,86 @@ ${programBody}
 `, /target return "nope" is not declared by this workflow/)
 })
 
+test('#133: checker config 未知键是配置错误，handler 未接通时不留隐含默认结果名', () => {
+  // D-130-05：`z.record` 不拒绝未知键，validate 必须点名该键（`criterias` 之类的笔误
+  // 不得静默退化成「没有共同条件」）。
+  const withConfig = (configBody: string) => parseCatalogConfig(`
+schemaVersion: agent-workflow/v3
+roles: {}
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  returns: [built]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Plan. }
+      checker: { checkerId: judge.claim-correct, config: ${configBody} }
+      results:
+        succeeded: { criteria: The plan exists., target: { return: built } }
+`)
+  for (const body of ['{ criterias: PASS. }', '{ criteria: PASS., extra: 1 }']) {
+    assert.throws(
+      () => validateAndNormalize(withConfig(body), { workflowId: 'w' }),
+      (error: unknown) => error instanceof CatalogValidationError
+        && error.message.includes('checker config has unknown key')
+        && error.message.includes(body.includes('criterias') ? 'criterias' : 'extra'),
+      `expected an unknown-config-key error for ${body}`,
+    )
+  }
+  // 省略 criteria 仍合法（v3：没有共同条件），且落成对象——两条归一化入口都不泄漏 undefined。
+  assert.deepEqual(validateAndNormalize(withConfig('{}'), { workflowId: 'w' }).workflow.nodes['plan']!.checker.config, {})
+  assert.deepEqual(
+    validateAndNormalize(withConfig('{ criteria: PASS. }'), { workflowId: 'w' }).workflow.nodes['plan']!.checker.config,
+    { criteria: 'PASS.' },
+  )
+  // 手工 config（不经过 schema 的归一化）同样得到对象：validate 侧的兜底是防御性而非重复。
+  const handBuilt = parseCatalogConfig(VALID_CONFIG)
+  delete (handBuilt.workflow.nodes['plan']!.checker as { config?: unknown }).config
+  assert.deepEqual(validateAndNormalize(handBuilt, { workflowId: 'w' }).workflow.nodes['plan']!.checker.config, {})
+  // D-130-01：v3 没有隐含默认结果名——只声明 `finished` 的节点合法，不会被自动补上 `succeeded`。
+  const renamed = parseCatalogConfig(configWith(
+    'succeeded: { criteria: The plan exists., target: { node: build } }',
+    'finished: { criteria: The plan exists., target: { node: build } }',
+  ))
+  assert.deepEqual(Object.keys(validateAndNormalize(renamed, { workflowId: 'w' }).workflow.nodes['plan']!.results!), ['finished'])
+})
+
+test('#133: Target 的互斥与裸 END 拒绝在 record 值位置同样生效（onReturn）', () => {
+  // D-130-06：`z.record(键, 值)` 不剥离值 schema 的 refine——onReturn 的值就是 `target`，
+  // 因此 schema 注释里「record 会剥离 refine」的前提不成立，真正理由是错误文本可定位。
+  const withOnReturn = (value: string) => `
+schemaVersion: agent-workflow/v3
+roles: {}
+judgeRole: { persona: J }
+workflow:
+  startNode: plan
+  returns: [done]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Plan. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      results:
+        succeeded: { criteria: The plan exists., target: { node: call } }
+    call:
+      execution: { type: child-workflow, workflowId: child }
+      onReturn:
+        finished: ${value}
+childWorkflows:
+  child:
+    startNode: work
+    returns: [finished]
+    nodes:
+      work:
+        execution: { type: actor-task, role: manager, instruction: Work. }
+        checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+        results:
+          succeeded: { criteria: Done., target: { return: finished } }
+`
+  assertSchemaIssue(withOnReturn('{ node: plan, return: done }'), 'target must be exactly')
+  assertSchemaIssue(withOnReturn('END'), 'target must be exactly')
+  assertSchemaIssue(withOnReturn('{}'), 'target must be exactly')
+})
+
 test('prototype-pollution role names are rejected (hasOwn checks)', () => {
   const config = parseCatalogConfig(configWith('        role: developer', '        role: constructor'))
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /unknown role/)

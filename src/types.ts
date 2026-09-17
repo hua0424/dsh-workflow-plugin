@@ -225,6 +225,15 @@ export function nodeOnReturn(node: NodeDef): Record<string, Target> | undefined 
   return node.execution.type === 'child-workflow' ? (node as ChildWorkflowNode).onReturn : undefined
 }
 
+/**
+ * 节点声明的裁决名（单源）：Actor/Program 是自己的结果集；Child caller 没有自己的
+ * 结果集，它的裁决就是被调用流程的返回名（`onReturn` 的键）。
+ */
+export function declaredResults(node: NodeDef | undefined): string[] {
+  if (node === undefined) return []
+  return Object.keys(nodeResults(node) ?? nodeOnReturn(node) ?? {})
+}
+
 export interface WorkflowDef {
   startNode: string
   /** 非空且不重复的返回名；Root 的返回即 Run 的业务终局。 */

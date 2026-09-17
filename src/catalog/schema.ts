@@ -105,8 +105,10 @@ const returnTarget = z.object({ return: z.string().regex(ID_PATTERN, 'target ret
  * "Invalid input"，看不出真正违规的键（例如 v2 的 `onPass`）。分派后错误直指
  * 具体节点类型与要求的 Target 形状，严格未知字段拒绝不变。
  *
- * 注意：Zod v4 的 `z.record(键, 值)` 会剥离值 schema 上的 refine，因此分派 schema
- * 直接用在具体的字段位置上（节点表是整表一个 custom），不放在 record 的值位置。
+ * 注意：`z.record(键, 值)` 的**值位置同样会执行值 schema 上的 refine**（见下方
+ * `onReturn` 的值就是 `target`，互斥性与裸 END 拒绝照常生效），所以这里不放在 record
+ * 值位置的真实理由是**错误文本可定位**：整表分派能把节点 id 写进 issue path 与消息，
+ * 裸 union 只会剩下 "Invalid input"。
  */
 function dispatched<T>(inner: z.ZodType<T>, shapeError: string, ok: (value: unknown) => boolean = () => true) {
   // 用 z.unknown().superRefine：z.custom 的校验器在 Zod v4 只收到 value，拿不到 ctx。
@@ -171,8 +173,9 @@ const childWorkflowNode = z
 
 /**
  * 节点表：整表一个 custom，逐节点按 `execution.type` 分派到对应 schema。
- * 放在这里（而不是 `z.record` 的值位置）是因为 Zod v4 的 record 会剥离值 schema
- * 上的 refine——那样只能得到裸 union 的 "Invalid input"，看不出违规的键。
+ * 放在这里（而不是 `z.record` 的值位置）是为了**错误文本可定位**：逐节点分派把节点 id
+ * 写进 issue path，并直指该节点类型要求的形状。值位置并不会剥离 refine（见 `onReturn`），
+ * 但 `z.record` 无法给每个值补上节点 id 这类上下文。
  */
 const nodeTable = z.unknown().superRefine((value, ctx) => {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {

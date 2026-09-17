@@ -17,8 +17,8 @@ pnpm run test:real-host  # node test/runtime-real-host.test.ts（exact 0.1.5-rc.
 
 | 脚本 | 角色生命周期合同 | 独有断言 |
 |---|---|---|
-| `scripts/t3-smoke.mjs` | 显式 `reuse: continuable`（旧行为基线） | Role 跨节点复用（`rolesCreated=1`）、节点边界 compact（`compacts=1`）、三节点 → END、关库重开后的终局 handoff 与事件顺序 |
-| `scripts/e2e-smoke.mjs` | 缺省 `reuse: node`（现行缺省） | REJECT 修正环路、failed onFail 自环、离开节点 drain + 新 visit 新会话、旧会话迟到 claim 失权、`#59` 警告型 catalog 可加载、`fmt=3` trace |
+| `scripts/t3-smoke.mjs` | 显式 `reuse: continuable`（旧行为基线） | Role 跨节点复用（`rolesCreated=1`）、节点边界 compact（`compacts=1`）、三节点 → 业务终局（`{ return: delivered }`）、关库重开后的终局 handoff 与事件顺序 |
+| `scripts/e2e-smoke.mjs` | 缺省 `reuse: node`（现行缺省） | REJECT 修正环路、`retry` 结果自环、离开节点 drain + 新 visit 新会话、旧会话迟到 claim 失权、`#59` 警告型 catalog 可加载、`#131` Child 显式返回 → Root 业务返回、`#132` Program ERROR BLOCK/人工确认恰好推进一次 + Program FAIL → Root 业务返回（#133 补）、`fmt=3` trace |
 
 **skip 口径（AC2）**：0 fail 必须无条件成立；skip 只允许**环境条件**，且不得把失败藏成 skip。当前唯一两处是 `test/programs.test.ts` 的 `runProgram captures output of a real command` 与 `runProgram reports ENOENT for missing commands`——它们在启动时探测 `spawn(..., {stdio:['ignore','pipe','pipe']})`，只有探测到沙箱 `EPERM` 才带原因跳过；`runProgram`/`spawnCollect` 的同一逻辑由受控进程适配器与受控 `SpawnDriver` 用例覆盖（Issue #92/#95），因此受限环境下跳过的是"真实子进程可跑性"，不是未被验证的行为。
 

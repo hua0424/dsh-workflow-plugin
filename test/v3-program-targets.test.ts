@@ -329,6 +329,22 @@ test('#132 A11/AC3: ERROR、抛错与结果未知都 BLOCK 保留材料，不默
       assert.deepEqual(durable.execution.program?.parameters, PARAMS, label)
       assert.equal(durable.execution.blockReason, row.execution.blockReason, label)
       assert.deepEqual(checkExecutionInvariants(durable.run, durable.execution), [])
+
+      // D-132-01（#133 收口）：重开后的 store 上，Manager 事实确认仍能完成推进且恰好一次
+      if (label === 'ERROR') {
+        assert.equal((await h.resolveProgram('PASS', 'Manager verified the milestone state after restart')).ok, true)
+        const advanced = await h.row()
+        assert.equal(advanced.execution.nodeId, 'after')
+        assert.equal(advanced.execution.predecessorId, programExecutionId, '直接前驱是 Program 工作单')
+        assert.equal((await events(h.store, programExecutionId)).filter(type => type === 'program-resolved').length, 1, '确认恰好留一次审计')
+        const program = (await h.store.execution('ws', programExecutionId))!
+        assert.deepEqual(program.returned, { kind: 'result', name: 'PASS', source: programExecutionId })
+        assert.equal(program.successorId, advanced.execution.executionId)
+        assert.match(h.messages.at(-1)!.text, /前驱节点 program 已确认结果：PASS（kind: result）/)
+        const completed = await h.accept('succeeded', 'delivered after restart')
+        assert.equal(completed.run.status, 'completed')
+        assert.deepEqual(completed.run.businessReturn, { name: 'delivered', source: advanced.execution.executionId })
+      }
     } finally { h.close() }
   }
 })

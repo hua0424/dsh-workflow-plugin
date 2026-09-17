@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { workflowConfigSchema } from '../catalog/schema.ts'
 import { computeDefinitionHash } from '../catalog/validate.ts'
-import { LIMITS, ID_PATTERN, nodeOnReturn, nodeResults, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
+import { LIMITS, ID_PATTERN, declaredResults, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
 
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
@@ -62,11 +62,6 @@ const executionSchema = z.object({
   returned: z.object({ kind: z.enum(['result', 'return']), name: z.string().min(1).max(64), source: text }).strict().optional(),
 }).strict()
 
-/** 节点声明的裁决名：Actor/Program 是自己的结果集；Child caller 是被调用流程的返回名（见 onReturn）。 */
-function resultNamesOf(node: NodeDef): string[] {
-  return Object.keys(nodeResults(node) ?? nodeOnReturn(node) ?? {})
-}
-
 export function newNodeToken(): string { return randomUUID() }
 
 /** Validate shape without transforming persisted opaque materials. */
@@ -106,7 +101,7 @@ export function checkExecutionInvariants(run: RunState, execution: NodeExecution
     if (execution.returned.kind === 'return') {
       if (!ID_PATTERN.test(execution.returned.name)) problems.push('workflow return name must be a lowercase id')
       else if (!def?.returns.includes(execution.returned.name)) problems.push('workflow return name is not declared by this workflow')
-    } else if (!!node && !resultNamesOf(node).includes(execution.returned.name)) {
+    } else if (!!node && !declaredResults(node).includes(execution.returned.name)) {
       problems.push('node result name is not declared by this node')
     }
   }

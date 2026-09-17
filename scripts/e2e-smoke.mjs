@@ -31,7 +31,7 @@ workflow:
         succeeded: { criteria: result.txt holds exactly the single line "smoke ok"., target: { node: worker-echo } }
     worker-echo:
       execution: { type: actor-task, role: worker, instruction: Append the single line "worker ok" to result.txt. }
-      checker: { checkerId: judge.claim-correct, config: { criteria: result.txt holds "smoke ok" then "worker ok", exactly two lines. } }
+      checker: { checkerId: judge.claim-correct, config: { criteria: 'result.txt holds "smoke ok" then "worker ok", exactly two lines.' } }
       results:
         succeeded: { criteria: 'result.txt holds "smoke ok" then "worker ok", exactly two lines.', target: { return: delivered } }
         retry: { criteria: The worker line is absent and the artifact needs another attempt., target: { node: worker-echo } }
@@ -348,7 +348,31 @@ try {
   store.close(); store = new StateStore(home)
   assert.deepEqual((await store.get(ws)).run.businessReturn, { name: 'delivered', source: programRow.execution.executionId })
 
-  console.log('E2E SMOKE PASS: REJECT correction + retry result self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen + #59 warned-persona catalog loadable + #131 Child explicit return mapped to the Root business return + #132 Program ERROR BLOCK/manual resolution advancing exactly once to a Root return')
+  // D-132-02（#133 收口）：同一个真实 catalog 走另一条边——FAIL → { return: reopened }，
+  // 使「两类 Target 在真实 catalog 下都有证据」与交付声明一致（不创建后继节点）。
+  assert.equal((await engine.startRun(ws, engine.buildInitialRun('manager', 'program-smoke', programEntry.config, programEntry.definitionHash), programEntry.path, 'program fail request')).ok, true)
+  programRow = await row()
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'program plan ok' }, caller(programRow.execution.dispatch))).ok, true)
+  await engine.handleTurnEnded(ws, caller(programRow.execution.dispatch))
+  const failPlanJudge = caller((await row()).execution.judge)
+  assert.equal((await engine.handleJudgeClaim(ws, (await row()).execution.nodeToken, 'ACCEPT', 'plan verified', failPlanJudge)).ok, true)
+  await engine.handleTurnEnded(ws, failPlanJudge)
+  programRow = await row()
+  assert.equal(programRow.execution.nodeId, 'check')
+  const failExecutionId = programRow.execution.executionId
+  programScript = async () => ({ kind: 'FAIL', reason: 'milestone 8 still has open issues', handoff: 'milestone 8 incomplete' })
+  assert.equal((await engine.handleRunProgram(ws, programRow.execution.nodeToken, { milestoneNumber: 8 }, 'manager')).ok, true)
+  programRow = await row()
+  assert.equal(programRow.run.status, 'completed', '#132: FAIL 直接路由到 Root 返回')
+  assert.equal(programRow.execution.executionId, failExecutionId, '#132: 终局工作单仍是 Program 自己')
+  assert.equal((await store.execution(ws, failExecutionId)).successorId, undefined, '#132: 返回目标不创建后继节点')
+  assert.deepEqual((await store.execution(ws, failExecutionId)).returned, { kind: 'return', name: 'reopened', source: failExecutionId })
+  assert.deepEqual(programRow.run.businessReturn, { name: 'reopened', source: failExecutionId })
+  assert.match(actorPrompts.at(-1).text, /业务终局：reopened/)
+  store.close(); store = new StateStore(home)
+  assert.deepEqual((await store.get(ws)).run.businessReturn, { name: 'reopened', source: failExecutionId })
+
+  console.log('E2E SMOKE PASS: REJECT correction + retry result self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen + #59 warned-persona catalog loadable + #131 Child explicit return mapped to the Root business return + #132 Program ERROR BLOCK/manual resolution advancing exactly once to a Root return + #132 Program FAIL routed to a Root business return (#133)')
 } finally {
   store.close()
   rmSync(home, { recursive: true, force: true })
