@@ -6,8 +6,8 @@
  * v3 shape: every workflow declares a non-empty unique `returns` list; every
  * node declares a non-empty `results` map whose entries each carry criteria and
  * one strictly exclusive Target (`{ node }` or `{ return }`). Child callers
- * declare `onReturn` keyed by the callee's returns (接通由后续票负责，本票静态
- * 拒绝未接通的 Child 执行路径，不给旧路径猜测推进的机会)。
+ * declare `onReturn` keyed by the callee's returns, each mapping to a Target in
+ * the caller's own flow.
  */
 import { createHash } from 'node:crypto'
 import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, isActorTaskNode, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
@@ -164,9 +164,8 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
         const extra = declared.filter(kind => !(PROGRAM_RESULT_NAMES as readonly string[]).includes(kind))
         if (extra.length > 0) problems.push(`${label} declares unknown Program results ${extra.join(', ')}; Program results are PASS and FAIL`)
       } else {
-        // child-workflow：数据形状已按 v3 冻结（onReturn ↔ 被调用流程 returns 完全一致），
-        // 但嵌套原子返回与显式映射的执行路径由后续票接通；本票在产生任何业务副作用前
-        // 明确拒绝，不沿旧路径猜测推进。
+        // child-workflow：v3 显式返回——`onReturn` 的键集合必须与被调用流程的 returns 精确
+        // 相等（缺映射/多余映射静态拒绝），值是本层 Target；递归引用与可达性另行校验。
         const childName = execution.workflowId
         const child = config.childWorkflows?.[childName]
         if (child === undefined) {
@@ -183,7 +182,6 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
           problems.push(`${label} cannot reference the root workflow as a child`)
         }
         validateTargets(label, nodeTargets(node), def, problems)
-        problems.push(`${label} uses child-workflow, which this version does not execute yet (T2); remove the node or wait for explicit Child return support`)
       }
     }
     // reachability: every node reachable from startNode via static targets

@@ -192,7 +192,7 @@ export interface BuiltinProgramNode {
 
 export interface ChildWorkflowNode {
   execution: ChildWorkflowExecution
-  /** 值域必须与被调用流程的 `returns` 集合完全一致（由后续票接通）。 */
+  /** 键集合必须与被调用流程的 `returns` 精确相等；值为本层 Target（可重命名并继续返回）。 */
   onReturn: Record<string, Target>
 }
 
@@ -208,7 +208,7 @@ export function isActorTaskNode(node: NodeDef): node is ActorTaskNode {
   return node.execution.type === 'actor-task'
 }
 
-/** 结果映射：Actor/Program 共用，Child 返回 undefined。 */
+/** 结果映射：Actor/Program 共用，Child 返回 undefined（它的裁决名是被调用流程的返回名）。 */
 export function nodeResults(node: NodeDef): Record<string, ResultDef> | undefined {
   return isActorTaskNode(node) || node.execution.type === 'builtin-program'
     ? (node as ActorTaskNode | BuiltinProgramNode).results
@@ -379,6 +379,10 @@ export interface ExecutionProgram {
 export interface ExecutionChild {
   workflowId: string
   executionId: string
+  /**
+   * 子流程已结算的终局：`terminalExecutionId` 是子流程内实际裁决终局的那张工作单
+   * （两层及以上连续返回时指向下一层 caller，形成可追溯的来源链）；handoff 是原文。
+   */
   result?: { terminalExecutionId: string; handoff: string }
 }
 
