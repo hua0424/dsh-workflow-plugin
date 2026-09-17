@@ -11,11 +11,11 @@
  * - 零副作用：先复制成临时快照（含可能存在的 `-wal`）再以 `readOnly: true` 打开副本，
  *   被诊断的库不被创建、改写，也不在它旁边生成 WAL/shm 索引；缺文件按 `missing`
  *   诊断返回，不是"空库"。
- * - 格式识别：只把 `user_version=9` 且恰好三表（runs / node_executions /
+ * - 格式识别：只把 `user_version=10` 且恰好三表（runs / node_executions /
  *   node_execution_events）识别为当前格式；旧单表 `workflow_state`、其它未知布局、
  *   坏库分别给出明确诊断，**不**把它们读成空结果。
  *
- * 退出码：0 = 当前 v9 格式；1 = 有诊断（missing/legacy/unknown/corrupt）；2 = 用法错误。
+ * 退出码：0 = 当前 v10 格式；1 = 有诊断（missing/legacy/unknown/corrupt）；2 = 用法错误。
  */
 import { DatabaseSync } from 'node:sqlite'
 import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
@@ -23,7 +23,12 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-/** 当前 State 格式（`agent-workflow-state/v9`）的权威表名，与 src/state/store.ts 一致。 */
+/**
+ * 当前 State 格式的权威常量，与 `src/types.ts` 的 `STATE_FORMAT_VERSION` /
+ * `STATE_USER_VERSION` 一致（本脚本是 .mjs，无法直接导入 TS 源码；改格式时两处同步）。
+ */
+export const CURRENT_STATE_USER_VERSION = 10
+export const CURRENT_STATE_FORMAT_VERSION = 'agent-workflow-state/v10'
 export const CURRENT_STATE_TABLES = ['node_execution_events', 'node_executions', 'runs']
 
 const message = error => (error instanceof Error ? error.message : String(error))
@@ -65,11 +70,11 @@ export function inspectStateDb(dbPath) {
           + '续跑无关时由 root 会话执行 `/dsh-flow reset --incompatible-store` 备份退出',
       }
     }
-    if (userVersion !== 9 || tables.join() !== CURRENT_STATE_TABLES.join()) {
+    if (userVersion !== CURRENT_STATE_USER_VERSION || tables.join() !== CURRENT_STATE_TABLES.join()) {
       return {
         kind: 'unknown', path: dbPath, userVersion, tables,
         detail: `未识别的 State 格式（user_version=${userVersion}，表=[${tables.join(', ')}]）：`
-          + `当前格式要求 user_version=9 且恰好三表 [${CURRENT_STATE_TABLES.join(', ')}]；不做猜测、不迁移`,
+          + `当前格式要求 user_version=${CURRENT_STATE_USER_VERSION} 且恰好三表 [${CURRENT_STATE_TABLES.join(', ')}]；不做猜测、不迁移`,
       }
     }
     const rows = db.prepare('SELECT run_id, workspace_key, format_version, state_version, status, current_execution_id, snapshot_json, updated_at FROM runs ORDER BY sequence DESC').all()
@@ -84,7 +89,7 @@ export function inspectStateDb(dbPath) {
           updatedAt: row.updated_at,
           workflowId: run?.catalogWorkflowId, callStack: Array.isArray(run?.callStack) ? run.callStack.length : undefined,
           managerSessionId: run?.managerSessionId,
-          problem: parsed.problem ?? (row.format_version === 'agent-workflow-state/v9' ? undefined : `format_version=${row.format_version} 与当前格式不一致`),
+          problem: parsed.problem ?? (row.format_version === CURRENT_STATE_FORMAT_VERSION ? undefined : `format_version=${row.format_version} 与当前格式不一致`),
         }
       }),
     }

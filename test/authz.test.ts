@@ -8,18 +8,20 @@ import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
 const CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   developer: { persona: D }
   reviewer: { persona: R }
 judgeRole: { persona: J }
 workflow:
   startNode: plan
+  returns: [done]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The plan is complete., target: { return: done } }
 `), { workflowId: 'authz-test' })
 
 function makeRun(): RunState {

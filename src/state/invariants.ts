@@ -56,8 +56,10 @@ const executionSchema = z.object({
   /**
    * v3：本工作单退出时实际裁决的终局名。`result` = 节点结果名（节点退出），
    * `return` = 流程返回名（本流程正常结束，Root 时即 Run 的业务终局）。
+   * 名字语法在下面的跨字段校验里按种类分别判定（Program 的结果键是协议固定的
+   * `PASS`/`FAIL`，不受业务结果名的小写标识符规则约束），此处只要求有界字符串。
    */
-  returned: z.object({ kind: z.enum(['result', 'return']), name: z.string().regex(ID_PATTERN), source: text }).strict().optional(),
+  returned: z.object({ kind: z.enum(['result', 'return']), name: z.string().min(1).max(64), source: text }).strict().optional(),
 }).strict()
 
 /** 节点声明的结果名（Child caller 用被调用流程的返回名，见 onReturn）。 */
@@ -98,10 +100,15 @@ export function checkExecutionInvariants(run: RunState, execution: NodeExecution
   // v3: 终局裁决名（节点结果名或流程返回名）随工作单材料保留，供 status/通知/trace 解释。
   if (execution.returned !== undefined) {
     if (execution.phase !== 'exited') problems.push('returned is only valid on an exited execution')
-    if (!ID_PATTERN.test(execution.returned.name)) problems.push('returned name must be a lowercase id')
     if (execution.returned.source !== execution.executionId) problems.push('returned source must be this execution')
-    if (execution.returned.kind === 'return' && !def?.returns.includes(execution.returned.name)) problems.push('workflow return name is not declared by this workflow')
-    if (execution.returned.kind === 'result' && !!node && !resultNamesOf(node).includes(execution.returned.name)) problems.push('node result name is not declared by this node')
+    // 语法按种类分别判定：流程返回名是本流程声明的小写标识符；节点结果名只需在**本节点
+    // 声明**中（Program 的结果键是协议固定的 PASS/FAIL）。
+    if (execution.returned.kind === 'return') {
+      if (!ID_PATTERN.test(execution.returned.name)) problems.push('workflow return name must be a lowercase id')
+      else if (!def?.returns.includes(execution.returned.name)) problems.push('workflow return name is not declared by this workflow')
+    } else if (!!node && !resultNamesOf(node).includes(execution.returned.name)) {
+      problems.push('node result name is not declared by this node')
+    }
   }
   if (execution.claim && execution.claim.dispatchId !== execution.dispatch?.id) problems.push('claim dispatch mismatch')
   if (execution.judge && (execution.judge.claimId !== execution.claim?.id || execution.judge.inputVersion !== execution.inputVersion)) problems.push('judge claim/input mismatch')

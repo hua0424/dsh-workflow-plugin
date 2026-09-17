@@ -11,49 +11,93 @@ import { isRootCommandAgent, makeDshFlowCommand, type CommandHost } from '../src
 import { makeStateHost } from '../src/plugin/host.ts'
 import { StateAccess, StateStore, stateDbPath } from '../src/state/store.ts'
 import type { WorkflowConfig } from '../src/types.ts'
+import { STATE_USER_VERSION } from '../src/types.ts'
 
-const CONFIG: WorkflowConfig = {
-  schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
-  workflow: { startNode: 'plan', nodes: {
-    plan: {
-      execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
-      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
-      onPass: 'END',
-    },
-  } },
+/** v3 迁移辅助：用例仍按 v2 的 onPass 描述图，这里翻译成命名结果 + 统一 Target。 */
+type LegacyActorNode = {
+  execution: { type: 'actor-task'; role: string; instruction: string }
+  checker: { checkerId: string; config: { criteria: string } }
+  onPass?: string
+  onFail?: string
 }
-const ROLE_CONFIG: WorkflowConfig = {
-  ...CONFIG,
-  roles: { worker: { persona: 'Worker' } },
-  workflow: { startNode: 'plan', nodes: {
-    plan: { ...CONFIG.workflow.nodes.plan!, onPass: 'work' },
-    work: {
-      execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
-      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct work' } },
-      onPass: 'END',
-    },
-  } },
+const ACTOR_NODES = new WeakMap<WorkflowConfig, Record<string, LegacyActorNode>>()
+const v3Target = (name: string, returns: string[]): import('../src/types.ts').Target =>
+  name === 'END' ? { return: returns[0] ?? 'done' } : { node: name }
+/** 用 v2 形状（onPass/onFail）描述一次图，再编译成 v3 results。 */
+function makeConfig(returns: string[], build: (nodes: Record<string, LegacyActorNode>) => void, roles: WorkflowConfig['roles'] = {}): WorkflowConfig {
+  const actors: Record<string, LegacyActorNode> = {}
+  build(actors)
+  const nodes: Record<string, import('../src/types.ts').NodeDef> = {}
+  for (const [nodeId, actor] of Object.entries(actors)) {
+    nodes[nodeId] = {
+      execution: actor.execution,
+      checker: actor.checker,
+      results: {
+        succeeded: { criteria: 'The node concluded successfully.', target: v3Target(actor.onPass ?? 'END', returns) },
+        ...(actor.onFail === undefined ? {} : { failed: { criteria: 'The node could not conclude successfully.', target: v3Target(actor.onFail, returns) } }),
+      },
+    }
+  }
+  const config: WorkflowConfig = { schemaVersion: 'agent-workflow/v3', roles, judgeRole: { persona: 'Read only' }, workflow: { startNode: 'plan', returns, nodes } }
+  ACTOR_NODES.set(config, actors)
+  return config
 }
-const SAME_ROLE_CONFIG: WorkflowConfig = {
-  ...ROLE_CONFIG,
+
+const CONFIG: WorkflowConfig = makeConfig(['done'], nodes => {
+  nodes.plan = {
+    execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
+    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+    onPass: 'END',
+  }
+})
+const ROLE_CONFIG: WorkflowConfig = makeConfig(['done'], nodes => {
+  nodes.plan = {
+    execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
+    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+    onPass: 'work',
+  }
+  nodes.work = {
+    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
+    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct work' } },
+    onPass: 'END',
+  }
+}, { worker: { persona: 'Worker' } })
+const SAME_ROLE_CONFIG: WorkflowConfig = makeConfig(['done'], nodes => {
+  nodes.plan = {
+    execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
+    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+    onPass: 'first',
+  }
+  nodes.first = {
+    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
+    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct work' } },
+    onPass: 'second',
+  }
+  nodes.second = {
+    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
+    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct work' } },
+    onPass: 'END',
+  }
+}, {
   // 同一个 Role 跨节点复用（整 Run 复用 + 边界 compact）是 `reuse: continuable` 的语义；
   // 缺省 `reuse: node` 在离开节点时即释放会话（见 runtime-work-order.test.ts 的 node 用例）。
-  roles: { worker: { persona: 'Worker', reuse: 'continuable' } },
-  workflow: { startNode: 'plan', nodes: {
-    plan: { ...ROLE_CONFIG.workflow.nodes.plan!, onPass: 'first' },
-    first: { ...ROLE_CONFIG.workflow.nodes.work!, onPass: 'second' },
-    second: { ...ROLE_CONFIG.workflow.nodes.work!, onPass: 'END' },
-  } },
-}
+  worker: { persona: 'Worker', reuse: 'continuable' },
+})
 const PROGRAM_CONFIG: WorkflowConfig = {
-  ...CONFIG,
-  workflow: { startNode: 'plan', nodes: {
-    plan: { ...CONFIG.workflow.nodes.plan!, onPass: 'program' },
-    program: {
-      execution: { type: 'builtin-program', programId: 'github.all-milestone-issues-complete' },
-      onPass: 'END',
-    },
-  } },
+  ...makeConfig(['done'], nodes => {
+    nodes.plan = {
+      execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
+      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+      onPass: 'program',
+    }
+  }),
+}
+PROGRAM_CONFIG.workflow.nodes.program = {
+  execution: { type: 'builtin-program', programId: 'github.all-milestone-issues-complete' },
+  results: {
+    PASS: { criteria: 'The program reported success.', target: { return: 'done' } },
+    FAIL: { criteria: 'The program reported failure.', target: { return: 'done' } },
+  },
 }
 
 function resetHarness() {
@@ -175,7 +219,7 @@ test('known active work from a terminated Run blocks immediate start while expli
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('old-manager', 'test', ROLE_CONFIG, 'ignored'), undefined, 'old input')
     const actor = { sessionId: 'old-manager', turnUserMessageIds: new Set(['manager-1']) }
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan handoff' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan handoff' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = (await h.store.get('ws'))!
     const judge = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-1']) }
@@ -203,7 +247,7 @@ test('known active Judge from a terminated Run blocks start and a safely inspect
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('old-manager', 'test', CONFIG, 'ignored'), undefined, 'old input')
     const actor = { sessionId: 'old-manager', turnUserMessageIds: new Set(['manager-1']) }
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const checking = (await h.store.get('ws'))!
     const oldJudge = { sessionId: checking.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-1']) }
@@ -225,7 +269,7 @@ test('terminated ready Role visit inspects its mapped Actor and unsettled predec
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('old-manager', 'test', SAME_ROLE_CONFIG, 'ignored'), undefined, 'old input')
     const manager = { sessionId: 'old-manager', turnUserMessageIds: new Set(['manager-1']) }
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan' }, manager)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan' }, manager)
     await h.engine.handleTurnEnded('ws', manager)
     let row = (await h.store.get('ws'))!
     let judge = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-1']) }
@@ -233,7 +277,7 @@ test('terminated ready Role visit inspects its mapped Actor and unsettled predec
     await h.engine.handleTurnEnded('ws', judge)
 
     const role = { sessionId: 'old-role', turnUserMessageIds: new Set(['role-1']) }
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'first result' }, role)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'first result' }, role)
     await h.engine.handleTurnEnded('ws', role)
     row = (await h.store.get('ws'))!
     judge = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-1']) }
@@ -279,7 +323,7 @@ test('repeated Reset is rejected; restart and late Actor work cannot mutate term
     await h.engine.handleRestartReconcile()
     assert.deepEqual(await h.store.get('ws'), terminated)
     const late = { sessionId: 'manager', turnUserMessageIds: new Set(['manager-1']) }
-    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'late' }, late)).ok, false)
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'late' }, late)).ok, false)
     assert.deepEqual(await h.store.get('ws'), terminated)
   } finally { h.close() }
 })
@@ -289,7 +333,7 @@ test('late Program result from a terminated Run cannot advance its replacement R
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('old-manager', 'test', PROGRAM_CONFIG, 'ignored'), undefined, 'old input')
     const actor = { sessionId: 'old-manager', turnUserMessageIds: new Set(['manager-1']) }
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'program input' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'program input' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = (await h.store.get('ws'))!
     const judge = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-1']) }
@@ -314,7 +358,7 @@ test('late Program result from a terminated Run cannot advance its replacement R
   } finally { h.close() }
 })
 
-test('incompatible v8 store enters maintenance and root-authorized cutover preserves a readable backup before v9 initialization', async () => {
+test('incompatible v8 store enters maintenance and root-authorized cutover preserves a readable backup before the current-format initialization', async () => {
   const h = resetHarness()
   let access: StateAccess | undefined
   try {
@@ -359,7 +403,7 @@ test('incompatible v8 store enters maintenance and root-authorized cutover prese
     }, { async run() { throw new Error('unexpected Program') } }, makeStateHost(() => access!.current()))
     assert.equal((await recovered.startRun('new-ws', recovered.buildInitialRun('new-manager', 'test', CONFIG, 'ignored'), undefined, 'new after cutover')).ok, true)
     const fresh = new DatabaseSync(stateDbPath(h.home), { readOnly: true })
-    try { assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9) }
+    try { assert.equal((fresh.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, STATE_USER_VERSION) }
     finally { fresh.close() }
   } finally {
     access?.close()

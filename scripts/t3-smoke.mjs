@@ -20,25 +20,29 @@ const home = mkdtempSync(join(tmpdir(), 'workflow-t3-smoke-'))
 const cwd = join(home, 'workspace')
 mkdirSync(cwd)
 mkdirSync(join(home, 'workflows'))
-writeFileSync(join(home, 'workflows', 'smoke.yaml'), `schemaVersion: agent-workflow/v2
+writeFileSync(join(home, 'workflows', 'smoke.yaml'), `schemaVersion: agent-workflow/v3
 roles:
   worker: { persona: Work only on the isolated artifact., reuse: continuable }
 judgeRole: { persona: Read only verification. }
 workflow:
   startNode: plan
+  returns: [delivered]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Create plan.txt. }
       checker: { checkerId: judge.claim-correct, config: { criteria: plan.txt is present and correct. } }
-      onPass: work
+      results:
+        succeeded: { criteria: plan.txt is present and correct., target: { node: work } }
     work:
       execution: { type: actor-task, role: worker, instruction: Create result.txt. }
       checker: { checkerId: judge.claim-correct, config: { criteria: result.txt is present and correct. } }
-      onPass: finish
+      results:
+        succeeded: { criteria: result.txt is present and correct., target: { node: finish } }
     finish:
       execution: { type: actor-task, role: worker, instruction: Final delivery. }
       checker: { checkerId: judge.claim-correct, config: { criteria: final handoff identifies result.txt. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The final handoff identifies result.txt., target: { return: delivered } }
 `)
 let store = new StateStore(home)
 try {
@@ -70,7 +74,7 @@ try {
     if (index === 0) writeFileSync(join(cwd, 'plan.txt'), 'plan ok')
     if (index === 1) writeFileSync(join(cwd, 'result.txt'), 'result ok')
     const actor = caller(row.execution.dispatch)
-    assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff }, actor)).ok, true)
+    assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff }, actor)).ok, true)
     assert.equal(packets.length, index, 'claim must wait for Actor settlement')
     await engine.handleTurnEnded(ws, actor)
     assert.equal(readFileSync(join(cwd, index === 0 ? 'plan.txt' : 'result.txt'), 'utf8'), index === 0 ? 'plan ok' : 'result ok')

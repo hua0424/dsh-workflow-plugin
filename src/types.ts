@@ -171,6 +171,12 @@ export interface ResultDef {
   target: Target
 }
 
+/**
+ * Program 节点的结果键是执行协议固定的 PASS/FAIL（不是业务结果名）。这是静态
+ * 校验与 schema 共用的单源。
+ */
+export const PROGRAM_RESULT_NAMES = ['PASS', 'FAIL'] as const
+
 export interface ActorTaskNode {
   execution: ActorTaskExecution
   checker: CheckerRef

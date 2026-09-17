@@ -5,7 +5,7 @@
  * no v2 `failed` → business result guessing.
  */
 import { z } from 'zod'
-import { ID_PATTERN, LIMITS, ROLE_REUSE_MODES } from '../types.ts'
+import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, ROLE_REUSE_MODES, type NodeDef } from '../types.ts'
 import { JUDGE_PROTECTED_TOOLS } from '../roles/roles.ts'
 
 const nonEmptyTrimmed = z.string().trim().min(1)
@@ -104,9 +104,13 @@ const returnTarget = z.object({ return: z.string().regex(ID_PATTERN, 'target ret
  * 按给定形状显式分派（而非裸 union）：union 会把互斥分支的失败混成一句
  * "Invalid input"，看不出真正违规的键（例如 v2 的 `onPass`）。分派后错误直指
  * 具体节点类型与要求的 Target 形状，严格未知字段拒绝不变。
+ *
+ * 注意：Zod v4 的 `z.record(键, 值)` 会剥离值 schema 上的 refine，因此分派 schema
+ * 直接用在具体的字段位置上（节点表是整表一个 custom），不放在 record 的值位置。
  */
 function dispatched<T>(inner: z.ZodType<T>, shapeError: string, ok: (value: unknown) => boolean = () => true) {
-  return z.any().superRefine((value, ctx) => {
+  // 用 z.unknown().superRefine：z.custom 的校验器在 Zod v4 只收到 value，拿不到 ctx。
+  return z.unknown().superRefine((value, ctx) => {
     if (!ok(value)) {
       ctx.addIssue({ code: 'custom', message: shapeError })
       return
@@ -134,8 +138,14 @@ const resultDef = z
   })
   .strict()
 
-/** 结果名在本节点局部解释；与返回名一样沿用小写标识符规则。 */
+/** 结果名在本节点局部解释；Actor 沿用小写标识符规则。 */
 const results = z.record(z.string().regex(ID_PATTERN, 'result name must be a lowercase [a-z][a-z0-9-]* id'), resultDef)
+/**
+ * Program 的结果键是执行协议固定的 PASS/FAIL（不是业务结果名）；键的合法性与
+ * 「PASS 与 FAIL 都必须声明」都由静态校验给出——若在 schema 用 enum 作 record 键，
+ * Zod 会一次性要求全部键，报错就变成"缺键"而不是"两个结果都必须声明"的语义。
+ */
+const programResults = z.record(nonEmptyTrimmed, resultDef)
 
 const actorTaskNode = z
   .object({
@@ -148,7 +158,7 @@ const actorTaskNode = z
 const builtinProgramNode = z
   .object({
     execution: builtinProgramExecution,
-    results,
+    results: programResults,
   })
   .strict()
 
@@ -159,19 +169,37 @@ const childWorkflowNode = z
   })
   .strict()
 
-const nodeUnion = dispatched(
-  z.union([actorTaskNode, builtinProgramNode, childWorkflowNode]),
-  'node requires execution.type of actor-task | builtin-program | child-workflow',
-  value => ['actor-task', 'builtin-program', 'child-workflow'].includes(
-    String((value as { execution?: { type?: unknown } } | null)?.execution?.type ?? ''),
-  ),
-)
+/**
+ * 节点表：整表一个 custom，逐节点按 `execution.type` 分派到对应 schema。
+ * 放在这里（而不是 `z.record` 的值位置）是因为 Zod v4 的 record 会剥离值 schema
+ * 上的 refine——那样只能得到裸 union 的 "Invalid input"，看不出违规的键。
+ */
+const nodeTable = z.unknown().superRefine((value, ctx) => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    ctx.addIssue({ code: 'custom', message: 'nodes must be a mapping of node id to node' })
+    return
+  }
+  for (const [nodeId, node] of Object.entries(value as Record<string, unknown>)) {
+    if (!ID_PATTERN.test(nodeId)) {
+      ctx.addIssue({ code: 'custom', path: [nodeId], message: `node id "${nodeId}" must be a lowercase [a-z][a-z0-9-]* id` })
+    }
+    const type = (node as { execution?: { type?: unknown } } | null)?.execution?.type
+    const schema = type === 'actor-task' ? actorTaskNode : type === 'builtin-program' ? builtinProgramNode : type === 'child-workflow' ? childWorkflowNode : undefined
+    if (schema === undefined) {
+      ctx.addIssue({ code: 'custom', path: [nodeId], message: `node requires execution.type of actor-task | builtin-program | child-workflow (got ${JSON.stringify(type)})` })
+      continue
+    }
+    const parsed = schema.safeParse(node)
+    if (parsed.success) continue
+    for (const issue of parsed.error.issues) ctx.addIssue({ ...issue, path: [nodeId, ...issue.path] } as never)
+  }
+}) as unknown as z.ZodType<Record<string, NodeDef>>
 
 const workflowDef = z
   .object({
     startNode: nonEmptyTrimmed,
     returns: z.array(z.string().regex(ID_PATTERN, 'return name must be a lowercase [a-z][a-z0-9-]* id')).min(1),
-    nodes: z.record(z.string(), nodeUnion),
+    nodes: nodeTable,
   })
   .strict()
 

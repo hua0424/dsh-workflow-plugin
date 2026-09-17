@@ -72,13 +72,13 @@ test('node_claim routes to host.claim and concludes the turn on success', async 
   let concluded = false
   const exec = { ...EXEC, concludeTurn: () => { concluded = true } }
   const result = await tool.execute(
-    { outcome: 'completed', handoff: 'did it; next: X' },
+    { result: 'succeeded', handoff: 'did it; next: X' },
     exec as never,
   )
   assert.equal(result, 'claimed')
   // A1 AC2: no nodeToken — only the payload plus the lease caller snapshot
   // (EXEC has no agent → fail-closed empty id set, sessionId '').
-  assert.deepEqual(host.calls[0], { name: 'claim', args: { ws: 'ws-1', claim: { outcome: 'completed', handoff: 'did it; next: X' }, caller: { sessionId: '', turnUserMessageIds: new Set<string>() } } })
+  assert.deepEqual(host.calls[0], { name: 'claim', args: { ws: 'ws-1', claim: { result: 'succeeded', handoff: 'did it; next: X' }, caller: { sessionId: '', turnUserMessageIds: new Set<string>() } } })
   assert.equal(concluded, true)
 })
 
@@ -166,32 +166,36 @@ test('trim-bounded payloads reach the host trimmed — a whitespace bomb never l
   const judgeClaim = findTool(host, 'judge_claim')
   const nodeBlock = findTool(host, 'node_block')
   const padded = ' '.repeat(10_000) + 'x'
-  await nodeClaim.execute({ outcome: 'completed', handoff: padded }, EXEC as never)
+  await nodeClaim.execute({ result: 'succeeded', handoff: padded }, EXEC as never)
   await judgeClaim.execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: padded }, EXEC as never)
   await nodeBlock.execute({ nodeToken: randomUUID(), reason: padded }, EXEC as never)
-  assert.deepEqual((host.calls[0]!.args as { claim: { handoff: string } }).claim, { outcome: 'completed', handoff: 'x' })
+  assert.deepEqual((host.calls[0]!.args as { claim: { handoff: string } }).claim, { result: 'succeeded', handoff: 'x' })
   assert.equal((host.calls[1]!.args as { reason: string }).reason, 'x')
   assert.equal((host.calls[2]!.args as { reason: string }).reason, 'x')
 })
 
-test('T2 public schema rejects legacy fields and invalid handoff symmetrically', async () => {
+test('#130 node_claim public schema rejects legacy fields and invalid handoff symmetrically', async () => {
   const host = makeToolHost()
   const tool = findTool(host, 'node_claim')
-  for (const outcome of ['completed', 'failed']) {
+  for (const result of ['succeeded', 'changes-required']) {
+    // v2 的 outcome / 旧的 summary / handoffContext 及缺失必填项一律拒绝
     for (const args of [
-      { outcome }, { outcome, handoff: 42 },
-      { outcome, summary: 'old' }, { outcome, handoffContext: 'old' },
-      { outcome, handoff: 'valid', summary: 'old' },
-      { outcome, handoff: 'valid', handoffContext: 'old' },
+      { result },
+      { outcome: 'completed', handoff: 'legacy' },
+      { result, handoff: 42 },
+      { result, summary: 'old' }, { result, handoffContext: 'old' },
+      { result, handoff: 'valid', summary: 'old' },
+      { result, handoff: 'valid', handoffContext: 'old' },
+      { result, handoff: 'valid', outcome: 'completed' },
     ]) {
       await assert.rejects(() => tool.execute(args, EXEC as never), /invalid arguments/)
     }
     for (const handoff of ['', '   ', 'x'.repeat(8001)]) {
-      assert.match(await tool.execute({ outcome, handoff }, EXEC as never) as string, /拒绝：handoff/)
+      assert.match(await tool.execute({ result, handoff }, EXEC as never) as string, /拒绝：handoff/)
     }
     const handoff = 'x'.repeat(8000)
-    assert.equal(await tool.execute({ outcome, handoff: `  ${handoff}  ` }, EXEC as never), 'claimed')
-    assert.deepEqual((host.calls.at(-1)!.args as { claim: unknown }).claim, { outcome, handoff })
+    assert.equal(await tool.execute({ result, handoff: `  ${handoff}  ` }, EXEC as never), 'claimed')
+    assert.deepEqual((host.calls.at(-1)!.args as { claim: unknown }).claim, { result, handoff })
   }
   assert.equal(host.calls.length, 2)
 })
@@ -219,7 +223,7 @@ test('authorize denial surfaces in control tools', async () => {
     authorize: async () => ({ workspaceKey: null, reason: 'only manager' }),
   })
   const tool = findTool(host, 'node_claim')
-  const result = await tool.execute({ outcome: 'completed', handoff: 's' }, EXEC as never)
+  const result = await tool.execute({ result: 'succeeded', handoff: 's' }, EXEC as never)
   assert.match(result as string, /拒绝：only manager/)
 })
 
@@ -234,7 +238,7 @@ test('target host Session snapshot binds native claim to its dispatch, excluding
   session.append('turn/end', { turn: 1, reason: { kind: 'completed' } } as never)
   session.append('turn/start', { turn: 2 } as never)
   session.append('user/message', createUserMessage({ content: [{ type: 'text', text: 'new work' }], source: { kind: 'user' } }), { surfaceOp: 'append' })
-  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'done' }, {
+  await findTool(host, 'node_claim').execute({ result: 'succeeded', handoff: 'done' }, {
     ...EXEC, agent: { session }, callId: 'native-claim', rootCallId: 'native-claim',
   } as never)
   assert.deepEqual((host.calls[0]!.args as { caller: unknown }).caller, {
@@ -261,10 +265,10 @@ test('target host Code Mode snapshot binds claim/block only with the real root a
     block: async (_ws, _token, _reason, caller) => { callers.push(caller); return { ok: true } },
   })
   const exec = { ...EXEC, agent: { session }, callId: 'root:code:1', rootCallId: 'root' }
-  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'done' }, exec as never)
+  await findTool(host, 'node_claim').execute({ result: 'succeeded', handoff: 'done' }, exec as never)
   await findTool(host, 'node_block').execute({ nodeToken: randomUUID(), reason: 'pause' }, exec as never)
-  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'forged root' }, { ...exec, rootCallId: 'other-root' } as never)
-  await findTool(host, 'node_claim').execute({ outcome: 'completed', handoff: 'forged subcall' }, { ...exec, callId: 'root:code:2' } as never)
+  await findTool(host, 'node_claim').execute({ result: 'succeeded', handoff: 'forged root' }, { ...exec, rootCallId: 'other-root' } as never)
+  await findTool(host, 'node_claim').execute({ result: 'succeeded', handoff: 'forged subcall' }, { ...exec, callId: 'root:code:2' } as never)
   assert.deepEqual(callers, [
     { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
     { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },

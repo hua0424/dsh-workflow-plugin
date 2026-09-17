@@ -96,6 +96,9 @@ function renderRecovery(recovery: boolean | undefined): string {
 export function renderJudgePrompt(input: JudgePromptInput): string {
   const fields: Record<string, string> = {
     ...input,
+    // 模板占位符名与领域字段名的唯一映射点：模板用 `{workerResult}`，领域字段是 `result`
+    // （与 `{workerHandoff}` 对称）。漏映射会让占位符原样下发，故集中在此。
+    workerResult: input.result,
     criteria: input.criteria.trim() === '' ? '(none)' : input.criteria,
     recovery: renderRecovery(input.recovery),
     previousFeedback: renderPreviousFeedback(input.previousFeedback),

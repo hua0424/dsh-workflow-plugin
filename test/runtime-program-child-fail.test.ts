@@ -6,21 +6,45 @@ import { join } from 'node:path'
 import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine, type ProgramHost } from '../src/engine/engine.ts'
-import { validateAndNormalize } from '../src/catalog/validate.ts'
-import type { ClaimCaller, ProgramResult, WorkflowConfig } from '../src/types.ts'
+import { validateAndNormalize, CatalogValidationError } from '../src/catalog/validate.ts'
+import type { ClaimCaller, ProgramResult, Target, WorkflowConfig } from '../src/types.ts'
 
 const CHECKER = { checkerId: 'judge.claim-correct', config: { criteria: 'existing criteria' } }
+const RETURNS = ['planned', 'repaired']
+const target = (name: string): Target => (RETURNS.includes(name) ? { return: name } : { node: name })
 
-function programConfig(): WorkflowConfig {
+function actorNode(role: string, instruction: string, onPass: string) {
   return {
-    schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
-    workflow: { startNode: 'plan', nodes: {
-      plan: { execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' }, checker: CHECKER, onPass: 'program' },
-      program: { execution: { type: 'builtin-program', programId: 'github.initialize-milestone', instruction: 'Initialize' }, onPass: 'after', onFail: 'repair' },
-      after: { execution: { type: 'actor-task', role: 'manager', instruction: 'Continue' }, checker: CHECKER, onPass: 'END' },
-      repair: { execution: { type: 'actor-task', role: 'manager', instruction: 'Repair' }, checker: CHECKER, onPass: 'END' },
-    } },
+    execution: { type: 'actor-task' as const, role, instruction },
+    checker: CHECKER,
+    results: { succeeded: { criteria: `${instruction} is complete.`, target: target(onPass) } },
   }
+}
+
+/**
+ * Program 节点在 v3 用执行协议固定的 PASS/FAIL 结果 + 统一 Target（可继续到节点或
+ * 显式返回流程结果）；ERROR 不配置路由，交 Manager 事实确认。
+ */
+function programConfig(): WorkflowConfig {
+  const config: WorkflowConfig = {
+    schemaVersion: 'agent-workflow/v3', roles: {}, judgeRole: { persona: 'Read only' },
+    workflow: {
+      startNode: 'plan', returns: [...RETURNS],
+      nodes: {
+        plan: actorNode('manager', 'Plan', 'program'),
+        program: {
+          execution: { type: 'builtin-program', programId: 'github.initialize-milestone', instruction: 'Initialize' },
+          results: {
+            PASS: { criteria: 'The program reported success.', target: { node: 'after' } },
+            FAIL: { criteria: 'The program reported failure.', target: { node: 'repair' } },
+          },
+        },
+        after: actorNode('manager', 'Continue', 'planned'),
+        repair: actorNode('manager', 'Repair', 'repaired'),
+      },
+    },
+  }
+  return validateAndNormalize(config, { workflowId: 'test' })
 }
 
 function harness(config: WorkflowConfig, programs: ProgramHost) {
@@ -71,10 +95,10 @@ function harness(config: WorkflowConfig, programs: ProgramHost) {
   }
 }
 
-async function acceptActor(h: ReturnType<typeof harness>, handoff: string, outcome: 'completed' | 'failed' = 'completed') {
+async function acceptActor(h: ReturnType<typeof harness>, handoff: string, result = 'succeeded') {
   let row = await h.row()
   const actor = h.caller(row.execution.dispatch!)
-  assert.equal((await h.engine.handleClaim('ws', { outcome, handoff }, actor)).ok, true)
+  assert.equal((await h.engine.handleClaim('ws', { result, handoff }, actor)).ok, true)
   await h.engine.handleTurnEnded('ws', actor)
   row = await h.row()
   const judge = h.caller(row.execution.judge!)
@@ -82,272 +106,36 @@ async function acceptActor(h: ReturnType<typeof harness>, handoff: string, outco
   await h.engine.handleTurnEnded('ws', judge)
 }
 
-// 已确认 seam：真实 Runtime + 临时 SQLite + 受控 Host Adapter。
+/**
+ * T2（#131）接通前，Child 执行路径在 catalog 静态校验期就被明确拒绝——本票不得沿旧
+ * 路径猜测推进。这里锁住该约束：v3 的 Child 形状可解析，但不可执行。
+ */
 function childConfig(): WorkflowConfig {
   return {
-    schemaVersion: 'agent-workflow/v2', roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
-    workflow: { startNode: 'plan', nodes: {
-      plan: { execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' }, checker: CHECKER, onPass: 'call-child' },
-      'call-child': { execution: { type: 'child-workflow', workflowId: 'child-a' }, onPass: 'after' },
-      after: { execution: { type: 'actor-task', role: 'manager', instruction: 'Continue' }, checker: CHECKER, onPass: 'END' },
-    } },
-    childWorkflows: { 'child-a': { startNode: 'work', nodes: {
-      work: { execution: { type: 'actor-task', role: 'worker', instruction: 'Child work' }, checker: CHECKER, onPass: 'END' },
-    } } },
+    schemaVersion: 'agent-workflow/v3', roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
+    workflow: {
+      startNode: 'plan', returns: [...RETURNS],
+      nodes: {
+        plan: actorNode('manager', 'Plan', 'call-child'),
+        'call-child': { execution: { type: 'child-workflow', workflowId: 'child-a' }, onReturn: { finished: { node: 'after' } } },
+        after: actorNode('manager', 'Continue', 'planned'),
+      },
+    },
+    childWorkflows: {
+      'child-a': {
+        startNode: 'work', returns: ['finished'],
+        nodes: { work: actorNode('worker', 'Child work', 'finished') },
+      },
+    },
   }
 }
 
-// 已确认 seam：真实 Runtime + 临时 SQLite + 受控 Host Adapter。
-test('one-level Child atomically returns its final handoff through the parent caller', async () => {
-  const h = harness(childConfig(), { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    await acceptActor(h, 'parent input')
-    let row = await h.row()
-    assert.equal(row.execution.workflowId, 'child-a')
-    assert.equal(row.execution.nodeId, 'work')
-    assert.equal(row.execution.input, 'parent input')
-    assert.equal(row.run.callStack.length, 2)
-    const parentExecutionId = row.run.callStack[0]!.executionId
-    assert.ok(parentExecutionId)
-    const parentWaiting = (await h.store.execution('ws', parentExecutionId))!
-    assert.equal(parentWaiting.phase, 'working')
-    assert.equal(parentWaiting.child?.executionId, row.execution.executionId)
-
-    const actor = h.caller(row.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'child final artifact' }, actor)
-    await h.engine.handleTurnEnded('ws', actor)
-    row = await h.row()
-    const leafExecutionId = row.execution.executionId
-    const judge = h.caller(row.execution.judge!)
-    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'child verified', judge)).ok, true)
-    const returned = await h.row()
-    assert.equal(returned.run.callStack.length, 1)
-    assert.equal(returned.execution.nodeId, 'after')
-    assert.equal(returned.execution.input, 'child final artifact')
-    assert.equal(returned.execution.phase, 'ready')
-    const parent = (await h.store.execution('ws', parentExecutionId))!
-    assert.equal(parent.phase, 'exited')
-    assert.equal(parent.child?.result?.terminalExecutionId, leafExecutionId)
-    assert.equal(parent.child?.result?.handoff, 'child final artifact')
-    await h.engine.handleTurnEnded('ws', judge)
-    assert.equal((await h.row()).execution.phase, 'working')
-  } finally { h.close() }
-})
-
-test('reopen resumes a registered Child caller transition exactly once', async () => {
-  const h = harness(childConfig(), { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    let row = await h.row()
-    const actor = h.caller(row.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'parent input' }, actor)
-    await h.engine.handleTurnEnded('ws', actor)
-    row = await h.row()
-    const judge = h.caller(row.execution.judge!)
-    await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified parent', judge)
-    const childCaller = await h.row()
-    assert.equal(childCaller.execution.nodeId, 'call-child')
-    assert.equal(childCaller.execution.phase, 'ready')
-    h.reopen()
-    await h.engine.handleRestartReconcile()
-    const blocked = await h.row()
-    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '恢复已登记的Child调用。', 'manager', 'auto')).ok, true)
-    const child = await h.row()
-    assert.equal(child.run.callStack.length, 2)
-    assert.equal(child.execution.workflowId, 'child-a')
-    assert.equal(child.execution.input, 'parent input')
-    const parent = (await h.store.execution('ws', blocked.execution.executionId))!
-    assert.equal(parent.child?.executionId, child.execution.executionId)
-    assert.equal((await h.store.events('ws', parent.executionId)).filter(event => event.type === 'child-entered').length, 1)
-  } finally { h.close() }
-})
-
-test('reopen resumes the stored Child top without pushing the parent again', async () => {
-  const h = harness(childConfig(), { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    await acceptActor(h, 'parent input')
-    const before = await h.row()
-    assert.equal(before.run.callStack.length, 2)
-    const parentExecutionId = before.run.callStack[0]!.executionId
-    h.reopen()
-    await h.engine.handleRestartReconcile()
-    const blocked = await h.row()
-    assert.equal(blocked.run.callStack.length, 2)
-    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '重启后核查Child栈顶现场。', 'manager', 'actor')).ok, true)
-    const resumed = await h.row()
-    assert.equal(resumed.run.callStack.length, 2)
-    assert.equal(resumed.run.callStack[0]!.executionId, parentExecutionId)
-    assert.equal(resumed.run.currentExecutionId, resumed.run.callStack[1]!.executionId)
-    assert.equal(resumed.execution.workflowId, 'child-a')
-    assert.equal(resumed.execution.input, 'parent input')
-  } finally { h.close() }
-})
-
-test('nested Child unwinds one final handoff, keeps one top, and reuses the Root Role mapping', async () => {
-  const config = childConfig()
-  // 跨 child 边界的会话复用 + 边界 compact 是 `reuse: continuable` 的语义；缺省 node 见
-  // runtime-work-order.test.ts 的「reuse: node」用例。
-  config.roles.worker = { persona: 'Worker', reuse: 'continuable' }
-  config.workflow.nodes.after = { execution: { type: 'actor-task', role: 'worker', instruction: 'Use child output' }, checker: CHECKER, onPass: 'END' }
-  config.childWorkflows!['child-a'] = { startNode: 'call-inner', nodes: {
-    'call-inner': { execution: { type: 'child-workflow', workflowId: 'child-b' }, onPass: 'END' },
-  } }
-  config.childWorkflows!['child-b'] = { startNode: 'work', nodes: {
-    work: { execution: { type: 'actor-task', role: 'worker', instruction: 'Nested work' }, checker: CHECKER, onPass: 'END' },
-  } }
-  const h = harness(config, { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    await acceptActor(h, 'nested parent input')
-    let row = await h.row()
-    assert.equal(row.run.callStack.length, 3)
-    assert.equal(row.execution.workflowId, 'child-b')
-    assert.equal(row.execution.input, 'nested parent input')
-    assert.equal(row.run.currentExecutionId, row.run.callStack.at(-1)!.executionId)
-    const outerCallerId = row.run.callStack[0]!.executionId
-    const innerCallerId = row.run.callStack[1]!.executionId
-    const leafId = row.execution.executionId
-    const actor = h.caller(row.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'deep child artifact' }, actor)
-    await h.engine.handleTurnEnded('ws', actor)
-    row = await h.row()
-    const judge = h.caller(row.execution.judge!)
-    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified nested child', judge)).ok, true)
-    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'duplicate nested child', judge)).ok, false)
-    const returned = await h.row()
-    assert.equal(returned.run.callStack.length, 1)
-    assert.equal(returned.execution.nodeId, 'after')
-    assert.equal(returned.execution.input, 'deep child artifact')
-    for (const callerId of [outerCallerId, innerCallerId]) {
-      const caller = (await h.store.execution('ws', callerId))!
-      assert.equal(caller.phase, 'exited')
-      assert.deepEqual(caller.child?.result, { terminalExecutionId: leafId, handoff: 'deep child artifact' })
-    }
-    assert.deepEqual(returned.run.roleActors, { worker: 'worker-session' })
-    assert.equal((await h.store.list()).length, 1)
-    await h.engine.handleTurnEnded('ws', judge)
-    const after = await h.row()
-    assert.equal(after.execution.phase, 'working')
-    assert.equal(after.execution.dispatch?.sessionId, 'worker-session')
-    assert.deepEqual(h.compacts, ['worker'])
-  } finally { h.close() }
-})
-
-test('accepted Actor FAIL without onFail reopens the same execution instead of rejudging the old claim', async () => {
-  const h = harness({
-    schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
-    workflow: { startNode: 'plan', nodes: {
-      plan: { execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' }, checker: CHECKER, onPass: 'END' },
-    } },
-  }, { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    let row = await h.row()
-    const visit = row.execution.visit
-    const executionId = row.execution.executionId
-    const oldActor = h.caller(row.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'failed', handoff: 'failed with preserved evidence' }, oldActor)
-    await h.engine.handleTurnEnded('ws', oldActor)
-    row = await h.row()
-    const oldJudge = h.caller(row.execution.judge!)
-    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'failure is accurate', oldJudge)).ok, true)
-    let blocked = await h.row()
-    assert.equal(blocked.run.status, 'blocked')
-    assert.equal(blocked.execution.phase, 'settling')
-    assert.equal(blocked.execution.claim?.handoff, 'failed with preserved evidence')
-    assert.equal(blocked.execution.judgment?.result, 'ACCEPT')
-    h.reopen()
-    await h.engine.handleRestartReconcile()
-    blocked = await h.row()
-    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Manager fixed the external cause; reopen the work.', 'manager', 'actor')).ok, true)
-    const reopened = await h.row()
-    assert.equal(reopened.execution.executionId, executionId)
-    assert.equal(reopened.execution.visit, visit)
-    assert.equal(reopened.execution.phase, 'working')
-    assert.equal(reopened.execution.claim, undefined)
-    assert.equal(reopened.execution.judgment, undefined)
-    assert.equal(reopened.execution.previousClaim?.handoff, 'failed with preserved evidence')
-    assert.match(h.messages.at(-1)!.text, /failed with preserved evidence/)
-    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'late old claim' }, oldActor)).ok, false)
-    assert.equal((await h.engine.handleJudgeClaim('ws', reopened.execution.nodeToken, 'ACCEPT', 'late old judgment', oldJudge)).ok, false)
-  } finally { h.close() }
-})
-
-test('model override safely replaces one blocked Role once and leaves Judge replacement explicit', async () => {
-  const h = harness(childConfig(), { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    await acceptActor(h, 'parent input')
-    let row = await h.row()
-    const oldActor = h.caller(row.execution.dispatch!)
-    const activeBefore = structuredClone(row)
-    h.setSafe(true)
-    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'early-provider', 'early-model', 'manager')).ok, false)
-    assert.deepEqual(await h.row(), activeBefore)
-    assert.equal((await h.engine.handleBlock('ws', row.execution.nodeToken, 'replace this blocked Role', oldActor)).ok, true)
-    row = await h.row()
-    h.setSafe(false)
-    h.setActivity('active')
-    const denied = await h.engine.handleSetRoleModel('ws', 'worker', ' next-provider ', ' next-model ', 'manager')
-    assert.equal(denied.ok, false)
-    assert.equal((await h.row()).run.roleActors.worker, 'worker-session')
-
-    h.setSafe(false)
-    h.setActivity('unknown')
-    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', ' next-provider ', ' next-model ', 'manager')).ok, true)
-    row = await h.row()
-    assert.deepEqual(row.run.modelOverrides.worker, { provider: 'next-provider', modelId: 'next-model' })
-    assert.equal(row.run.roleActors.worker, undefined)
-    assert.equal((await h.engine.handleResume('ws', row.execution.nodeToken, 'Use the replacement Role.', 'manager', 'actor')).ok, true)
-    const replacement = await h.row()
-    assert.equal(replacement.execution.dispatch?.sessionId, 'worker-replacement-2')
-    assert.equal(replacement.run.roleActors.worker, 'worker-replacement-2')
-    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'late old Role' }, oldActor)).ok, false)
-
-    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'next-provider', 'next-model', 'manager')).ok, true)
-    assert.equal((await h.row()).run.roleActors.worker, 'worker-replacement-2', 'same override is idempotent and does not replace again')
-    const beforeJudgeOverride = await h.row()
-    assert.equal((await h.engine.handleSetRoleModel('ws', 'judge', 'judge-provider', 'judge-model', 'manager')).ok, true)
-    const judgeOverride = await h.row()
-    assert.deepEqual(judgeOverride.run.modelOverrides.judge, { provider: 'judge-provider', modelId: 'judge-model' })
-    assert.deepEqual(judgeOverride.execution.dispatch, beforeJudgeOverride.execution.dispatch)
-    assert.equal((await h.engine.handleSetRoleModel('ws', 'ghost', 'p', 'm', 'manager')).ok, false)
-    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'p', 'm', 'not-manager')).ok, false)
-  } finally { h.close() }
-})
-
-test('terminal Program and Child expose their effective final handoff through status', async () => {
-  const programDefinition = programConfig()
-  programDefinition.workflow.nodes.program!.onPass = 'END'
-  delete programDefinition.workflow.nodes.after
-  const program = harness(programDefinition, { async run() { return { kind: 'PASS', handoff: 'program final artifact' } } })
-  try {
-    await program.start()
-    await acceptActor(program, 'approved plan')
-    const row = await program.row()
-    await program.engine.handleRunProgram('ws', row.execution.nodeToken, { title: 'M7', branchName: 'feature/t7' }, 'manager')
-    const status = await program.engine.status('ws', 'manager')
-    assert.equal(status.status.finalHandoffPreview, 'program final artifact')
-  } finally { program.close() }
-
-  const childDefinition = childConfig()
-  childDefinition.workflow.nodes['call-child']!.onPass = 'END'
-  delete childDefinition.workflow.nodes.after
-  const child = harness(childDefinition, { async run() { throw new Error('unexpected Program') } })
-  try {
-    await child.start()
-    await acceptActor(child, 'parent input')
-    let row = await child.row()
-    const actor = child.caller(row.execution.dispatch!)
-    await child.engine.handleClaim('ws', { outcome: 'completed', handoff: 'child final artifact' }, actor)
-    await child.engine.handleTurnEnded('ws', actor)
-    row = await child.row()
-    await child.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified child', child.caller(row.execution.judge!))
-    const status = await child.engine.status('ws', 'manager')
-    assert.equal(status.status.finalHandoffPreview, 'child final artifact')
-  } finally { child.close() }
+test('#130: Child execution is rejected at catalog validation until T2 connects the path', () => {
+  assert.throws(() => validateAndNormalize(childConfig(), { workflowId: 'test' }), CatalogValidationError, /does not execute yet \(T2\)/)
+  // onReturn 与被调用流程 returns 的一致性仍然静态校验（形状已按 v3 冻结）
+  const mismatched = childConfig()
+  ;(mismatched.workflow.nodes['call-child'] as { onReturn: Record<string, unknown> }).onReturn = { other: { node: 'after' } }
+  assert.throws(() => validateAndNormalize(mismatched, { workflowId: 'test' }), CatalogValidationError, /onReturn is missing mappings for returns finished/)
 })
 
 test('Program parameters persist before effect and explicit bounded handoff becomes successor input', async () => {
@@ -366,7 +154,7 @@ test('Program parameters persist before effect and explicit bounded handoff beco
     const program = await h.row()
     assert.equal(program.execution.nodeId, 'program')
     const outcome = await h.engine.handleRunProgram('ws', program.execution.nodeToken, { title: 'M7', branchName: 'feature/t7' }, 'manager')
-    assert.equal(outcome.ok, true)
+    assert.equal(outcome.ok, true, outcome.ok ? '' : outcome.reason)
     assert.deepEqual(inspected!.execution.program?.parameters, { title: 'M7', branchName: 'feature/t7' })
     const after = await h.row()
     assert.equal(after.execution.nodeId, 'after')
@@ -435,7 +223,7 @@ test('Program ERROR retains parameters across reopen and manual resolution route
   } finally { h.close() }
 })
 
-test('Program FAIL routes its explicit handoff through onFail without a Judge', async () => {
+test('Program FAIL routes its explicit handoff through the FAIL result target without a Judge', async () => {
   const h = harness(programConfig(), { async run() { return { kind: 'FAIL', reason: 'milestone is closed', handoff: 'repair milestone #7' } } })
   try {
     await h.start()
@@ -450,54 +238,52 @@ test('Program FAIL routes its explicit handoff through onFail without a Judge', 
   } finally { h.close() }
 })
 
-test('Program FAIL without onFail retains its result in settling BLOCK', async () => {
+test('#130: an accepted Actor result completes the Root with its business return name, not as a generic success', async () => {
   const config = programConfig()
-  const program = config.workflow.nodes.program!
-  delete (program as { onFail?: string }).onFail
+  config.workflow.nodes.plan = {
+    execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
+    checker: CHECKER,
+    results: {
+      succeeded: { criteria: 'The plan is complete.', target: { return: 'planned' } },
+      cancelled: { criteria: 'The work was cancelled after review.', target: { return: 'repaired' } },
+    },
+  }
+  delete config.workflow.nodes.program
+  delete config.workflow.nodes.after
   delete config.workflow.nodes.repair
-  const h = harness(config, { async run() { return { kind: 'FAIL', reason: 'milestone is closed', handoff: 'repair milestone #7' } } })
+  const h = harness(validateAndNormalize(config, { workflowId: 'test' }), { async run() { throw new Error('unexpected Program') } })
   try {
     await h.start()
-    await acceptActor(h, 'approved plan')
-    const before = await h.row()
-    assert.equal((await h.engine.handleRunProgram('ws', before.execution.nodeToken, { title: 'M7', branchName: 'feature/t7' }, 'manager')).ok, true)
-    const blocked = await h.row()
-    assert.equal(blocked.run.status, 'blocked')
-    assert.equal(blocked.execution.executionId, before.execution.executionId)
-    assert.equal(blocked.execution.phase, 'settling')
-    assert.deepEqual(blocked.execution.program?.result, { kind: 'FAIL', reason: 'milestone is closed', handoff: 'repair milestone #7' })
-    assert.equal(blocked.execution.successorId, undefined)
-  } finally { h.close() }
-})
-
-test('accepted Actor failed→END completes the root with failed-terminal wording (#17)', async () => {
-  const h = harness({
-    schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
-    workflow: { startNode: 'plan', nodes: {
-      plan: { execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' }, checker: CHECKER, onPass: 'END', onFail: 'END' },
-    } },
-  }, { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    await acceptActor(h, 'user cancelled after review', 'failed')
+    await acceptActor(h, 'user cancelled after review', 'cancelled')
     const row = await h.row()
     assert.equal(row.run.status, 'completed')
     assert.deepEqual(row.run.callStack, [])
+    assert.equal(row.execution.claim?.result, 'cancelled')
     assert.equal(row.execution.claim?.handoff, 'user cancelled after review')
     assert.equal(row.execution.judgment?.result, 'ACCEPT')
+    // 终局只记业务返回名与来源；handoff 仍从终局工作单读取
+    assert.deepEqual(row.run.businessReturn, { name: 'repaired', source: row.execution.executionId })
+    assert.deepEqual(row.execution.returned, { kind: 'return', name: 'repaired', source: row.execution.executionId })
     const terminal = h.messages.at(-1)!.text
-    assert.match(terminal, /以失败结果结束/)
-    assert.match(terminal, /FAIL→END/)
+    assert.match(terminal, /业务终局：repaired/)
+    assert.match(terminal, /节点结果：cancelled/)
     assert.match(terminal, /user cancelled after review/)
     assert.doesNotMatch(terminal, /已完成（run/)
   } finally { h.close() }
 })
 
-test('builtin FAIL→END completes the root without a Judge (#17)', async () => {
+test('builtin FAIL→return completes the root without a Judge (#17)', async () => {
   const config = programConfig()
-  config.workflow.nodes.program!.onFail = 'END'
+  config.workflow.nodes.program = {
+    execution: { type: 'builtin-program', programId: 'github.initialize-milestone' },
+    results: {
+      PASS: { criteria: 'The program reported success.', target: { return: 'planned' } },
+      FAIL: { criteria: 'The program reported failure.', target: { return: 'repaired' } },
+    },
+  }
+  delete config.workflow.nodes.after
   delete config.workflow.nodes.repair
-  const h = harness(config, { async run() { return { kind: 'FAIL', reason: 'milestone is closed', handoff: 'cancelled: no work to do' } } })
+  const h = harness(validateAndNormalize(config, { workflowId: 'test' }), { async run() { return { kind: 'FAIL', reason: 'milestone is closed', handoff: 'cancelled: no work to do' } } })
   try {
     await h.start()
     await acceptActor(h, 'approved plan')
@@ -508,52 +294,13 @@ test('builtin FAIL→END completes the root without a Judge (#17)', async () => 
     assert.equal(row.run.status, 'completed')
     assert.deepEqual(row.run.callStack, [])
     assert.equal(h.messages.filter(message => message.text === 'judge').length, judgesBefore)
+    assert.deepEqual(row.run.businessReturn, { name: 'repaired', source: row.execution.executionId })
     const terminal = h.messages.at(-1)!.text
-    assert.match(terminal, /以失败结果结束/)
+    assert.match(terminal, /业务终局：repaired/)
     assert.match(terminal, /cancelled: no work to do/)
     const status = await h.engine.status('ws', 'manager')
     assert.equal(status.status.finalHandoffPreview, 'cancelled: no work to do')
-  } finally { h.close() }
-})
-
-test('nested Child failed→END returns to the parent onPass with the child handoff (#17)', async () => {
-  const config = childConfig()
-  config.childWorkflows!['child-a'] = { startNode: 'work', nodes: {
-    work: { execution: { type: 'actor-task', role: 'worker', instruction: 'Child work' }, checker: CHECKER, onPass: 'nowhere', onFail: 'END' },
-  } }
-  // 子图自带一条悬空 onPass 目标时校验仍应拒绝：未知目标不可用 END 绕过。
-  assert.throws(() => validateAndNormalize(structuredClone(config), { workflowId: 'test' }), /does not exist/)
-  config.childWorkflows!['child-a'] = { startNode: 'work', nodes: {
-    work: { execution: { type: 'actor-task', role: 'worker', instruction: 'Child work' }, checker: CHECKER, onPass: 'END', onFail: 'END' },
-  } }
-  const h = harness(config, { async run() { throw new Error('unexpected Program') } })
-  try {
-    await h.start()
-    await acceptActor(h, 'parent input')
-    let row = await h.row()
-    assert.equal(row.execution.workflowId, 'child-a')
-    assert.equal(row.run.callStack.length, 2)
-    const parentExecutionId = row.run.callStack[0]!.executionId
-    // 子流程内 FAIL 被 ACCEPT 后走 onFail→END：pop 回父 onPass，不把 failed 传播成父失败。
-    // 注：acceptActor 内已含 handleTurnEnded（与既有单层 Child 测试一致），后继已派发为 working。
-    let childRow = await h.row()
-    const childActor = h.caller(childRow.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'failed', handoff: 'no deliverable issues remain' }, childActor)
-    await h.engine.handleTurnEnded('ws', childActor)
-    childRow = await h.row()
-    const childJudge = h.caller(childRow.execution.judge!)
-    assert.equal((await h.engine.handleJudgeClaim('ws', childRow.execution.nodeToken, 'ACCEPT', 'honest failure', childJudge)).ok, true)
-    const returned = await h.row()
-    assert.equal(returned.run.callStack.length, 1)
-    assert.equal(returned.execution.nodeId, 'after')
-    assert.equal(returned.execution.input, 'no deliverable issues remain')
-    assert.equal(returned.execution.phase, 'ready')
-    assert.equal(returned.run.status, 'running')
-    const parent = (await h.store.execution('ws', parentExecutionId))!
-    assert.equal(parent.phase, 'exited')
-    assert.equal(parent.child?.result?.handoff, 'no deliverable issues remain')
-    await h.engine.handleTurnEnded('ws', childJudge)
-    assert.equal((await h.row()).execution.phase, 'working')
+    assert.deepEqual(status.status.businessReturn, { name: 'repaired', source: row.execution.executionId })
   } finally { h.close() }
 })
 
@@ -590,4 +337,79 @@ test('explicit Program retry rotates invocation identity and ignores the late fi
     assert.equal(events.filter(event => event.type === 'program-arranged').length, 2)
     assert.equal(events.filter(event => event.type === 'program-result').length, 1)
   } finally { first.resolve({ kind: 'ERROR', reason: 'cleanup' }); h.close() }
+})
+
+test('model override safely replaces one blocked Role once and leaves Judge replacement explicit', async () => {
+  // Child 调用路径由 T2 接通；这里用 actor(worker) 后继表达同一「已登记后继 + 角色替换」现场。
+  const config: WorkflowConfig = {
+    schemaVersion: 'agent-workflow/v3', roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
+    workflow: {
+      startNode: 'plan', returns: ['planned'],
+      nodes: { plan: actorNode('manager', 'Plan', 'work'), work: actorNode('worker', 'Work', 'planned') },
+    },
+  }
+  const h = harness(validateAndNormalize(config, { workflowId: 'test' }), { async run() { throw new Error('unexpected Program') } })
+  try {
+    await h.start()
+    await acceptActor(h, 'parent input')
+    let row = await h.row()
+    assert.equal(row.execution.nodeId, 'work')
+    const oldActor = h.caller(row.execution.dispatch!)
+    const activeBefore = structuredClone(row)
+    h.setSafe(true)
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'early-provider', 'early-model', 'manager')).ok, false)
+    assert.deepEqual(await h.row(), activeBefore)
+    assert.equal((await h.engine.handleBlock('ws', row.execution.nodeToken, 'replace this blocked Role', oldActor)).ok, true)
+    row = await h.row()
+    h.setSafe(false)
+    h.setActivity('active')
+    const denied = await h.engine.handleSetRoleModel('ws', 'worker', ' next-provider ', ' next-model ', 'manager')
+    assert.equal(denied.ok, false)
+    assert.equal((await h.row()).run.roleActors.worker, 'worker-session')
+
+    h.setSafe(false)
+    h.setActivity('unknown')
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', ' next-provider ', ' next-model ', 'manager')).ok, true)
+    row = await h.row()
+    assert.deepEqual(row.run.modelOverrides.worker, { provider: 'next-provider', modelId: 'next-model' })
+    assert.equal(row.run.roleActors.worker, undefined)
+    assert.equal((await h.engine.handleResume('ws', row.execution.nodeToken, 'Use the replacement Role.', 'manager', 'actor')).ok, true)
+    const replacement = await h.row()
+    assert.equal(replacement.execution.dispatch?.sessionId, 'worker-replacement-2')
+    assert.equal(replacement.run.roleActors.worker, 'worker-replacement-2')
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'late old Role' }, oldActor)).ok, false)
+
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'next-provider', 'next-model', 'manager')).ok, true)
+    assert.equal((await h.row()).run.roleActors.worker, 'worker-replacement-2', 'same override is idempotent and does not replace again')
+    const beforeJudgeOverride = await h.row()
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'judge', 'judge-provider', 'judge-model', 'manager')).ok, true)
+    const judgeOverride = await h.row()
+    assert.deepEqual(judgeOverride.run.modelOverrides.judge, { provider: 'judge-provider', modelId: 'judge-model' })
+    assert.deepEqual(judgeOverride.execution.dispatch, beforeJudgeOverride.execution.dispatch)
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'ghost', 'p', 'm', 'manager')).ok, false)
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'p', 'm', 'not-manager')).ok, false)
+  } finally { h.close() }
+})
+
+test('terminal Program exposes its effective final handoff and business return through status', async () => {
+  const programDefinition = programConfig()
+  programDefinition.workflow.nodes.program = {
+    execution: { type: 'builtin-program', programId: 'github.initialize-milestone' },
+    results: {
+      PASS: { criteria: 'The program reported success.', target: { return: 'planned' } },
+      FAIL: { criteria: 'The program reported failure.', target: { return: 'repaired' } },
+    },
+  }
+  delete programDefinition.workflow.nodes.after
+  delete programDefinition.workflow.nodes.repair
+  const program = harness(validateAndNormalize(programDefinition, { workflowId: 'test' }), { async run() { return { kind: 'PASS', handoff: 'program final artifact' } } })
+  try {
+    await program.start()
+    await acceptActor(program, 'approved plan')
+    const row = await program.row()
+    await program.engine.handleRunProgram('ws', row.execution.nodeToken, { title: 'M7', branchName: 'feature/t7' }, 'manager')
+    const status = await program.engine.status('ws', 'manager')
+    assert.equal(status.status.finalHandoffPreview, 'program final artifact')
+    assert.equal(status.status.businessReturn?.name, 'planned')
+  } finally { program.close() }
 })

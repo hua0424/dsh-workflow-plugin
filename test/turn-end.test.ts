@@ -127,10 +127,11 @@ function harness() {
   }, {}, makeStateHost(store))
   engine.cwdResolver = async () => home
   const config = {
-    schemaVersion: 'agent-workflow/v2' as const, roles: {}, judgeRole: { persona: 'Read only' },
-    workflow: { startNode: 'plan', nodes: { plan: {
+    schemaVersion: 'agent-workflow/v3' as const, roles: {}, judgeRole: { persona: 'Read only' },
+    workflow: { startNode: 'plan', returns: ['done'], nodes: { plan: {
       execution: { type: 'actor-task' as const, role: 'manager', instruction: 'Plan' },
-      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } }, onPass: 'END',
+      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+      results: { succeeded: { criteria: 'The plan is complete.', target: { return: 'done' } } },
     } } },
   }
   return {
@@ -180,7 +181,7 @@ async function driveToJudge(h: ReturnType<typeof harness>) {
   const row = (await h.store.get('ws'))!
   const e = row.execution
   e.phase = 'checking'
-  e.claim = { id: 'claim-1', dispatchId: e.dispatch!.id, outcome: 'completed', handoff: 'Actor handoff' }
+  e.claim = { id: 'claim-1', dispatchId: e.dispatch!.id, result: 'succeeded', handoff: 'Actor handoff' }
   e.judge = { id: 'judge-1', sessionId: 'judge', messageId: 'judge-message-1', settled: false, claimId: 'claim-1', inputVersion: e.inputVersion }
   await h.store.updateRow('ws', row.run, row.stateVersion, [
     { execution: e, expectedRevision: row.execution.revision, events: ['claim'] },

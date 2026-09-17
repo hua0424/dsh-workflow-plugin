@@ -10,7 +10,7 @@
  * 拒绝未接通的 Child 执行路径，不给旧路径猜测推进的机会)。
  */
 import { createHash } from 'node:crypto'
-import { ID_PATTERN, LIMITS, RESERVED_ROLE_KEYS, isActorTaskNode, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
+import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, isActorTaskNode, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
 // #100：固定 program id 名单从 Program 元数据单源派生，不在这里另维护一份。
 import { BUILTIN_PROGRAM_IDS } from '../programs/metadata.ts'
 
@@ -27,11 +27,11 @@ export class CatalogValidationError extends Error {
 export const BUILTIN_CHECKER_IDS = new Set(['judge.claim-correct'])
 
 /**
- * Actor 节点隐含支持的结果名：单结果节点直接声明 `succeeded`。Program 节点的
- * PASS/FAIL 是执行协议而非业务结果，`results` 的键固定为 `PASS`/`FAIL`。
+ * Actor 节点隐含支持的结果名：单结果节点直接声明 `succeeded`。Program 的
+ * PASS/FAIL 是执行协议而非业务结果，`results` 的键固定为 `PASS`/`FAIL`（单源在
+ * `types.PROGRAM_RESULT_NAMES`）。
  */
 export const ACTOR_SUCCESS_RESULT = 'succeeded'
-export const PROGRAM_RESULT_NAMES = ['PASS', 'FAIL'] as const
 
 /** 统一 Target 的目标种类（判定与路由共用同一解释，不各自解析字符串）。 */
 export function targetName(target: Target): string {
@@ -280,13 +280,15 @@ function validateChecker(label: string, checker: CheckerRef, problems: string[])
 function validateResults(label: string, node: NodeDef, def: WorkflowDef, problems: string[]): void {
   const results = nodeResults(node)
   if (results === undefined) return
+  // Program 的结果键是执行协议固定的 PASS/FAIL，不受业务结果名的小写标识符规则约束。
+  const programKeys = node.execution.type === 'builtin-program'
   const names = Object.keys(results)
   if (names.length === 0) {
     problems.push(`${label} must declare at least one result`)
     return
   }
   for (const [resultName, result] of Object.entries(results)) {
-    if (!ID_PATTERN.test(resultName)) {
+    if (!programKeys && !ID_PATTERN.test(resultName)) {
       problems.push(`${label} result name "${resultName}" is not a valid lowercase [a-z][a-z0-9-]* id`)
     }
     const criteria = result.criteria.trim()
