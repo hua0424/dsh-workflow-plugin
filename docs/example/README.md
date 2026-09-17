@@ -1,12 +1,15 @@
 # 工作流配置模板（docs/example/）
 
-> ⚠️ **版本状态（#131 T2 / #132 T3 之后）**：本目录的 `workflow-template.yaml` 仍是
+> ⚠️ **版本状态（#133 T4 之后）**：本目录的 `workflow-template.yaml` 仍是
 > **v2 时代**的示例，运行时已只接受 `agent-workflow/v3`，因此**暂不可直接加载**。
 > v3 的节点形状是「命名结果 + 统一 Target + 流程 returns」，`node_claim` 只接受
-> `{ result, handoff }`，Child 调用节点用 `onReturn` 显式映射（#131 已接通执行），
-> Program 节点的 `PASS`/`FAIL` 也按统一 Target 路由（#132 已接通，含 ERROR 的人工恢复）；
-> 本模板自身的迁移仍由配置迁移 Issue #129 负责。在它落地前，请以
-> `docs/specs/named-results-and-workflow-returns.md` 的合同与
+> `{ result, handoff }`，Child 调用节点用 `onReturn` 显式映射（#131 已接通执行）。
+> Program 节点的 `PASS`/`FAIL` 按统一 Target 路由**自 #130（T1）的 v3 迁移起即生效**；
+> #132（T3）交付的是 Program 定向证据、ERROR 人工恢复（`node_run_program` /
+> `node_resolve_program`）的文档与示例入口。本模板自身的迁移仍由配置迁移
+> Issue #129 负责。在它落地前，请以
+> `docs/specs/named-results-and-workflow-returns.md` 的合同、
+> `docs/example/v3-combined-example.yaml`（完整 v3 组合示例）与
 > `test/v3-actor-root.test.ts`、`test/v3-child-returns.test.ts`、
 > `test/v3-program-targets.test.ts` 的可运行示例为准；
 > 下面的字段说明按 v2 原文保留。
@@ -199,7 +202,8 @@ Role 定义：
 - Program 节点的 `results` 键固定为 `PASS`/`FAIL`（其他键含 `ERROR` 在校验期拒绝），
   值为统一 Target：可继续到本流程节点，也可 `{ return }` 结束本流程；ERROR、抛错与
   结果未知只 BLOCK 保留参数，Manager 用 `node_resolve_program` 事实确认后恰好推进一次，
-  Program 不派 Judge（#132 T3 起生效）。
+  Program 不派 Judge（Program 的路由自 #130 T1 起生效，#132 T3 交付定向证据与 ERROR
+  人工恢复的文档/示例入口）。
 
 静态校验（复制模板后常见报错）：
 
@@ -213,7 +217,11 @@ Role 定义：
 
 ## 完整示例
 
-真实生产配置见
+- **完整 v3 组合示例**：[`docs/example/v3-combined-example.yaml`](v3-combined-example.yaml)
+  ——覆盖三出口 Actor、单出口 Actor、同一 Child 的两个返回分别进入两个不同父后继、
+  两层 Child 嵌套返回、Program 在 Child 内结束，以及 Root 的三个不同业务终局；
+  想看 v3 合同的完整形状可从它入手（该文件是 v3 示例，不是已迁移的模板）。
+- 真实生产配置见
 [`docs/prd/20260903-workflow-hardening/milestone-delivery.yaml`](../prd/20260903-workflow-hardening/milestone-delivery.yaml)
 （里程碑交付：plan → builtin-program → PRD → issues → child-workflow 循环
 → 终审 → close，覆盖全部三种节点类型与 onFail 修复回路）。

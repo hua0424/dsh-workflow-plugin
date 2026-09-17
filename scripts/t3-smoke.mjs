@@ -1,8 +1,9 @@
 /** T3 隔离烟测（受控 Host，不代表真实 DSH 宿主 E2E）：
  * 真实 Catalog/Runtime/SQLite + 显式 `reuse: continuable` 的 Role —— 覆盖 e2e-smoke
  * 不覆盖的那一半角色生命周期：Manager 节点 → Role 跨节点复用（节点边界 compact）
- * → END → SQLite 关库重开；e2e-smoke.mjs 覆盖缺省 `reuse: node` 的 REJECT 修正、
- * failed onFail 自环、离开节点 drain 与新 visit 新会话。两者合起来是 `pnpm run test:smoke`。
+ * → 业务终局（`{ return: delivered }`）→ SQLite 关库重开；e2e-smoke.mjs 覆盖缺省
+ * `reuse: node` 的 REJECT 修正、`retry` 结果自环、离开节点 drain 与新 visit 新会话。
+ * 两者合起来是 `pnpm run test:smoke`。
  * 全部使用独立临时 home，绝不读写真实 ~/.dsh；Adapter 必须跟随当前 Host 合同
  * （`safeToInspect` 返回 'safe'|'unsafe'，不是 boolean——旧 boolean 断言会把
  * continuable 复用误判成 "Judge/known tools not safely closed" 的假失败）。
@@ -93,7 +94,7 @@ try {
   store.close(); store = new StateStore(home)
   assert.equal((await store.get(ws)).execution.claim.handoff, 'final result.txt')
   assert.deepEqual((await store.events(ws, finalId)).map(e => e.type), ['entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited'])
-  console.log('T3 ISOLATED SMOKE PASS: Catalog → Actor → safe settlement → Judge ACCEPT → reused Role/compact → END → SQLite reopen')
+  console.log('T3 ISOLATED SMOKE PASS: Catalog → Actor → safe settlement → Judge ACCEPT → reused Role/compact → 业务终局（{ return: delivered }）→ SQLite reopen')
 } finally {
   store.close()
   rmSync(home, { recursive: true, force: true })

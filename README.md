@@ -15,17 +15,19 @@ claim，settled claim 或显式 judge 决议进入只读 Judge。恢复派发收
 
 T8 的普通 `/dsh-flow reset` 仅允许当前 Manager，把 active Run 标为 `terminated` 并保留工作单、事件、Snapshot 与 Role mapping；它撤销旧推进资格但不 drain/cancel 外部动作。terminated 后显式 start 会先拒绝已知仍 active/idle 的旧 Role/Judge，Host unknown 风险由用户/Manager 核查。旧 execution/events 仍保留供维护读取，但公开 `workflow_status` 只允许查询当前 Run 的 execution，旧/新 Manager 都不能跨 Run 读取。
 
-当前 claim 合同为 `node_claim({outcome, handoff})`：handoff 必填、trim 后
-1..8000 字符，completed/failed 对称，END 也交付；明确拒绝旧 summary/handoffContext。
+当前 claim 合同为 `node_claim({ result, handoff })`：`result` 必须命中当前冻结节点声明的
+结果名（Child 调用层是被调用流程的返回名，Program 是协议固定的 PASS/FAIL），两者都必填；
+handoff trim 后 1..8000 字符，业务终局也必填；明确拒绝旧 `outcome` 与 summary/handoffContext。
 claim 不携带 nodeToken，运行时核对真实派发身份。Judge、Manager、后继与最终结果
-共用原文，无独立摘要或 fallback。Catalog v2 保持，v1 Catalog 被拒绝。
+共用原文，无独立摘要或 fallback。Catalog 只接受 `agent-workflow/v3`：v2/v1 Catalog 被拒绝，
+不提供双协议运行时、不把 v2 的 `failed` 猜测转换成业务结果。
 
-State format 为 `agent-workflow-state/v9`：`runs`、`node_executions`、
-`node_execution_events` 保存位置、当前工作与关键快照；旧 v3–v8/legacy 或坏库进入 maintenance 并
-fail-closed，不静默迁移。只有 root 人类显式执行 `/dsh-flow reset --incompatible-store` 才会备份整个 SQLite（含 WAL；坏库保留原始 bundle）后切换空 v9，失败不替换源库。REJECT 后当前单保留一代完整 previous claim/Judge 与统一 judgment 关联，
+State format 为 `agent-workflow-state/v10`：`runs`、`node_executions`、
+`node_execution_events` 保存位置、当前工作与关键快照；旧 v3–v9/legacy 或坏库进入 maintenance 并
+fail-closed，不静默迁移。只有 root 人类显式执行 `/dsh-flow reset --incompatible-store` 才会备份整个 SQLite（含 WAL；坏库保留原始 bundle）后切换空 v10 库，失败不替换源库。REJECT 后当前单保留一代完整 previous claim/Judge 与统一 judgment 关联，
 补充/恢复材料只保留当前完整版本，旧值由 events 解释；正常恢复不回放 events。
 
-当前接通 Actor Task 的 ACCEPT/REJECT/NEED_CONTEXT、正常 BLOCK 的 auto/actor/judge resume、有效 claim 下 Judge respawn、Program 直接结算/人工裁决、嵌套 Child 原子返回、FAIL 无出口重开、显式 Role/Judge model override、Reset/terminated（自 #30 起同 workspace 任意顶层会话可执行，工作流内部参与者拒绝），以及 `workflow_status` 的 Manager-only 当前 Run execution 历史分页（stable after、limit ≤ 50，跨 Run 拒绝）。标准 Web profile 必须提供正式 `jobs` 与 `compaction`；Session persistence 缺失/读取异常只记为 availability unknown，不冒充 missing。不兼容 Store 的 status/全库备份退出命令在 maintenance 下保持可用，普通 list/start/tools 明确拒绝，不退回旧引擎。
+当前接通 Actor Task 的 ACCEPT/REJECT/NEED_CONTEXT、正常 BLOCK 的 auto/actor/judge resume、有效 claim 下 Judge respawn、Program 按统一 Target 路由 PASS/FAIL（ERROR 交 `node_resolve_program` 事实确认，恰好推进一次）、嵌套 Child 原子返回、结果互斥路由（REJECT 后改选另一结果需重新核验）、显式 Role/Judge model override、Reset/terminated（自 #30 起同 workspace 任意顶层会话可执行，工作流内部参与者拒绝），以及 `workflow_status` 的 Manager-only 当前 Run execution 历史分页（stable after、limit ≤ 50，跨 Run 拒绝）。标准 Web profile 必须提供正式 `jobs` 与 `compaction`；Session persistence 缺失/读取异常只记为 availability unknown，不冒充 missing。不兼容 Store 的 status/全库备份退出命令在 maintenance 下保持可用，普通 list/start/tools 明确拒绝，不退回旧引擎。
 真实宿主组合命令为 `pnpm run test:real-host`；受控 smoke、真实 Host + 脚本 LLM、外部模型行为三者不得混称。
 
 ## Current documentation
@@ -37,7 +39,7 @@ fail-closed，不静默迁移。只有 root 人类显式执行 `/dsh-flow reset 
 - [`docs/work-plans/runtime-refact.md`](docs/work-plans/runtime-refact.md) — T1–T9 历史工单依赖与分票证据（已完成并合入）。
 - [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — 旧版设计参考，不覆盖 refact 新规格。
 - [`docs/testing/acceptance-test-plan.md`](docs/testing/acceptance-test-plan.md) / [`report`](docs/testing/acceptance-report.md) — 原单表实现的历史验收资料（带版本标记，保留适用版本；不代表当前实现），现行入口见 [`旧测试迁移/现行验收入口`](docs/testing/runtime-refact-test-migration.md)。
-- [`docs/example/`](docs/example/) — copyable workflow config template (`workflow-template.yaml`) + config/model reference for new workflows.
+- [`docs/example/`](docs/example/) — copyable workflow config template (`workflow-template.yaml`, 仍是 v2 时代的示例、暂不可直接加载) + config/model reference for new workflows；完整 v3 组合示例见 [`v3-combined-example.yaml`](docs/example/v3-combined-example.yaml)（`workflow-template.yaml` 自身的迁移归 Issue #129）。
 
 Superseded `feature-delivery/v1` designs remain available in Git history.
 
@@ -65,10 +67,10 @@ cordis.patch.yml      profile-bundle patch (inserts the plugin row)
 - 验收（现行单入口）：`pnpm run verify` = `typecheck`（`tsc --noEmit`）+ `test:suite`（全量 suite）+ `test:smoke`（两套受控 smoke）。逐项：
   - `pnpm test` — 全量 node:test（标准入口，按文件隔离子进程）。
   - `pnpm run test:suite` — 同样全量、`--test-isolation=none`：受限沙箱禁止派生进程（`spawn EPERM`）时的等价入口；Node 22.x 该 flag 名为 `--experimental-test-isolation=none`。
-  - `pnpm run test:smoke` — 统一受控 smoke 入口 = `node scripts/t3-smoke.mjs`（`reuse: continuable`：Role 跨节点复用 + 节点边界 compact + END + 关库重开）&& `node scripts/e2e-smoke.mjs`（缺省 `reuse: node`：REJECT 修正 + failed onFail 自环 + 离开节点 drain + trace）。二者都只用独立临时 home，不读写真实 `~/.dsh`。
+  - `pnpm run test:smoke` — 统一受控 smoke 入口 = `node scripts/t3-smoke.mjs`（`reuse: continuable`：Role 跨节点复用 + 节点边界 compact + 业务终局 + 关库重开）&& `node scripts/e2e-smoke.mjs`（缺省 `reuse: node`：REJECT 修正 + `retry` 结果自环 + 离开节点 drain + #131 Child 显式返回 + #132 Program 目标路由与人工恢复 + trace）。二者都只用独立临时 home，不读写真实 `~/.dsh`。
   - `pnpm run test:real-host` — 单独运行 exact 0.1.5-rc.2 真实 Host 组合（单文件直跑，不派生 test runner 子进程）；与上面两类 controlled smoke 分开报告，三者不得混称。
   - 计数口径：0 fail；仅允许**环境条件**跳过的用例（`test/programs.test.ts` 两条真实 spawn 用例在禁派生进程的环境按 EPERM 探测跳过，其逻辑由受控适配器用例覆盖）——不靠隐藏失败换取 0 skip，逐项替代见迁移账本。
-- 诊断工具：`node scripts/check-state-rows.mjs <state.sqlite3 路径>` 只读诊断指定库（显式路径、不默认真实 home、复制成临时快照后只读打开，不改写目标库）；当前 v9 / 旧单表 / 未知布局 / 坏库分别给诊断，退出码 0/1/2。
+- 诊断工具：`node scripts/check-state-rows.mjs <state.sqlite3 路径>` 只读诊断指定库（显式路径、不默认真实 home、复制成临时快照后只读打开，不改写目标库）；当前 v10 / 旧三表（v9 及更早）/ 旧单表 / 未知布局 / 坏库分别给诊断，退出码 0/1/2。
 - Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.1.5-rc.2` types and are required Host services, not plugin runtime dependencies.
 
 ## Installation (development)
@@ -106,10 +108,10 @@ Trace 是便于人工排障的派生产物，关键业务历史以 SQLite `node_
 - **限制**：trace 不保存 reasoning、完整工具 transcript 或 Program 参数，也不是 secret scanner。长期细粒度可观测性取舍见 `docs/pending-discussions/runtime-refact-long-tail.md`。
 
 The controlled smokes (`pnpm run test:smoke` = `t3-smoke.mjs` && `e2e-smoke.mjs`) drive the full
-v2 loop on production code paths. `e2e-smoke.mjs`（`pnpm run test:e2e`）覆盖缺省 `reuse: node`：
+v3 loop on production code paths. `e2e-smoke.mjs`（`pnpm run test:e2e`）覆盖缺省 `reuse: node`：
 wrong work → claim → async REJECT → correction re-dispatch → corrected
 work → re-claim → ACCEPT → next node — for BOTH a Manager node and a Role node，
-外加 failed onFail 自环、离开节点 drain + 新 visit 新会话、迟到旧 Judge 失权与 `fmt=3` trace；
+外加 `retry` 结果自环、离开节点 drain + 新 visit 新会话、迟到旧 Judge 失权与 `fmt=3` trace；
 `t3-smoke.mjs`（`pnpm run test:t3`）覆盖 `reuse: continuable` 的另一半：Role 跨节点复用 +
-节点边界 compact + END + SQLite 关库重开。两者都用 embedded v2 catalog 与隔离临时 DSH home，
+节点边界 compact + 业务终局（`{ return: delivered }`）+ SQLite 关库重开。两者都用内联 v3 catalog 与隔离临时 DSH home，
 真实 `~/.dsh` 绝不被触碰，且都不冒充真实宿主 E2E。
