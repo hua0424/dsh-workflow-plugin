@@ -431,7 +431,7 @@ test('incompatible backup failure leaves the source bytes and maintenance state 
   } finally { access?.close(); rmSync(home, { recursive: true, force: true }) }
 })
 
-test('corrupt SQLite bytes stay diagnosable and are preserved as the raw backup before empty v9 cutover', async () => {
+test('corrupt SQLite bytes stay diagnosable and are preserved as the raw backup before empty current-format cutover', async () => {
   const home = mkdtempSync(join(tmpdir(), 'workflow-t8-corrupt-'))
   const bytes = Buffer.from('not a sqlite database\0old active bytes')
   mkdirSync(join(home, 'workflows'))

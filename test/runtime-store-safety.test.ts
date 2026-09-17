@@ -77,7 +77,7 @@ async function fixture(roleReview = false) {
   }
 }
 
-test('event type constant drives the v9 SQLite CHECK contract', async () => {
+test('event type constant drives the current-format SQLite CHECK contract', async () => {
   const f = await fixture()
   try {
     const schema = (f.sql.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'node_execution_events'").get() as { sql: string }).sql
