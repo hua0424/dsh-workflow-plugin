@@ -301,8 +301,9 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
     return renderJudgePrompt({
       nodeToken: input.nodeToken,
       criteria: input.criteria,
+      result: input.result,
+      resultCriteria: input.resultCriteria,
       recovery: input.recovery,
-      workerOutcome: input.claim.outcome,
       workerHandoff: input.claim.handoff,
       workspaceCwd: input.cwd,
       transcript: projectNodeLocal(manager.session, input.boundary, actorSession),

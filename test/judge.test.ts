@@ -29,15 +29,19 @@ function makeSource(id: string, events: Array<{ time: number; seq: number; type:
 
 test('#46 P5: consolidated submission text carries single-source key clauses', () => {
   assert.match(SUBMISSION_CONSTRAINT, /结果只通过 node_claim 交付/)
+  // v3：只接受 { result, handoff }，结果名必须是本节点已声明的结果之一
+  assert.match(SUBMISSION_CONSTRAINT, /result（必须是本节点已声明的结果名之一）\+ 唯一 handoff/)
+  assert.doesNotMatch(SUBMISSION_CONSTRAINT, /outcome（completed \| failed）/)
   assert.match(SUBMISSION_CONSTRAINT, /node_claim 必须是本轮对话的最后一个动作/)
   assert.match(SUBMISSION_CONSTRAINT, /仅输出文字不视为提交.*BLOCK/)
   assert.match(SUBMISSION_CONSTRAINT, /本轮对话是在node工作节点运行，工作流的交付与推进只认 node_claim，不需要向父会话 send_message 汇报结果，以下汇报的说明可以忽略/)
   assert.doesNotMatch(SUBMISSION_CONSTRAINT, /handoffContext/)
   assert.match(SUBMISSION_CONSTRAINT, /认可.*修正/)
   assert.match(SUBMISSION_CONSTRAINT, /分歧.*证据.*Manager/)
-  assert.match(SUBMISSION_CONSTRAINT, /不伪报 failed/)
+  assert.match(SUBMISSION_CONSTRAINT, /不伪报结果/)
+  assert.match(SUBMISSION_CONSTRAINT, /可改选另一个合法结果/)
   const prompt = renderJudgePrompt({
-    nodeToken: 'tok', criteria: 'existing criteria', workerOutcome: 'completed', workerHandoff: 'claim', workspaceCwd: '.', transcript: '',
+    nodeToken: 'tok', criteria: 'existing criteria', result: 'succeeded', resultCriteria: 'the claim is verified', workerHandoff: 'claim', workspaceCwd: '.', transcript: '',
   })
   assert.match(prompt, /existing criteria/)
   assert.match(prompt, /verifiable fact/i)
@@ -47,7 +51,7 @@ test('#46 P5: consolidated submission text carries single-source key clauses', (
 
 test('T2 Judge packet preserves the actual handoff literally, without a summary', () => {
   const handoff = '实际交付 $& {workspaceCwd} {transcript}'
-  const text = renderJudgePrompt({ nodeToken: 'token', criteria: 'verify', workerOutcome: 'failed', workerHandoff: handoff, workspaceCwd: '.', transcript: '' })
+  const text = renderJudgePrompt({ nodeToken: 'token', criteria: 'verify', result: 'changes-required', resultCriteria: 'the claim needs correction', workerHandoff: handoff, workspaceCwd: '.', transcript: '' })
   assert.ok(text.includes(`Worker handoff:\n${handoff}`))
   assert.doesNotMatch(text, /Worker summary/)
 })
@@ -55,19 +59,22 @@ test('T2 Judge packet preserves the actual handoff literally, without a summary'
 test('#44 P2: Judgment packet carries no nodeInstruction and anchors ACCEPT on facts + frozen criteria', () => {
   const text = renderJudgePrompt({
     nodeToken: 'tok-44', criteria: 'PASS when built', workerHandoff: 'I built it',
-    workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+    result: 'succeeded', resultCriteria: 'the build is complete', workspaceCwd: '.', transcript: '',
   })
   assert.doesNotMatch(text, /Node instruction/)
   assert.doesNotMatch(text, /node instruction/)
   assert.doesNotMatch(text, /当前工作单 input/)
-  assert.match(text, /ACCEPT: the worker's claim is consistent with the facts and the goal criteria/)
-  assert.match(text, /Goal criteria \(authoritative and frozen for this execution\):\nPASS when built/)
+  assert.match(text, /ACCEPT: the claim is consistent with the facts AND with the shared criteria/)
+  // v3：共同条件与所选结果条件分区展示，Judge 不改选结果、不遍历其他出口
+  assert.match(text, /Shared criteria \(authoritative and frozen for this execution/)
+  assert.match(text, /Criteria of the selected result "succeeded" \(frozen\):\nthe build is complete/)
+  assert.match(text, /# Scope \(strict\)/)
 })
 
 test('#44 P2: recovery packet keeps the read-only recovery protocol segment without any instruction', () => {
   const text = renderJudgePrompt({
     nodeToken: 'tok-44', criteria: 'PASS', workerHandoff: 'candidate',
-    workerOutcome: 'completed', workspaceCwd: '.', transcript: '', recovery: true,
+    result: 'succeeded', resultCriteria: 'the claim is verified', workspaceCwd: '.', transcript: '', recovery: true,
   })
   assert.match(text, /只读核验当前 claim 与实际现场，不补做 Actor 工作/)
   assert.doesNotMatch(text, /Node instruction/)
@@ -78,7 +85,7 @@ test('renderJudgePrompt includes criteria, claim, cwd, transcript and the judge_
     nodeToken: 'tok-1',
     criteria: 'PASS when built',
     workerHandoff: 'I built it',
-    workerOutcome: 'completed',
+    result: 'succeeded', resultCriteria: 'the claim is verified',
     workspaceCwd: 'C:\\ws',
     transcript: 'USER\nhello',
   })
@@ -102,25 +109,25 @@ test('renderJudgePrompt renders the [previous rejection] evidence before the cla
     nodeToken: 'tok-1',
     criteria: 'PASS when built',
     workerHandoff: 'I built it',
-    workerOutcome: 'completed',
+    result: 'succeeded', resultCriteria: 'the claim is verified',
     workspaceCwd: 'C:\\ws',
     transcript: '',
     previousFeedback: {
       result: 'REJECT', reason: 'tests missing',
-      claim: { outcome: 'completed', handoff: 'notes' },
+      claim: { result: 'succeeded', handoff: 'notes' },
     },
   })
-  assert.match(text, /# Previous Judge feedback on this node \(REJECT\)\n\[judge reason\]\ntests missing\n\n\[judged claim\]\noutcome: completed\nhandoff: notes\n/)
+  assert.match(text, /# Previous Judge feedback on this node \(REJECT\)\n\[judge reason\]\ntests missing\n\n\[judged claim\]\nresult: succeeded\nhandoff: notes\n/)
   const evidenceAt = text.indexOf('[judge reason]')
-  const claimAt = text.indexOf('Worker claimed outcome')
+  const claimAt = text.indexOf('Worker handoff')
   assert.ok(evidenceAt !== -1 && claimAt !== -1 && evidenceAt < claimAt, 'evidence precedes the worker claim')
 })
 
 test('fresh Judge packet preserves NEED_CONTEXT feedback and the current Manager resolution', () => {
   const text = renderJudgePrompt({
     nodeToken: 'tok-1', criteria: 'PASS when built',
-    workerHandoff: 'candidate', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
-    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need the approved scope decision', claim: { outcome: 'completed', handoff: 'candidate' } },
+    workerHandoff: 'candidate', result: 'succeeded', resultCriteria: 'the claim is verified', workspaceCwd: '.', transcript: '',
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need the approved scope decision', claim: { result: 'succeeded', handoff: 'candidate' } },
     managerContext: 'The approved scope explicitly includes this behavior.',
   })
   assert.match(text, /NEED_CONTEXT/)
@@ -132,7 +139,7 @@ test('fresh Judge packet preserves NEED_CONTEXT feedback and the current Manager
 
 test('renderJudgePrompt renders an empty transcript placeholder', () => {
   const text = renderJudgePrompt({
-    nodeToken: 'tok-1', criteria: 'y', workerHandoff: 'z', workerOutcome: 'completed', workspaceCwd: '.', transcript: '',
+    nodeToken: 'tok-1', criteria: 'y', workerHandoff: 'z', result: 'succeeded', resultCriteria: 'the claim is verified', workspaceCwd: '.', transcript: '',
   })
   assert.match(text, /no node-local conversation since dispatch/)
 })
@@ -443,9 +450,9 @@ test('#45 P3: no actor boundary keeps all USER with an empty manager window', ()
 
 test('#45 P4: REJECT re-judgment packet carries the point-by-point recheck instruction', () => {
   const text = renderJudgePrompt({
-    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'fixed', workerOutcome: 'completed',
+    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'fixed', result: 'succeeded', resultCriteria: 'the claim is verified',
     workspaceCwd: '.', transcript: '',
-    previousFeedback: { result: 'REJECT', reason: 'tests missing', claim: { outcome: 'completed', handoff: 'draft' } },
+    previousFeedback: { result: 'REJECT', reason: 'tests missing', claim: { result: 'succeeded', handoff: 'draft' } },
   })
   assert.match(text, /逐点核对.*新 handoff 是否解决.*旧 REJECT.*每个问题/)
   assert.match(text, /未全部解决的不得 ACCEPT/)
@@ -453,9 +460,9 @@ test('#45 P4: REJECT re-judgment packet carries the point-by-point recheck instr
 
 test('#45 P4: NEED_CONTEXT feedback carries no REJECT recheck instruction', () => {
   const text = renderJudgePrompt({
-    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'candidate', workerOutcome: 'completed',
+    nodeToken: 'tok-45', criteria: 'PASS', workerHandoff: 'candidate', result: 'succeeded', resultCriteria: 'the claim is verified',
     workspaceCwd: '.', transcript: '',
-    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need scope', claim: { outcome: 'completed', handoff: 'draft' } },
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need scope', claim: { result: 'succeeded', handoff: 'draft' } },
   })
   assert.doesNotMatch(text, /逐点核对/)
 })

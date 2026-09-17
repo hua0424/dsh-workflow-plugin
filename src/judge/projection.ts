@@ -115,12 +115,13 @@ function stripSubmissionConstraint(text: string): string {
 
 /**
  * #44 P2：executor 首条 dispatch 在投影中只留 `[handoff]`。模板化压缩——
- * 按 `[instruction]` / `[criteria]` / `[提交要求]` 段边界截断（#43 后派发
- * 已无 `[criteria]`，此处兼容旧文本）；派发模板内的纠错/补充/恢复段都挂在
- * `[instruction]` 之后，随之一并截掉。无模板标记时原文保留，不破坏未知文本。
+ * 按 `[instruction]` / `[验收合同` / `[criteria]` / `[提交要求]` 段边界截断
+ * （v3 派发在 handoff 之后注入验收合同与合法结果段；`[criteria]` 仅兼容旧文本）；
+ * 派发模板内的纠错/补充/恢复段都挂在 `[instruction]` 之后，随之一并截掉。
+ * 无模板标记时原文保留，不破坏未知文本。
  */
 export function compressDispatchToHandoff(text: string): string {
-  const markers = ['\n\n[instruction]', '\n\n[criteria]', '\n\n[提交要求]']
+  const markers = ['\n\n[instruction]', '\n\n[验收合同', '\n\n[criteria]', '\n\n[提交要求]']
   let end = text.length
   for (const marker of markers) {
     const at = text.indexOf(marker)

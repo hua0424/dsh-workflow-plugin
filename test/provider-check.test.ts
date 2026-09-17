@@ -5,7 +5,7 @@ import { validateAndNormalize } from '../src/catalog/validate.ts'
 import { checkCatalogProviders, renderProviderCheckReport } from '../src/catalog/provider-check.ts'
 
 const CONFIG = `
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   developer:
     persona: Implement.
@@ -20,6 +20,7 @@ judgeRole:
   model: { provider: "good-provider", modelId: "jm" }
 workflow:
   startNode: plan
+  returns: [built]
   nodes:
     plan:
       execution:
@@ -30,7 +31,8 @@ workflow:
         checkerId: judge.claim-correct
         config:
           criteria: PASS when a plan exists.
-      onPass: build
+      results:
+        succeeded: { criteria: The plan exists., target: { node: build } }
     build:
       execution:
         type: actor-task
@@ -40,7 +42,8 @@ workflow:
         checkerId: judge.claim-correct
         config:
           criteria: PASS when built.
-      onPass: END
+      results:
+        succeeded: { criteria: The build is complete., target: { return: built } }
 `
 
 function loadConfig() {

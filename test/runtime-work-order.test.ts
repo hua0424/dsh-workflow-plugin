@@ -12,21 +12,71 @@ import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from '../src/eng
 import { withShortTimeouts } from './helpers/timeouts.ts'
 
 const CONFIG = {
-  schemaVersion: 'agent-workflow/v2' as const, roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
-  workflow: { startNode: 'plan', nodes: { plan: {
+  schemaVersion: 'agent-workflow/v3' as const, roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
+  workflow: { startNode: 'plan', returns: ['done'], nodes: { plan: {
     execution: { type: 'actor-task' as const, role: 'manager', instruction: 'Plan' },
-    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } }, onPass: 'END',
+    checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+    results: { succeeded: { criteria: 'The plan is complete.', target: { return: 'done' } } },
   } } },
 }
-function configWithWorker(onFail?: string, reuse?: 'node' | 'continuable'): import('../src/types.ts').WorkflowConfig {
-  const config = structuredClone(CONFIG) as import('../src/types.ts').WorkflowConfig
-  config.roles.worker = { persona: 'Worker', ...(reuse ? { reuse } : {}) }
-  config.workflow.nodes.plan.onPass = 'work'
-  config.workflow.nodes.work = {
-    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
-    checker: CONFIG.workflow.nodes.plan.checker, onPass: 'END', ...(onFail ? { onFail } : {}),
+/**
+ * v3 迁移期配置辅助：用例仍在按 v2 的 `onPass`/`onFail` 描述图，这里把它翻译成
+ * v3 的命名结果 + 统一 Target（单出口 = succeeded；两条边 = succeeded/failed）。
+ */
+type LegacyNode = {
+  execution: { type: 'actor-task'; role: string; instruction: string }
+  checker: { checkerId: string; config: { criteria: string } }
+  onPass?: string
+  onFail?: string
+}
+type Tracked = import('../src/types.ts').WorkflowConfig & { __actor: Record<string, LegacyNode> }
+/**
+ * 记录每个 actor 节点的可迁移描述（**浅拷贝**，不是节点引用——否则写入的
+ * onPass/onFail 会污染 definitionSnapshot，严格的 v3 schema 会拒绝）。
+ */
+const track = (config: import('../src/types.ts').WorkflowConfig): Tracked => {
+  const tracked = config as Tracked
+  tracked.__actor = {}
+  for (const [nodeId, node] of Object.entries(config.workflow.nodes)) {
+    if (node.execution.type !== 'child-workflow') tracked.__actor[nodeId] = { ...node } as unknown as LegacyNode
   }
+  return tracked
+}
+const targetV3 = (name: string, returns: string[]): import('../src/types.ts').Target =>
+  name === 'END' ? { return: returns[0] ?? 'done' } : { node: name }
+/** 从 `__actor` 的 onPass/onFail 重新编译 v3 results（缺 onPass 时不改该节点）。 */
+const compile = (config: Tracked): import('../src/types.ts').WorkflowConfig => {
+  const returns = config.workflow.returns
+  for (const [nodeId, legacy] of Object.entries(config.__actor)) {
+    const node = config.workflow.nodes[nodeId]
+    if (!node || node.execution.type === 'child-workflow') continue
+    if (legacy.onPass === undefined) continue
+    node.results = {
+      succeeded: { criteria: 'The node concluded successfully.', target: targetV3(legacy.onPass, returns) },
+      ...(legacy.onFail === undefined ? {} : { failed: { criteria: 'The node could not conclude successfully.', target: targetV3(legacy.onFail, returns) } }),
+    }
+  }
+  // 迁移辅助不得进入 definitionSnapshot（严格的 v3 schema 会拒绝额外字段）。
+  delete (config as { __actor?: unknown }).__actor
   return config
+}
+const legacyNodes = (config: Tracked): Record<string, LegacyNode> => config.__actor
+/**
+ * 单出口 work：`onFail` 省略时默认回到 `again`，与 v2 用例「reuse: node 但两条边都
+ * 指向该节点」的语义一致（用例显式传 onFail 时以传入值为准）。
+ */
+function configWithWorker(onFail = 'work', reuse?: 'node' | 'continuable'): import('../src/types.ts').WorkflowConfig {
+  const config = track(structuredClone(CONFIG) as import('../src/types.ts').WorkflowConfig)
+  config.roles.worker = { persona: 'Worker', ...(reuse ? { reuse } : {}) }
+  legacyNodes(config)['plan']!.onPass = 'work'
+  legacyNodes(config)['work'] = {
+    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
+    checker: CONFIG.workflow.nodes.plan.checker,
+    onPass: 'END',
+    onFail,
+  } as LegacyNode
+  config.workflow.nodes.work = { execution: legacyNodes(config)['work']!.execution, checker: legacyNodes(config)['work']!.checker } as never
+  return compile(config)
 }
 /**
  * plan(manager) → work(worker) → again(同一个 worker Role)。
@@ -34,10 +84,13 @@ function configWithWorker(onFail?: string, reuse?: 'node' | 'continuable'): impo
  * （`reuse: node` 的节点级语义见「reuse: node」用例）。
  */
 function configWithReusedWorker(reuse: 'node' | 'continuable' = 'continuable'): import('../src/types.ts').WorkflowConfig {
-  const config = configWithWorker(undefined, reuse)
-  config.workflow.nodes.work!.onPass = 'again'
-  config.workflow.nodes.again = { ...config.workflow.nodes.work!, onPass: 'END' }
-  return config
+  const config = configWithWorker('work', reuse) as Tracked
+  // 先按 v3 编译结果重建迁移描述，再改图：work → again，again → END（不能自我成环）。
+  const tracked = track(config)
+  legacyNodes(tracked)['work'] = { ...legacyNodes(tracked)['work']!, onPass: 'again' }
+  legacyNodes(tracked)['again'] = { ...legacyNodes(tracked)['work']!, instruction: 'Work again', onPass: 'END' }
+  tracked.workflow.nodes.again = { execution: legacyNodes(tracked)['again']!.execution, checker: legacyNodes(tracked)['again']!.checker } as never
+  return compile(tracked)
 }
 function harness(config: import('../src/types.ts').WorkflowConfig = CONFIG) {
   const home = mkdtempSync(join(tmpdir(), 'workflow-t3-'))
@@ -144,15 +197,16 @@ test('start persists root input before dispatch; claim waits for its Actor tail'
   engine.cwdResolver = async () => home
   try {
     const run = engine.buildInitialRun('manager', 'test', {
-      schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
-      workflow: { startNode: 'plan', nodes: { plan: {
+      schemaVersion: 'agent-workflow/v3', roles: {}, judgeRole: { persona: 'Read only' },
+      workflow: { startNode: 'plan', returns: ['done'], nodes: { plan: {
         execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
-        checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } }, onPass: 'END',
+        checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+        results: { succeeded: { criteria: 'The plan is complete.', target: { return: 'done' } } },
       } } },
     }, 'hash')
     assert.equal((await engine.startRun('ws', run, undefined, 'root request')).ok, true)
     assert.equal(persistedInput, 'root request')
-    assert.equal((await engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan artifact' }, {
+    assert.equal((await engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan artifact' }, {
       sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']),
     })).ok, true)
     assert.equal((await store.get('ws'))?.execution?.phase, 'checking')
@@ -165,7 +219,7 @@ test('Judge cwd preparation failure BLOCKs durably without losing the accepted c
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'saved artifact' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'saved artifact' }, actor)
     const before = await h.row()
     h.engine.cwdResolver = async () => { throw new Error('manager session has no cwd') }
     await h.engine.handleTurnEnded('ws', actor)
@@ -191,7 +245,7 @@ test('late cwd preparation failure cannot BLOCK a newer Judge arrangement', asyn
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'saved artifact' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'saved artifact' }, actor)
     h.engine.cwdResolver = () => { entered(); return new Promise((_resolve, reject) => { fail = reject }) }
     const stale = h.engine.handleTurnEnded('ws', actor)
     await preparing
@@ -213,7 +267,7 @@ test('failed Judge arrangement transaction BLOCKs against the last committed ide
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'saved artifact' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'saved artifact' }, actor)
     const before = await h.row()
     faults.exec(`CREATE TRIGGER reject_judge_arranged BEFORE INSERT ON node_execution_events
       WHEN NEW.type = 'judge-arranged' BEGIN SELECT RAISE(ABORT, 'injected Judge arrangement failure'); END`)
@@ -250,9 +304,12 @@ test('failed Actor arrangement transaction leaves visible ready BLOCK without di
   } finally { faults.close(); h.close() }
 })
 
+/** v3：把 v2 的 completed/failed 意图映射到本测试配置声明的结果名。 */
+const resultOf = (outcome: 'completed' | 'failed'): string => outcome === 'completed' ? 'succeeded' : 'failed'
+
 async function acceptCurrent(h: ReturnType<typeof harness>, handoff = 'artifact', outcome: 'completed' | 'failed' = 'completed') {
   const actor = h.caller((await h.row()).execution.dispatch!)
-  assert.equal((await h.engine.handleClaim('ws', { outcome, handoff }, actor)).ok, true)
+  assert.equal((await h.engine.handleClaim('ws', { result: resultOf(outcome), handoff }, actor)).ok, true)
   await h.engine.handleTurnEnded('ws', actor)
   const row = await h.row()
   const judge = h.caller(row.execution.judge!)
@@ -260,7 +317,7 @@ async function acceptCurrent(h: ReturnType<typeof harness>, handoff = 'artifact'
   return judge
 }
 
-test('actor dispatch excludes criteria but keeps handoff, instruction and submission constraint', async () => {
+test('#130: actor dispatch carries the frozen contract (shared criteria + all legal results) and the handoff, instruction and submission constraint', async () => {
   const h = harness()
   try {
     await h.start()
@@ -269,13 +326,17 @@ test('actor dispatch excludes criteria but keeps handoff, instruction and submis
     assert.match(prompt, /\[instruction\]\nPlan/)
     assert.match(prompt, /\[提交要求\]/)
     assert.doesNotMatch(prompt, /\[criteria\]/)
-    assert.doesNotMatch(prompt, /Correct plan/)
-    // criteria 仍冻结进 Judge packet，不随派发瘦身丢失。
+    // v3：共同条件与全部合法结果条件随派发下发（同源于冻结快照）
+    assert.match(prompt, /\[验收合同·共同条件\]\nCorrect plan/)
+    assert.match(prompt, /\[合法结果与各自条件\]\n- succeeded：The plan is complete\./)
     assert.equal(h.judges.length, 0)
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
+    // Judge 只拿共同条件与所选结果条件
     assert.equal(h.judges.at(-1)!.criteria, 'Correct plan')
+    assert.equal(h.judges.at(-1)!.result, 'succeeded')
+    assert.equal(h.judges.at(-1)!.resultCriteria, 'The plan is complete.')
   } finally { h.close() }
 })
 
@@ -284,7 +345,7 @@ test('END final handoff persists; a retired read-only Judge missing end does not
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'final artifact' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'final artifact' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const checking = await h.row()
     assert.equal(h.judges.length, 1)
@@ -324,7 +385,7 @@ test('Actor tail and stale turn-end cannot start a Judge; interrupt acceptance i
   try {
     await h.start()
     const caller = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'written artifact' }, caller)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'written artifact' }, caller)
     await h.engine.handleTurnEnded('ws', { sessionId: 'manager', turnUserMessageIds: new Set(['old-turn-message']) })
     assert.equal(h.judges.length, 0)
     h.setSafe(false) // Known write tail still running, even if interrupt was accepted.
@@ -344,7 +405,7 @@ test('same Role across visits reuses Session and compacts; old dispatch cannot c
     const first = await h.row()
     const oldCaller = h.caller(first.execution.dispatch!)
     assert.equal(first.execution.input, 'root handoff')
-    await h.engine.handleClaim('ws', { outcome: 'failed', handoff: 'repair this artifact' }, oldCaller)
+    await h.engine.handleClaim('ws', { result: 'failed', handoff: 'repair this artifact' }, oldCaller)
     await h.engine.handleTurnEnded('ws', oldCaller)
     const checking = await h.row()
     const judge = h.caller(checking.execution.judge!)
@@ -360,7 +421,7 @@ test('same Role across visits reuses Session and compacts; old dispatch cannot c
     assert.equal(current.execution.dispatch?.sessionId, 'worker-session')
     assert.deepEqual(h.compacts, ['worker'])
     assert.deepEqual(h.lifecycle, [`safe:${judge.sessionId}`, 'safe:worker-session', 'compact:worker', 'send:worker'])
-    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'stale' }, oldCaller)).ok, false)
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'stale' }, oldCaller)).ok, false)
     await h.engine.handleTurnEnded('ws', oldCaller)
     assert.equal((await h.row()).run.status, 'running')
     assert.equal((await h.row()).execution.phase, 'working')
@@ -378,7 +439,7 @@ test('same-execution Role correction reuses its Session without node-boundary co
     assert.deepEqual(before.run.roleActors, { worker: 'worker-session' })
     assert.deepEqual(h.compacts, [], 'first Role use and Manager work do not compact')
     const actor = h.caller(before.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const checking = await h.row()
     const sentBefore = h.messages.filter(message => message.sessionId === 'worker-session').length
@@ -409,7 +470,7 @@ test('reuse: continuable 现状回归：跨节点复用同一会话 + 边界 com
 
     // 同 visit 返工：REJECT 复用当前会话，不额外 compact、不释放会话。
     const actor = h.caller(first.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'first candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'first candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const checking = await h.row()
     await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'REJECT', 'fix the evidence', h.caller(checking.execution.judge!))
@@ -449,7 +510,7 @@ test('reuse: node（缺省）：节点内修正复用同一会话且无边界 co
     assert.deepEqual(h.compacts, [])
 
     const actor = h.caller(first.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'first candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'first candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', 'fix the evidence', h.caller(row.execution.judge!))
@@ -477,7 +538,7 @@ test('reuse: node（缺省）：节点内修正复用同一会话且无边界 co
     assert.equal(row.execution.dispatch?.sessionId, 'worker-session-2')
     assert.deepEqual(h.compacts, [])
     assert.deepEqual(h.roleDrains, ['worker-session'], '只释放离开节点的那一个会话')
-    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'stale' }, actor)).ok, false)
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'stale' }, actor)).ok, false)
   } finally { h.close() }
 })
 
@@ -613,7 +674,7 @@ test('REJECT keeps one execution and binds the corrected claim to a fresh Judge 
     const first = await h.row()
     const executionId = first.execution.executionId
     const actor1 = h.caller(first.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'failed', handoff: 'first candidate' }, actor1)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'first candidate' }, actor1)
     await h.engine.handleTurnEnded('ws', actor1)
     const checking1 = await h.row()
     const claim1 = checking1.execution.claim!
@@ -634,7 +695,7 @@ test('REJECT keeps one execution and binds the corrected claim to a fresh Judge 
     assert.equal((await h.engine.handleJudgeClaim('ws', checking1.execution.nodeToken, 'ACCEPT', 'late old result', judge1)).ok, false)
 
     const actor2 = h.caller(correcting.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'corrected candidate' }, actor2)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'corrected candidate' }, actor2)
     await h.engine.handleTurnEnded('ws', actor2)
     const checking2 = await h.row()
     assert.notEqual(checking2.execution.claim?.id, claim1.id)
@@ -659,14 +720,14 @@ test('Manager return after a later Judge no-result keeps only that claim as curr
     await h.start()
     const executionId = (await h.row()).execution.executionId
     const actor1 = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim one' }, actor1)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim one' }, actor1)
     await h.engine.handleTurnEnded('ws', actor1)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', 'claim one misses existing criteria', h.caller(row.execution.judge!))
 
     row = await h.row()
     const actor2 = h.caller(row.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim two awaiting Judge' }, actor2)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim two awaiting Judge' }, actor2)
     await h.engine.handleTurnEnded('ws', actor2)
     row = await h.row()
     await h.engine.handleTurnEnded('ws', h.caller(row.execution.judge!))
@@ -685,7 +746,7 @@ test('Manager return after a later Judge no-result keeps only that claim as curr
     assert.ok(events.some(event => event.type === 'judgment' && event.snapshot.judgment?.result === 'REJECT' && event.snapshot.previousClaim?.handoff === 'claim one'))
 
     const actor3 = h.caller(returned.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim three' }, actor3)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim three' }, actor3)
     await h.engine.handleTurnEnded('ws', actor3)
     row = await h.row()
     assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified claim three', h.caller(row.execution.judge!))).ok, true)
@@ -698,14 +759,14 @@ test('Actor return after claim2 Judge preparation fault drops unrelated claim1 f
     await h.start()
     const executionId = (await h.row()).execution.executionId
     const actor1 = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim one' }, actor1)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim one' }, actor1)
     await h.engine.handleTurnEnded('ws', actor1)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', 'claim one rejected', h.caller(row.execution.judge!))
 
     row = await h.row()
     const actor2 = h.caller(row.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim two after preparation fault' }, actor2)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim two after preparation fault' }, actor2)
     h.engine.cwdResolver = async () => { throw new Error('Judge cwd unavailable') }
     await h.engine.handleTurnEnded('ws', actor2)
     const blocked = await h.row()
@@ -725,7 +786,7 @@ test('Actor return after claim2 Judge preparation fault drops unrelated claim1 f
     assert.ok((await h.store.events('ws', executionId)).some(event => event.type === 'judgment' && event.snapshot.previousClaim?.handoff === 'claim one'))
 
     const actor3 = h.caller(returned.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim three' }, actor3)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim three' }, actor3)
     await h.engine.handleTurnEnded('ws', actor3)
     row = await h.row()
     assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'claim three verified', h.caller(row.execution.judge!))).ok, true)
@@ -737,7 +798,7 @@ test('NEED_CONTEXT keeps the claim and Manager context creates a fresh bound Jud
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate needing context' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate needing context' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const checking = await h.row()
     const claim = checking.execution.claim!
@@ -785,7 +846,7 @@ test('Manager context and claim survive a failed Judge followup delivery', async
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'durable candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'durable candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     const oldJudge = h.caller(row.execution.judge!)
@@ -809,7 +870,7 @@ test('NEED_CONTEXT supplement followed by REJECT preserves context through Actor
   try {
     await h.start()
     const actor1 = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate one' }, actor1)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate one' }, actor1)
     await h.engine.handleTurnEnded('ws', actor1)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'need policy decision', h.caller(row.execution.judge!))
@@ -822,7 +883,7 @@ test('NEED_CONTEXT supplement followed by REJECT preserves context through Actor
     assert.match(h.messages.at(-1)!.text, /Policy permits the change/)
     assert.match(h.messages.at(-1)!.text, /existing criteria still lacks test evidence/)
     const actor2 = h.caller(correcting.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate two with tests' }, actor2)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate two with tests' }, actor2)
     await h.engine.handleTurnEnded('ws', actor2)
     row = await h.row()
     assert.equal(h.judges.at(-1)?.managerContext, 'Policy permits the change but requires test evidence.')
@@ -836,7 +897,7 @@ test('Manager can return NEED_CONTEXT work to Actor with the exact feedback and 
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim needing another look' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim needing another look' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'cannot reconcile the repository fact', h.caller(row.execution.judge!))
@@ -869,7 +930,7 @@ test('judge_respawn replaces the Judge but keeps claim, NEED_CONTEXT question, a
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'need scope', h.caller(row.execution.judge!))
@@ -912,7 +973,7 @@ test('Judge drain failure BLOCKs before fresh spawn and preserves respawn materi
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'durable candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'durable candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'need scope', h.caller(row.execution.judge!))
@@ -956,7 +1017,7 @@ test('#98: Judge respawn dispatches through the driver and never reports success
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'NEED_CONTEXT', 'replace me', h.caller(row.execution.judge!))
@@ -987,7 +1048,7 @@ test('Judge drain CAS rejects a stale Actor resume after a concurrent state winn
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate held by old Judge' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate held by old Judge' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     h.setSafe(false)
@@ -1020,7 +1081,7 @@ test('Actor-target resume drains an unjudged unsafe Judge before returning its c
     await h.start()
     const executionId = (await h.row()).execution.executionId
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim returned from unsafe Judge' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim returned from unsafe Judge' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     const oldJudge = structuredClone(row.execution.judge)!
@@ -1053,7 +1114,7 @@ test('Judge-target resume drains an unjudged old Judge before fresh spawn and re
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate awaiting verdict' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate awaiting verdict' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     const oldJudge = structuredClone(row.execution.judge)!
@@ -1086,12 +1147,7 @@ test('Judge-target resume drains an unjudged old Judge before fresh spawn and re
 })
 
 test('Actor-target resume does not compact or redispatch while the blocked Role turn is unsafe', async () => {
-  const config = structuredClone(CONFIG) as import('../src/types.ts').WorkflowConfig
-  config.workflow.nodes.plan.onPass = 'work'
-  config.workflow.nodes.work = {
-    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
-    checker: CONFIG.workflow.nodes.plan.checker, onPass: 'END',
-  }
+  const config = configWithWorker('work')
   const h = harness(config)
   try {
     await h.start()
@@ -1149,17 +1205,12 @@ test('workflow_status history is Manager-only and pages retained Run events by s
 })
 
 test('resume refuses a ready successor whose predecessor Judge is not safely settled', async () => {
-  const config = structuredClone(CONFIG) as import('../src/types.ts').WorkflowConfig
-  config.workflow.nodes.plan.onPass = 'work'
-  config.workflow.nodes.work = {
-    execution: { type: 'actor-task', role: 'worker', instruction: 'Work' },
-    checker: CONFIG.workflow.nodes.plan.checker, onPass: 'END',
-  }
+  const config = configWithWorker('work')
   const h = harness(config)
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan ready' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan ready' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     const judge = h.caller(row.execution.judge!)
@@ -1367,7 +1418,7 @@ test('#54 actor turn end while a running subagent is awaited keeps the claim bin
     assert.equal(waiting.stateVersion, before.stateVersion, '等待不写状态')
 
     h.setSafe(true)
-    const late = await h.engine.handleClaim('ws', { outcome: 'completed', handoff: '子代理结果已合并' }, actor)
+    const late = await h.engine.handleClaim('ws', { result: 'succeeded', handoff: '子代理结果已合并' }, actor)
     assert.equal(late.ok, true, 'claim 绑定未被解除，同一 Actor 仍可提交')
     await h.engine.handleTurnEnded('ws', actor)
     const checking = await h.row()
@@ -1392,7 +1443,7 @@ test('#54 unsafe closure still BLOCKs the same turn end', async () => {
 
 async function acceptRecoveryCurrent(h: ReturnType<typeof recoveryHarness>, handoff: string) {
   const actor = h.caller((await h.row()).execution.dispatch!)
-  assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff }, actor)).ok, true)
+  assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff }, actor)).ok, true)
   await h.engine.handleTurnEnded('ws', actor)
   const checking = await h.row()
   const judge = h.caller(checking.execution.judge!)
@@ -1422,9 +1473,9 @@ test('working without an interrupted event reopens into recoverable BLOCK and re
     assert.equal(resumed.run.status, 'running')
     assert.notEqual(resumed.execution.dispatch?.id, before.execution.dispatch?.id)
     assert.match(h.messages.at(-1)!.text, /之前中断，请先检查实际完成情况；已完成勿重复副作用，未完继续；不确定\/缺权限BLOCK/)
-    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'late old work' }, oldActor)).ok, false)
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'late old work' }, oldActor)).ok, false)
 
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: '现场核验后完成' }, h.caller(resumed.execution.dispatch!))
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: '现场核验后完成' }, h.caller(resumed.execution.dispatch!))
     await h.engine.handleTurnEnded('ws', h.caller(resumed.execution.dispatch!))
     const checking = await h.row()
     await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'ACCEPT', '只读核验通过', h.caller(checking.execution.judge!))
@@ -1517,7 +1568,7 @@ test('actor resume rechecks a settled Role dispatch and rejects a newly active S
   try {
     await enterRecoveryWorker(h)
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim awaiting a Judge' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim awaiting a Judge' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     let row = await h.row()
     await h.engine.handleTurnEnded('ws', h.caller(row.execution.judge!))
@@ -1576,10 +1627,10 @@ test('missing Role Session is replaced in the resume transaction and correction 
     assert.doesNotMatch(replacementPrompt, /\[criteria\]/)
     assert.match(replacementPrompt, /持久Session确认不存在/)
     assert.match(replacementPrompt, /已完成勿重复副作用/)
-    assert.equal((await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'old Role late claim' }, oldActor)).ok, false)
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'old Role late claim' }, oldActor)).ok, false)
 
     const replacement = h.caller(row.execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'replacement candidate' }, replacement)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'replacement candidate' }, replacement)
     h.setSafe(true)
     await h.engine.handleTurnEnded('ws', replacement)
     row = await h.row()
@@ -1598,7 +1649,7 @@ test('checking recovery keeps a settled claim and follows up the available unjud
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'durable candidate' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'durable candidate' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const before = await h.row()
     const oldJudge = structuredClone(before.execution.judge)!
@@ -1630,7 +1681,7 @@ test('checking recovery preserves an unjudged Judge when persistence availabilit
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate under uncertain persistence' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate under uncertain persistence' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const oldJudge = structuredClone((await h.row()).execution.judge)!
     h.reopen()
@@ -1655,7 +1706,7 @@ test('checking recovery respawns a fresh Judge only when the durable Judge Sessi
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate for replacement Judge' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate for replacement Judge' }, actor)
     await h.engine.handleTurnEnded('ws', actor)
     const oldJudge = structuredClone((await h.row()).execution.judge)!
 
@@ -1678,7 +1729,7 @@ test('checking with an unsettled Actor defaults auto recovery back to Actor and 
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'possibly completed before interruption' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'possibly completed before interruption' }, actor)
     const claim = structuredClone((await h.row()).execution.claim)!
     h.reopen()
     await h.engine.handleRestartReconcile()
@@ -1702,7 +1753,7 @@ test('explicit Judge recovery keeps an unsettled Manager claim without treating 
   try {
     await h.start()
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'Manager claim retained' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'Manager claim retained' }, actor)
     const claimId = (await h.row()).execution.claim!.id
     h.reopen()
     h.setSafe(false)
@@ -1722,7 +1773,7 @@ test('explicit Judge recovery rejects known-unsafe Role activity but accepts Man
   try {
     await enterRecoveryWorker(h)
     const actor = h.caller((await h.row()).execution.dispatch!)
-    await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'Role claim retained for Judge' }, actor)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'Role claim retained for Judge' }, actor)
     const claimId = (await h.row()).execution.claim!.id
     h.reopen()
     await h.engine.handleRestartReconcile()
@@ -1746,7 +1797,7 @@ test('explicit Judge recovery rejects known-unsafe Role activity but accepts Man
 async function blockRecoveryNeedContext(h: ReturnType<typeof recoveryHarness>) {
   await h.start()
   const actor = h.caller((await h.row()).execution.dispatch!)
-  await h.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim awaiting context' }, actor)
+  await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim awaiting context' }, actor)
   await h.engine.handleTurnEnded('ws', actor)
   const checking = await h.row()
   const oldJudge = structuredClone(checking.execution.judge)!

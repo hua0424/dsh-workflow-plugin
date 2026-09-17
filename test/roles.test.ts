@@ -7,7 +7,7 @@ import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
 const CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   developer:
     persona: Developer persona.
@@ -19,11 +19,13 @@ judgeRole:
   persona: Judge persona.
 workflow:
   startNode: plan
+  returns: [done]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The plan is complete., target: { return: done } }
 `), { workflowId: 'role-test' })
 
 function makeRun(): RunState {
@@ -90,7 +92,7 @@ test('judge deny list: defaults + catalog entries, never a required tool', () =>
 test('catalog judgeRole.tools.deny adds to the defaults (duplicates collapse)', () => {
   const run = makeRun()
   const withExtra = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   developer: { persona: D }
 judgeRole:
@@ -98,11 +100,13 @@ judgeRole:
   tools: { deny: [edit, node_claim] }
 workflow:
   startNode: plan
+  returns: [done]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The plan is complete., target: { return: done } }
 `), { workflowId: 'role-test' })
   run.definitionSnapshot = withExtra
   const deny = judgeDenyList(run)
@@ -114,7 +118,7 @@ workflow:
 test('catalog rejects denying a protected Judge tool', () => {
   for (const name of JUDGE_PROTECTED_TOOLS) {
     assert.throws(() => parseCatalogConfig(`
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   developer: { persona: D }
 judgeRole:
@@ -122,11 +126,13 @@ judgeRole:
   tools: { deny: [${name}] }
 workflow:
   startNode: plan
+  returns: [done]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The plan is complete., target: { return: done } }
 `), /cannot be denied/, name)
   }
 })

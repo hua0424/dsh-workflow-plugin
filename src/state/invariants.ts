@@ -3,13 +3,14 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { workflowConfigSchema } from '../catalog/schema.ts'
 import { computeDefinitionHash } from '../catalog/validate.ts'
-import { LIMITS, type CallFrame, type NodeExecution, type RunState } from '../types.ts'
+import { LIMITS, ID_PATTERN, declaredResults, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
 
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
 const dispatch = z.object({ id: text, sessionId: text.optional(), messageId: text.optional(), settled: z.boolean() }).strict()
 const judge = dispatch.extend({ sessionId: text, claimId: text, inputVersion: revision })
-const claim = z.object({ id: text, dispatchId: text, outcome: z.enum(['completed', 'failed']), handoff: z.string().trim().min(1).max(LIMITS.handoffMax) }).strict()
+// v3: claim 携带一个已声明的节点结果名（result），不再有 outcome。
+const claim = z.object({ id: text, dispatchId: text, result: z.string().regex(ID_PATTERN), handoff: z.string().trim().min(1).max(LIMITS.handoffMax) }).strict()
 const frame = z.object({ workflowId: text, nodeId: text, nodeToken: z.uuid(), executionId: text }).strict()
 const model = z.object({ provider: text, modelId: text }).strict()
 const runSchema = z.object({
@@ -19,6 +20,8 @@ const runSchema = z.object({
   blockReason: text.nullable(), currentExecutionId: text, traceLogPath: text.optional(),
   // #91: 启动时冻结的默认模型路由；旧 Run 无该字段（不得由运行时补造）。
   delegationRoute: z.object({ provider: text.optional(), modelId: text.optional() }).strict().optional(),
+  // v3: 已确认的业务终局（名字 + 终局来源 executionId）；handoff 不做第二份镜像。
+  businessReturn: z.object({ name: z.string().regex(ID_PATTERN), source: text }).strict().optional(),
 }).strict()
 const executionSchema = z.object({
   executionId: text, runId: text, workflowId: text, nodeId: text, nodeToken: z.uuid(),
@@ -50,6 +53,13 @@ const executionSchema = z.object({
     result: z.object({ terminalExecutionId: text, handoff: z.string().trim().min(1).max(LIMITS.handoffMax) }).strict().optional(),
   }).strict().optional(),
   inputVersion: revision, blockReason: text.nullable(), enteredAt: z.iso.datetime(), exitedAt: z.iso.datetime().optional(),
+  /**
+   * v3：本工作单退出时实际裁决的终局名。`result` = 节点结果名（节点退出），
+   * `return` = 流程返回名（本流程正常结束，Root 时即 Run 的业务终局）。
+   * 名字语法在下面的跨字段校验里按种类分别判定（Program 的结果键是协议固定的
+   * `PASS`/`FAIL`，不受业务结果名的小写标识符规则约束），此处只要求有界字符串。
+   */
+  returned: z.object({ kind: z.enum(['result', 'return']), name: z.string().min(1).max(64), source: text }).strict().optional(),
 }).strict()
 
 export function newNodeToken(): string { return randomUUID() }
@@ -82,6 +92,19 @@ export function checkExecutionInvariants(run: RunState, execution: NodeExecution
     if (execution.phase === 'exited' && !execution.child?.result) problems.push('exited Child caller requires a returned Child result')
   }
   if ((execution.phase === 'exited') !== (execution.exitedAt !== undefined)) problems.push('exited phase/time mismatch')
+  // v3: 终局裁决名（节点结果名或流程返回名）随工作单材料保留，供 status/通知/trace 解释。
+  if (execution.returned !== undefined) {
+    if (execution.phase !== 'exited') problems.push('returned is only valid on an exited execution')
+    if (execution.returned.source !== execution.executionId) problems.push('returned source must be this execution')
+    // 语法按种类分别判定：流程返回名是本流程声明的小写标识符；节点结果名只需在**本节点
+    // 声明**中（Program 的结果键是协议固定的 PASS/FAIL）。
+    if (execution.returned.kind === 'return') {
+      if (!ID_PATTERN.test(execution.returned.name)) problems.push('workflow return name must be a lowercase id')
+      else if (!def?.returns.includes(execution.returned.name)) problems.push('workflow return name is not declared by this workflow')
+    } else if (!!node && !declaredResults(node).includes(execution.returned.name)) {
+      problems.push('node result name is not declared by this node')
+    }
+  }
   if (execution.claim && execution.claim.dispatchId !== execution.dispatch?.id) problems.push('claim dispatch mismatch')
   if (execution.judge && (execution.judge.claimId !== execution.claim?.id || execution.judge.inputVersion !== execution.inputVersion)) problems.push('judge claim/input mismatch')
   const currentJudgment = execution.judgment !== undefined
@@ -132,6 +155,12 @@ export function checkStateInvariants(run: RunState, execution?: NodeExecution): 
   const problems: string[] = []
   if (computeDefinitionHash(run.definitionSnapshot) !== run.definitionHash) problems.push('definitionSnapshot hash mismatch')
   if (run.status === 'completed' ? run.callStack.length !== 0 : run.callStack.length === 0) problems.push('status/callStack mismatch')
+  // v3: 业务终局只在 completed 且只由终局工作单承载；terminated 不制造返回值。
+  if (run.status !== 'completed' && run.businessReturn !== undefined) problems.push('only a completed run carries a business return')
+  if (run.status === 'completed' && run.businessReturn !== undefined) {
+    if (!run.definitionSnapshot.workflow.returns.includes(run.businessReturn.name)) problems.push('business return name is not declared by the root workflow')
+    if (run.businessReturn.source !== run.currentExecutionId) problems.push('business return source must be the terminal execution')
+  }
   if ((run.status === 'running' || run.status === 'completed') && run.blockReason !== null) problems.push('status/blockReason mismatch')
   if (run.status === 'terminated' && !run.blockReason?.trim()) problems.push('terminated run requires a reason')
   const tokens = new Set(run.callStack.map(f => f.nodeToken))
@@ -155,6 +184,8 @@ export function checkStateInvariants(run: RunState, execution?: NodeExecution): 
     if (run.currentExecutionId !== execution.executionId) problems.push('currentExecutionId mismatch')
     if (run.status === 'completed') {
       if (execution.phase !== 'exited' || execution.successorId) problems.push('completed must point to terminal execution')
+      // v3：终局裁决名必须有材料（节点结果名或流程返回名）；否则 status 无法解释终局。
+      if (execution.returned === undefined) problems.push('completed run requires a terminal decision on its work order')
     } else {
       const top = run.callStack.at(-1)
       if (!top || top.executionId !== execution.executionId || top.workflowId !== execution.workflowId || top.nodeId !== execution.nodeId || top.nodeToken !== execution.nodeToken) problems.push('current execution/callStack mismatch')

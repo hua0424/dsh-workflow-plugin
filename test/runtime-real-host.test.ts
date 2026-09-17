@@ -130,9 +130,7 @@ class A30Adapter extends LlmAdapter {
     } else if (sessionId === 'a30-manager') {
       if (!this.managerClaimed && text.includes('Kickoff the isolated A30 Host scenario.')) {
         this.managerClaimed = true
-        chunks = toolChunks(`a30-call-${++this.call}`, 'node_claim', {
-          outcome: 'completed',
-          handoff: OLD_SURFACE.repeat(60),
+        chunks = toolChunks(`a30-call-${++this.call}`, 'node_claim', { result: 'succeeded', handoff: OLD_SURFACE.repeat(60),
         })
       } else if (text.includes('Workflow BLOCK: actor-turn-ended-without-result') && !this.managerStatusRequested) {
         this.blockedSeen = true
@@ -163,9 +161,7 @@ class A30Adapter extends LlmAdapter {
         if (!this.firstRoleClaimed) {
           assert.equal(nodeId, 'first-role')
           this.firstRoleClaimed = true
-          chunks = toolChunks(`a30-call-${++this.call}`, 'node_claim', {
-            outcome: 'completed',
-            handoff: 'first Role visit accepted handoff',
+          chunks = toolChunks(`a30-call-${++this.call}`, 'node_claim', { result: 'succeeded', handoff: 'first Role visit accepted handoff',
           })
         } else if (!this.secondRoleInterrupted && nodeId === 'second-role') {
           this.secondRoleInterrupted = true
@@ -179,9 +175,7 @@ class A30Adapter extends LlmAdapter {
         } else if (!this.resumedRoleClaimed && this.secondRoleInterrupted && nodeId === 'second-role'
           && /"status"\s*:\s*"running"/.test(text)) {
           this.resumedRoleClaimed = true
-          chunks = toolChunks(`a30-call-${++this.call}`, 'node_claim', {
-            outcome: 'completed',
-            handoff: 'second Role visit completed after Host interrupt and same-execution resume',
+          chunks = toolChunks(`a30-call-${++this.call}`, 'node_claim', { result: 'succeeded', handoff: 'second Role visit completed after Host interrupt and same-execution resume',
           })
         } else {
           chunks = textChunks('Role observed a non-work lifecycle notice.')
@@ -217,7 +211,7 @@ test('A30 real DSH Host composes cold Role continuation, Basic compaction, Host 
   const sessions = join(home, 'sessions')
   mkdirSync(join(home, 'workflows'), { recursive: true })
   mkdirSync(workspace, { recursive: true })
-  writeFileSync(join(home, 'workflows', 'a30.yaml'), `schemaVersion: agent-workflow/v2
+  writeFileSync(join(home, 'workflows', 'a30.yaml'), `schemaVersion: agent-workflow/v3
 roles:
   worker:
     # A30 场景断言的是 continuable 语义（整 Run 复用 + 节点边界 compact + 冷延续）；
@@ -228,19 +222,23 @@ judgeRole:
   persona: Read-only verification of the isolated workspace.
 workflow:
   startNode: kickoff
+  returns: [done]
   nodes:
     kickoff:
       execution: { type: actor-task, role: manager, instruction: Kickoff the isolated A30 Host scenario. }
       checker: { checkerId: judge.claim-correct, config: { criteria: Accept the scripted kickoff handoff. } }
-      onPass: first-role
+      results:
+        succeeded: { criteria: The kickoff handoff is accepted., target: { node: first-role } }
     first-role:
       execution: { type: actor-task, role: worker, instruction: FIRST_ROLE_VISIT complete the first isolated Host task. }
       checker: { checkerId: judge.claim-correct, config: { criteria: Accept the first Role handoff. } }
-      onPass: second-role
+      results:
+        succeeded: { criteria: The first Role handoff is accepted., target: { node: second-role } }
     second-role:
       execution: { type: actor-task, role: worker, instruction: "SECOND_ROLE_VISIT wait for a Host interrupt, then complete after Manager resume." }
       checker: { checkerId: judge.claim-correct, config: { criteria: Accept only the resumed second Role handoff. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The resumed second Role handoff is accepted., target: { return: done } }
 `, 'utf8')
 
   const catalog = await scanCatalog(home)

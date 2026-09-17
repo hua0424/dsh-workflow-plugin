@@ -15,7 +15,7 @@ import { newNodeToken } from '../src/state/invariants.ts'
 import type { RunState } from '../src/types.ts'
 
 const CATALOG = `
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   developer:
     persona: Implement.
@@ -30,6 +30,7 @@ judgeRole:
   model: { provider: "good-provider", modelId: "jm" }
 workflow:
   startNode: plan
+  returns: [planned]
   nodes:
     plan:
       execution:
@@ -40,7 +41,8 @@ workflow:
         checkerId: judge.claim-correct
         config:
           criteria: PASS when a plan exists.
-      onPass: END
+      results:
+        succeeded: { criteria: The plan exists., target: { return: planned } }
 `
 
 function loadConfig() {

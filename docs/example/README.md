@@ -1,7 +1,22 @@
 # 工作流配置模板（docs/example/）
 
-本目录存放 `agent-workflow/v2` 工作流的**可复制模板**。新建工作流时，把
-`workflow-template.yaml` 复制到 catalog 目录后按需修改，不要从零手写。
+> ⚠️ **版本状态（#133 T4 之后）**：本目录的 `workflow-template.yaml` 仍是
+> **v2 时代**的示例，运行时已只接受 `agent-workflow/v3`，因此**暂不可直接加载**。
+> v3 的节点形状是「命名结果 + 统一 Target + 流程 returns」，`node_claim` 只接受
+> `{ result, handoff }`，Child 调用节点用 `onReturn` 显式映射（#131 已接通执行）。
+> Program 节点的 `PASS`/`FAIL` 按统一 Target 路由**自 #130（T1）的 v3 迁移起即生效**；
+> #132（T3）交付的是 Program 定向证据、ERROR 人工恢复（`node_run_program` /
+> `node_resolve_program`）的文档与示例入口。本模板自身的迁移仍由配置迁移
+> Issue #129 负责。在它落地前，请以
+> `docs/specs/named-results-and-workflow-returns.md` 的合同、
+> `docs/example/v3-combined-example.yaml`（完整 v3 组合示例）与
+> `test/v3-actor-root.test.ts`、`test/v3-child-returns.test.ts`、
+> `test/v3-program-targets.test.ts` 的可运行示例为准；
+> 下面的字段说明按 v2 原文保留。
+
+本目录存放 `agent-workflow/v2` 工作流的**模板与字段说明**。新建工作流时，把
+`workflow-template.yaml` 复制到 catalog 目录后按需修改，不要从零手写
+（v3 迁移完成前请先按上面的提示核对版本）。
 
 ## 使用方法
 
@@ -129,11 +144,11 @@ Judge 与其他 Role 一样继承**全量工具目录**，插件只把写类/副
 
 ## 配置面速查
 
-顶层字段（strict schema，unknown 字段一律拒绝）：
+顶层字段（strict schema，unknown 字段一律拒绝；下表按 v2 原文保留，见本文开头的版本状态提示）：
 
 | 字段 | 必填 | 内容 |
 | --- | --- | --- |
-| `schemaVersion` | ✓ | 固定 `agent-workflow/v2` |
+| `schemaVersion` | ✓ | v2 示例为 `agent-workflow/v2`；**当前运行时要求 `agent-workflow/v3`** |
 | `roles` | ✓ | worker Role 定义表；key 即 roleKey |
 | `judgeRole` | ✓ | Judge 定义（persona 必填，model / tools.deny 可选，见「Judge 工具面」） |
 | `workflow` | ✓ | 根工作流图 |
@@ -156,7 +171,7 @@ Role 定义：
 | `builtin-program` | `programId` | `instruction`、`config` | 仅内置程序：`github.initialize-milestone`、`github.all-milestone-issues-complete` |
 | `child-workflow` | `workflowId` | — | 引用 `childWorkflows` 中的子图，禁止递归/引用根 |
 
-边与判定：
+边与判定（**v2 原文**；v3 的对应合同见下）：
 
 - `checker`：目前仅 `judge.claim-correct`，`config.criteria` 为 trim 后
   1..8000 字符，是 Judge 判定的权威标准。
@@ -167,6 +182,28 @@ Role 定义：
   pop 回父节点 `onPass`，对父读作 PASS，父只能经 handoff 文本感知失败）。
 - FAIL 且未配置 `onFail` → 进入 BLOCK（Manager 处理后 resume 同一节点），
   这不是一种边。
+
+**v3 对应合同（#130 T1 起生效）**：
+
+- 节点改为 `results: { <result-name>: { criteria, target } }`；`target` 是严格互斥的
+  `{ node: <本流程节点> }` 或 `{ return: <本流程返回名> }`，**没有**裸 `END`、
+  `onPass`/`onFail`、默认路由或通配映射。单出口节点也必须显式声明结果名。
+- `checker.config.criteria` 变为**可选**的共同条件；每个结果另有自己的必填
+  `criteria`，两者随 Run 冻结并同源下发给 Actor 与 Judge（Judge 只核验共同条件 +
+  本次所选结果条件）。
+- 工作流（含 child）声明非空且不重复的 `returns`；每个返回至少需要一条结构可达的
+  返回路径。走到 `{ return }` 即流程返回，Root 的返回就是 Run 的业务终局
+  （`workflow_status` 的 `businessReturn`）。
+- `node_claim` 只接受 `{ result, handoff }`；`result` 必须命中当前冻结节点声明的
+  结果名，非法结果/额外字段在写入状态前被拒。
+- Child 调用节点用 `onReturn`（键集必须与被调用流程的 `returns` 完全一致，值为本层
+  Target）；子流程走到 `{ return }` 时按该映射继续，允许逐层重命名，调用层不派模型/
+  Judge（#131 T2 起生效）。
+- Program 节点的 `results` 键固定为 `PASS`/`FAIL`（其他键含 `ERROR` 在校验期拒绝），
+  值为统一 Target：可继续到本流程节点，也可 `{ return }` 结束本流程；ERROR、抛错与
+  结果未知只 BLOCK 保留参数，Manager 用 `node_resolve_program` 事实确认后恰好推进一次，
+  Program 不派 Judge（Program 的路由自 #130 T1 起生效，#132 T3 交付定向证据与 ERROR
+  人工恢复的文档/示例入口）。
 
 静态校验（复制模板后常见报错）：
 
@@ -180,7 +217,11 @@ Role 定义：
 
 ## 完整示例
 
-真实生产配置见
+- **完整 v3 组合示例**：[`docs/example/v3-combined-example.yaml`](v3-combined-example.yaml)
+  ——覆盖三出口 Actor、单出口 Actor、同一 Child 的两个返回分别进入两个不同父后继、
+  两层 Child 嵌套返回、Program 在 Child 内结束，以及 Root 的三个不同业务终局；
+  想看 v3 合同的完整形状可从它入手（该文件是 v3 示例，不是已迁移的模板）。
+- 真实生产配置见
 [`docs/prd/20260903-workflow-hardening/milestone-delivery.yaml`](../prd/20260903-workflow-hardening/milestone-delivery.yaml)
 （里程碑交付：plan → builtin-program → PRD → issues → child-workflow 循环
 → 终审 → close，覆盖全部三种节点类型与 onFail 修复回路）。

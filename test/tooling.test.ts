@@ -28,7 +28,7 @@ function tempDir(prefix) {
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 
-test('#101 诊断：当前 v9 库被识别为 current，且读取前后字节与目录内容不变', () => {
+test('#101 诊断：当前格式库被识别为 current，且读取前后字节与目录内容不变', () => {
   const { dir, cleanup } = tempDir('wf101-diag-current-')
   try {
     const store = new StateStore(dir)

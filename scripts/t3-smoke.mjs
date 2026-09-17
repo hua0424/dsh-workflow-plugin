@@ -1,8 +1,9 @@
 /** T3 隔离烟测（受控 Host，不代表真实 DSH 宿主 E2E）：
  * 真实 Catalog/Runtime/SQLite + 显式 `reuse: continuable` 的 Role —— 覆盖 e2e-smoke
  * 不覆盖的那一半角色生命周期：Manager 节点 → Role 跨节点复用（节点边界 compact）
- * → END → SQLite 关库重开；e2e-smoke.mjs 覆盖缺省 `reuse: node` 的 REJECT 修正、
- * failed onFail 自环、离开节点 drain 与新 visit 新会话。两者合起来是 `pnpm run test:smoke`。
+ * → 业务终局（`{ return: delivered }`）→ SQLite 关库重开；e2e-smoke.mjs 覆盖缺省
+ * `reuse: node` 的 REJECT 修正、`retry` 结果自环、离开节点 drain 与新 visit 新会话。
+ * 两者合起来是 `pnpm run test:smoke`。
  * 全部使用独立临时 home，绝不读写真实 ~/.dsh；Adapter 必须跟随当前 Host 合同
  * （`safeToInspect` 返回 'safe'|'unsafe'，不是 boolean——旧 boolean 断言会把
  * continuable 复用误判成 "Judge/known tools not safely closed" 的假失败）。
@@ -20,25 +21,29 @@ const home = mkdtempSync(join(tmpdir(), 'workflow-t3-smoke-'))
 const cwd = join(home, 'workspace')
 mkdirSync(cwd)
 mkdirSync(join(home, 'workflows'))
-writeFileSync(join(home, 'workflows', 'smoke.yaml'), `schemaVersion: agent-workflow/v2
+writeFileSync(join(home, 'workflows', 'smoke.yaml'), `schemaVersion: agent-workflow/v3
 roles:
   worker: { persona: Work only on the isolated artifact., reuse: continuable }
 judgeRole: { persona: Read only verification. }
 workflow:
   startNode: plan
+  returns: [delivered]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Create plan.txt. }
       checker: { checkerId: judge.claim-correct, config: { criteria: plan.txt is present and correct. } }
-      onPass: work
+      results:
+        succeeded: { criteria: plan.txt is present and correct., target: { node: work } }
     work:
       execution: { type: actor-task, role: worker, instruction: Create result.txt. }
       checker: { checkerId: judge.claim-correct, config: { criteria: result.txt is present and correct. } }
-      onPass: finish
+      results:
+        succeeded: { criteria: result.txt is present and correct., target: { node: finish } }
     finish:
       execution: { type: actor-task, role: worker, instruction: Final delivery. }
       checker: { checkerId: judge.claim-correct, config: { criteria: final handoff identifies result.txt. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The final handoff identifies result.txt., target: { return: delivered } }
 `)
 let store = new StateStore(home)
 try {
@@ -70,7 +75,7 @@ try {
     if (index === 0) writeFileSync(join(cwd, 'plan.txt'), 'plan ok')
     if (index === 1) writeFileSync(join(cwd, 'result.txt'), 'result ok')
     const actor = caller(row.execution.dispatch)
-    assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff }, actor)).ok, true)
+    assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff }, actor)).ok, true)
     assert.equal(packets.length, index, 'claim must wait for Actor settlement')
     await engine.handleTurnEnded(ws, actor)
     assert.equal(readFileSync(join(cwd, index === 0 ? 'plan.txt' : 'result.txt'), 'utf8'), index === 0 ? 'plan ok' : 'result ok')
@@ -89,7 +94,7 @@ try {
   store.close(); store = new StateStore(home)
   assert.equal((await store.get(ws)).execution.claim.handoff, 'final result.txt')
   assert.deepEqual((await store.events(ws, finalId)).map(e => e.type), ['entered', 'actor-arranged', 'claim', 'judge-arranged', 'judgment', 'exited'])
-  console.log('T3 ISOLATED SMOKE PASS: Catalog → Actor → safe settlement → Judge ACCEPT → reused Role/compact → END → SQLite reopen')
+  console.log('T3 ISOLATED SMOKE PASS: Catalog → Actor → safe settlement → Judge ACCEPT → reused Role/compact → 业务终局（{ return: delivered }）→ SQLite reopen')
 } finally {
   store.close()
   rmSync(home, { recursive: true, force: true })

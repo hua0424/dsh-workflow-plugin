@@ -12,10 +12,18 @@ import { authorizeToolCall } from '../src/tools/authz.ts'
 import { EVENT_TYPES, type ClaimCaller, type WorkflowConfig } from '../src/types.ts'
 
 const config: WorkflowConfig = {
-  schemaVersion: 'agent-workflow/v2', roles: {}, judgeRole: { persona: 'Read only' },
-  workflow: { startNode: 'plan', nodes: {
-    plan: { execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' }, checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } }, onPass: 'review' },
-    review: { execution: { type: 'actor-task', role: 'manager', instruction: 'Review' }, checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct review' } }, onPass: 'END' },
+  schemaVersion: 'agent-workflow/v3', roles: {}, judgeRole: { persona: 'Read only' },
+  workflow: { startNode: 'plan', returns: ['done'], nodes: {
+    plan: {
+      execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
+      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+      results: { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } },
+    },
+    review: {
+      execution: { type: 'actor-task', role: 'manager', instruction: 'Review' },
+      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct review' } },
+      results: { succeeded: { criteria: 'The review is complete.', target: { return: 'done' } } },
+    },
   } },
 }
 
@@ -125,7 +133,7 @@ test('competing SQLite CAS writers cannot overwrite a winner or cross workspace 
 test('Manager controls Role BLOCK, but sibling mapping drift cannot impersonate the current dispatch', async () => {
   const f = await fixture(true)
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan artifact' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan artifact' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     const checking = (await f.store.get('ws'))!
     const judge: ClaimCaller = { sessionId: checking.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
@@ -154,7 +162,7 @@ test('Manager controls Role BLOCK, but sibling mapping drift cannot impersonate 
 test('Role 离开节点的提交遇 CAS 冲突：映射保持原值、会话仍授权、无半提交', async () => {
   const f = await fixture(true)
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan artifact' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan artifact' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     let row = (await f.store.get('ws'))!
     const planJudge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
@@ -164,7 +172,7 @@ test('Role 离开节点的提交遇 CAS 冲突：映射保持原值、会话仍�
     assert.equal(row.execution.dispatch?.sessionId, 'role-reviewer', '缺省 reuse=node 的 Role 已派发')
 
     const reviewer: ClaimCaller = { sessionId: 'role-reviewer', turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
-    assert.equal((await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'review artifact' }, reviewer)).ok, true)
+    assert.equal((await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'review artifact' }, reviewer)).ok, true)
     await f.engine.handleTurnEnded('ws', reviewer)
     const before = (await f.store.get('ws'))!
     const history = await f.store.events('ws', before.execution.executionId)
@@ -195,11 +203,11 @@ test('Manager Actor needs its exact message for claim/BLOCK, and accepted claim 
     const before = (await f.store.get('ws'))!
     for (const ids of [[], ['old-message']]) {
       const caller: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(ids) }
-      assert.equal((await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'unbound result' }, caller)).ok, false)
+      assert.equal((await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'unbound result' }, caller)).ok, false)
       assert.equal((await f.engine.handleBlock('ws', before.execution.nodeToken, 'unbound BLOCK', caller)).ok, false)
       assert.deepEqual(await f.store.get('ws'), before)
     }
-    assert.equal((await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'accepted candidate' }, f.actor)).ok, true)
+    assert.equal((await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'accepted candidate' }, f.actor)).ok, true)
     const claimed = (await f.store.get('ws'))!
     assert.equal((await f.engine.handleBlock('ws', before.execution.nodeToken, 'late BLOCK', f.actor)).ok, false)
     assert.deepEqual(await f.store.get('ws'), claimed)
@@ -219,7 +227,7 @@ test('BLOCK event failure preserves dispatch qualification; successful BLOCK ref
     assert.equal((await f.engine.handleBlock('ws', before.execution.nodeToken, 'need help', f.actor)).ok, true)
     const blocked = (await f.store.get('ws'))!
     assert.equal(blocked.run.status, 'blocked')
-    assert.equal((await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'late result' }, f.actor)).ok, false)
+    assert.equal((await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'late result' }, f.actor)).ok, false)
     assert.equal((await f.engine.handleBlock('ws', before.execution.nodeToken, 'duplicate', f.actor)).ok, false)
     assert.deepEqual(await f.store.get('ws'), blocked)
     assert.equal((await f.store.events('ws', before.execution.executionId)).filter(event => event.type === 'blocked').length, 1)
@@ -229,7 +237,7 @@ test('BLOCK event failure preserves dispatch qualification; successful BLOCK ref
 test('ACCEPT and successor entered failure commits neither work order nor events; exact Judge can retry once', async () => {
   const f = await fixture()
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan artifact' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan artifact' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     const before = (await f.store.get('ws'))!
     const history = await f.store.events('ws', before.execution.executionId)
@@ -301,7 +309,7 @@ test('legacy state fails closed without creating empty replacement tables or cha
 test('Store rejects previousJudge without a historical judgment', async () => {
   const f = await fixture()
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'returned claim' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'returned claim' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     let row = (await f.store.get('ws'))!
     const oldJudge = structuredClone(row.execution.judge)!
@@ -326,7 +334,7 @@ test('Store rejects previousJudge without a historical judgment', async () => {
 test('Store and event reads reject forged historical Judge dispatch or Session identity', async () => {
   const f = await fixture()
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'claim one' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'claim one' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     let row = (await f.store.get('ws'))!
     const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-message-1']) }
@@ -358,7 +366,7 @@ test('Store and event reads reject forged historical Judge dispatch or Session i
 test('Store rejects invalid current and same-claim historical REJECT verdict positions', async () => {
   const f = await fixture()
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     let row = (await f.store.get('ws'))!
     const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
@@ -392,7 +400,7 @@ test('Store rejects invalid current and same-claim historical REJECT verdict pos
 test('Store binds Judge followup mode to the exact historical NEED_CONTEXT Judge Session', async () => {
   const f = await fixture()
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     let row = (await f.store.get('ws'))!
     const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId, turnUserMessageIds: new Set(['judge-message-1']) }
@@ -419,7 +427,7 @@ test('Store binds Judge followup mode to the exact historical NEED_CONTEXT Judge
 test('failed respawn arrangement keeps the old Judge identity and reports failure', async () => {
   const f = await fixture()
   try {
-    await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'candidate' }, f.actor)
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate' }, f.actor)
     await f.engine.handleTurnEnded('ws', f.actor)
     let row = (await f.store.get('ws'))!
     const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
@@ -597,12 +605,12 @@ test('claim event failure rolls back current work; original dispatch retries and
     const before = (await f.store.get('ws'))!
     const events = await f.store.events('ws', before.execution.executionId)
     f.sql.exec("CREATE TRIGGER fail_claim BEFORE INSERT ON node_execution_events WHEN NEW.type = 'claim' BEGIN SELECT RAISE(ABORT, 'injected claim event failure'); END")
-    await assert.rejects(f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan artifact' }, f.actor), /injected claim event failure/)
+    await assert.rejects(f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan artifact' }, f.actor), /injected claim event failure/)
     assert.deepEqual(await f.store.get('ws'), before)
     assert.deepEqual(await f.store.events('ws', before.execution.executionId), events)
     f.sql.exec('DROP TRIGGER fail_claim')
-    assert.equal((await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'plan artifact' }, f.actor)).ok, true)
-    assert.equal((await f.engine.handleClaim('ws', { outcome: 'completed', handoff: 'duplicate artifact' }, f.actor)).ok, false)
+    assert.equal((await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan artifact' }, f.actor)).ok, true)
+    assert.equal((await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'duplicate artifact' }, f.actor)).ok, false)
     f.store.close()
     const reopened = new StateStore(f.home)
     try {
