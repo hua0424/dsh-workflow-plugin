@@ -234,10 +234,13 @@ v3 运行时**不接受 v2 配置**，也不把 v2 的 `failed` 猜测成任何�
 ### 8.2 旧格式状态库的正常加载行为：维护态，不隐式切换
 
 用新版本打开**旧格式**或**坏**的状态库时，插件进入**维护态（maintenance）**：普通
-命令直接以 `maintenance mode` 报错拒绝（`/dsh-flow list` 会给出 `list 失败：workflow
-state is in maintenance mode: <原因>` 这类结果），而 `/dsh-flow reset
---incompatible-store` 会打印完整维护诊断（状态库路径、`user_version`、原因，以及
-“未迁移或替换任何数据”的说明）。维护态下的行为：
+命令一律回复**完整维护诊断**——状态库路径、`user_version`、原因，以及“未迁移或替换
+任何数据”的说明（`/dsh-flow list` 给出 `list 失败：Workflow State Store is in
+maintenance mode; ordinary list/start/tools are disabled.` 后接 `path:` /
+`user_version:` / `reason:` 各行；`start` / `check` 与普通 `reset` 同样以该诊断作为
+失败原因，`status` 把它作为状态正文输出）。`/dsh-flow reset --incompatible-store`
+**不打印这段诊断**：它是 root 会话的显式**整库切换**命令，直接执行备份 → 归档 →
+初始化新空库（见 §8.3），返回的是切换本身的消息。维护态下的行为：
 
 - 普通 `list` / `start` / 工作流控制工具在维护态下**全部被拒绝**，不退回旧引擎；
   连普通 `reset` 也不会在维护态下执行——它只会回复维护诊断，并提示必须用
