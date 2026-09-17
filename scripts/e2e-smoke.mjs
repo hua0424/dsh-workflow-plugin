@@ -16,37 +16,42 @@ const home = mkdtempSync(join(tmpdir(), 'dsh-t4-e2e-'))
 const cwd = join(home, 'workspace')
 mkdirSync(cwd)
 mkdirSync(join(home, 'workflows'))
-writeFileSync(join(home, 'workflows', 'smoke-test.yaml'), `schemaVersion: agent-workflow/v2
+writeFileSync(join(home, 'workflows', 'smoke-test.yaml'), `schemaVersion: agent-workflow/v3
 roles:
   worker: { persona: Work only in the isolated workspace. }
 judgeRole: { persona: Read-only verification. }
 workflow:
   startNode: hello
+  returns: [delivered]
   nodes:
     hello:
       execution: { type: actor-task, role: manager, instruction: Write the single line "smoke ok" into result.txt. }
       checker: { checkerId: judge.claim-correct, config: { criteria: result.txt holds exactly the single line "smoke ok". } }
-      onPass: worker-echo
+      results:
+        succeeded: { criteria: result.txt holds exactly the single line "smoke ok"., target: { node: worker-echo } }
     worker-echo:
       execution: { type: actor-task, role: worker, instruction: Append the single line "worker ok" to result.txt. }
       checker: { checkerId: judge.claim-correct, config: { criteria: result.txt holds "smoke ok" then "worker ok", exactly two lines. } }
-      onPass: END
-      onFail: worker-echo
+      results:
+        succeeded: { criteria: 'result.txt holds "smoke ok" then "worker ok", exactly two lines.', target: { return: delivered } }
+        retry: { criteria: The worker line is absent and the artifact needs another attempt., target: { node: worker-echo } }
 `)
 
 // #59: a catalog whose persona hand-writes the submission protocol must stay
 // loadable/startable (warning diagnostic only).
-writeFileSync(join(home, 'workflows', 'warn-persona.yaml'), `schemaVersion: agent-workflow/v2
+writeFileSync(join(home, 'workflows', 'warn-persona.yaml'), `schemaVersion: agent-workflow/v3
 roles:
   worker: { persona: Report only through node_claim. }
 judgeRole: { persona: Read-only verification. }
 workflow:
   startNode: hello
+  returns: [delivered]
   nodes:
     hello:
       execution: { type: actor-task, role: manager, instruction: Say ok. }
       checker: { checkerId: judge.claim-correct, config: { criteria: ok was said. } }
-      onPass: END
+      results:
+        succeeded: { criteria: ok was said., target: { return: delivered } }
 `)
 
 let store = new StateStore(home)
@@ -114,7 +119,7 @@ try {
 
   writeFileSync(join(cwd, 'result.txt'), 'wrong\n')
   let current = await row()
-  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'wrote wrong result' }, caller(current.execution.dispatch))).ok, true)
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'wrote wrong result' }, caller(current.execution.dispatch))).ok, true)
   const firstJudge = await settleActorAndJudge('REJECT', 'existing criteria requires exactly smoke ok')
   current = await row()
   assert.equal(current.execution.executionId, firstExecutionId)
@@ -123,7 +128,7 @@ try {
   assert.equal((await engine.handleJudgeClaim(ws, current.execution.nodeToken, 'ACCEPT', 'late old verdict', firstJudge)).ok, false)
 
   writeFileSync(join(cwd, 'result.txt'), 'smoke ok\n')
-  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'wrote smoke ok' }, caller(current.execution.dispatch))).ok, true)
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'wrote smoke ok' }, caller(current.execution.dispatch))).ok, true)
   const helloAccepted = await settleActorAndJudge('ACCEPT', 'content matches criteria')
   await engine.handleTurnEnded(ws, helloAccepted)
   current = await row()
@@ -132,7 +137,7 @@ try {
 
   const failedHandoff = 'rework: append the exact line worker ok'
   const releasedWorkerCaller = caller(current.execution.dispatch)
-  assert.equal((await engine.handleClaim(ws, { outcome: 'failed', handoff: failedHandoff }, releasedWorkerCaller)).ok, true)
+  assert.equal((await engine.handleClaim(ws, { result: 'retry', handoff: failedHandoff }, releasedWorkerCaller)).ok, true)
   const failureAccepted = await settleActorAndJudge('ACCEPT', 'honest failure; worker line is absent')
   await engine.handleTurnEnded(ws, failureAccepted)
   current = await row()
@@ -142,14 +147,14 @@ try {
   assert.deepEqual(compacts, [], 'reuse: node 全程不做节点边界 compact')
   assert.equal(current.run.roleActors.worker, 'worker-2', '回边重入同一节点得到全新 child 会话')
   assert.equal(current.execution.dispatch.sessionId, 'worker-2')
-  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'stale worker-1 claim' }, releasedWorkerCaller)).ok, false,
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'stale worker-1 claim' }, releasedWorkerCaller)).ok, false,
     '旧会话随映射删除失权：worker-1 的迟到 claim 不被接受')
   assert.equal(authorizeToolCall({
     run: current.run, sessionId: 'worker-1', knownRoleOfSession: 'worker', isJudgeSession: false, toolName: 'node_claim',
   }).allow, false, '映射已删除：worker-1 不再持有 workflow 工具授权（authz 精确比对 roleActors）')
 
   writeFileSync(join(cwd, 'result.txt'), 'smoke ok\nwrong worker\n')
-  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'appended wrong worker line' }, caller(current.execution.dispatch))).ok, true)
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'appended wrong worker line' }, caller(current.execution.dispatch))).ok, true)
   await settleActorAndJudge('REJECT', 'existing criteria requires the exact worker ok line')
   current = await row()
   assert.match(actorPrompts.at(-1).text, /appended wrong worker line/)
@@ -157,7 +162,7 @@ try {
   assert.deepEqual(drained, ['worker-1'], '节点内修正不离开节点，会话不释放')
 
   writeFileSync(join(cwd, 'result.txt'), 'smoke ok\nworker ok\n')
-  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: 'final verified result.txt' }, caller(current.execution.dispatch))).ok, true)
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'final verified result.txt' }, caller(current.execution.dispatch))).ok, true)
   await settleActorAndJudge('ACCEPT', 'content matches criteria')
   current = await row()
   assert.equal(current.run.status, 'completed')
@@ -180,7 +185,7 @@ try {
   const trace = readFileSync(join(logDir, logs[0]), 'utf8')
   for (const marker of [' START ', ' CLAIM ', ' JUDGE ', ' result=REJECT ', ' result=ACCEPT ', ' ROUTE ']) assert.match(trace, new RegExp(marker))
 
-  console.log('E2E SMOKE PASS: REJECT correction + failed onFail self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen + #59 warned-persona catalog loadable')
+  console.log('E2E SMOKE PASS: REJECT correction + retry result self-loop + node-level Role reuse (drain on leave + fresh re-entry) + final ACCEPT + SQLite reopen + #59 warned-persona catalog loadable')
 } finally {
   store.close()
   rmSync(home, { recursive: true, force: true })

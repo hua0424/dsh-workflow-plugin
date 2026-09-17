@@ -5,7 +5,7 @@
  */
 import { defineTool, ToolArgsError } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
-import { LIMITS, normalizeNodeClaim, type ClaimOutcome, type ClaimCaller } from '../types.ts'
+import { LIMITS, normalizeNodeClaim, type ClaimCaller, type NodeClaim } from '../types.ts'
 import { callerTurnUserMessageIds } from '../plugin/turnbind.ts'
 
 /** Length-check a tool text argument per the design bounds. */
@@ -54,7 +54,7 @@ export interface ToolHost {
   // Engine mutations (callers already passed authorize; `caller` identifies
   // the calling agent's session — for claim/block it also carries the calling
   // turn's user-message id snapshot for dispatch-lease admission, A1 R2/R3).
-  claim(workspaceKey: string, claim: { outcome: ClaimOutcome; handoff: string }, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
+  claim(workspaceKey: string, claim: NodeClaim, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   block(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string, target?: 'auto' | 'actor' | 'judge'): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -139,16 +139,16 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
       name: 'node_claim',
       description: '提交当前 Node 的工作结果声明（candidate result）。由 Checker 独立确认 ACCEPT/REJECT。无需任何 token——绑定由派发 lease 自动完成。这必须是当前 Turn 的最后一个动作。',
       parameters: {
-        outcome: { type: 'string', required: true, enum: ['completed', 'failed'], description: 'completed | failed' },
-        handoff: { type: 'string', required: true, description: '唯一结果与交接说明（trim 后 1..8000 字符，completed/failed 对称，END 也必填）：实际结果、产物位置与核验依据、剩余问题和后续约束。Judge、Manager、后继读取同一文本；不接受旧 summary/handoffContext。' },
+        result: { type: 'string', required: true, description: '本节点已声明的结果名之一（互斥出口：一次只提交一个）。运行时以当前冻结节点的结果枚举为准，非法结果被拒绝且不消费资格。' },
+        handoff: { type: 'string', required: true, description: '唯一结果与交接说明（trim 后 1..8000 字符，终局也必填）：实际完成内容、产物位置与核验依据、剩余问题和后续约束。Judge、Manager、后继读取同一文本；不接受旧 outcome/summary/handoffContext。' },
       },
       output: stringOut,
       async execute(args, exec) {
         const auth = await controlWorkspace(host, exec.agent, 'node_claim')
         if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
-        // 宿主 defineTool 的参数根是 open object；显式拒绝旧字段及其它业务入口。
-        const unknown = Object.keys(args).filter(key => key !== 'outcome' && key !== 'handoff')
-        if (unknown.length > 0) throw new ToolArgsError(unknown.map(key => `unsupported node_claim property "${key}"; use outcome and handoff`))
+        // 宿主 defineTool 的参数根是 open object；显式拒绝旧协议字段及其它业务入口。
+        const unknown = Object.keys(args).filter(key => key !== 'result' && key !== 'handoff')
+        if (unknown.length > 0) throw new ToolArgsError(unknown.map(key => `unsupported node_claim property "${key}"; use result and handoff`))
         let claim
         try {
           claim = normalizeNodeClaim(args)

@@ -5,7 +5,7 @@ import { basename, dirname, join } from 'node:path'
 import { backup, DatabaseSync } from 'node:sqlite'
 import { isDeepStrictEqual } from 'node:util'
 import { snapshotJsonValue, isJsonValue } from '@deepseek-ai/dsh-util-values'
-import { CATALOG_DIR_NAME, EVENT_TYPES, STATE_DB_NAME, STATE_FORMAT_VERSION, type ExecutionChange, type NodeExecution, type NodeExecutionEvent, type RunState, type StateRow } from '../types.ts'
+import { CATALOG_DIR_NAME, EVENT_TYPES, STATE_DB_NAME, STATE_FORMAT_VERSION, STATE_USER_VERSION, type ExecutionChange, type NodeExecution, type NodeExecutionEvent, type RunState, type StateRow } from '../types.ts'
 import { checkExecutionInvariants, checkStateInvariants } from './invariants.ts'
 
 interface RunRow {
@@ -67,7 +67,7 @@ CREATE TABLE node_execution_events (
   snapshot_json TEXT NOT NULL CHECK(json_valid(snapshot_json)),
   PRIMARY KEY(execution_id, sequence)
 ) STRICT;
-PRAGMA user_version = 9;
+PRAGMA user_version = ${STATE_USER_VERSION};
 `
 
 function json(value: unknown): string {
@@ -108,7 +108,7 @@ export class StateStore {
       if (names.length === 0 && version.user_version === 0) {
         this.db.exec('BEGIN IMMEDIATE')
         try { this.db.exec(CREATE_SQL); this.db.exec('COMMIT') } catch (error) { this.db.exec('ROLLBACK'); throw error }
-      } else if (version.user_version !== 9 || names.length !== 3 || !['runs', 'node_executions', 'node_execution_events'].every(name => names.includes(name))) {
+      } else if (version.user_version !== STATE_USER_VERSION || names.length !== 3 || !['runs', 'node_executions', 'node_execution_events'].every(name => names.includes(name))) {
         throw new Error('incompatible state format; original data retained; authorized backup/reset required')
       }
       this.db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000')
@@ -133,7 +133,7 @@ export class StateStore {
       const userVersion = (db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version
       const tables = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as { name: string }[]).map(row => row.name)
       const expected = ['node_execution_events', 'node_executions', 'runs']
-      if (userVersion === 9 && isDeepStrictEqual(tables, expected)) return undefined
+      if (userVersion === STATE_USER_VERSION && isDeepStrictEqual(tables, expected)) return undefined
       return { kind: 'incompatible', path, userVersion, tables, reason: `incompatible state format (user_version=${userVersion}); original data retained` }
     } catch (error) {
       return { kind: 'corrupt', path, userVersion: null, tables: [], reason: `state database is unreadable: ${error instanceof Error ? error.message : String(error)}; original bytes retained` }

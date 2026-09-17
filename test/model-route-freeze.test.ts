@@ -25,7 +25,7 @@ import { routeToAgentOptions, type RunState, type SpawnAgentOptions, type Workfl
 import { StateStore } from '../src/state/store.ts'
 
 const CONFIG: WorkflowConfig = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   worker:
     persona: Worker persona.
@@ -33,15 +33,18 @@ judgeRole:
   persona: Judge persona.
 workflow:
   startNode: plan
+  returns: [done]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Plan. }
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
-      onPass: work
+      results:
+        succeeded: { criteria: The plan is complete., target: { node: work } }
     work:
       execution: { type: actor-task, role: worker, instruction: Work. }
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The work is complete., target: { return: done } }
 `), { workflowId: 'model-route-freeze' })
 
 /** 受控 Manager Agent：正式 helper 无 requestHeader 时回退到 creation options。 */
@@ -111,7 +114,7 @@ function startRun(engine: WorkflowEngine, ws: string, managerSessionId: string):
 async function advance(engine: WorkflowEngine, store: StateStore, ws: string): Promise<void> {
   const row = (await store.get(ws))!
   const caller = { sessionId: row.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
-  assert.equal((await engine.handleClaim(ws, { outcome: 'completed', handoff: `${ws} artifact` }, caller)).ok, true)
+  assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: `${ws} artifact` }, caller)).ok, true)
   await engine.handleTurnEnded(ws, caller)
   const checking = (await store.get(ws))!
   assert.equal(checking.execution.phase, 'checking', `${ws} should be waiting for its Judge`)
@@ -250,7 +253,7 @@ function hostRun(managerSessionId: string, delegationRoute?: RunState['delegatio
 function judgeInput(run: RunState, judgeSessionId: string): JudgeSpawnInput {
   return {
     nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
-    boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
+    boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
     cwd: '.', judgeSessionId,
   }
 }

@@ -12,9 +12,9 @@
 1. Run 启动时校验并保存完整 Definition Snapshot；当前 Run 不随 YAML 修改而变化。
 2. 一个 canonical workspace 最多一个未结束 Root Run，BLOCK 仍占用此资格。Root/Child 共用该 Run 的 Role mappings；Child 不另占 workspace。
 3. 任一时刻只有当前实际工作位置获得推进权。Parent 调用等待 Child 时不能自行推进。
-4. Actor Task 的 claim 必须经独立只读 Judge；ACCEPT 才按 `completed → PASS`、`failed → FAIL` 路由。
-5. Builtin Program 用其确定性结果确认；Child END 是父调用的 PASS 依据，不额外要求 LLM Judge。
-6. BLOCK 是可恢复暂停，不是 Graph FAIL；REJECT 是当前工作返工，不沿 onFail 离开。
+4. Actor Task 的 claim 必须经独立只读 Judge；ACCEPT 才沿**该 claim 所选结果**声明的静态 Target 原子推进（v3 命名结果；判定与选路分离，Judge 不改选结果）。
+5. Builtin Program 用其确定性 PASS/FAIL 结果确认（同样走统一 Target）；Child 返回是父调用 `onReturn` 映射的依据，不额外要求 LLM Judge。
+6. BLOCK 是可恢复暂停，不是业务出口；REJECT 是当前工作返工，留在同一 execution 重提。
 7. Role Actor 在整个 Root/Child Run 内复用 continuable Session，承担下一 Node Execution 前执行 Node 边界 compact。工作单独立不等于 Session 独立。
 8. 同一工作单内补充、返工、恢复默认续接原 Actor；Session 不可用或显式换人时允许 replacement。
 9. 常规按记录继续，长尾交给 Actor/Manager 检查现场；不追求完整复原 Turn、全部消息投递和外部副作用。
@@ -65,11 +65,11 @@ Child 首节点接收调用工作单的 input；Child 最后节点按自身执�
 
 - 进入工作单。
 - 安排 Actor/Judge/Program；表述为派发意图，不声称已送达或已执行。
-- Actor 提交 claim，保存 outcome 与完整 handoff。
+- Actor 提交 claim，保存所选命名结果与完整 handoff。
 - Judge 提交 ACCEPT / REJECT / NEED_CONTEXT，保存判定依据及所针对的 claim/判定输入关联。
 - BLOCK、Manager 补充与 resume。
 - Program 确定结果或 Manager 裁决。
-- 离开工作单；Reset 的终止记录挂到当前工作单，不冒充正常离开。
+- 离开工作单（含该次退出的裁决名：节点结果名或流程返回名）；Reset 的终止记录挂到当前工作单，不冒充正常离开。
 
 当前状态更新与对应关键事件插入放在同一 SQLite 事务中；事件插入失败则该次业务更新也不提交。时间戳只供显示，排序与去重使用稳定事件序号/提交身份。
 
@@ -77,22 +77,26 @@ Child 首节点接收调用工作单的 input；Child 最后节点按自身执�
 
 **恢复读当前工作单，解释过程读事件明细。** 明细可以帮助 Manager 查争议，但正常恢复不需要扫描整条事件流重建状态。原有 trace 仍是 best-effort 调试产物，与这张业务明细表不是同一合同。
 
-## 3. Actor 结果合同：只保留 outcome 与 handoff
+## 3. Actor 结果合同：唯一命名结果与 handoff（v3）
 
 Actor claim 的业务内容统一为：
 
-- `outcome: completed | failed`。
-- `handoff: string`：必填、非空、有界的结果与交接说明；completed/failed 使用同一长度与校验规则。
+- `result: string`：必填，必须命中**当前冻结节点**声明的结果集合；结果是该节点局部的业务结论（不是全局 completed/failed 二分）。
+- `handoff: string`：必填、非空、有界的结果与交接说明；所有结果共用同一长度与校验规则。
 
-取消独立 `summary` 字段。Manager、Judge、后继 Actor 和最终用户读取同一份 handoff；状态展示可截取其预览，不新增模型摘要、持久化 summary 或隐式 fallback。
+`node_claim` 严格只接受 `{ result, handoff }`，不接受的旧字段（outcome/exit/nodeId/额外业务字段）在参数边界被拒；结果名的运行时枚举校验先于任何状态写入，非法提交既不消费派发资格也不留下部分状态。
 
-handoff 应说明实际完成/失败的内容、产物位置与核验依据、剩余问题和约束、后续需要的信息。到 END 时仍提交，作为最终结果材料。
+每个节点声明 `results`：每项含**非空 criteria** 与一个**统一 Target**（严格互斥的 `{ node: <本流程节点> }` 或 `{ return: <本流程返回名> }`）。`checker.config.criteria` 是可选的非空**共同条件**。共同条件与所选结果条件**同源**取自随 Run 冻结的定义快照：Actor 初次派发、REJECT 修正与恢复都收到共同条件 + 全部合法结果条件；Judge 只收到共同条件与本次所选结果的条件，不改选结果、不遍历其他出口。
 
-插件把 handoff 作为 opaque 文本保存和传递，不引入业务变量、自动对象合并、输出绑定或任务数据流 DSL。内容要求由通用提示与当前 criteria 核验，不强制新增结构化业务字段。
+取消独立 `summary` 字段。Manager、Judge、后继 Actor 和最终用户读取同一份 handoff；状态展示可截取其预览，不新增模型摘要、持久化 summary 或隐式 fallback。走到流程返回时仍提交，作为最终结果材料。
 
-这是对旧工具合同的显式破坏性调整：新提示与 schema 同步移除 summary，不维持运行时双协议。Host 所需的 nodeToken/调用身份是控制合同，不由 outcome/handoff 替代。
+handoff 应说明实际完成的内容、产物位置与核验依据、剩余问题和约束、后续需要的信息。
 
-`failed` 是业务失败声明；额度不足、缺少条件、临时无法继续或判定争议应使用 BLOCK，不为了退出执行而伪报 failed。
+插件把 handoff 作为 opaque 文本保存和传递，不引入业务变量、自动对象合并、输出绑定或任务数据流 DSL。内容要求由通用提示与当前验收合同核验，不强制新增结构化业务字段。
+
+这是对旧工具合同的显式破坏性调整：v2 的 `outcome`/`onPass`/`onFail` 与裸 `END` 全部移除，不维持运行时双协议、也不把 v2 的 `failed` 猜测转换成任何业务结果。
+
+缺权限、网络故障或证据不足是 BLOCK（控制面暂停），不是业务结果；不要为了退出执行而伪报某个结果。
 
 ## 4. 阶段与暂停
 
@@ -108,7 +112,7 @@ working 不证明现在仍有活跃 Actor，也不证明外部动作已发生；
 
 BLOCK 保留原 phase 与已有材料，增加原因，不新增 quota/network/persistence 等 phase。Run-level 故障可记录 Run 控制原因，节点故障以工作单原因为权威，避免重复镜像。
 
-REJECT 使当前 claim 的判定资格失效，保留历史和最新拒绝依据，同一 execution 回到 ready。FAIL 无 onFail 则保留已确认失败，停在 settling 并 BLOCK；resume 重开本次工作版本，把旧失败转为历史，不能把它误当未判定 claim 再派 Judge。
+REJECT 使当前 claim 的判定资格失效，保留历史和最新拒绝依据，同一 execution 回到 ready；Actor 可改选另一个合法结果，但必须重新核验，不能沿原边偷跑。v3 下每个已声明结果都有静态 Target，因此不存在「已确认但没有出口边」的常规状态：这类内部不一致只保留 fail-closed 的 settling BLOCK 兜底，不伪造交接。
 
 ## 5. 一个推进器，统一正常执行与恢复
 
@@ -121,8 +125,8 @@ start、Actor claim、Judge 提交、有效宿主结算、Manager resume 都进�
 3. Host Adapter 取得/续接 Role；新 visit 先按规则 compact，再交付当前输入。
 4. Actor claim 入库，并插入 claim 快照事件；失去本次重复提交资格。
 5. checking 阶段等待该 Actor 派发安全收口，再让只读 Judge 核验。
-6. 校验 Judge 结果的当前身份、claim 及判定输入版本，确定状态转换；有合法出口的 ACCEPT 不先单独提交判定。
-7. 若有合法出口，在同一个事务中提交：判定/结果及事件、前驱离开、后继工作单/input/进入事件、Run 指针与 Child 栈更新。ROOT END 同样原子结束。REJECT、NEED_CONTEXT 或 FAIL 无出口时，单独原子提交对应判定/事件与返工或暂停状态，不伪造交接。
+6. 校验 Judge 结果的当前身份、claim 及判定输入版本，确定状态转换；ACCEPT 不先单独提交判定。
+7. 若有合法出口，在同一个事务中提交：判定/结果及事件、前驱离开、后继工作单/input/进入事件、Run 指针与 Child 栈更新。走到 Root 流程返回时同样原子结束并记录业务终局名与来源。REJECT、NEED_CONTEXT 或内部不一致的暂停单独原子提交对应判定/事件与返工或暂停状态，不伪造交接。
 8. 事务提交后再安排后继。settling 可以是该事务中的短暂概念，不强制额外一次写入。
 
 REJECT 与 NEED_CONTEXT 进入同一状态转换路径。重复触发必须先看当前阶段与已登记安排，不能重复创建后继或反复发送当前活跃工作。
@@ -155,7 +159,7 @@ SQLite 提交和宿主投递之间存在窗口，不能通过多记几个字段�
 
 Actor 或承担执行职责的 Manager 收到：
 
-> 本任务此前执行中断。请先核对已保存材料与实际完成情况。已完成的部分不要重复产生副作用；未完成的部分继续或补做。完成后重新提交 outcome 和 handoff。无法可靠判断或需要额外权限时，请说明情况并请求 Manager 处理。
+> 本任务此前执行中断。请先核对已保存材料与实际完成情况。已完成的部分不要重复产生副作用；未完成的部分继续或补做。完成后重新提交 result 和 handoff。无法可靠判断或需要额外权限时，请说明情况并请求 Manager 处理。
 
 Judge 收到只读核验提示：基于当前有效 claim、当前判定材料和只读现场继续/重新检查，不补做被核验工作。信息不足使用 NEED_CONTEXT。
 
@@ -167,7 +171,7 @@ Judge 收到只读核验提示：基于当前有效 claim、当前判定材料�
 
 Role mappings 归 Root Run。DSH continuable 持久的是 Session 身份，不保证 live Activation 一直存在；冷续接沿用同一 Session，而不是正常新建 Actor。
 
-Actor 再次承担新 Node Execution（包括自环）前执行 Node 边界 compact，随后接收明确的当前 input、instruction（+ correction/resolution/recovery/引擎提交要求）、补充和适用提示，不含 criteria；criteria 仅进 Judge packet 作为判定依据。同工作单返工/resume 不额外触发 Node 边界 compact。
+Actor 再次承担新 Node Execution（包括自环）前执行 Node 边界 compact，随后接收明确的当前 input、instruction（+ correction/resolution/recovery/引擎提交要求）、**该节点的验收合同（共同条件 + 全部合法结果条件）**、插件提供的直接前驱结果与适用提示。同工作单返工/resume 不额外触发 Node 边界 compact；这三条路径收到的是同一份同源合同。Judge packet 只带共同条件与本次所选结果的条件。
 
 compact 需要合适的 idle live Agent。Host Adapter 封装冷物化/维护/释放等宿主细节，区分成功、有明确语义的无可压缩范围 no-op、busy 和失败。busy 不能伪装为压缩成功；失败保留材料并可恢复 BLOCK，不绕过必要准备直接派发。
 

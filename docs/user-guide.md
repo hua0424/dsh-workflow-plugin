@@ -5,11 +5,12 @@
 
 ## 1. 插件是什么
 
-在 DSH（deepseek harness）中运行可配置的**串行团队工作流**（`agent-workflow/v2`）：
+在 DSH（deepseek harness）中运行可配置的**串行团队工作流**（`agent-workflow/v3`）：
 一个 **Manager**（你当前会话）按工作单（work order）逐节点推进，每个节点把任务
 派发给一个 **Role Actor**（子会话，默认节点级复用，可配置为跨节点复用），完成后由独立的
 **Judge**（只读）核验 claim（ACCEPT / REJECT / NEED_CONTEXT），通过才进入下一
-节点；全部节点完成即 Run 结束。
+节点；全部节点完成即 Run 结束。每个节点声明有限的**命名结果**（各有自己的验收条件
+和静态目标），流程声明**返回集合**——结果是业务结论，不是 completed/failed 二分。
 
 - 一个 **workspace**（canonical realpath）最多一个活动 Run。
 - 状态存于 `${DSH_HOME}/workflows/state.sqlite3`（默认 `~/.dsh/workflows/`）。
@@ -175,12 +176,18 @@ GitHub 列表按 `per_page=100` 翻页取全、PR 从 issues 结果中排除；�
 ## 7. 运行中会发生什么
 
 - 节点推进：Manager 派发 → Actor 工作 → `node_claim` → Judge 核验 →
-  通过走 `onPass`，REJECT 以 reason 作为纠正指令重派同节点，NEED_CONTEXT
-  由 Manager 补充材料后重判。`onFail` 可指向节点 id 或 `END`（#17 起）：
-  FAIL→END 为业务终局——根 Run 状态沿用 `completed` 表示执行结束，终局
-  业务结果由终局 claim outcome + handoff 表达（`workflow_status` 的
-  `claimOutcome` / `finalHandoffPreview` 可见）；子流程 FAIL→END 返回父
-  节点 `onPass`（对父读作 PASS，父只能经 handoff 文本感知失败）。
+  通过后沿**该结果声明的静态 Target** 走唯一后继，REJECT 以 reason 作为纠正指令
+  重派同节点（可改选另一个合法结果，但必须重新核验），NEED_CONTEXT 由 Manager
+  补充材料后重判。v3 的 Target 是严格互斥的 `{ node: <本流程节点> }` 或
+  `{ return: <本流程返回名> }`：**没有**裸 `END`、`onPass`/`onFail` 或默认路由。
+  走到 `{ return }` 即流程返回——Root 的返回就是 Run 的**业务终局**，`workflow_status`
+  的 `businessReturn`（返回名 + 终局来源 executionId）与 `claimResult` /
+  `finalHandoffPreview` 可见；Run 状态 `completed` 只表示执行已结束，`reset` 的
+  `terminated` 不制造业务返回。节点结果名由该节点声明，与流程返回名不必同名。
+- 各节点的结果集合与验收条件随 Run **冻结**（`checker.config.criteria` 是共同条件，
+  每个结果另有自己的 criteria）：Actor 初次派发、REJECT 修正与恢复都收到同一份共同
+  条件 + 全部合法结果条件；Judge 只收到共同条件与本次所选结果的条件，不改选结果、
+  不遍历其他出口。
 - Role Actor 的会话按 `roles.<role>.reuse` 复用（缺省 `node`，见 §3.1）：
   `node` 为节点级复用、离开节点即 drain + 撤权、无边界 compact；`continuable`
   保留整 Run 复用，并在**节点边界**对其做一次压缩（cold materialize →
@@ -199,12 +206,12 @@ dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿�
 
 ### 8.2 `/dsh-flow list` 报 maintenance mode（incompatible state format）
 
-**原因**：`~/.dsh/workflows/state.sqlite3` 里的数据不是当前 v9 三表格式。
-典型场景：旧版本插件（重构前单表 `workflow_state`）留下的真实数据——v9
-按设计**拒绝迁移或覆盖**旧数据，进入维护模式保护现场（list/start/tools
-全部禁用，直到 root 用户裁决）。
+**原因**：`~/.dsh/workflows/state.sqlite3` 里的数据不是当前格式（`agent-workflow-state/v10`，
+`user_version=10` 的三表布局）。典型场景：旧版本插件留下的真实数据（重构前的单表
+`workflow_state`，或 v3 协议之前的 v9 库）——当前版本按设计**拒绝迁移或覆盖**旧数据，
+进入维护模式保护现场（list/start/tools 全部禁用，直到 root 用户裁决）。
 
-诊断特征：`user_version=0` 且表里有 `workflow_state`（旧单表格式）。
+诊断特征：`user_version` 不是 10，或表里出现 `workflow_state`（旧单表格式）。
 
 **恢复步骤**（确认旧 Run 不需要续跑后）：
 
@@ -213,7 +220,7 @@ dsh 0.1.1-rc.7+ 把压缩后端移进每个会话 preset 的 isolate 域，宿�
 2. 插件会：把旧库完整备份为
    `state.sqlite3.backup-<时间戳>-<uuid>.sqlite3`（可直接用 sqlite 打开），
    原始文件移入 `state.sqlite3.archive-<时间戳>-<uuid>/`，然后创建全新空
-   v9 库。
+   v10 库。
 3. 恢复后 `/dsh-flow list` 应正常列出工作流。
 4. 注意：旧 Run 已产生的**外部效果**（PR、issue、分支等）不会被取消，
    需要时先去对应平台确认现场。

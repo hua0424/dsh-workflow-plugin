@@ -17,7 +17,7 @@ import { withShortTimeouts, withFastCompactRetry } from './helpers/timeouts.ts'
 import type { RunState } from '../src/types.ts'
 
 const CONFIG = validateAndNormalize(parseCatalogConfig(`
-schemaVersion: agent-workflow/v2
+schemaVersion: agent-workflow/v3
 roles:
   developer:
     persona: Developer persona.
@@ -28,11 +28,13 @@ judgeRole:
   persona: Judge persona.
 workflow:
   startNode: plan
+  returns: [done]
   nodes:
     plan:
       execution: { type: actor-task, role: manager, instruction: Do. }
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
-      onPass: END
+      results:
+        succeeded: { criteria: The plan is complete., target: { return: done } }
 `), { workflowId: 'host-compact-test' })
 
 function makeRun(actorForDeveloper: string | undefined): RunState {
@@ -73,8 +75,8 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
   assert.deepEqual(await host.ensureRoleActor(run, 'developer', 'resume node'), { childId: 'sess-dev', messageId: 'dispatch-2' })
   assert.deepEqual(await host.followupJudge(run, 'sess-judge', {
     nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
-    boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
-    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need facts', claim: { outcome: 'completed', handoff: 'candidate' } },
+    boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
+    previousFeedback: { result: 'NEED_CONTEXT', reason: 'need facts', claim: { result: 'succeeded', handoff: 'candidate' } },
     managerContext: 'more evidence', cwd: '.', judgeSessionId: 'sess-judge', recovery: true,
   }), { messageId: 'dispatch-3' })
   assert.deepEqual(deliveries.slice(0, 2), [
@@ -127,7 +129,7 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
       /timeout after 20ms at stage "spawn role developer"/)
     await assert.rejects(host.startJudge(run, {
       nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
-      boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
+      boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
       cwd: '.', judgeSessionId: 'judge-new',
     }), /timeout after 20ms at stage "spawn judge"/)
     assert.deepEqual(signals.map(signal => signal.aborted), [true, true],
@@ -565,7 +567,7 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
       /timeout after 20ms at stage "send"/)
     await assert.rejects(makeSubagentHost(adapters, testParticipants(adapters.ctx)).followupJudge(run, 'sess-judge', {
       nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
-      boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { outcome: 'completed', handoff: 'candidate' },
+      boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
       cwd: '.', judgeSessionId: 'sess-judge',
     }), /timeout after 20ms at stage "send"/)
     assert.deepEqual(signals.map(signal => signal.aborted), [true, true])
