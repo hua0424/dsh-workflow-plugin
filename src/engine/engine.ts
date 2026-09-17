@@ -1,6 +1,6 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
-import type { WorkflowConfig, NodeClaim, NodeDef, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
-import { WorkflowError, LIMITS, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
+import type { WorkflowConfig, NodeClaim, NodeDef, Target, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
+import { WorkflowError, LIMITS, nodeChecker, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
@@ -16,7 +16,11 @@ export interface DispatchTargets {
 }
 export interface JudgeSpawnInput {
   nodeToken: string
+  /** 共同验收条件（可省略 = 无共同条件）。 */
   criteria: string
+  /** 本次 claim 选择的节点结果名及其验收条件。 */
+  result: string
+  resultCriteria: string
   boundary: NodeContextBoundary
   claim: NodeClaim
   previousFeedback?: { result: 'REJECT' | 'NEED_CONTEXT'; reason: string; claim: NodeClaim }
@@ -74,6 +78,26 @@ const executionHandoff = (execution: NodeExecution): string | undefined => execu
   ?? execution.child?.result?.handoff
 const change = (execution: NodeExecution, ...events: NodeExecutionEvent['type'][]): ExecutionChange => ({ execution, expectedRevision: execution.revision, events })
 export const TERMINATED_REASON = 'terminated; external effects not cancelled'
+/** Child 执行路径由后续票（T2）接通；本版本在产生业务副作用前明确拒绝。 */
+const CHILD_UNSUPPORTED = 'child-workflow execution is not implemented in this version (T2: explicit Child returns)'
+
+/** 节点声明的结果名（Child caller 用被调用流程的返回名，由 T2 接通）。 */
+export function declaredResults(node: NodeDef | undefined): string[] {
+  if (node === undefined) return []
+  return Object.keys(nodeResults(node) ?? {})
+}
+/** 取某个已声明结果的验收条件；未声明即 undefined。 */
+function resultDefOf(node: NodeDef | undefined, result: string): { criteria: string; target: Target } | undefined {
+  if (node === undefined) return undefined
+  return nodeResults(node)?.[result]
+}
+/** 执行协议的缺省结果名：Actor 用 `succeeded`，Program 用 `PASS`。 */
+function defaultResultName(node: NodeDef): string | undefined {
+  if (node.execution.type === 'actor-task') return 'succeeded'
+  if (node.execution.type === 'builtin-program') return 'PASS'
+  return undefined
+}
+
 
 export class WorkflowEngine {
   cwdResolver: (run: RunState) => Promise<string> = async () => { throw new WorkflowError('cwd resolver is not wired') }
@@ -134,16 +158,19 @@ export class WorkflowEngine {
   }
   private judgePacket(run: RunState, e: NodeExecution, cwd: string): JudgeSpawnInput {
     const node = this.nodeAt(run, topFrame(run))!
-    // criteria 只存在于 actor-task Node 的 checker；Program / Child Node 不派 Judge。
-    const criteria = 'checker' in node ? node.checker.config.criteria ?? '' : ''
+    // 共同条件只存在于 actor-task Node 的 checker；Program / Child Node 不派 Judge。
+    const criteria = nodeChecker(node)?.config.criteria ?? ''
+    // Judge 只核验共同条件与**本次 claim 所选结果**的条件，不改选结果、不遍历其他出口。
+    const selected = resultDefOf(node, e.claim!.result)
     const feedback = e.judgment?.result === 'REJECT' && e.previousClaim
-      ? { result: e.judgment.result, reason: e.judgment.reason, claim: { outcome: e.previousClaim.outcome, handoff: e.previousClaim.handoff } }
+      ? { result: e.judgment.result, reason: e.judgment.reason, claim: { result: e.previousClaim.result, handoff: e.previousClaim.handoff } }
       : e.judgment?.result === 'NEED_CONTEXT' && e.claim
-        ? { result: e.judgment.result, reason: e.judgment.reason, claim: { outcome: e.claim.outcome, handoff: e.claim.handoff } }
+        ? { result: e.judgment.result, reason: e.judgment.reason, claim: { result: e.claim.result, handoff: e.claim.handoff } }
         : undefined
     return {
       nodeToken: e.nodeToken, criteria: String(criteria),
-      boundary: e.boundary!, claim: { outcome: e.claim!.outcome, handoff: e.claim!.handoff }, cwd, judgeSessionId: e.judge!.sessionId!,
+      result: e.claim!.result, resultCriteria: selected?.criteria ?? '',
+      boundary: e.boundary!, claim: { result: e.claim!.result, handoff: e.claim!.handoff }, cwd, judgeSessionId: e.judge!.sessionId!,
       ...(feedback ? { previousFeedback: feedback } : {}),
       ...(e.resolution?.context ? { managerContext: e.resolution.context } : {}),
       ...(e.resolution?.target === 'judge' ? { recovery: true } : {}),
@@ -177,7 +204,9 @@ export class WorkflowEngine {
       execution: {
         executionId: execution.executionId, workflowId: execution.workflowId, nodeId: execution.nodeId,
         nodeToken: execution.nodeToken, visit: execution.visit, phase: execution.phase,
-        hasClaim: execution.claim !== undefined, claimOutcome: execution.claim?.outcome ?? null,
+        hasClaim: execution.claim !== undefined, claimResult: execution.claim?.result ?? null,
+        declaredResults: declaredResults(node),
+        returned: execution.returned ? { kind: execution.returned.kind, name: execution.returned.name } : null,
         judgment: execution.judgment ? { result: execution.judgment.result, reasonPreview: execution.judgment.reason.slice(0, 500) } : null,
         inputPreview: execution.input.slice(0, 500), handoffPreview,
         blockReason: execution.blockReason ?? run.blockReason, recoveryTarget: execution.resolution?.target ?? null,
@@ -185,6 +214,8 @@ export class WorkflowEngine {
       },
       blockReason: execution.blockReason ?? run.blockReason,
       handoffPreview,
+      // v3：Run 生命周期（status）与业务终局分离；终局名与来源单源来自终局工作单。
+      businessReturn: run.businessReturn ? { name: run.businessReturn.name, source: run.businessReturn.source } : null,
       finalHandoffPreview: run.status === 'completed' ? handoffPreview : null,
     } }
   }
@@ -266,16 +297,9 @@ export class WorkflowEngine {
         return
       }
       if (node.execution.type === 'child-workflow') {
-        const child = run.definitionSnapshot.childWorkflows?.[node.execution.workflowId]
-        if (!child) { await this.blockRow(ws, row, 'Child workflow is missing from the frozen snapshot'); return }
-        const executionId = newNodeToken()
-        e.phase = 'working'
-        e.child = { workflowId: node.execution.workflowId, executionId }
-        run.currentExecutionId = executionId
-        run.callStack.push({ workflowId: node.execution.workflowId, nodeId: child.startNode, nodeToken: newNodeToken(), executionId })
-        const first = this.newExecution(run, e.input, e.visit + 1)
-        await this.state.put(ws, run, version, [change(e, 'child-entered'), { execution: first, expectedRevision: null, events: ['entered'] }])
-        await this.drive(ws)
+        // 本版本静态校验已拒绝 Child 节点（见 catalog/validate.ts）；此处兜底防御：
+        // 在创建任何子工作单/副作用之前 BLOCK，不沿旧路径猜测推进。
+        await this.blockRow(ws, row, CHILD_UNSUPPORTED)
         return
       }
       const role = node.execution.role
@@ -318,12 +342,13 @@ export class WorkflowEngine {
         }
         const correction = e.previousClaim
           ? e.judgment && e.judgment.result !== 'ACCEPT' && e.judgment.claimId === e.previousClaim.id
-            ? `\n\n[最近 Judge ${e.judgment.result} 与旧 claim]\n[judge feedback]\n${e.judgment.reason}\n\n[previous claim]\noutcome: ${e.previousClaim.outcome}\nhandoff: ${e.previousClaim.handoff}`
-            : `\n\n[Manager 退回的旧 claim；无当前 Judge 反馈]\n[previous claim]\noutcome: ${e.previousClaim.outcome}\nhandoff: ${e.previousClaim.handoff}`
+            ? `\n\n[最近 Judge ${e.judgment.result} 与旧 claim]\n[judge feedback]\n${e.judgment.reason}\n\n[previous claim]\nresult: ${e.previousClaim.result}\nhandoff: ${e.previousClaim.handoff}`
+            : `\n\n[Manager 退回的旧 claim；无当前 Judge 反馈]\n[previous claim]\nresult: ${e.previousClaim.result}\nhandoff: ${e.previousClaim.handoff}`
           : ''
         const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
         const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
-        const text = `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}${correction}${resolution}${recovery}${SUBMISSION_CONSTRAINT}`
+        const predecessor = await this.predecessorResultContext(ws, e)
+        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${SUBMISSION_CONSTRAINT}`
         const sent = role === 'manager'
           ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
           : run.roleActors[role]
@@ -452,13 +477,32 @@ export class WorkflowEngine {
     const reason = result.kind === 'FAIL' && result.reason?.trim() ? result.reason.trim().slice(0, LIMITS.blockReasonMax) : undefined
     return { kind: result.kind, handoff, ...(reason ? { reason } : {}) }
   }
-  private async advanceKnownResult(ws: string, row: RuntimeRow, result: 'PASS' | 'FAIL', handoff: string, ...events: NodeExecutionEvent['type'][]): Promise<EngineOutcome> {
+  /**
+   * v3 唯一推进入口：把「已确认的节点结果/流程返回」按静态 Target 原子交接。
+   * 每次推进恰好走一条边、创建一个后继；没有优先级路由、没有默认路由。
+   */
+  private async advanceKnownResult(ws: string, row: RuntimeRow, kind: 'result' | 'return', name: string, handoff: string, ...events: NodeExecutionEvent['type'][]): Promise<EngineOutcome> {
     const { run, execution: e, version } = row
     const node = this.nodeAt(run, topFrame(run))!
-    const target = result === 'PASS' ? node.onPass : 'onFail' in node ? node.onFail : undefined
+    const target: Target | undefined = kind === 'result' ? resultDefOf(node, name)?.target : { return: name }
     if (!target) {
       e.phase = 'settling'
-      e.blockReason = `${result} has no configured Graph edge`.slice(0, LIMITS.blockReasonMax)
+      e.blockReason = `result "${name}" has no configured Target`.slice(0, LIMITS.blockReasonMax)
+      run.status = 'blocked'
+      await this.state.put(ws, run, version, [change(e, ...events, 'blocked')])
+      await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n材料已保存；Manager 核查后可显式恢复。`).catch(() => {})
+      return { ok: true, run, message: e.blockReason }
+    }
+    // 终局裁决名的种类由**实际目标**决定：走到 `{ return }` 就是流程返回，否则是节点结果。
+    // `result` = 节点声明的结果名（节点退出的裁决）；`return` = 本流程返回名（可能由该
+    // 结果的 Target 给出，两者不必同名）；到达 Root 返回时后者即 Run 的业务终局名。
+    const decisionKind: 'result' | 'return' = 'return' in target ? 'return' : 'result'
+    const decidedName = 'return' in target ? target.return : name
+    // Child 执行路径由后续票接通：在产生任何业务副作用前明确拒绝。
+    const nextNodeId = 'node' in target ? target.node : undefined
+    if (nextNodeId !== undefined && run.definitionSnapshot.workflow.nodes[nextNodeId]?.execution.type === 'child-workflow') {
+      e.phase = 'settling'
+      e.blockReason = CHILD_UNSUPPORTED.slice(0, LIMITS.blockReasonMax)
       run.status = 'blocked'
       await this.state.put(ws, run, version, [change(e, ...events, 'blocked')])
       await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n材料已保存；Manager 核查后可显式恢复。`).catch(() => {})
@@ -469,50 +513,67 @@ export class WorkflowEngine {
     const released = await this.releaseNodeScopedActor(run, node)
     e.phase = 'exited'
     e.exitedAt = new Date().toISOString()
+    e.returned = { kind: decisionKind, name: decidedName, source: e.executionId }
     const changes = [change(e, ...events, 'exited')]
-    const exitedChain = [e]
-    let nextTarget = target
-    let terminalVisit = e.visit
-    while (nextTarget === 'END' && run.callStack.length > 1) {
-      run.callStack.pop()
-      const parentFrame = topFrame(run)
-      const parent = await this.state.execution(ws, parentFrame.executionId)
-      const parentNode = this.nodeAt(run, parentFrame)
-      if (!parent || parentNode?.execution.type !== 'child-workflow' || parent.phase !== 'working'
-        || !parent.child || parent.child.result) throw new WorkflowError('stale or corrupt Child return')
-      parent.child.result = { terminalExecutionId: e.executionId, handoff }
-      parent.phase = 'exited'
-      parent.exitedAt = new Date().toISOString()
-      terminalVisit = Math.max(terminalVisit, parent.visit)
-      exitedChain.push(parent)
-      changes.push(change(parent, 'child-returned', 'exited'))
-      nextTarget = parentNode.onPass
-    }
-    if (nextTarget === 'END') {
+    if ('return' in target && run.callStack.length === 1) {
+      // Root 流程返回 = Run 的业务终局；Run 状态只表示执行已结束，业务返回单独记录。
+      // handoff 仍是终局工作单上的原文，不另存一份镜像。
       run.status = 'completed'
-      run.currentExecutionId = exitedChain.at(-1)!.executionId
+      run.currentExecutionId = e.executionId
       run.callStack = []
-    } else {
+      run.businessReturn = { name: decidedName, source: e.executionId }
+    } else if ('node' in target) {
       run.currentExecutionId = newNodeToken()
       const frame = topFrame(run)
-      frame.nodeId = nextTarget
+      frame.nodeId = target.node
       frame.nodeToken = newNodeToken()
       frame.executionId = run.currentExecutionId
-      const successor = this.newExecution(run, handoff, terminalVisit + 1, e.executionId)
-      for (const exited of exitedChain) exited.successorId = successor.executionId
+      const successor = this.newExecution(run, handoff, e.visit + 1, e.executionId)
+      e.successorId = successor.executionId
       changes.push({ execution: successor, expectedRevision: null, events: ['entered'] })
+    } else {
+      // `{ return }` 来自嵌套流程：嵌套返回链路由后续票（T2）接通，此处不可达。
+      e.phase = 'settling'
+      e.blockReason = CHILD_UNSUPPORTED.slice(0, LIMITS.blockReasonMax)
+      run.status = 'blocked'
+      await this.state.put(ws, run, version, [change(e, ...events, 'blocked')])
+      await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n材料已保存；Manager 核查后可显式恢复。`).catch(() => {})
+      return { ok: true, run, message: e.blockReason }
     }
     await this.state.put(ws, run, version, changes)
-    this.trace(run, 'ROUTE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, target })
+    this.trace(run, 'ROUTE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result: decisionKind === 'return' ? `return:${name}` : name, target: 'node' in target ? target.node : `return:${target.return}` })
     if (released) this.trace(run, 'RELEASE', { workflow: e.workflowId, role: released.role, drained: released.drained })
     if (run.status === 'completed') {
       this.traceWarned.delete(run.runId)
-      const terminal = result === 'FAIL'
-        ? `workflow "${run.catalogWorkflowId}" 以失败结果结束（run ${run.runId}，FAIL→END）。Run 状态沿用 completed 表示执行结束，终局业务结果见 handoff。\n\n[handoff]\n${handoff}`
-        : `workflow "${run.catalogWorkflowId}" 已完成（run ${run.runId}）。\n\n[handoff]\n${handoff}`
+      // 业务返回名逐字呈现：cancelled 之类的业务终局不被一概渲染成交付成功。
+      const terminal = `workflow "${run.catalogWorkflowId}" 业务终局：${decidedName}（节点结果：${name}；run ${run.runId}）。Run 状态 completed 表示执行已结束，业务返回见上；handoff 为终局工作单原文。\n\n[handoff]\n${handoff}`
       await this.targets.steerManager(run, terminal).catch(() => {})
     }
-    return { ok: true, run, message: `${result} committed` }
+    return { ok: true, run, message: `${decisionKind === 'return' ? 'return ' : ''}${name} committed` }
+  }
+  /**
+   * v3 派发控制上下文：共同条件与全部合法结果条件同源取自**冻结快照**（磁盘配置
+   * 修改不影响活动 Run）；本 Actor 只提交一个结果。
+   */
+  private exitContract(node: NodeDef): string {
+    const criteria = nodeChecker(node)?.config.criteria ?? ''
+    return criteria === '' ? '' : `\n\n[验收合同·共同条件]\n${criteria}`
+  }
+  private legalResults(node: NodeDef): string {
+    const names = declaredResults(node)
+    if (names.length === 0) return ''
+    const entries = names.map(name => `- ${name}：${resultDefOf(node, name)!.criteria}`).join('\n')
+    return `\n\n[合法结果与各自条件]\n${entries}\n本次只能选择一个结果提交（互斥出口）。`
+  }
+  /**
+   * 直接前驱的已确认结果由插件提供（Actor 提交的是节点结果名，Program 是 PASS/FAIL），
+   * 不从 handoff 文本猜测、也不允许 Actor 伪造。Root 首次派发没有前驱，段落省略。
+   */
+  private async predecessorResultContext(ws: string, e: NodeExecution): Promise<string> {
+    if (e.predecessorId === undefined) return ''
+    const predecessor = await this.state.execution(ws, e.predecessorId)
+    if (predecessor?.returned === undefined) return ''
+    return `\n\n[直接前驱结果]\n前驱节点 ${predecessor.nodeId} 已确认结果：${predecessor.returned.name}（kind: ${predecessor.returned.kind}）`
   }
   /**
    * `reuse: node` 离开节点时的会话释放：drain 内存驻留（best-effort——失败降级为仅撤权，
@@ -534,11 +595,20 @@ export class WorkflowEngine {
     if (!row || row.run.status !== 'running') return rejected('no running work order')
     const e = row.execution
     if (e.phase !== 'working' || e.claim || !matches(e.dispatch, caller)) return rejected('当前调用无法绑定到一个已 dispatch 的 Node')
+    // v3：结果名必须在**当前冻结节点**声明中；运行时枚举校验先于任何状态写入，
+    // 非法提交既不消费派发资格也不留下部分状态。
+    const node = this.nodeAt(row.run, topFrame(row.run))
+    const declared = declaredResults(node)
+    if (!declared.includes(claim.result)) {
+      return rejected(declared.length === 0
+        ? `${node?.execution.type ?? 'current'} node declares no results; node_claim is not applicable`
+        : `unknown result "${claim.result}"; declared results: ${declared.join(', ')}`)
+    }
     e.claim = { ...claim, id: newNodeToken(), dispatchId: e.dispatch!.id }
     e.phase = 'checking'
     // lease消费就是该事务中的phase/claim更新；失败不改内存权威，没有第二本lease book。
     await this.state.put(ws, row.run, row.version, [change(e, 'claim')])
-    this.trace(row.run, 'CLAIM', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), outcome: claim.outcome, handoff: jsonField(claim.handoff, LIMITS.handoffMax) })
+    this.trace(row.run, 'CLAIM', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result: claim.result, handoff: jsonField(claim.handoff, LIMITS.handoffMax) })
     return { ok: true, run: row.run, message: 'claim saved; waiting for Actor safe settlement' }
   }
   async handleJudgeClaim(ws: string, token: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
@@ -598,8 +668,8 @@ export class WorkflowEngine {
       result, reason, claimId: e.claim.id, judgeDispatchId: e.judge.id,
       judgeSessionId, inputVersion: e.judge.inputVersion,
     }
-    const graphResult = e.claim.outcome === 'completed' ? 'PASS' : 'FAIL'
-    const advanced = await this.advanceKnownResult(ws, row, graphResult, e.claim.handoff, 'judgment')
+    const graphResult = e.claim.result
+    const advanced = await this.advanceKnownResult(ws, row, 'result', graphResult, e.claim.handoff, 'judgment')
     this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(judgeSessionId) })
     await this.subagents.retireJudge(run, judgeSessionId).catch(() => {})
     // 后继只由Judge的精确、安全turn settlement驱动，绝不在自身提交Turn里drain。
@@ -698,20 +768,7 @@ export class WorkflowEngine {
         recoveredPredecessor = predecessor
       }
     }
-    if (node.execution.type === 'child-workflow') {
-      if (target !== 'auto' || e.phase !== 'ready' || e.child) return rejected('Child resume requires an unentered ready caller and target=auto')
-      e.inputVersion++
-      e.resolution = { target: 'child', context, inputVersion: e.inputVersion }
-      e.restartPending = false
-      e.blockReason = null
-      e.nodeToken = newNodeToken()
-      topFrame(run).nodeToken = e.nodeToken
-      run.status = 'running'
-      run.blockReason = null
-      await this.state.put(ws, run, version, [change(e, 'manager-context', 'resumed'), ...(recoveredPredecessor ? [change(recoveredPredecessor)] : [])])
-      await this.drive(ws)
-      return { ok: true, run, message: 'Child caller resume committed; driver invoked' }
-    }
+    if (node.execution.type === 'child-workflow') return rejected(CHILD_UNSUPPORTED)
     if (node.execution.type !== 'actor-task') return rejected('Program recovery requires node_run_program or node_resolve_program')
     const resolvedTarget: Exclude<ResumeTarget, 'auto'> = target === 'auto'
       ? e.phase === 'checking' && e.claim && e.dispatch?.settled && e.judgment?.result !== 'ACCEPT' ? 'judge' : 'actor'
@@ -783,10 +840,10 @@ export class WorkflowEngine {
       if (sameJudgeNeedContext && oldJudge) e.previousJudge = oldJudge
       delete e.judge
     } else {
-      const acceptedFailureWithoutEdge = e.phase === 'settling' && e.claim?.outcome === 'failed'
-        && e.judgment?.result === 'ACCEPT' && ('onFail' in node ? node.onFail : undefined) === undefined
+      // v3：每个已声明结果都有静态 Target，因此不存在"已 ACCEPT 但没有出口边"的状态；
+      // 只有尚可回到 Actor 重新提交的阶段才能 actor resume。
       const canReturnActor = e.phase === 'ready' || (e.phase === 'working' && !e.claim)
-        || (e.phase === 'checking' && !!e.claim && e.judgment?.result !== 'ACCEPT') || acceptedFailureWithoutEdge
+        || (e.phase === 'checking' && !!e.claim && e.judgment?.result !== 'ACCEPT')
       if (!canReturnActor) return rejected('actor resume would overwrite a transferable conclusion')
       const relatedClaimId = e.claim?.id ?? e.previousClaim?.id
       const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === relatedClaimId ? e.previousJudge : undefined)
@@ -950,7 +1007,7 @@ export class WorkflowEngine {
       return { ok: true, run: current.run, message: current.execution.blockReason! }
     }
     try {
-      const advanced = await this.advanceKnownResult(ws, current, normalized.kind, normalized.handoff, 'program-result')
+      const advanced = await this.advanceKnownResult(ws, current, 'result', normalized.kind, normalized.handoff, 'program-result')
       if (advanced.ok && advanced.run?.status === 'running') await this.drive(ws)
       return advanced
     } catch (error) {
@@ -978,7 +1035,7 @@ export class WorkflowEngine {
     row.execution.restartPending = false
     row.run.status = 'running'
     row.run.blockReason = null
-    const advanced = await this.advanceKnownResult(ws, row, result, handoff, 'program-resolved')
+    const advanced = await this.advanceKnownResult(ws, row, 'result', result, handoff, 'program-resolved')
     if (advanced.ok && advanced.run?.status === 'running') await this.drive(ws)
     return advanced
   }

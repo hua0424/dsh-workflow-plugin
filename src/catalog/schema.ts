@@ -1,10 +1,11 @@
 /**
- * Strict zod schema for agent-workflow/v2 configs (design §2.3/§2.4/§7; A1
- * in-place upgrade — no v1 dual-track). Unknown fields are rejected at every
- * level (zod object default = strip; we use .strict()).
+ * Strict zod schema for agent-workflow/v3 configs (design §2.3/§2.4/§7).
+ * Unknown fields are rejected at every level (zod object default = strip; we
+ * use .strict()). v2 configs are rejected outright — no dual-track runtime and
+ * no v2 `failed` → business result guessing.
  */
 import { z } from 'zod'
-import { LIMITS, ROLE_REUSE_MODES } from '../types.ts'
+import { ID_PATTERN, LIMITS, ROLE_REUSE_MODES } from '../types.ts'
 import { JUDGE_PROTECTED_TOOLS } from '../roles/roles.ts'
 
 const nonEmptyTrimmed = z.string().trim().min(1)
@@ -84,46 +85,99 @@ const childWorkflowExecution = z
 const checkerRef = z
   .object({
     checkerId: nonEmptyTrimmed,
-    config: z.record(z.string(), z.unknown()),
+    // v3: 共同验收条件可省略（省略 = 本节点没有共同条件）；提供时非空。
+    config: z.record(z.string(), z.unknown()).optional(),
   })
   .strict()
+  // 归一化在 schema 边界完成：省略的 config 落成空对象，运行期无需再兜底。
+  .transform(value => ({ ...value, config: value.config ?? {} }))
+
+/**
+ * 统一 Target：严格互斥的 `{ node }` 或 `{ return }`。恰好一个字段——同时出现
+ * node+return、空对象、额外字段以及裸 END 字符串一律被拒。标识符语法与存在性由
+ * validateAndNormalize 静态校验。
+ */
+const nodeTarget = z.object({ node: z.string().regex(ID_PATTERN, 'target node must be a lowercase [a-z][a-z0-9-]* id') }).strict()
+const returnTarget = z.object({ return: z.string().regex(ID_PATTERN, 'target return must be a lowercase [a-z][a-z0-9-]* id') }).strict()
+
+/**
+ * 按给定形状显式分派（而非裸 union）：union 会把互斥分支的失败混成一句
+ * "Invalid input"，看不出真正违规的键（例如 v2 的 `onPass`）。分派后错误直指
+ * 具体节点类型与要求的 Target 形状，严格未知字段拒绝不变。
+ */
+function dispatched<T>(inner: z.ZodType<T>, shapeError: string, ok: (value: unknown) => boolean = () => true) {
+  return z.any().superRefine((value, ctx) => {
+    if (!ok(value)) {
+      ctx.addIssue({ code: 'custom', message: shapeError })
+      return
+    }
+    const parsed = inner.safeParse(value)
+    if (!parsed.success) for (const issue of parsed.error.issues) ctx.addIssue(issue as never)
+  })
+}
+
+const TARGET_SHAPE = 'target must be exactly { node: <this-flow node> } or { return: <declared return> }'
+const target = dispatched(
+  z.union([nodeTarget, returnTarget]),
+  TARGET_SHAPE,
+  value => {
+    const record = typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+    if (record === undefined) return false
+    return Object.prototype.hasOwnProperty.call(record, 'node') !== Object.prototype.hasOwnProperty.call(record, 'return')
+  },
+)
+
+const resultDef = z
+  .object({
+    criteria: nonEmptyTrimmed.max(LIMITS.criteriaMax),
+    target,
+  })
+  .strict()
+
+/** 结果名在本节点局部解释；与返回名一样沿用小写标识符规则。 */
+const results = z.record(z.string().regex(ID_PATTERN, 'result name must be a lowercase [a-z][a-z0-9-]* id'), resultDef)
 
 const actorTaskNode = z
   .object({
     execution: actorTaskExecution,
     checker: checkerRef,
-    onPass: nonEmptyTrimmed,
-    onFail: nonEmptyTrimmed.optional(),
+    results,
   })
   .strict()
 
 const builtinProgramNode = z
   .object({
     execution: builtinProgramExecution,
-    onPass: nonEmptyTrimmed,
-    onFail: nonEmptyTrimmed.optional(),
+    results,
   })
   .strict()
 
 const childWorkflowNode = z
   .object({
     execution: childWorkflowExecution,
-    onPass: nonEmptyTrimmed,
+    onReturn: z.record(z.string().regex(ID_PATTERN, 'return name must be a lowercase [a-z][a-z0-9-]* id'), target),
   })
   .strict()
 
-const nodeUnion = z.union([actorTaskNode, builtinProgramNode, childWorkflowNode])
+const nodeUnion = dispatched(
+  z.union([actorTaskNode, builtinProgramNode, childWorkflowNode]),
+  'node requires execution.type of actor-task | builtin-program | child-workflow',
+  value => ['actor-task', 'builtin-program', 'child-workflow'].includes(
+    String((value as { execution?: { type?: unknown } } | null)?.execution?.type ?? ''),
+  ),
+)
 
 const workflowDef = z
   .object({
     startNode: nonEmptyTrimmed,
+    returns: z.array(z.string().regex(ID_PATTERN, 'return name must be a lowercase [a-z][a-z0-9-]* id')).min(1),
     nodes: z.record(z.string(), nodeUnion),
   })
   .strict()
 
 export const workflowConfigSchema = z
   .object({
-    schemaVersion: z.literal('agent-workflow/v2'),
+    schemaVersion: z.literal('agent-workflow/v3'),
     roles: z.record(z.string(), roleDefinition),
     judgeRole: judgeRoleDefinition,
     workflow: workflowDef,
@@ -131,10 +185,28 @@ export const workflowConfigSchema = z
   })
   .strict()
 
+/**
+ * 裸 union 的顶层错误只说 "Invalid input"，用户看不到真正违规的键（例如 v2 的
+ * `onPass`）。这里把嵌套分支里的 unknown-key 诊断提到顶层，保持严格拒绝的同时
+ * 让错误文本可定位。
+ */
+function collectUnrecognizedKeys(issue: z.core.$ZodIssue, found: Set<string>): void {
+  const keys = (issue as { keys?: unknown }).keys
+  if (Array.isArray(keys)) for (const key of keys) if (typeof key === 'string') found.add(key)
+  const nested = (issue as { errors?: unknown }).errors
+  if (Array.isArray(nested)) for (const branch of nested) {
+    const list = Array.isArray(branch) ? branch : [branch]
+    for (const inner of list) collectUnrecognizedKeys(inner as z.core.$ZodIssue, found)
+  }
+}
+
 export class CatalogSchemaError extends Error {
   readonly issues: z.core.$ZodIssue[]
   constructor(issues: z.core.$ZodIssue[]) {
-    super(issues.map(issue => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; '))
+    const unrecognized = new Set<string>()
+    for (const issue of issues) collectUnrecognizedKeys(issue, unrecognized)
+    const detail = unrecognized.size > 0 ? `; unrecognized keys: ${[...unrecognized].sort().join(', ')}` : ''
+    super(issues.map(issue => `${issue.path.join('.') || '(root)'}: ${issue.message}`).join('; ') + detail)
     this.name = 'CatalogSchemaError'
     this.issues = issues
   }

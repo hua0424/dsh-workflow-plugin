@@ -1,11 +1,17 @@
 /**
- * Core domain types for agent-workflow/v2 (A1: claim admission + judge
- * confirmation). Pure data types only — no Cordis imports, testable without
- * the host.
+ * Core domain types for agent-workflow/v3 (named node results, exit contracts
+ * and explicit workflow returns). Pure data types only — no Cordis imports,
+ * testable without the host.
+ *
+ * v3 取代 v2 的 outcome(completed/failed)+onPass/onFail 双语义：节点声明有限
+ * 命名结果，每个结果带自己的验收条件与静态目标；流程声明非空 `returns`，到达
+ * 终局时显式产生业务返回。不保留 v2 兼容层。
  */
 
-export const SCHEMA_VERSION = 'agent-workflow/v2' as const
-export const STATE_FORMAT_VERSION = 'agent-workflow-state/v9' as const
+export const SCHEMA_VERSION = 'agent-workflow/v3' as const
+export const STATE_FORMAT_VERSION = 'agent-workflow-state/v10' as const
+/** SQLite `PRAGMA user_version` of the current state format (single source). */
+export const STATE_USER_VERSION = 10 as const
 export const CATALOG_DIR_NAME = 'workflows' as const
 export const STATE_DB_NAME = 'state.sqlite3' as const
 
@@ -153,28 +159,70 @@ export interface CheckerRef {
   config: Record<string, unknown>
 }
 
+/**
+ * 统一 Target（v3）：恰好一个字段。`node` 指向本流程内的节点，`return` 指向
+ * 本流程声明的返回名。没有裸字符串 END、没有默认路由、没有通配映射。
+ */
+export type Target = { node: string } | { return: string }
+
+/** 一个节点的命名结果：非空验收条件 + 一个静态目标。 */
+export interface ResultDef {
+  criteria: string
+  target: Target
+}
+
 export interface ActorTaskNode {
   execution: ActorTaskExecution
   checker: CheckerRef
-  onPass: string
-  onFail?: string
+  /** 必填非空；单出口节点也显式声明，不隐含任何结果。 */
+  results: Record<string, ResultDef>
 }
 
 export interface BuiltinProgramNode {
   execution: BuiltinProgramExecution
-  onPass: string
-  onFail?: string
+  /** Program 的 PASS/FAIL 沿用统一 Target（ERROR 不路由，交 Manager 事实确认）。 */
+  results: Record<string, ResultDef>
 }
 
 export interface ChildWorkflowNode {
   execution: ChildWorkflowExecution
-  onPass: string
+  /** 值域必须与被调用流程的 `returns` 集合完全一致（由后续票接通）。 */
+  onReturn: Record<string, Target>
 }
 
 export type NodeDef = ActorTaskNode | BuiltinProgramNode | ChildWorkflowNode
 
+/**
+ * NodeDef 的类型交界（单点）：判别键是嵌套的 `execution.type`（`results` 同时
+ * 存在于 Actor 与 Program 上，不能单独作判别属性），而 TypeScript 不会因嵌套
+ * 判别键收窄整对象——因此**只在这三个 helper 内**做一次收窄断言，其余代码一律
+ * 通过这些 helper 取用，不再散落 `as`。
+ */
+export function isActorTaskNode(node: NodeDef): node is ActorTaskNode {
+  return node.execution.type === 'actor-task'
+}
+
+/** 结果映射：Actor/Program 共用，Child 返回 undefined。 */
+export function nodeResults(node: NodeDef): Record<string, ResultDef> | undefined {
+  return isActorTaskNode(node) || node.execution.type === 'builtin-program'
+    ? (node as ActorTaskNode | BuiltinProgramNode).results
+    : undefined
+}
+
+/** actor-task 节点的 checker 引用；其它执行类型返回 undefined。 */
+export function nodeChecker(node: NodeDef): CheckerRef | undefined {
+  return isActorTaskNode(node) ? node.checker : undefined
+}
+
+/** Child caller 的返回映射；非 child-workflow 节点返回 undefined。 */
+export function nodeOnReturn(node: NodeDef): Record<string, Target> | undefined {
+  return node.execution.type === 'child-workflow' ? (node as ChildWorkflowNode).onReturn : undefined
+}
+
 export interface WorkflowDef {
   startNode: string
+  /** 非空且不重复的返回名；Root 的返回即 Run 的业务终局。 */
+  returns: string[]
   nodes: Record<string, NodeDef>
 }
 
@@ -185,6 +233,15 @@ export interface WorkflowConfig {
   judgeRole: JudgeRoleDefinition
   workflow: WorkflowDef
   childWorkflows?: Record<string, WorkflowDef>
+}
+
+/**
+ * 已确认的流程业务返回：返回名 + 终局来源 executionId。handoff 不在这里镜像，
+ * 始终从终局工作单自己的材料（claim / Program result / Child result）读取。
+ */
+export interface RunReturn {
+  name: string
+  source: string
 }
 
 export type RunStatus = 'running' | 'blocked' | 'completed' | 'terminated'
@@ -206,9 +263,10 @@ export interface NodeContextBoundary {
 }
 
 /**
- * Judge confirmation protocol (A1 v2): the Judge only CONFIRMS whether the
- * Actor's claim is trustworthy — ACCEPT/REJECT. The Graph verdict (PASS/FAIL)
- * is derived from the Actor's claim outcome, never from the Judge result.
+ * Judge confirmation protocol (v3): the Judge only CONFIRMS whether the
+ * Actor's claim is trustworthy — ACCEPT/REJECT/NEED_CONTEXT. The routing target
+ * comes from the Actor's chosen `result`, never from the Judge's verdict; the
+ * Judge never picks or re-picks a business result.
  */
 export type JudgeVerdict = 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT'
 
@@ -255,6 +313,11 @@ export interface RunState {
    * `resolveChildAgentOptions` 的继承语义（仍只从本 Run 自己的 Manager 解析）。
    */
   delegationRoute?: DelegationRoute
+  /**
+   * 已确认的业务终局（v3）：只在 completed 时存在，名字取自 Root 的 `returns`。
+   * terminated/reset 不制造业务返回；handoff 仍只存在于终局工作单材料。
+   */
+  businessReturn?: RunReturn
 }
 
 /** 派发意图先存；messageId 只由真实 Host 返回，不能由模型填写。 */
@@ -342,6 +405,12 @@ export interface NodeExecution {
   resolution?: ExecutionResolution
   program?: ExecutionProgram
   child?: ExecutionChild
+  /**
+   * v3：本工作单退出时实际裁决的终局名。`result` = 节点结果名（机构内节点退出），
+   * `return` = 流程返回名（本流程正常结束；Root 时即 Run 的业务终局）。这是
+   * status/通知/trace 解释终局的单源，不再另存一份可漂移的终局文本。
+   */
+  returned?: { kind: 'result' | 'return'; name: string; source: string }
   inputVersion: number
   blockReason: string | null
   enteredAt: string
@@ -375,9 +444,6 @@ export interface StateRow {
   updatedAt: string
 }
 
-/** Claim outcome a worker may submit. */
-export type ClaimOutcome = 'completed' | 'failed'
-
 /**
  * A1 R3: who is calling node_claim / node_block — the calling session plus a
  * snapshot of the CURRENT turn's user/message ids (taken by the tool layer
@@ -389,23 +455,29 @@ export interface ClaimCaller {
   turnUserMessageIds: ReadonlySet<string>
 }
 
-/** A worker's completion claim. No nodeToken (A1 AC2): admission binds the
- * claim to the current dispatch lease, so the claim carries only its payload. */
+/**
+ * A worker's claim: ONE named node result plus the single handoff. No
+ * nodeToken (A1 AC2): admission binds the claim to the current dispatch lease.
+ * The result name is only meaningful inside the frozen node's declared results;
+ * the runtime enumerates and validates it before any state is written.
+ */
 export interface NodeClaim {
-  outcome: ClaimOutcome
+  result: string
   handoff: string
 }
 
 /** 工具与 Runtime 共用同一交付合同；失败不产生部分 claim。 */
-export function normalizeNodeClaim(claim: NodeClaim): NodeClaim {
-  if (Object.keys(claim).some(key => key !== 'outcome' && key !== 'handoff')) {
-    throw new WorkflowError('node_claim only accepts outcome and handoff; summary/handoffContext are not supported')
+export function normalizeNodeClaim(claim: { result?: unknown; handoff?: unknown }): NodeClaim {
+  if (Object.keys(claim).some(key => key !== 'result' && key !== 'handoff')) {
+    throw new WorkflowError('node_claim only accepts result and handoff; outcome/summary/handoffContext are not supported')
   }
-  if (claim.outcome !== 'completed' && claim.outcome !== 'failed') throw new WorkflowError('invalid claim outcome')
+  if (typeof claim.result !== 'string' || !ID_PATTERN.test(claim.result)) {
+    throw new WorkflowError('node_claim result must be a declared lowercase result name')
+  }
   if (typeof claim.handoff !== 'string' || claim.handoff.trim() === '') throw new WorkflowError('handoff is required')
   const handoff = claim.handoff.trim()
   if (handoff.length > LIMITS.handoffMax) throw new WorkflowError(`handoff must be at most ${LIMITS.handoffMax} characters after trim`)
-  return { outcome: claim.outcome, handoff }
+  return { result: claim.result, handoff }
 }
 
 /** Judge decision submitted through the `judge_claim` protocol (A1 R9). */

@@ -1,13 +1,15 @@
 /**
- * judge.claim-correct (A1 v2): the Judgment Packet prompt template + the
+ * judge.claim-correct (v3): the Judgment Packet prompt template + the
  * `judge_claim` protocol contract.
  *
  * The continuable Judge receives a fixed Judgment Packet and submits its
  * confirmation through the dedicated `judge_claim({ nodeToken, result, reason })`
  * tool. ACCEPT/REJECT confirm whether the Actor's claim is trustworthy — the
- * Graph verdict (PASS/FAIL) is derived from the claim outcome, never from the
- * Judge. This module owns only the packet text; the persona is delivered via
- * the spawn's `persona` option.
+ * routing edge comes from the Actor's chosen node result, never from the Judge.
+ * The Judge verifies the SHARED criteria plus the criteria of the ONE result the
+ * claim selected: it never picks or re-picks a business result and never has to
+ * rule out every other exit. This module owns only the packet text; the persona
+ * is delivered via the spawn's `persona` option.
  *
  * #100：`judge_claim` 的参数合同只有生产路径一处——工具层 `judge_claim` 的
  * parameters/enum + `tools.ts` 的长度校验，引擎 `handleJudgeClaim` 再做授权与
@@ -18,8 +20,11 @@ import { JUDGE_RECOVERY_INSTRUCTION } from '../engine/texts.ts'
 
 export interface JudgePromptInput {
   nodeToken: string
+  /** 共同验收条件；空字符串 = 本节点没有共同条件。 */
   criteria: string
-  workerOutcome: 'completed' | 'failed'
+  /** 本次 claim 选择的节点结果名及其专属验收条件。 */
+  result: string
+  resultCriteria: string
   workerHandoff: string
   workspaceCwd: string
   transcript: string
@@ -43,16 +48,21 @@ Submit your verdict ONLY through the \`judge_claim\` tool, exactly once, with:
 - "result": "ACCEPT" | "REJECT" | "NEED_CONTEXT"
 - "reason": 1..2000 characters explaining the judgment
 
-- ACCEPT: the worker's claim is consistent with the facts and the goal criteria. The node then concludes exactly as the worker claimed (completed → PASS edge, failed → FAIL edge).
+- ACCEPT: the claim is consistent with the facts AND with the shared criteria plus the criteria of the ONE result it selected. The node then advances along that result's static target.
 - REJECT: the claim conflicts with an existing criterion or a verifiable fact. Your reason MUST identify that criterion, cite the factual basis, and state concretely HOW to correct the work — the worker receives it verbatim for another attempt at the SAME node.
 - Use NEED_CONTEXT when information is insufficient or an existing requirement is unclear. State what is missing, why it affects judgment, and what the Manager should provide — never turn a personal preference into a new criterion and never just say "cannot judge".
 
-# Current judgment
-Goal criteria (authoritative and frozen for this execution):
-{criteria}
-{recovery}{previousFeedback}{managerContext}
-Worker claimed outcome: {workerOutcome}
+# Scope (strict)
+- The worker's chosen result is {workerResult}; verify it against the shared criteria and THAT result's criteria only.
+- Do NOT re-pick, rename or substitute a business result, and do NOT rule out the other exits one by one.
+- Other exits' conditions are deliberately not part of this judgment.
 
+# Current judgment
+Shared criteria (authoritative and frozen for this execution; "(none)" means this node has no shared condition):
+{criteria}
+Criteria of the selected result "{workerResult}" (frozen):
+{resultCriteria}
+{recovery}{previousFeedback}{managerContext}
 Worker handoff:
 {workerHandoff}
 
@@ -71,7 +81,7 @@ function renderPreviousFeedback(feedback: JudgePromptInput['previousFeedback']):
   const recheck = feedback.result === 'REJECT'
     ? '\n[重判要求]\n逐点核对 Actor 新 handoff 是否解决了旧 REJECT 指出的每个问题；未全部解决的不得 ACCEPT。\n'
     : ''
-  return `\n# Previous Judge feedback on this node (${feedback.result})\n[judge reason]\n${feedback.reason}\n\n[judged claim]\noutcome: ${feedback.claim.outcome}\nhandoff: ${feedback.claim.handoff}\n${recheck}`
+  return `\n# Previous Judge feedback on this node (${feedback.result})\n[judge reason]\n${feedback.reason}\n\n[judged claim]\nresult: ${feedback.claim.result}\nhandoff: ${feedback.claim.handoff}\n${recheck}`
 }
 
 function renderManagerContext(context: string | undefined): string {
@@ -86,6 +96,7 @@ function renderRecovery(recovery: boolean | undefined): string {
 export function renderJudgePrompt(input: JudgePromptInput): string {
   const fields: Record<string, string> = {
     ...input,
+    criteria: input.criteria.trim() === '' ? '(none)' : input.criteria,
     recovery: renderRecovery(input.recovery),
     previousFeedback: renderPreviousFeedback(input.previousFeedback),
     managerContext: renderManagerContext(input.managerContext),
