@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { workflowConfigSchema } from '../catalog/schema.ts'
 import { computeDefinitionHash } from '../catalog/validate.ts'
-import { LIMITS, ID_PATTERN, nodeResults, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
+import { LIMITS, ID_PATTERN, nodeOnReturn, nodeResults, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
 
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
@@ -62,9 +62,9 @@ const executionSchema = z.object({
   returned: z.object({ kind: z.enum(['result', 'return']), name: z.string().min(1).max(64), source: text }).strict().optional(),
 }).strict()
 
-/** 节点声明的结果名（Child caller 用被调用流程的返回名，见 onReturn）。 */
+/** 节点声明的裁决名：Actor/Program 是自己的结果集；Child caller 是被调用流程的返回名（见 onReturn）。 */
 function resultNamesOf(node: NodeDef): string[] {
-  return Object.keys(nodeResults(node) ?? {})
+  return Object.keys(nodeResults(node) ?? nodeOnReturn(node) ?? {})
 }
 
 export function newNodeToken(): string { return randomUUID() }

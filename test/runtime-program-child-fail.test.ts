@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine, type ProgramHost } from '../src/engine/engine.ts'
-import { validateAndNormalize, CatalogValidationError } from '../src/catalog/validate.ts'
+import { validateAndNormalize } from '../src/catalog/validate.ts'
 import type { ClaimCaller, ProgramResult, Target, WorkflowConfig } from '../src/types.ts'
 
 const CHECKER = { checkerId: 'judge.claim-correct', config: { criteria: 'existing criteria' } }
@@ -105,38 +105,6 @@ async function acceptActor(h: ReturnType<typeof harness>, handoff: string, resul
   assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified', judge)).ok, true)
   await h.engine.handleTurnEnded('ws', judge)
 }
-
-/**
- * T2（#131）接通前，Child 执行路径在 catalog 静态校验期就被明确拒绝——本票不得沿旧
- * 路径猜测推进。这里锁住该约束：v3 的 Child 形状可解析，但不可执行。
- */
-function childConfig(): WorkflowConfig {
-  return {
-    schemaVersion: 'agent-workflow/v3', roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
-    workflow: {
-      startNode: 'plan', returns: [...RETURNS],
-      nodes: {
-        plan: actorNode('manager', 'Plan', 'call-child'),
-        'call-child': { execution: { type: 'child-workflow', workflowId: 'child-a' }, onReturn: { finished: { node: 'after' } } },
-        after: actorNode('manager', 'Continue', 'planned'),
-      },
-    },
-    childWorkflows: {
-      'child-a': {
-        startNode: 'work', returns: ['finished'],
-        nodes: { work: actorNode('worker', 'Child work', 'finished') },
-      },
-    },
-  }
-}
-
-test('#130: Child execution is rejected at catalog validation until T2 connects the path', () => {
-  assert.throws(() => validateAndNormalize(childConfig(), { workflowId: 'test' }), CatalogValidationError, /does not execute yet \(T2\)/)
-  // onReturn 与被调用流程 returns 的一致性仍然静态校验（形状已按 v3 冻结）
-  const mismatched = childConfig()
-  ;(mismatched.workflow.nodes['call-child'] as { onReturn: Record<string, unknown> }).onReturn = { other: { node: 'after' } }
-  assert.throws(() => validateAndNormalize(mismatched, { workflowId: 'test' }), CatalogValidationError, /onReturn is missing mappings for returns finished/)
-})
 
 test('Program parameters persist before effect and explicit bounded handoff becomes successor input', async () => {
   let inspected: Awaited<ReturnType<StateStore['get']>>
@@ -340,7 +308,7 @@ test('explicit Program retry rotates invocation identity and ignores the late fi
 })
 
 test('model override safely replaces one blocked Role once and leaves Judge replacement explicit', async () => {
-  // Child 调用路径由 T2 接通；这里用 actor(worker) 后继表达同一「已登记后继 + 角色替换」现场。
+  // 后继已登记且带 Role 映射的现场（Child 调用层的同类现场由 v3-child-returns.test.ts 覆盖）。
   const config: WorkflowConfig = {
     schemaVersion: 'agent-workflow/v3', roles: { worker: { persona: 'Worker' } }, judgeRole: { persona: 'Read only' },
     workflow: {
