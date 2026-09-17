@@ -336,7 +336,7 @@ export function apply(ctx: Context) {
         if (!isRootCommandAgent(agent)) return { ok: false, reason: 'incompatible-store cutover is root-command-only; subagent/diagnostic Sessions are not authorized' }
         try {
           const cutover = await stateAccess.archiveIncompatible()
-          return { ok: true, message: `Entire incompatible Workflow State Store was backed up to ${cutover.backupPath} and replaced with an empty v9 Store. Original raw files: ${cutover.archivePath}. External effects were not cancelled.` }
+          return { ok: true, message: `Entire incompatible Workflow State Store was backed up to ${cutover.backupPath} and replaced with an empty current-format Store. Original raw files: ${cutover.archivePath}. External effects were not cancelled.` }
         } catch (error) { return { ok: false, reason: String(error) }
         }
       }

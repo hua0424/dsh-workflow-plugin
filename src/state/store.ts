@@ -341,7 +341,7 @@ export class StateStore {
   close(): void { if (!this.closed) { this.closed = true; this.db.close() } }
 }
 
-/** One mutable store holder: maintenance diagnostics or exactly one healthy v9 Store. */
+/** One mutable store holder: maintenance diagnostics or exactly one healthy current-format Store. */
 export class StateAccess {
   private store: StateStore | undefined
   private diagnostic: StateMaintenanceDiagnostic | undefined
@@ -364,7 +364,13 @@ export class StateAccess {
   maintenanceDiagnostic(): StateMaintenanceDiagnostic | undefined {
     return this.diagnostic ? structuredClone(this.diagnostic) : undefined
   }
-  archiveIncompatible(backupDatabase: typeof backup = backup): Promise<{ backupPath: string; archivePath: string }> {
+  /**
+   * 显式不兼容切换：先备份（成功才继续）→ 归档旧库文件 → 初始化新库（#128 Q6 方案 A）。
+   * 备份失败不建新库；归档失败回滚已移动的文件；初始化失败删除半成品并还原旧库。
+   * `backupDatabase` 与 `openStore` 都是故障注入点（默认分别用 `node:sqlite` 的
+   * `backup` 与真实 `StateStore`），生产调用点只用默认值。
+   */
+  archiveIncompatible(backupDatabase: typeof backup = backup, openStore: (home: string) => StateStore = home => new StateStore(home)): Promise<{ backupPath: string; archivePath: string }> {
     const next = this.queue.then(async () => {
       const diagnostic = this.diagnostic
       if (!diagnostic || this.store) throw new Error('state store is compatible; incompatible-store cutover is not applicable')
@@ -401,7 +407,7 @@ export class StateAccess {
         throw new Error(`state archive failed; original store restored: ${error instanceof Error ? error.message : String(error)}`)
       }
       try {
-        const fresh = new StateStore(this.home)
+        const fresh = openStore(this.home)
         this.store = fresh
         this.diagnostic = undefined
       } catch (error) {

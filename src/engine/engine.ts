@@ -1,6 +1,6 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
 import type { WorkflowConfig, NodeClaim, NodeDef, Target, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
-import { WorkflowError, LIMITS, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
+import { WorkflowError, LIMITS, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
@@ -79,14 +79,6 @@ const executionHandoff = (execution: NodeExecution): string | undefined => execu
 const change = (execution: NodeExecution, ...events: NodeExecutionEvent['type'][]): ExecutionChange => ({ execution, expectedRevision: execution.revision, events })
 export const TERMINATED_REASON = 'terminated; external effects not cancelled'
 /**
- * 节点声明的裁决名：Actor/Program 是自己的结果集；Child caller 没有自己的结果集，
- * 它的裁决就是被调用流程的返回名（`onReturn` 的键）。
- */
-export function declaredResults(node: NodeDef | undefined): string[] {
-  if (node === undefined) return []
-  return Object.keys(nodeResults(node) ?? nodeOnReturn(node) ?? {})
-}
-/**
  * 终局裁决名由**实际目标**决定：走到 `{ return: r }` 就是本流程返回 r；否则是本节点
  * 选中的结果名 `name`（Child caller 的 `name` 是它映射的被调用流程返回名）。
  */
@@ -97,12 +89,6 @@ function decisionOf(target: Target, name: string, source: string): NonNullable<N
 function resultDefOf(node: NodeDef | undefined, result: string): { criteria: string; target: Target } | undefined {
   if (node === undefined) return undefined
   return nodeResults(node)?.[result]
-}
-/** 执行协议的缺省结果名：Actor 用 `succeeded`，Program 用 `PASS`。 */
-function defaultResultName(node: NodeDef): string | undefined {
-  if (node.execution.type === 'actor-task') return 'succeeded'
-  if (node.execution.type === 'builtin-program') return 'PASS'
-  return undefined
 }
 
 
@@ -456,12 +442,21 @@ export class WorkflowEngine {
     if (row?.run.status !== 'running' || row.run.runId !== e.runId || row.execution.executionId !== e.executionId || row.version !== committedVersion) return
     await this.blockRow(ws, row, `dispatch fault: ${error instanceof Error ? error.message : String(error)}`)
   }
+  /**
+   * BLOCK 的两处共用动作（#133 收口 D-130-02）：原因的单点截断，与统一
+   * 「Workflow BLOCK: <原因>」前缀的 Manager 通知（通知失败静默——状态真源已提交）。
+   * 落库本身仍留在各调用点：三处的 phase/事件前缀/trace/退役 Judge 顺序不同。
+   */
+  private blockReason(reason: string): string { return reason.slice(0, LIMITS.blockReasonMax) }
+  private async notifyBlock(run: RunState, blockReason: string, hint: string): Promise<void> {
+    await this.targets.steerManager(run, `Workflow BLOCK: ${blockReason}\n${hint}`).catch(() => {})
+  }
   private async blockRow(ws: string, row: RuntimeRow, reason: string, ...beforeBlock: NodeExecutionEvent['type'][]): Promise<void> {
     row.run.status = 'blocked'
-    row.execution.blockReason = reason.slice(0, LIMITS.blockReasonMax)
+    row.execution.blockReason = this.blockReason(reason)
     await this.state.put(ws, row.run, row.version, [change(row.execution, ...beforeBlock, 'blocked')])
     this.trace(row.run, 'BLOCK', { workflow: row.execution.workflowId, node: row.execution.nodeId, reason: jsonField(row.execution.blockReason, LIMITS.blockReasonMax) })
-    await this.targets.steerManager(row.run, `Workflow BLOCK: ${row.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`).catch(() => {})
+    await this.notifyBlock(row.run, row.execution.blockReason, '材料已保存；Manager 可查看 status 后选择恢复目标。')
   }
   private programParameters(execution: BuiltinProgramExecution, supplied: Record<string, unknown>): Record<string, unknown> {
     if (typeof supplied !== 'object' || supplied === null || Array.isArray(supplied)) throw new WorkflowError('program parameters must be an object')
@@ -505,10 +500,10 @@ export class WorkflowEngine {
     const target: Target | undefined = kind === 'result' ? resultDefOf(node, name)?.target : { return: name }
     if (!target) {
       e.phase = 'settling'
-      e.blockReason = `result "${name}" has no configured Target`.slice(0, LIMITS.blockReasonMax)
+      e.blockReason = this.blockReason(`result "${name}" has no configured Target`)
       run.status = 'blocked'
       await this.state.put(ws, run, version, [change(e, ...events, 'blocked')])
-      await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n材料已保存；Manager 核查后可显式恢复。`).catch(() => {})
+      await this.notifyBlock(run, e.blockReason, '材料已保存；Manager 核查后可显式恢复。')
       return { ok: true, run, message: e.blockReason }
     }
     // `reuse: node` 的会话生命周期止于节点：先 drain 会话（失败降级为仅撤权，不阻塞推进），
@@ -694,12 +689,12 @@ export class WorkflowEngine {
         result, reason, claimId: e.claim.id, judgeDispatchId: judge.id,
         judgeSessionId: judge.sessionId!, inputVersion: judge.inputVersion,
       }
-      e.blockReason = `Judge NEED_CONTEXT: ${reason}`.slice(0, LIMITS.blockReasonMax)
+      e.blockReason = this.blockReason(`Judge NEED_CONTEXT: ${reason}`)
       run.status = 'blocked'
       await this.state.put(ws, run, version, [change(e, 'judgment', 'blocked')])
       this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(judge.sessionId!) })
       await this.subagents.retireJudge(run, judge.sessionId!).catch(() => {})
-      await this.targets.steerManager(run, `Workflow BLOCK: ${e.blockReason}\n请用 node_resume target=judge 提供完整当前补充；已保存 claim 不会丢失。`).catch(() => {})
+      await this.notifyBlock(run, e.blockReason, '请用 node_resume target=judge 提供完整当前补充；已保存 claim 不会丢失。')
       return { ok: true, run, message: 'NEED_CONTEXT committed; Manager context required' }
     }
     delete e.previousJudge

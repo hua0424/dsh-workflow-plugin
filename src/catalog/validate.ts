@@ -26,13 +26,6 @@ export class CatalogValidationError extends Error {
 /** Builtin checker ids known to this plugin version (design §3). */
 export const BUILTIN_CHECKER_IDS = new Set(['judge.claim-correct'])
 
-/**
- * Actor 节点隐含支持的结果名：单结果节点直接声明 `succeeded`。Program 的
- * PASS/FAIL 是执行协议而非业务结果，`results` 的键固定为 `PASS`/`FAIL`（单源在
- * `types.PROGRAM_RESULT_NAMES`）。
- */
-export const ACTOR_SUCCESS_RESULT = 'succeeded'
-
 /** 统一 Target 的目标种类（判定与路由共用同一解释，不各自解析字符串）。 */
 export function targetName(target: Target): string {
   return 'node' in target ? target.node : target.return
@@ -247,6 +240,9 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
   return config
 }
 
+/** 每个 builtin checker 允许的 `config` 键白名单（`z.record` 不拒绝未知键，故在此显式拒绝）。 */
+const CHECKER_CONFIG_KEYS: Record<string, readonly string[]> = { 'judge.claim-correct': ['criteria'] }
+
 function validateChecker(label: string, checker: CheckerRef, problems: string[]): void {
   if (!BUILTIN_CHECKER_IDS.has(checker.checkerId)) {
     problems.push(`${label} references unknown checker "${checker.checkerId}"`)
@@ -254,6 +250,14 @@ function validateChecker(label: string, checker: CheckerRef, problems: string[])
   }
   // 归一化：省略的 config 落成空对象（「没有共同条件」），后续读取无需再兜底。
   checker.config ??= {}
+  // 未知键必须是配置错误：`criterias:` 之类的笔误会静默退化成「没有共同条件」，
+  // 使 Judge 缺少本应生效的核验输入（#133 收口 D-130-05）。
+  const allowed = CHECKER_CONFIG_KEYS[checker.checkerId] ?? []
+  for (const key of Object.keys(checker.config)) {
+    if (!allowed.includes(key)) {
+      problems.push(`${label} checker config has unknown key "${key}"; ${checker.checkerId} accepts ${allowed.length > 0 ? allowed.join(', ') : 'no keys'}`)
+    }
+  }
   if (checker.checkerId === 'judge.claim-correct') {
     const criteria = checker.config['criteria']
     // v3: 共同条件可省略（省略 = 没有共同条件）；提供时非空且有界。
