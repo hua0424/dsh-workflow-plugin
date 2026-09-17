@@ -5,7 +5,7 @@
  * no v2 `failed` → business result guessing.
  */
 import { z } from 'zod'
-import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, ROLE_REUSE_MODES, type NodeDef } from '../types.ts'
+import { ID_PATTERN, LIMITS, ROLE_REUSE_MODES, type NodeDef } from '../types.ts'
 import { JUDGE_PROTECTED_TOOLS } from '../roles/roles.ts'
 
 const nonEmptyTrimmed = z.string().trim().min(1)

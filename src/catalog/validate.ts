@@ -10,7 +10,7 @@
  * the caller's own flow.
  */
 import { createHash } from 'node:crypto'
-import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, isActorTaskNode, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
+import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
 // #100：固定 program id 名单从 Program 元数据单源派生，不在这里另维护一份。
 import { BUILTIN_PROGRAM_IDS } from '../programs/metadata.ts'
 
