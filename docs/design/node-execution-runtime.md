@@ -106,6 +106,15 @@ handoff 应说明实际完成的内容、产物位置与核验依据、剩余问
 - 后继派发的控制上下文给出已确认的直接前驱结果：Actor 是节点结果名，Child caller 是**该 Child 的返回名**，Program 是 PASS/FAIL。该字段由插件从工作单读取，不从文本猜测。
 - 调用层不派模型也不派 Judge：Child 进入只登记子流程起点的工作单与新 frame，子流程内部按其节点类型正常执行与判定；转交的收口门是子流程终局工作单的 Judge（`reuse: node` 的离开节点会话释放照常生效）。
 
+### 3.2 Program 目标与人工恢复（v3）
+
+- Program 节点用执行协议固定的 `results: { PASS, FAIL }`（各自带非空 criteria 与统一 Target）表达它的确定性结论，v3 不再接受 `onPass`/`onFail`。两个结果都必须声明；其他结果键（包括 `ERROR`）在 catalog 校验期拒绝——异常**不配置路由**。
+- PASS/FAIL 按各自 Target 原子交接：可继续到本流程节点，也可 `{ return: <本流程返回名> }` 结束本流程（Root 时即 Run 业务终局）。Program 工作单的 `exited`/`returned` 与后继登记在同一次 `state.put`，一次推进只创建一个后继。
+- 后继派发的控制上下文由插件给出前驱结果 `PASS`/`FAIL`（与 §3.1 同源）。Program 的 handoff 沿用单文本规则：Program 返回有界 handoff 时用它，否则透传该工作单原 input；不 stringify 任意 `details`、也不另造 summary。
+- ERROR、抛错与结果未知一律保留参数与原因材料并 BLOCK，不默认走任一业务边、也不产生业务终局。Program 不派 Judge：状态校验拒绝 Program 工作单携带 Actor/Judge 材料或进入 checking。
+- Manager 用 `node_run_program` 提供当前参数并运行，用 `node_resolve_program`（仅 Manager、需当前 BLOCK 与 nodeToken）在核实现场后提交 PASS/FAIL 事实确认：合法确认恰好推进一次，越权、旧 token、重复确认与非法 reason 都拒绝，确认原因连同原工作单材料留作审计。Program 自身不由 `node_resume` 恢复（恢复入口就是上面两个工具）。
+- 事务失败（含交接提交）全部回滚：失败后不留下已结算结果与后继，只 BLOCK 并保留参数供 Manager 核实后重试或裁决；关库重开后现场与材料仍在。
+
 ## 4. 阶段与暂停
 
 | 阶段 | 数据库知道的事实 | 下一责任 |

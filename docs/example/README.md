@@ -1,12 +1,14 @@
 # 工作流配置模板（docs/example/）
 
-> ⚠️ **版本状态（#131 T2 之后）**：本目录的 `workflow-template.yaml` 仍是
+> ⚠️ **版本状态（#131 T2 / #132 T3 之后）**：本目录的 `workflow-template.yaml` 仍是
 > **v2 时代**的示例，运行时已只接受 `agent-workflow/v3`，因此**暂不可直接加载**。
 > v3 的节点形状是「命名结果 + 统一 Target + 流程 returns」，`node_claim` 只接受
-> `{ result, handoff }`，Child 调用节点用 `onReturn` 显式映射（#131 已接通执行）；
+> `{ result, handoff }`，Child 调用节点用 `onReturn` 显式映射（#131 已接通执行），
+> Program 节点的 `PASS`/`FAIL` 也按统一 Target 路由（#132 已接通，含 ERROR 的人工恢复）；
 > 本模板自身的迁移仍由配置迁移 Issue #129 负责。在它落地前，请以
 > `docs/specs/named-results-and-workflow-returns.md` 的合同与
-> `test/v3-actor-root.test.ts`、`test/v3-child-returns.test.ts` 的可运行示例为准；
+> `test/v3-actor-root.test.ts`、`test/v3-child-returns.test.ts`、
+> `test/v3-program-targets.test.ts` 的可运行示例为准；
 > 下面的字段说明按 v2 原文保留。
 
 本目录存放 `agent-workflow/v2` 工作流的**模板与字段说明**。新建工作流时，把
@@ -194,8 +196,10 @@ Role 定义：
 - Child 调用节点用 `onReturn`（键集必须与被调用流程的 `returns` 完全一致，值为本层
   Target）；子流程走到 `{ return }` 时按该映射继续，允许逐层重命名，调用层不派模型/
   Judge（#131 T2 起生效）。
-- Program 节点的 `results` 键固定为 `PASS`/`FAIL`，值为统一 Target；ERROR 不配置
-  路由，仍由 Manager 经 `node_resolve_program` 事实确认后推进。
+- Program 节点的 `results` 键固定为 `PASS`/`FAIL`（其他键含 `ERROR` 在校验期拒绝），
+  值为统一 Target：可继续到本流程节点，也可 `{ return }` 结束本流程；ERROR、抛错与
+  结果未知只 BLOCK 保留参数，Manager 用 `node_resolve_program` 事实确认后恰好推进一次，
+  Program 不派 Judge（#132 T3 起生效）。
 
 静态校验（复制模板后常见报错）：
 
