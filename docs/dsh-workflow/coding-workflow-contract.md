@@ -1,157 +1,113 @@
-# coding-workflow 工作流合同
+# coding-workflow：GitHub Milestone 与 Issue 跟踪合同
 
-合同版本：`2026-09-17.1`；配置协议：`agent-workflow/v3`。仅适用于显式引用本合同的 `coding-workflow` 单仓两级 PR 工作流，其他工作流不自动继承角色、节点、目录和报告要求。首次派发读取适用合同；同一会话后续派发可按运行入口读取当前对象材料，不能假定新会话已有合同认知。审查证据格式见 [review-contract.md](review-contract.md)，操作排障按需读 [operations.md](operations.md)。
+版本：2026-09-18.3；协议：agent-workflow/v3。适用于单仓、Milestone 多任务串行交付：实施 PR 合入 milestone 分支，集成 PR 合入目标基线，两级均使用 merge commit。
 
-## 存放与版本管理
+本合同解释配置；实际节点、结果和验收条件以本 Run 冻结的 YAML 为准。YAML 自足，不要求先读取本合同、运行 setup 或创建本地台账。其他工作流不继承这里的角色和节点约定。项目既有 GitHub issue-tracker、长期规格、CONTEXT/ADR 等约定继续使用。
 
-- 本文件纳入 Git；运行产物统一放 `docs/dsh-workflow/runs/`，该目录 gitignore，不提交、不强制 add、不用报告提交推进 PR head。
-- `runDir = docs/dsh-workflow/runs/<YYYYMMDD-HHmmss>-coding-workflow-<slug>`，Manager 按本地启动时间命名并确认不与已有运行冲突；重入复用 handoff 的路径，不重新命名。
-- 只创建实际需要的文件，不预建空目录/空报告。新运行使用独立目录；确需参考旧材料时，在 run.md 记录其原路径与适用范围，保留旧文件。
-- ignore 不会让已跟踪文件停止跟踪。发现运行产物已 tracked 时 BLOCK，由 Manager 确认后处理；不擅自 `git rm --cached`、清理文件或覆盖用户改动。
-- ignored 材料只存在当前工作区，不随 push、clone 或 worktree 自动共享。关键决策、验收证据摘要和最终结果须同步至关联 Issue/PR，不能只贴本地路径。异机/新工作树执行前由 Manager 提供完整材料；缺失时 BLOCK。
-- 不在此存凭据、令牌或未脱敏日志。不要运行会删除 ignored 产物的清理操作。备份/归档由 Manager 明确安排，本目录不是插件 SQLite/trace 的替代品。
+## 权威与跟踪入口
 
-## 最小结构
+- 用户授权、主 Issue 规格和明确采纳的澄清决定范围。初始化评论记录本次验收与不做事项；新评论不自动扩大授权。
+- GitHub Milestone 表示任务集合与里程碑状态；主 Issue 保存初始化、计划索引、范围变更、集成审查和最终交付。初始化与首次计划可合为一条评论，两个交接入口可指向同一 URL；ready 必须同时满足初始化和规划验收，主票及本轮子票均关联同仓 Milestone。主 Issue 已关闭仍可作为跟踪入口，不因此另建或重开。
+- 每张实施/修复 Issue 保存领取与分支身份、实施证据、审查和合并评论；PR 只保留必要摘要及评论链接，保留用户正文和历史。
+- Issue 评论提供人工可读证据；插件冻结定义、工作单和 Judge 判定负责推进。评论不能替代 claim，也不能单凭自述证明外部操作成功。
+- 无需 run.md、合同副本、delivery.md、每轮 review/decision 文件或 completion.md。本地文件不存在不构成阻塞；长报告按需处理，见下节。
+- actorCommonPersona 只注入 Role Actor system；Manager 与 Judge 使用各自规则。合并后的 Manager 节点在 instruction 和 criteria 中自足定义范围、任务分类、依赖、记录与出口条件，不依赖 planner persona 或公共 persona。角色 persona 承载稳定职责，instruction 给出当前动作，共同及结果 criteria 保留实际验收条件。
 
-```text
-docs/dsh-workflow/
-├─ INDEX.md                         # 跨工作流通用入口规则（纳入 Git）
-├─ coding-workflow-contract.md   # 本工作流合同（纳入 Git）
-├─ review-contract.md               # 可复用审查证据格式（纳入 Git）
-└─ runs/                            # 本地运行产物（gitignore）
-   └─ <timestamp>-coding-workflow-<slug>/
-      ├─ run.md                     # 必建：身份、范围、任务索引和当前进度
-      ├─ contracts/                 # 初始化时保存适用合同及引用规范内容副本
-      ├─ coordination.md            # 按需：Manager 澄清、授权、BLOCK 处理与核验证据
-      ├─ deferred.md                # 按需：经决策延期的问题及后续入口
-      ├─ issues/
-      │  └─ <issue-number>/
-      │     ├─ delivery.md          # 分支起点、实现/自测和合并收尾记录
-      │     ├─ r001-review.md       # 该 Issue PR 第一轮审查
-      │     ├─ r001-decision.md     # 对同轮报告的逐项决策
-      │     ├─ r002-review.md       # 有返工时增加，不覆盖旧轮次
-      │     └─ r002-decision.md
-      ├─ integration/
-      │  ├─ delivery.md             # milestone→基线 PR 身份和最终合并记录
-      │  ├─ r001-review.md
-      │  └─ r001-decision.md
-      └─ completion.md              # 完成/取消时的最终摘要
-```
+## 评论与长报告
 
-测试角色当前仅预留，没有独立测试节点。现阶段验证来自 developer 自测及仓库已有 CI，不能写成 tester 已验收。未来接入测试节点时再定义测试产物与路由，不预建测试子流程目录。
+评论标题标明 workflowId、真实 runId、节点/阶段，审查注明轮次和对象。先按 handoff 的精确链接读初始化、当前计划及对象证据，再定向读取相关新信息；入口不全时按 runId/对象分页检索。少量最近评论不能证明全部历史或任务范围已查全。
 
-已有 PRD、ADR、设计和测试文档优先引用原位置。澄清草稿确需长文时按需放 `notes/<slug>.md`；正式需求以 Issue 为准，项目级长期设计决策回归项目原有规范，不在每次运行复制一套文档体系。
+| 位置/阶段 | 最少内容 |
+|---|---|
+| 主 Issue 初始化 | 仓库及 workspace、Milestone/主 Issue URL、授权与规格、验收及不做范围、baseBranch/milestoneBranch、创建时基线 SHA、merge commit 策略、合同版本 |
+| 主 Issue 计划索引 | 任务 URL、分类、父子关系、依赖、验收归属、有效授权/hold；新增修复票映射及获准移出/取消依据；关联各票原始分支起点记录 |
+| 实施 Issue 领取 | 初始化/计划链接、featureBranch/milestoneBranch、原始 baseCommit、归属与创建/复用依据 |
+| 实施 Issue 实现 | PR/base/head/实现 SHA、验收覆盖、自测命令/结果/对象 SHA、未测边界、旧必修项处置 |
+| 对应 Issue 审查 | 轮次、PR/base/head/mergeBase、范围及方法、复用证据、发现 ID/依据/处置、必修清单或 approvedBase/approvedHead、验证/延期边界 |
+| 主 Issue 集成准备 | 完整任务核对依据、集成 PR/base/head、范围及待集成验收项 |
+| 对应 Issue 批准失效 | 原批准链接、修订变化或未覆盖的新失败验证/实质反证、失效原因及远端现状 |
+| 对应 Issue 合并前核验 | 批准链接及 approvedBase/approvedHead、检查时间、必要 CI/保护证据或不适用依据、merge commit 策略 |
+| 对应 Issue 交付 | 合并前证据、源 head/merge SHA/实际起点及目标包含关系、远端状态、验证与延期边界 |
+| 主 Issue 澄清/BLOCK | 问题、事实、决定/授权；Manager 补证的来源、对象/SHA、时间及关键结果 |
 
-## 文件合同与写入责任
+计划索引保留范围与依赖事实，不重复维护实时 PR/CI/Issue 状态；副作用前查询远端。原始 baseCommit 不可被当前 tip 覆盖。更新计划保留历史与授权来源，不能静默移除任务。
 
-多角色共用同一工作区，并发写按以下分区协议执行，避免覆盖他人区块：
+“必交集”指用户最新有效授权要求本轮交付的任务集合，是选票穷尽与最终全部完成的核验范围。获准移出/取消的票保留历史及依据，不计入必交集；仅改标签或移出 Milestone 不构成授权。集合变更须同步验收归属、依赖和聚合子票范围，不能留下无归属验收或隐性等待。仍须至少有一张 implementation；必交集中没有实施票时 BLOCK，不伪造 delivered。
 
-- **任务表（run.md）分字段维护**：planner 维护任务范围、父子关系、依赖与 taskKind；coordinator 维护领取、PR、合并及关闭等执行状态。Manager 初始化并处理授权/范围争议。每次先读最新文件，只改自有字段，保留其他字段；其他角色发现过期状态时实查远端并交责任角色修正。
-- **当前进度（run.md）为追加时间线**：每个角色只追加带时间与角色前缀的自己的行，不编辑他人行、不改写历史行。
-- delivery/review/decision/deferred 按下述归属角色编辑自有区块；发现他人区块有误时记录在 coordination.md 交 Manager 处理，不直接改。
+发布前查询相同节点执行、修订、输入和结论的记录；完全一致的重入可复用。新修订、证据或结论追加评论并链接被替代记录，保留旧批准。写入超时/结果未知先查远端，避免重复资源或评论。多行正文用临时文件和 `--body-file`，明确 owner/repo、采用非交互参数；临时传输文件不充当台账。评论成功取得 URL 后再交接。GitHub 不可用时 BLOCK，发布不了阻塞评论则先保留失败事实，恢复后补记。
 
-### run.md — 稳定入口
+普通报告直接写 Issue。确需长篇复杂报告时，使用当前 workspace 的 ignored `docs/dsh-workflow/runs/<runId>/` 或初始化已指定目录；真正写文件前确认在仓库内、目标已 ignore 且未 tracked，不预建空报告或为尚不存在的报告提交忽略规则。developer 可在任务分支最小补充必要忽略规则并纳入审查；其他角色使用 Issue 分段记录或交 Manager 安排。新增提交改变 head，旧批准随之失效。
 
-Manager 初始化；planner 维护计划字段，coordinator 更新执行状态；各角色按追加规则记录进度。至少包含：
+Issue 须保留报告用途、关键结论和验证边界，并登记适用修订/轮次、workspace、绝对/仓库相对路径和 SHA256。哈希不能替代内容或证明结论。本地路径不能在异机下载；当前节点确需全文却不可读时请求传递或补证，无需全文则不因路径不可读阻塞。不强制 add、取消跟踪或清理报告，不写凭据和未脱敏敏感日志。
 
-- 身份：runDir、workflowId、workspace 绝对路径、仓库标识/绝对路径/远端 `owner/repo`、Milestone 编号/URL/标题、主 Issue URL；适用合同原路径、版本、内容哈希及运行内副本绝对路径。初始化保存本合同、通用 INDEX 与引用的 review-contract 副本，后续按该运行副本执行；副本中的其他链接若未一并复制，按记录的原文档位置解析，操作备忘只按需读取。
-- 范围：目标、验收入口、明确不做的内容、用户确认记录；取消也记录已产生的外部资源和未清理事项。
-- 分支：baseBranch、milestoneBranch、创建时的基线 SHA；分支名不能靠标题推断。
-- 任务表：Issue URL、父子关系、依赖、taskKind（implementation / aggregate / integration-acceptance）、验收归属、交付记录路径；记录已批准的移出/取消，不静默删行。
-- 当前进度：当前 Issue 或集成 PR、材料路径、最近核验时间、已知阻塞。
+## 图与职责
 
-此文件是运行身份/范围的入口，不是实时远端状态数据库。分支 tip、Issue 状态和 PR/CI 状态每个有副作用的节点都须重新查询。历史创建基线不可被当前 tip 覆盖。
-
-### delivery.md — 对象级交付
-
-coordinator 建立分支身份与交付入口；developer 创建/复用 Issue PR 并补 PR 身份、实现与自测；coordinator 建立集成 PR 并补各级合并收尾，更新时保留历史。
-
-- Issue 交付：Issue URL、featureBranch、milestoneBranch、原始 baseCommit；PR URL/编号、实现 SHA、当前 base/head SHA。
-- 自测：对象 SHA、命令、结果、必要的验收/回归覆盖、未执行项和原因；无适用测试需给出依据，不把未测写成通过。
-- 集成交付：集成 PR URL/编号、milestone/base 分支、当前 base/head SHA、必要 CI/回归结果或不适用依据。
-- 收尾：对应决策路径和批准 base/head、合并源 head、merge SHA、目标包含关系核验、Issue/Milestone 最终状态和时间。
-- 关联 Issue/PR 的交付上下文保留身份和关键证据摘要；编辑自有区块，不替换用户原正文。
-
-### rNNN-review.md / rNNN-decision.md — 不可混轮的证据
-
-code-reviewer 写 review，review-judger 写 decision。即使报告很短，也保留这两个最小文件，使后继与重入有固定入口；handoff 只摘要和引用。
-
-核心规则（详细格式合同见 run.md 指向的 review-contract 内容副本）：轮次按对象从 r001 递增，先读上一轮再固定本轮；相同 PR/base/head 且任务未变的重入复用原轮次，不同修订开新轮次。默认审查固定 base/head 的完整 PR diff，仅满足增量条件时可增量但仍复核旧必修项。通过才记录 approvedBase/approvedHead，返工不保留有效批准；变更实现、head 或批准 base 后原批准失效，漂移时 BLOCK。决策摘要同步至对应 PR（集成同时同步主 Issue）。
-
-### coordination.md / deferred.md / completion.md
-
-- coordination：Manager 按时间追加问题、依据、决定/授权和恢复对象。Judge 缺查询能力时，记录 Manager 独立只读查询的仓库/PR/SHA、时间、命令/API、原始关键输出、分页完整性和结论；通过 `node_resume.resolutionContext` 同时提交关键证据与路径，有有效 claim 时恢复 Judge。不是重复 Actor 自述或直接替 Judge 宣布 ACCEPT。Manager 自己是当前 Actor 时，需要另有可独立读取的可信来源或用户核验；不足则保持 BLOCK。
-- deferred：review-judger 登记发现 ID、延期理由、影响、授权依据（需要范围取舍时）、后续 Issue URL或明确待决入口。不把“已登记”当成“已修复”。
-- completion：coordinator 完成时写交付范围、集成 PR/merge SHA、实际验证与未测边界、延期事项及远端摘要链接；取消由 Manager 写原因、外部资源现状与清理约束，不能写成交付成功。
-
-## Handoff 与结果约定
-
-每次 claim 的 handoff 必须自足且不超工具长度限制；后继只有前驱交接，不自动累计所有历史字段。使用如下短格式，按节点删去不适用字段：
-
-```text
-入口：run.md 的绝对路径 + runDir 绝对路径；workspace / 仓库身份；适用合同副本路径与版本；Milestone 编号；当前 Issue/集成对象。
-结果：所选 result 及其成立依据；技术障碍改用 BLOCK，不冒充业务结果。
-修订：PR URL；base/head 分支与 SHA；原始 baseCommit/实现 SHA（适用时）。
-证据：delivery/review/decision 路径；远端摘要链接；必要检查结果。
-后续：必修清单、未核实项、约束；下一角色需要的批准修订等信息。
-```
-
-- **运行产物一律写 handoff 给定的 runDir 绝对路径**，不得相对当前 cwd 猜测或写到 `docs/dsh-workflow/` 其它位置。
-
-- 调用前核对当前任务身份；claim/block 是本轮最后动作，读取和写入证据须先完成。
-- 使用 `node_claim({ result, handoff })`；result 必须是当前节点声明的名称。报告节点提交 `reviewed` 表示已完成审查报告，无论是否发现缺陷；裁决节点用 `approved` 或 `changes-required` 表达处置结论。无法执行/核验、缺权限或需要授权时用 BLOCK。
-- `node_block` 按当前工具参数提供 reason（问题、证据、缺失信息、需要 Manager 决定的事项）；不自行扩展参数，不为传材料再调用 node_claim。
-- 外部副作用重入先查现场，匹配则补缺失收尾；不匹配 BLOCK，不强推、不重复创建、不替换原始基线。合并前保护检查/权限不满足时 BLOCK，不绕过保护。
-- 技能用实际 catalog 的精确名称。必需技能缺失先由 Manager 决定替代步骤或 BLOCK，不虚构调用成功。
-
-### 节点结果与流程返回
-
-本表解释本工作流的结果；实际合法名称、共同条件、结果条件与目标以本次冻结 YAML 为准。persona 保留 system 层的稳定职责、权限边界和证据纪律；instruction 提供当前动作与材料，强制验收条件同时进入 checker 共同条件或对应 result 的 criteria。
-
-| 所属流程 | 节点 | result 与后继 |
+| 流程 | 节点 | 结果与后继 |
 |---|---|---|
-| root | grilling | `ready` → need-tickets；`cancelled` → root 返回 cancelled |
-| root | need-tickets | `planned` → issue-cycle 调用 |
-| root | integrate-milestone | `prepared` → final-review |
-| root | final-review | `reviewed` → decide-pr |
-| root | decide-pr | `approved` → close-milestone；`changes-required` → plan-remediation |
-| root | close-milestone | `delivered` → root 返回 delivered |
-| root | plan-remediation | `planned` → issue-cycle 调用 |
-| issue-cycle | select-next-issue | `selected` → issue-delivery 调用；`exhausted` → issue-cycle 返回 exhausted |
-| issue-delivery | implement | `implemented` → review |
-| issue-delivery | review | `reviewed` → decide-pr |
-| issue-delivery | decide-pr | `approved` → complete-issue；`changes-required` → implement |
-| issue-delivery | complete-issue | `delivered` → issue-delivery 返回 delivered |
+| root | initialize-and-plan（Manager） | ready → run-issue-cycle；cancelled → 返回 cancelled |
+| root | run-issue-cycle（Child） | integration-ready → final-review |
+| root | final-review（code-reviewer） | approved → close-milestone；changes-required → plan-remediation |
+| root | plan-remediation（planner） | planned → run-issue-cycle |
+| root | close-milestone（coordinator） | stale-review → final-review；delivered → 返回 delivered |
+| issue-cycle | select-next-issue（coordinator） | selected → deliver-one-issue；integration-ready → 返回 integration-ready |
+| issue-cycle | deliver-one-issue（Child） | delivered → select-next-issue |
+| issue-delivery | implement（developer） | implemented → review |
+| issue-delivery | review（code-reviewer） | approved → complete-issue；changes-required → implement |
+| issue-delivery | complete-issue（coordinator） | stale-review → review；delivered → 返回 delivered |
 
-issue-delivery 返回 `delivered` 后，issue-cycle 继续选票；issue-cycle 返回 `exhausted` 后，root 进入集成准备。两个 Child 调用通过显式 onReturn 映射推进，没有额外报告节点，也不从 handoff 文本猜测返回值。
+Manager 在 initialize-and-plan 一次完成澄清、授权、仓库/Milestone/分支身份、主票和子票的创建或复用、分类与依赖规划，并处理 BLOCK；planner 仅负责集成返工的修复规划；developer 实施、自测并维护实施 PR；独立 code-reviewer 发现问题并逐项决定本次修复、延期或不成立；coordinator 负责选票、分支/PR 和合并收尾。专业审查合并原两级 decide-pr，不另设裁决或预留 tester。插件 Judge 仍独立核验出口合同，不等于另一轮专业代码审查。
 
-- 本流程保留独立 code-reviewer 与 review-judger；reviewer 负责发现，review-judger 完成逐项核实与处置。存在未解决的范围或授权争议时 BLOCK，请 Manager 提供决定；技术信息不足时补证，不新增猜测出口。
-- 裁决出口互斥：所有发现已处置、无本次必修项且批准修订明确时 `approved`；有明确且可执行的本次必修清单时 `changes-required`。延期必须具备必要授权与后续入口。
-- Judge 核验共同 criteria 与 Actor 所选 result 的 criteria；满足则 ACCEPT，不满足则 REJECT，需要补充信息才 NEED_CONTEXT。不另加遍历所有出口或证明唯一性的任务。
-- REJECT 是同一节点内修正 claim，不能当作 `changes-required` 业务返工边；只有 `changes-required` 被 ACCEPT 后才沿静态目标返工。NEED_CONTEXT 保留 claim 并 BLOCK，经补证恢复 Judge。
-- root 返回 `delivered` 表示完成交付；`cancelled` 表示已确认取消，并保留资源现状和清理约束。运行状态 completed 仅表示执行结束；控制面终止不等于已交付或已处理全部外部副作用。
+清晰范围沿用已有授权，不重复确认；缺范围或授权时澄清。授权内可创建/复用相关资源、推送任务分支、满足条件后合并关票。强推、硬重置、绕过保护、部署、擅自扩大范围不属默认授权；本配置仅支持单仓，涉及子仓改动或跨仓交付时 BLOCK，由用户选择适用工作流。两级 merge commit 不被仓库允许时 BLOCK，不自动换合并方式；不自动删分支。
 
-## 任务分类与阶段退出
+## 计划与任务选择
 
-- `implementation`：本轮必须完成的实现或修复叶任务。简单任务的主 Issue 直接归此类，不另建无意义子票。
-- `aggregate`：仅聚合子任务、没有独立验收的父 Issue。子任务完成且无未结事项后由 coordinator 自底向上关闭，直到无可关闭的聚合票；每次关闭后分页核对同 Milestone 依赖该票的 open implementation，全部依赖已关闭的补齐 ready-for-agent，仍阻塞的不动。不得留下开放聚合票再退出开发循环。
-- `integration-acceptance`：仅允许主 Issue 使用，须明确列出集成阶段验收项及其证据入口。实现工作必须拆入 implementation，不得借此分类把未完成代码、修复或子任务留到集成阶段。
-- planner 在初始化/拆票及补救规划时维护分类、依赖与验收归属。依赖及父子关系不得成环，integration-acceptance 主票不能成为 implementation/aggregate 等待关闭的依赖。无法分类或范围有争议时交 Manager，不靠默认猜测排除任务。
-- 退出开发循环前完整分页核对 Milestone 成员及 run.md 登记：至少有一个 implementation 且其全部关闭、aggregate 已完成并关闭；剩余开放 Issue 可为空，否则只允许是已显式登记的 integration-acceptance 主 Issue。handoff 列出待验收项，没有则写“无”。缺页、未登记、子任务未完成、状态冲突时不得声明穷尽。记录超过 100 不是失败条件，应继续分页或报告确切查询障碍。
-- 集成准备接受上述状态，不提前要求主 Issue 已被未来的集成审查/裁决批准。若主 Issue 是 integration-acceptance，须在当前集成审查/裁决覆盖全部独立验收项、集成合并成功并验证目标包含关系后，由 coordinator 关闭主 Issue，再核验所有任务与 Milestone 的最终状态。
-- 集成审查发现需要实现/修复时，补救规划登记 implementation 任务并重新进入开发循环，不能仅改分类绕过返工。
+任务分类：
 
-## 集成批准不可按 Issue 数量跳过
+- implementation：本轮必须完成的实现或修复叶任务；简单任务可直接使用主 Issue，不另建无意义子票。
+- aggregate：只有聚合责任、无独立验收的父票；按获准变更后的子票范围核验，全部必交子任务及自身显式依赖满足、无未结事项后可关闭。
+- integration-acceptance：仅用于主 Issue，须列明独立集成验收及证据入口。全部实现必须拆入 implementation，不能隐藏待实现代码。
 
-不论实施 Issue 数量，当前集成 PR 都须有本对象、本轮的 review 和 decision，decision 明确记录当前 approvedBase / approvedHead 后才可进入合并收尾。
+Manager 初始化计划，planner 在集成返工时增补主 Issue 计划索引，检查覆盖、归属、分类和依赖。在同一等待图中检查“聚合父票等待子票”与显式 Blocked by 边无环，分别检查两类关系无环不足以排除交叉死锁。implementation/aggregate 不得依赖集成验收主票的关闭。依赖含义不清、人工暂停或范围争议交 Manager，不按猜测放行。
 
-可引用旧审查证据以减少重复工作，但当前报告必须说明证据对应的仓库、PR、修订及覆盖范围，并补充核验基线变化、新增内容、集成差异、主 Issue 独立验收和必要回归。Issue 数量相同、提交 tree 相同或旧 feature PR 已批准，都不单独构成集成批准。不能证明完整覆盖时执行完整审查。复用证据不等于复用旧批准。
+选票节点集中维护工作流负责的就绪标签和聚合关闭：完整分页查询 Milestone 记录并排除 PR，与计划索引逐项核对；依赖及子任务满足时自底向上关闭 aggregate，再核对已授权 implementation 的就绪状态。只修复有来源的工作流标签；人工 hold、撤销授权、needs-info/ready-for-human 等有效限制优先，不能因依赖关闭就覆盖。普通关票节点不再重复扫描解阻标签。
 
-## 合同变更与已有运行
+选取 open、implementation、就绪且依赖满足的叶票；多候选按依赖优先级再按编号升序串行处理。从当前 milestone 的确切 SHA 建立或核验 feature 分支，领取评论保存原始 baseCommit。复用前核对原始记录、归属和祖先关系，缺失时 BLOCK，不把当前 tip 追认为原始起点。
 
-YAML 定义快照与文档是两回事：YAML 修改不更新活动 Run 已冻结定义，但插件不会自动冻结或注入这些外部文档。上述合同副本由初始化步骤保存，不能宣称插件已提供此功能。
+无候选时，只有必交集中至少一个 implementation 且全部关闭、aggregate 全部关闭、无未解释移出/取消或未分类项，才进入集成准备；必交集剩余开放票只能为空或已登记的 integration-acceptance 主 Issue。Milestone 此时仍须 open。查询不完整、仍有未就绪实施票或聚合票未关闭均 BLOCK；记录超过 100 应继续分页，不是失败条件。
 
-本配置新建 `coding-workflow` 运行，不迁移活动旧 Run、不复用旧工作流的 runDir。切换前用匹配旧格式的插件结束或显式终止旧 Run，核对外部操作收尾；如状态库仍为旧格式，按升级手册显式备份后新建，新版不恢复或查询旧格式历史。保留原工作流文件与历史材料，不能因改用本合同而覆盖。仅保存版本字符串不足以防止外部文档后来被覆盖。
+同一次选票执行在任务耗尽时创建/复用 milestone → 基线的开放集成 PR，记录完整范围和待集成验收项，返回 integration-ready，不再派独立 integrate-milestone。集成验收不提前当作任务耗尽的条件。集成发现必修问题时，plan-remediation 按审查轮次/发现 ID 创建或复用同 Milestone 的修复票，更新计划映射并重入选票；不擅自重开已关闭主 Issue或扩大到非阻断优化。
 
-初始化前明确取消时，仅需可读取的取消依据、已产生资源现状及清理约束；不要求尚未创建的 run.md、合同副本或远端资源。已有 runDir 时取消摘要写 completion.md。
+## 审查、返工与批准失效
 
+首次审查完整验收和确切 PR diff；后续可引用可追溯旧证据，但须复核旧必修项、变化与交互影响，无法证明覆盖则完整审查。集成审查无论实施票多少均保留，补查目标基线变化、完整范围、合并差异、主 Issue 独立验收及必要集成回归。旧实施 PR 批准不能跨 PR 复用为集成批准。
+
+审查评论合并发现与处置：逐项记录本次修复、延期或不成立及理由。只有无未解决必修项且必需验证齐全才记录 approvedBase/approvedHead 并返回 approved；明确、可执行的范围内必修清单返回 changes-required。延期需记录影响、必要授权与后续入口，不把登记当修复。技术、权限、证据缺口或范围争议用 BLOCK，不伪装成产品返工。
+
+审查轮次从 r001 递增；修订、反证、验证材料或结论变化开新轮，即使 SHA 未变。提交审查结果前后复核修订，漂移时追加失效事实，不交旧批准。内部 approved 不替代 GitHub 保护要求的人工 approval。
+
+实现返工复用同一开放实施 PR；无须代码变动时可复用 head，不制造空提交。返工必须逐项修复或提供具体反证，reviewer 独立核实。集成返工经修复票交付后重新审查集成 PR。
+
+## 两级合并与重入
+
+coordinator 先区分 PR 现状：
+
+- 开放 PR：base/head 与批准不一致，或出现批准未覆盖且与既定验收相关的新失败验证/实质反证时，登记批准失效并以 stale-review 回本对象的审查，保持未合并、未手动关票；同 SHA 也交接反证链接。普通进度评论不触发重审。缺批准、检查未完成、无可核验原因的技术性检查失败、权限/保护缺口用 BLOCK。
+- 已合并 PR：读取当时批准、合并前证据和实际合并事实，只补遗漏收尾。正常合并推动目标 tip 不使已合并 PR 重新审查；事后检查不能冒充合并前证据。
+
+合并前先成功发布核验评论，紧邻操作再次查询 base/head，以工具提供的 head 条件保护执行 merge commit，保留仓库保护。head 条件不原子锁住 base，不能宣称消除并发窗口。操作超时或结果未知先查远端，不盲目重复。
+
+合并后核验 merge SHA 第一父节点等于 approvedBase，合并源 head 等于 approvedHead，远端目标包含批准 head/merge SHA（实施 PR 同时核验实现提交）。不匹配或无法证明则记录事实并 BLOCK，不自动回滚、不手动关票；若 GitHub 已自动关票，记录实际副作用。
+
+核验通过后先发布交付证据，再关闭本 Issue；已关闭则核对本次归属及关闭依据复用。实施交付安全切回并快进 milestone。最终交付还须覆盖集成验收主票的全部验收、必要时关主票、分页确认必交集全部关闭且获准排除项依据完整，再关闭 Milestone 并安全切回基线。任何评论、关票或本地切换失败都保留已发生远端事实，重入只补缺失步骤，不能重复合并。
+
+## Handoff、Judge 与已有运行
+
+handoff 简短但自足：workflowId/runId、仓库/workspace、主 Issue/Milestone、初始化与最新计划链接；当前 Issue/PR、原始分支起点、base/head；精确证据/批准评论链接、所选结果依据及后续约束。子流程只自动传前驱交接，不假定会累计此前字段。普通文件路径不是固定入口。
+
+提交协议使用插件统一注入的工具说明；命名结果必须属于当前冻结节点。Child 的 onReturn 显式映射推进，不从文本猜返回值。REJECT 是原节点内修正，只有 changes-required 被 ACCEPT 才进入业务返工。Judge 按共同与所选结果 criteria 独立核验；评论只是事实入口，不把 Actor 自述当独立证据。
+
+Manager 补证在相关 Issue 记录可追溯的只读查询来源、对象/SHA、时间、关键结果及分页依据，并用 node_resume.resolutionContext 传关键事实和链接。有有效 claim 时补证恢复 Judge；不代替 Judge 宣布通过。Manager 自己是 Actor 时仍需可信的独立来源。
+
+root delivered 表示完整交付，cancelled 要有用户明确取消及资源现状/清理约束。初始化前取消不要求尚未创建的远端资源或本地文件；已有入口则记录取消摘要，不自动删除资源。执行状态 completed 不单独表示已交付。
+
+新版仅供新 Run；不改活动 Run 冻结定义、原合同和历史材料，不迁移或删除旧 run.md。文档版本或哈希不是内容快照，有可重现 Git commit/blob 时可附永久链接；执行门槛已经写入冻结 YAML，不再按运行复制合同。

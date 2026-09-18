@@ -1,17 +1,22 @@
 # Issue tracker: GitHub
 
-Issues and specs for this repo live as GitHub issues in `hua0424/dsh-workflow-plugin`. Use the `gh` CLI for all operations.
+Issues and specs for this repo live as GitHub issues in `hua0424/dsh-workflow-plugin`. Use the `gh` CLI for GitHub operations. Check the current clone's remote identity before acting; pass `--repo hua0424/dsh-workflow-plugin` explicitly rather than relying on the working directory.
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
-- **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
-- **Comment on an issue**: `gh issue comment <number> --body "..."`
-- **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
-- **Close**: `gh issue close <number> --comment "..."`
+Use non-interactive flags. For multi-line issue bodies, comments or PR descriptions, write the exact text to a temporary file and pass `--body-file`; preserve newlines and avoid shell interpolation. Do not print credentials or include sensitive logs in remote records.
 
-Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
+```text
+gh issue create --repo hua0424/dsh-workflow-plugin --title "..." --body-file <file>
+gh issue view <number> --repo hua0424/dsh-workflow-plugin --json number,title,body,labels,state,url,comments
+gh issue list --repo hua0424/dsh-workflow-plugin --state open --json number,title,labels,url
+gh issue comment <number> --repo hua0424/dsh-workflow-plugin --body-file <file>
+gh issue edit <number> --repo hua0424/dsh-workflow-plugin --add-label "..."
+gh issue edit <number> --repo hua0424/dsh-workflow-plugin --remove-label "..."
+gh issue close <number> --repo hua0424/dsh-workflow-plugin
+```
+
+Read precise issue/comment links and relevant fields first. Use appropriate filters; default list limits do not prove completeness. When claiming all matching issues or comments were checked, paginate through the whole relevant result set. Before retrying a write whose outcome is unknown, query GitHub to avoid duplicate resources or comments.
 
 ## Pull requests as a triage surface
 
@@ -19,11 +24,8 @@ Infer the repo from `git remote -v`; `gh` does this automatically when run insid
 
 ## 项目约定
 
-- 可实施标签：`ready-for-agent`。拆票直接使用此标签，不再次 triage。
-- 总规格 #7 与 T1–T9 子票均已完成并关闭；实施分支 `refact`。工单、证据和最终提交见 `docs/work-plans/runtime-refact.md`。
-- 工单使用 GitHub 原生 dependencies/blocked_by 关系，并在正文保留相同 Blocked by 引用；只领取所有阻塞已完成的票。
-- 每票记录起始 commit，实施后按该固定点审查本票差异；提交前的审查包含工作区变更，排除用户自有未提交文件。最终提交后复核 diff/commit 范围，发现修复纳入本票。
-- Standards 与 Spec 使用独立并行审查；Spec 以当前子票为实施范围，总规格约束不得违背，后续票的未实现项不冒充当前票缺陷。
-- T1–T5逐票验收/审查/提交；用户随后要求T6–T9实现完成后统一测试、双轴审查和最终提交。最终提交`c263e64a7d69d3bacb4936654aaa595951d1d3c5`后按依赖关闭#14/#15/#12/#16，再独立关闭父规格#7。
-- 本地 commit 不等于 push。用户未授权推送/部署；不把 GitHub Issue 关闭描述为运行版本已经升级。
-- 当前用户自有改动：`docs/example/workflow-template.yaml`；不修改、暂存或纳入本轮提交。
+- 五类标签：`needs-triage`、`needs-info`、`ready-for-agent`、`ready-for-human`、`wontfix`；定义见 [triage-labels.md](triage-labels.md)。标签变更须符合当前授权与就绪事实；拆票本身不自动授予实施权限或覆盖人工暂停。
+- 依赖使用 GitHub 原生 dependencies/blocked_by，并在正文保留一致的 Blocked by 引用；两处不一致先核实并修正，不把正文引用缺失当作没有依赖。
+- Issue 规格及明确采纳的澄清提供范围依据。节点、角色、拆票顺序、审查方式、报告位置、PR/关票/合并时机按当前工作流冻结配置执行；无工作流时按用户任务及所选 skill，项目质量规范仍适用。
+- 查询仓库现状并保护用户已有改动，不擅自覆盖、暂存或纳入提交。推送、关闭对象、合并和部署按当前有效授权执行，已有明确授权不反复请求确认；本地 commit、远端交付和运行环境部署是不同事实，汇报须分别准确。
+- 需要追溯 #7 / T1–T9 重构的工单、实施顺序、证据与提交时，按需查 [runtime-refact.md](../work-plans/runtime-refact.md)。其中历史授权、分支和用户文件记录不构成当前任务的持续约束。

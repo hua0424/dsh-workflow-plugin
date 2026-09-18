@@ -1,29 +1,29 @@
 # coding-workflow 使用说明
 
-`coding-workflow` 是单仓、两级 PR 的 `agent-workflow/v3` 工作流。配置见 [coding-workflow.yaml](../example/coding-workflow.yaml)，业务合同见 [coding-workflow-contract.md](coding-workflow-contract.md)。保留独立审查与裁决，以及原角色和模型选择；不覆盖原 `milestone-delivery` 配置及合同。
+`coding-workflow` 是单仓、GitHub Milestone 多任务、两级 PR 的 `agent-workflow/v3` 工作流。实施 PR 合入 milestone 分支，集成 PR 合入目标基线，两级均采用 merge commit。配置见 [coding-workflow.yaml](../example/coding-workflow.yaml)，证据与重入规则见 [coding-workflow-contract.md](coding-workflow-contract.md)。
 
 ## 启动前
 
-本次迁移时的只读检查（2026-09-17）：仓库主线已支持 v3，但 `C:/Users/hua/.dsh/profiles/web/wfdev/lib/types.js` 仍声明 v2/v9。该记录不是实时状态，启动前须重新确认实际加载的插件；本次只新增配置，不部署插件或切换状态库。
+1. 确认实际运行的插件支持 v3 命名结果、子流程返回和 actorCommonPersona。仓库代码更新不等于已部署；需要升级旧格式状态库时按[升级手册](../user-guide.md#8-v3-升级与回滚停机切换)操作，配置安装不自动部署或迁移活动 Run。
+2. 在目标仓库根启动，确认 GitHub 仓库、目标基线及授权。沿用项目已有 GitHub tracker，无需重新 setup；配置包含执行规则，其他项目无需先复制 INDEX、合同或本地报告目录。
+3. 将配置保存到实际 catalog 的 `coding-workflow.yaml`，用 `/dsh-flow list` 校验，再用 `/dsh-flow start coding-workflow` 启动。同一 workspace 已有活动 Run 时先按实际状态处理，不用 reset 代替外部操作收尾。
 
-1. 确认实际运行的插件支持 v3；仓库代码更新不代表 DSH 已部署新插件。仍使用旧格式状态库时，先按 [升级手册](../user-guide.md#8-v3-升级与回滚停机切换)结束旧 Run、停止运行环境并显式备份后新建库。配置安装本身不执行部署、切库或恢复旧 Run。
-2. 在目标仓库根启动，确认工作区及 GitHub 仓库身份。该配置引用 `docs/dsh-workflow/` 下的 INDEX、本工作流合同及 review-contract；在其他项目使用时先提供这些通用入口与本工作流适用合同，并按项目调整配置。具体角色、节点和两级 PR 规则只由本工作流合同规定。
-3. 将配置以 `coding-workflow.yaml` 放入实际 catalog 目录，用 `/dsh-flow list` 确认识别，再用 `/dsh-flow start coding-workflow` 启动。配置文件新增不等于已有 Run 被迁移；同一 workspace 的旧 Run 须先结束。
+## 跟踪材料
 
-## 运行材料
+主 Issue 保存初始化、计划索引、范围变更、集成审查与最终交付；实施/修复 Issue 保存各票的原始分支起点、实施、自测、审查与合并证据。评论标明 workflowId、真实 runId、阶段及修订，handoff 传精确链接。主 Issue 已关闭仍可作为入口。初始化和首次计划可合为一条评论，ready 前两者均须完成。本配置仅支持单仓，不承担子仓改动或跨仓交付。
 
-Manager 在初始化阶段建立 `docs/dsh-workflow/runs/<YYYYMMDD-HHmmss>-coding-workflow-<slug>/run.md`，保存本合同、INDEX 和 review-contract 内容副本，记录原路径、版本、哈希及副本绝对路径。后续角色从 handoff 找入口并读取冻结副本；这一步由工作流执行，插件不会自动复制外部文档。
+计划索引记录分类、父子关系、依赖、验收归属及有效授权/hold，不复制实时 CI/PR 状态。最新用户授权的必交集用于穷尽和最终完成核验；获准移出/取消的票保留历史依据，不因单纯改标签或移出 Milestone 就排除。至少一张 implementation 的门槛仍适用。
 
-运行产物保留在 ignored 目录，重要结论与精确修订摘要同步对应 Issue/PR。仅创建实际使用的材料；初始化前明确取消不要求先建立目录、Milestone 或 Issue。
+普通报告直接写 Issue，无需 run.md、合同副本、审查文件或 completion.md。确需长篇复杂报告才写 ignored `docs/dsh-workflow/runs/<runId>/`，并在 Issue 登记关键结论、适用修订、workspace、路径及哈希。远端摘要应独立保留关键证据；本地路径不等于异机可下载链接。
 
 ## 路由与验收
 
-正常路径：初始化 → 规划 → 选票 → 实现 → 审查 → 裁决 → 合并关票 → 再次选票；任务穷尽后进入集成准备 → 集成审查 → 裁决 → 集成交付。
+正常路径：初始化与规划（Manager 的 initialize-and-plan）→ 选票 → 实现 → 审查 → 合并关票 → 再次选票。选票同时维护依赖解阻标签与聚合关闭；人工 hold、撤销授权和待补信息优先。任务穷尽时选票节点直接准备集成 PR → 集成审查 → 合并关闭 Milestone。
 
-单票裁决需要修改时返回实现；集成裁决需要修改时进入补救规划、开发循环，再回到集成。初始化明确取消则直接返回 cancelled。
+单票审查 `changes-required` 返回实现；集成审查 `changes-required` 进入补救规划、开发循环后再回集成。两级合并的 `stale-review` 都返回本对象审查，包括同 SHA 出现批准未覆盖的新失败验证或实质反证。不再派独立裁决节点或预留 tester，开发与专业审查仍隔离，插件 Judge 核验所选出口合同。
 
-Actor 用 `node_claim({ result, handoff })` 提交当前节点合法的命名结果；Judge ACCEPT 后才走相应业务边。REJECT 留在当前节点修正；缺信息时 NEED_CONTEXT/BLOCK 后补证。子流程通过显式返回值映射推进。
+Manager 初始化时完成主票与必要子票的创建/复用，关联同仓 Milestone，并检查聚合等待子票与显式依赖构成的联合等待图；planner 仅处理后续集成修复规划。穷尽要求必交集实施票和聚合票完成，只允许留下明确登记的主 Issue 集成验收项；不能把未完成实现归为集成验收。单票也执行当前集成 PR 审查，可引用旧证据，不能跨 PR 复用批准。
 
-选票穷尽以实施任务和聚合任务完成为条件，允许留下已登记的主 Issue 集成验收项供集成阶段完成；不能把未完成实现伪装成集成验收。单个 Issue 也执行当前集成 PR 的审查和裁决，批准必须对应当前 base/head。具体证据、轮次、重入与合并约束以工作流合同为准。
+合并前保留确切批准与检查评论，使用 head 条件保护；合并后核验 merge commit 第一父节点等于 approvedBase、源 head 匹配 approvedHead、目标包含相关提交。已合并重入只补收尾，正常目标分支推进不触发重审。
 
-最终业务返回 `delivered` 或 `cancelled`，分别表示交付与取消；completed 运行状态不单独证明交付成功。
+Actor 遵循插件注入的提交协议，Judge ACCEPT 后才沿结果推进；REJECT 留在原节点修正，NEED_CONTEXT/BLOCK 补证后恢复。actorCommonPersona 只覆盖 Role Actor，Manager/Judge 独立配置。最终 `delivered` 表示交付，`cancelled` 表示用户明确取消；运行状态 completed 不单独证明交付成功。新配置只供新 Run，旧定义和历史材料保持原状。

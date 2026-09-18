@@ -70,29 +70,29 @@ function harness() {
 type Harness = ReturnType<typeof harness>
 async function plan(h: Harness) {
   await h.start()
-  await h.step('coding-workflow', 'grilling', 'ready')
-  await h.step('coding-workflow', 'need-tickets', 'planned')
+  const initial = await h.row()
+  assert.equal(initial.execution.dispatch?.sessionId, 'manager')
+  const ready = await h.step('coding-workflow', 'initialize-and-plan', 'ready')
+  assert.equal(ready.execution.workflowId, 'issue-cycle')
+  assert.equal(ready.execution.nodeId, 'select-next-issue', '初始化并规划完成后直接选票')
 }
 async function deliverIssue(h: Harness, rework = false) {
   await h.step('issue-cycle', 'select-next-issue', 'selected')
   await h.step('issue-delivery', 'implement', 'implemented')
-  await h.step('issue-delivery', 'review', 'reviewed')
   if (rework) {
-    await h.step('issue-delivery', 'decide-pr', 'changes-required')
+    await h.step('issue-delivery', 'review', 'changes-required')
     await h.step('issue-delivery', 'implement', 'implemented')
-    await h.step('issue-delivery', 'review', 'reviewed')
   }
-  await h.step('issue-delivery', 'decide-pr', 'approved')
+  await h.step('issue-delivery', 'review', 'approved')
   const row = await h.step('issue-delivery', 'complete-issue', 'delivered')
   assert.equal(row.execution.workflowId, 'issue-cycle')
   assert.equal(row.execution.nodeId, 'select-next-issue', '单票返回不得提前结束整个流程')
 }
 async function integrate(h: Harness) {
-  const row = await h.step('issue-cycle', 'select-next-issue', 'exhausted')
-  assert.equal(row.execution.nodeId, 'integrate-milestone', '无下一票仍须父流程集成验收')
+  const row = await h.step('issue-cycle', 'select-next-issue', 'integration-ready')
+  assert.equal(row.execution.workflowId, 'coding-workflow')
+  assert.equal(row.execution.nodeId, 'final-review', '无下一票仍须父流程集成验收')
   assert.equal(row.run.status, 'running', '主 Issue 尚待集成验收时不可宣布交付')
-  await h.step('coding-workflow', 'integrate-milestone', 'prepared')
-  await h.step('coding-workflow', 'final-review', 'reviewed')
 }
 
 for (const [name, count, rework] of [['简单单票', 1, false], ['多票与父集成验收', 3, false], ['单票返工', 1, true]] as const) {
@@ -102,7 +102,7 @@ for (const [name, count, rework] of [['简单单票', 1, false], ['多票与父�
       await plan(h)
       for (let i = 0; i < count; i++) await deliverIssue(h, rework)
       await integrate(h)
-      await h.step('coding-workflow', 'decide-pr', 'approved')
+      await h.step('coding-workflow', 'final-review', 'approved')
       const row = await h.step('coding-workflow', 'close-milestone', 'delivered')
       assert.equal(row.run.status, 'completed')
       assert.equal(row.run.businessReturn?.name, 'delivered')
@@ -116,13 +116,92 @@ test('#129 集成返工：补票重新进入循环，重新审查批准才交付
     await plan(h)
     await deliverIssue(h)
     await integrate(h)
-    await h.step('coding-workflow', 'decide-pr', 'changes-required')
+    await h.step('coding-workflow', 'final-review', 'changes-required')
     await h.step('coding-workflow', 'plan-remediation', 'planned')
     await deliverIssue(h)
     await integrate(h)
-    await h.step('coding-workflow', 'decide-pr', 'approved')
+    await h.step('coding-workflow', 'final-review', 'approved')
     const row = await h.step('coding-workflow', 'close-milestone', 'delivered')
     assert.equal(row.run.businessReturn?.name, 'delivered')
+  } finally { h.close() }
+})
+
+test('单票批准失效可多次重审，并可转入同票返工，不提前返回父流程', async () => {
+  const h = harness()
+  try {
+    await plan(h)
+    await h.step('issue-cycle', 'select-next-issue', 'selected')
+    await h.step('issue-delivery', 'implement', 'implemented')
+    for (let i = 0; i < 2; i++) {
+      const approved = await h.step('issue-delivery', 'review', 'approved')
+      const stale = await h.step('issue-delivery', 'complete-issue', 'stale-review')
+      assert.equal(stale.execution.workflowId, 'issue-delivery')
+      assert.equal(stale.execution.nodeId, 'review')
+      assert.notEqual(stale.execution.executionId, approved.execution.executionId)
+      assert.notEqual(stale.execution.nodeToken, approved.execution.nodeToken)
+      assert.equal(stale.run.status, 'running')
+      assert.equal(stale.run.businessReturn, undefined)
+    }
+    await h.step('issue-delivery', 'review', 'changes-required')
+    await h.step('issue-delivery', 'implement', 'implemented')
+    await h.step('issue-delivery', 'review', 'approved')
+    const delivered = await h.step('issue-delivery', 'complete-issue', 'delivered')
+    assert.equal(delivered.execution.workflowId, 'issue-cycle')
+    assert.equal(delivered.execution.nodeId, 'select-next-issue')
+    await integrate(h)
+    await h.step('coding-workflow', 'final-review', 'approved')
+    const row = await h.step('coding-workflow', 'close-milestone', 'delivered')
+    assert.equal(row.run.businessReturn?.name, 'delivered')
+  } finally { h.close() }
+})
+
+test('集成批准失效可多次重审，发现问题后补票重入并重新批准', async () => {
+  const h = harness()
+  try {
+    await plan(h)
+    await deliverIssue(h)
+    await integrate(h)
+    for (let i = 0; i < 2; i++) {
+      const approved = await h.step('coding-workflow', 'final-review', 'approved')
+      const stale = await h.step('coding-workflow', 'close-milestone', 'stale-review')
+      assert.equal(stale.execution.workflowId, 'coding-workflow')
+      assert.equal(stale.execution.nodeId, 'final-review')
+      assert.notEqual(stale.execution.executionId, approved.execution.executionId)
+      assert.notEqual(stale.execution.nodeToken, approved.execution.nodeToken)
+      assert.equal(stale.run.status, 'running')
+      assert.equal(stale.run.businessReturn, undefined)
+    }
+    await h.step('coding-workflow', 'final-review', 'changes-required')
+    await h.step('coding-workflow', 'plan-remediation', 'planned')
+    await deliverIssue(h)
+    await integrate(h)
+    await h.step('coding-workflow', 'final-review', 'approved')
+    const row = await h.step('coding-workflow', 'close-milestone', 'delivered')
+    assert.equal(row.run.status, 'completed')
+    assert.equal(row.run.businessReturn?.name, 'delivered')
+  } finally { h.close() }
+})
+
+test('初始化的旧 planned 结果和 Judge REJECT 都不能跳过规划验收', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const before = await h.row()
+    assert.equal(before.execution.nodeId, 'initialize-and-plan')
+    assert.equal(before.execution.dispatch?.sessionId, 'manager')
+    const invalid = await h.engine.handleClaim('ws', { result: 'planned', handoff: '旧拆票节点结果' }, h.caller(before.execution.dispatch!))
+    assert.equal(invalid.ok, false)
+    const unchanged = await h.row()
+    assert.equal(unchanged.execution.executionId, before.execution.executionId)
+    assert.equal(unchanged.execution.successorId, undefined)
+    const rejected = await h.step('coding-workflow', 'initialize-and-plan', 'ready', 'REJECT')
+    assert.equal(rejected.execution.workflowId, 'coding-workflow')
+    assert.equal(rejected.execution.nodeId, 'initialize-and-plan')
+    assert.equal(rejected.execution.successorId, undefined)
+    assert.equal(rejected.run.businessReturn, undefined)
+    const accepted = await h.step('coding-workflow', 'initialize-and-plan', 'ready')
+    assert.equal(accepted.execution.workflowId, 'issue-cycle')
+    assert.equal(accepted.execution.nodeId, 'select-next-issue')
   } finally { h.close() }
 })
 
@@ -130,7 +209,7 @@ test('#129 用户取消有独立终局，不伪装成交付', async () => {
   const h = harness()
   try {
     await h.start()
-    const row = await h.step('coding-workflow', 'grilling', 'cancelled')
+    const row = await h.step('coding-workflow', 'initialize-and-plan', 'cancelled')
     assert.equal(row.run.status, 'completed')
     assert.equal(row.run.businessReturn?.name, 'cancelled')
   } finally { h.close() }
@@ -145,11 +224,11 @@ test('#129 无下一票仍进入集成；未知结果和 Judge REJECT 不能绕�
     const invalid = await h.engine.handleClaim('ws', { result: 'skipped', handoff: '单票无需批准' }, h.caller(before.execution.dispatch!))
     assert.equal(invalid.ok, false)
     assert.equal((await h.row()).execution.executionId, before.execution.executionId)
-    const rejected = await h.step('coding-workflow', 'decide-pr', 'approved', 'REJECT')
-    assert.equal(rejected.execution.nodeId, 'decide-pr')
+    const rejected = await h.step('coding-workflow', 'final-review', 'approved', 'REJECT')
+    assert.equal(rejected.execution.nodeId, 'final-review')
     assert.equal(rejected.execution.successorId, undefined)
     assert.equal(rejected.run.businessReturn, undefined)
-    await h.step('coding-workflow', 'decide-pr', 'approved')
+    await h.step('coding-workflow', 'final-review', 'approved')
     assert.equal((await h.row()).execution.nodeId, 'close-milestone')
   } finally { h.close() }
 })
@@ -157,6 +236,6 @@ test('#129 无下一票仍进入集成；未知结果和 Judge REJECT 不能绕�
 test('#129 配置拒绝旧协议及不完整 Child 返回映射', () => {
   assert.throws(() => parseCatalogConfig(source().replace('agent-workflow/v3', 'agent-workflow/v2')))
   // 新协议不能因混入旧默认通过边而产生第二条隐含路线。
-  assert.throws(() => parseCatalogConfig(source().replace('    grilling:', '    grilling:\n      onPass: need-tickets')))
-  assert.throws(() => validateAndNormalize(parseCatalogConfig(source().replace(/onReturn:\s*\n\s*exhausted:/, 'onReturn:\n        undeclared:'))))
+  assert.throws(() => parseCatalogConfig(source().replace('    initialize-and-plan:', '    initialize-and-plan:\n      onPass: run-issue-cycle')))
+  assert.throws(() => validateAndNormalize(parseCatalogConfig(source().replace(/onReturn:\s*\n\s*integration-ready:/, 'onReturn:\n        undeclared:'))))
 })

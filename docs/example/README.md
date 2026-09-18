@@ -240,9 +240,15 @@ roles:
 ## 完整示例
 
 - **v3 生产配置（#129 起，可直接加载）**：
-  [`coding-workflow.yaml`](coding-workflow.yaml)（标准编码流程，含子流程）与
+  [`coding-workflow.yaml`](coding-workflow.yaml)（GitHub Milestone 多任务、两级 PR，含子流程；
+  Manager 合并初始化与拆票，选票兼集成准备，审查直接返回批准/返工，两级合并均有批准失效回审查出口）与
   [`coding-workflow-rapid.yaml`](coding-workflow-rapid.yaml)（轻量单任务，四节点
-  无子流程）——配套合同见 `docs/dsh-workflow/` 对应 `*-contract.md`。
+  无子流程，GitHub Issue 评论跟踪；仅长报告按需写 ignored run 目录并登记路径）——
+  配套参考合同见 `docs/dsh-workflow/` 对应 `*-contract.md`；两者均以 Issue 评论跟踪，
+  不要求本地 run.md、合同副本或普通审查文件。完整流程用主 Issue 保存运行身份、
+  计划索引和集成交付，用实施/修复 Issue 保存各票证据；保留独立开发与审查，
+  不再派单独裁决角色或预留 tester。配置可直接采用项目已有 GitHub tracker，
+  无须重新 setup；实际验收以冻结 YAML 为准。
 - **完整 v3 组合示例**：[`docs/example/v3-combined-example.yaml`](v3-combined-example.yaml)
   ——覆盖三出口 Actor、单出口 Actor、同一 Child 的两个返回分别进入两个不同父后继、
   两层 Child 嵌套返回、Program 在 Child 内结束，以及 Root 的三个不同业务终局；

@@ -36,9 +36,11 @@ ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.
 
 ## Project
 
-DSH Agent-Team Workflow plugin (`dsh-agent-team-workflow`) — a Cordis plugin for DSH that runs configurable serial Manager / Role-Actor team workflows (`agent-workflow/v2`). TypeScript ESM (`module: nodenext`, strict), Node ≥ 22.19, pnpm, Windows dev environment.
+DSH Agent-Team Workflow plugin (`dsh-agent-team-workflow`) — a Cordis plugin for DSH that runs configurable serial Manager / Role-Actor team workflows (`agent-workflow/v3`). TypeScript ESM (`module: nodenext`, strict), Node ≥ 22.19, pnpm, Windows dev environment.
 
 Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages are devDependencies — at runtime they resolve from the DSH installation via the profile fallback. Do not move them into `dependencies`.
+
+本文件规定稳定的项目规范。节点、角色、执行顺序、报告位置及拆票/审查/合并流程由当前工作流的冻结配置决定；未运行工作流时，按当前用户任务与所选 skill 执行。流程选择不能降低项目的编码、验证和质量要求。保护用户已有改动，不擅自覆盖、暂存或纳入提交；远端操作及部署遵循当前有效授权，历史任务的授权不自动沿用。
 
 ## DSH 运行基线（用户确认）
 
@@ -80,13 +82,13 @@ Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 
 ## Docs to read first
 
-- 工单实施/审查先读 `docs/agents/issue-tracker.md` 和 `docs/work-plans/runtime-refact.md`（T1–T9 历史台账），获取实际工单依赖、完成状态与用户改动保护范围。
-- Node Execution Runtime（现行实现）：先读 `docs/design/node-execution-runtime.md` 与 `docs/specs/node-execution-runtime.md`（三表工作单、outcome+handoff 单文本、Role 复用/compact、BLOCK 争议处理），验收入口与 skip 口径见 `docs/testing/runtime-refact-test-migration.md`，冻结证据见 `docs/testing/node-execution-runtime-acceptance.md`。
+- 涉及工单时读 `docs/agents/issue-tracker.md`；只在追溯 Node Execution Runtime 重构时读取 `docs/work-plans/runtime-refact.md`（T1–T9 历史台账），不将历史实施顺序或授权作为当前任务规则。
+- 涉及 Node Execution Runtime 时读 `docs/design/node-execution-runtime.md` 与 `docs/specs/node-execution-runtime.md`（三表工作单、Role 复用/compact、BLOCK 争议处理）；现行 v3 提交为 `result` + `handoff`，旧文档中的 outcome 属历史协议。验收入口与 skip 口径见 `docs/testing/runtime-refact-test-migration.md`，冻结证据见 `docs/testing/node-execution-runtime-acceptance.md`。
 - `CONTEXT.md` — 领域术语表（Manager、Role Actor、Judge、Run Frame、nodeToken、BLOCK、pendingClaim、Handoff Context 等含义精确，代码/文档中使用原词）.
 - `docs/user-guide.md` — 面向使用者/运维者的操作手册（命令、工具、部署、故障排查）.
 - `docs/design/configurable-agent-workflow-graph.md` — v1 权威设计.
 - `docs/testing/acceptance-test-plan.md` / `acceptance-report.md` — 原单表实现的历史验收资料（带版本标记，不代表当前实现）；现行入口见上一条.
-- `docs/prd/<YYYYMMDD-topic>/` — 每轮修复/加固的 PRD；`docs/test-reports/` — 每个_issue 的测试报告；`docs/pending-discussions/` — 已记录的前提结论.
+- `docs/prd/<YYYYMMDD-topic>/`、`docs/test-reports/`、`docs/pending-discussions/` — 按需追溯既有需求、测试报告和前提结论；目录存在不要求每票新建本地报告，当前产物位置按所采用流程决定.
 
 ## Conventions
 
