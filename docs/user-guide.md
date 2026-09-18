@@ -100,6 +100,14 @@ REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona`
 `/dsh-flow start`，`/dsh-flow list` 中以 `[warn]` 单独一档提示（角色、
 关键词、迁移指引），迁移完警告即消失。
 
+**工作流级公共 persona（#140 起）**：顶层可选字段 `actorCommonPersona`
+放各 Role Actor 共同遵守的约定——配置后每个 Role Actor 的 system prompt
+为「公共 persona 在前 + 空行 + 角色专属 persona 在后」，未配置时行为不变；
+该字段同样触发上述提交协议关键词警告。**共同约定放此字段，节点动作仍放
+instruction**（结果验收条件进各结果 `criteria`，不依赖 persona 上下文）。
+`judgeRole.persona` 与 Manager 派发不受影响。字段细节见
+`docs/example/README.md`「工作流级公共 persona（Issue #140）」。
+
 旧 `~/.dsh/workflows/*.yaml` 按三步迁移（插件不代改你的用户文件）：
 
 1. **删 persona 纪律段**：去掉 persona 里"仅通过 node_claim/node_block
