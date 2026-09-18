@@ -358,6 +358,15 @@ export interface ExecutionJudge extends ExecutionDispatch {
   sessionId: string
   claimId: string
   inputVersion: number
+  /**
+   * Issue #22：该 Judge 会话创建时解析到的生效路由快照（override > role def >
+   * Run 冻结值，与 `resolveRoleModel` 同源）。`node_resume` 在偏好 followup 前
+   * 比对它与当前解析值：override 已热更新则旧会话仍绑定旧路由，自动走 fresh
+   *（释放旧会话 + 新路由 spawn），与 Role Actor“覆盖即删映射”一致。旧行无该
+   * 字段：有 judge override 即视为已过期（fail-safe 走 fresh），无 override
+   * 则保持原 followup 行为。
+   */
+  model?: DelegationRoute
 }
 
 /** 最新 Judge 判定/反馈；保留 claim/Judge/input 关联，只有 ACCEPT 可交接。 */
