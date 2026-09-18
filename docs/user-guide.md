@@ -39,7 +39,9 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
 
 ## 3. 配置一个工作流
 
-1. 复制模板：`docs/example/workflow-template.yaml` → `~/.dsh/workflows/<workflow-id>.yaml`
+1. 复制 v3 示例：`docs/example/coding-workflow-rapid.yaml`（单仓单任务）或
+   `docs/example/coding-workflow.yaml`（含子流程）→ `~/.dsh/workflows/<workflow-id>.yaml`。
+   （`workflow-template.yaml` 是 v2 遗留模板，运行时已不接受，仅作历史参考。）
 2. 文件名去掉 `.yaml` 即 workflowId，必须匹配 `[a-z][a-z0-9-]*`（拒绝 `.yml`）。
 3. YAML 是受限单文档 1.2：禁止 duplicate key、anchor/alias/merge、custom tag、
    模板插值。invalid 文件**只阻塞自身**，`/dsh-flow list` 会给出诊断。

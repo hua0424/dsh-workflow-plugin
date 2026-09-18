@@ -1,29 +1,30 @@
 # 工作流配置模板（docs/example/）
 
-> ⚠️ **版本状态（#133 T4 之后）**：本目录的 `workflow-template.yaml` 仍是
-> **v2 时代**的示例，运行时已只接受 `agent-workflow/v3`，因此**暂不可直接加载**。
+> ✅ **版本状态（#129 起）**：运行时只接受 `agent-workflow/v3`。本目录的
+> [`coding-workflow.yaml`](coding-workflow.yaml) 与
+> [`coding-workflow-rapid.yaml`](coding-workflow-rapid.yaml) 是**可直接加载的 v3
+> 生产配置**（#129 迁移落地，与本文件字段说明同源维护）；
+> [`v3-combined-example.yaml`](v3-combined-example.yaml) 是覆盖全部节点类型的
+> v3 组合示例。`workflow-template.yaml` 仍是 **v2 时代**的遗留模板，
+> **不可加载**，仅作历史参考保留（不半迁移成中间态）。
 > v3 的节点形状是「命名结果 + 统一 Target + 流程 returns」，`node_claim` 只接受
 > `{ result, handoff }`，Child 调用节点用 `onReturn` 显式映射（#131 已接通执行）。
-> Program 节点的 `PASS`/`FAIL` 按统一 Target 路由**自 #130（T1）的 v3 迁移起即生效**；
-> #132（T3）交付的是 Program 定向证据、ERROR 人工恢复（`node_run_program` /
-> `node_resolve_program`）的文档与示例入口。本模板自身的迁移仍由配置迁移
-> Issue #129 负责。在它落地前，请以
-> `docs/specs/named-results-and-workflow-returns.md` 的合同、
-> `docs/example/v3-combined-example.yaml`（完整 v3 组合示例）与
-> `test/v3-actor-root.test.ts`、`test/v3-child-returns.test.ts`、
-> `test/v3-program-targets.test.ts` 的可运行示例为准；
-> 下面的字段说明按 v2 原文保留。
+> Program 节点的 `PASS`/`FAIL` 按统一 Target 路由**自 #130（T1）起即生效**；
+> #132（T3）交付 Program 定向证据、ERROR 人工恢复（`node_run_program` /
+> `node_resolve_program`）的文档与示例入口。
+> 更多可运行示例见 `test/v3-actor-root.test.ts`、`test/v3-child-returns.test.ts`、
+> `test/v3-program-targets.test.ts`。
 
-本目录存放 `agent-workflow/v2` 工作流的**模板与字段说明**。新建工作流时，把
-`workflow-template.yaml` 复制到 catalog 目录后按需修改，不要从零手写
-（v3 迁移完成前请先按上面的提示核对版本）。
+本目录存放 `agent-workflow/v3` 工作流的**示例与字段说明**。新建工作流时，把
+`coding-workflow-rapid.yaml`（单仓单任务）或 `coding-workflow.yaml` 复制到
+catalog 目录后按需修改，不要从零手写。
 
 ## 使用方法
 
 1. 复制模板：
 
    ```powershell
-   Copy-Item docs/example/workflow-template.yaml "$env:USERPROFILE\.dsh\workflows\<workflow-id>.yaml"
+   Copy-Item docs/example/coding-workflow-rapid.yaml "$env:USERPROFILE\.dsh\workflows\<workflow-id>.yaml"
    ```
 
    （`%DSH_HOME%\workflows\`，DSH_HOME 默认为 `~/.dsh`。）
@@ -144,11 +145,11 @@ Judge 与其他 Role 一样继承**全量工具目录**，插件只把写类/副
 
 ## 配置面速查
 
-顶层字段（strict schema，unknown 字段一律拒绝；下表按 v2 原文保留，见本文开头的版本状态提示）：
+顶层字段（strict schema，unknown 字段一律拒绝）：
 
 | 字段 | 必填 | 内容 |
 | --- | --- | --- |
-| `schemaVersion` | ✓ | v2 示例为 `agent-workflow/v2`；**当前运行时要求 `agent-workflow/v3`** |
+| `schemaVersion` | ✓ | `agent-workflow/v3`（v2 配置自 #128 起不再接受） |
 | `roles` | ✓ | worker Role 定义表；key 即 roleKey |
 | `actorCommonPersona` | ✗ | 工作流级公共 persona：可选非空字符串，见「工作流级公共 persona（Issue #140）」 |
 | `judgeRole` | ✓ | Judge 定义（persona 必填，model / tools.deny 可选，见「Judge 工具面」） |
@@ -203,26 +204,14 @@ roles:
 | `builtin-program` | `programId` | `instruction`、`config` | 仅内置程序：`github.initialize-milestone`、`github.all-milestone-issues-complete` |
 | `child-workflow` | `workflowId` | — | 引用 `childWorkflows` 中的子图，禁止递归/引用根 |
 
-边与判定（**v2 原文**；v3 的对应合同见下）：
+边与判定（v3，#128/#130 起生效；v2 的 `onPass`/`onFail`/裸 `END` 已不存在）：
 
-- `checker`：目前仅 `judge.claim-correct`，`config.criteria` 为 trim 后
-  1..8000 字符，是 Judge 判定的权威标准。
-- `onPass` 必填，指向节点 id 或 `END`；`onFail` 可选，可指向节点 id
-  或 `END`（#17 起允许，FAIL→END 为业务终局：根 Run 状态沿用 `completed`
-  表示执行结束，终局业务结果由终局 claim outcome + handoff 表达；终局通知
-  按 PASS/FAIL 区分措辞，不把取消/失败报成“已完成”。子流程 FAIL→END
-  pop 回父节点 `onPass`，对父读作 PASS，父只能经 handoff 文本感知失败）。
-- FAIL 且未配置 `onFail` → 进入 BLOCK（Manager 处理后 resume 同一节点），
-  这不是一种边。
-
-**v3 对应合同（#130 T1 起生效）**：
-
-- 节点改为 `results: { <result-name>: { criteria, target } }`；`target` 是严格互斥的
+- `checker`：目前仅 `judge.claim-correct`。`config.criteria` 变为**可选**的共同条件
+  （trim 后 1..8000 字符）；每个结果另有自己的必填 `criteria`，两者随 Run 冻结并同源
+  下发给 Actor 与 Judge（Judge 只核验共同条件 + 本次所选结果条件）。
+- 节点用 `results: { <result-name>: { criteria, target } }`；`target` 是严格互斥的
   `{ node: <本流程节点> }` 或 `{ return: <本流程返回名> }`，**没有**裸 `END`、
   `onPass`/`onFail`、默认路由或通配映射。单出口节点也必须显式声明结果名。
-- `checker.config.criteria` 变为**可选**的共同条件；每个结果另有自己的必填
-  `criteria`，两者随 Run 冻结并同源下发给 Actor 与 Judge（Judge 只核验共同条件 +
-  本次所选结果条件）。
 - 工作流（含 child）声明非空且不重复的 `returns`；每个返回至少需要一条结构可达的
   返回路径。走到 `{ return }` 即流程返回，Root 的返回就是 Run 的业务终局
   （`workflow_status` 的 `businessReturn`）。
@@ -241,7 +230,8 @@ roles:
 
 - id 语法（workflowId/roleKey/nodeId）：`[a-z][a-z0-9-]*`。
 - 根 `startNode` 必须是 `role: manager` 的 `actor-task` 节点。
-- 每个工作流的所有节点从 `startNode` 可达，且至少一条路径到 `END`。
+- 每个工作流的所有节点从 `startNode` 可达；每个声明的返回至少存在一条结构可达的
+  返回路径（v3 没有裸 `END`，流程经 `{ return }` 结束）。
 - `actor-task` 引用的 role 必须在 `roles` 中定义（或为 `manager`）；
   `judge` 不能当 worker 用。
 - YAML 限制：单文档、无 duplicate key、无 anchor/alias/merge key、
@@ -249,11 +239,14 @@ roles:
 
 ## 完整示例
 
+- **v3 生产配置（#129 起，可直接加载）**：
+  [`coding-workflow.yaml`](coding-workflow.yaml)（标准编码流程，含子流程）与
+  [`coding-workflow-rapid.yaml`](coding-workflow-rapid.yaml)（轻量单任务，四节点
+  无子流程）——配套合同见 `docs/dsh-workflow/` 对应 `*-contract.md`。
 - **完整 v3 组合示例**：[`docs/example/v3-combined-example.yaml`](v3-combined-example.yaml)
   ——覆盖三出口 Actor、单出口 Actor、同一 Child 的两个返回分别进入两个不同父后继、
   两层 Child 嵌套返回、Program 在 Child 内结束，以及 Root 的三个不同业务终局；
-  想看 v3 合同的完整形状可从它入手（该文件是 v3 示例，不是已迁移的模板）。
-- 真实生产配置见
-[`docs/prd/20260903-workflow-hardening/milestone-delivery.yaml`](../prd/20260903-workflow-hardening/milestone-delivery.yaml)
-（里程碑交付：plan → builtin-program → PRD → issues → child-workflow 循环
-→ 终审 → close，覆盖全部三种节点类型与 onFail 修复回路）。
+  想看 v3 合同的完整形状可从它入手（该文件是 v3 示例，不是生产配置）。
+- 历史 v2 生产配置：
+  [`docs/prd/20260903-workflow-hardening/milestone-delivery.yaml`](../prd/20260903-workflow-hardening/milestone-delivery.yaml)
+  （v2 时代，**不可加载**，仅作历史参考）。
