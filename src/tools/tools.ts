@@ -241,7 +241,7 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
 
     defineTool({
       name: 'workflow_set_role_model',
-      description: 'Manager 为某个 Role 或 Judge 切换模型（provider + modelId）。目标 Role 有 active Actor 时拒绝。',
+      description: 'Manager 为某个 Role 或 Judge 切换模型（provider + modelId）。只影响之后新建的会话：Worker 覆盖即删旧映射（下次派发按新路由重建），Judge 覆盖后 node_resume 自动对旧会话走 fresh（释放旧会话 + 新路由 spawn）；目标 Role 有 active Actor 时拒绝，正在判定的 live Judge 会话不受影响。',
       parameters: {
         roleKey: { type: 'string', required: true, description: 'roleKey 或 judge' },
         provider: { type: 'string', required: true, description: 'provider route' },

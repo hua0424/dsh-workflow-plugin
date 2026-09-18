@@ -167,8 +167,8 @@ instruction**（结果验收条件进各结果 `criteria`，不依赖 persona �
 | `node_resume` | Manager | 恢复 BLOCK 节点（target=auto/actor/judge，轮换新 nodeToken） |
 | `node_run_program` | Manager | 为 builtin-program 节点提交 typed parameters 并运行 |
 | `node_resolve_program` | Manager | BLOCK 的 program 节点现场检查后手工提交 PASS/FAIL |
-| `workflow_set_role_model` | Manager | 给某 Role / Judge 切换模型（有活动 Actor 时拒绝） |
-| `judge_respawn` | Manager | 重建当前节点的 Judge（drain 旧的 + spawn 新的） |
+| `workflow_set_role_model` | Manager | 给某 Role / Judge 切换模型（有活动 Actor 时拒绝；只影响之后新建的会话，Judge 覆盖后 `node_resume` 自动对旧会话走 fresh） |
+| `judge_respawn` | Manager | 重建当前节点的 Judge（drain 旧的 + spawn 新的；Judge 模型覆盖后也可直接 `node_resume`，见 §7） |
 | `judge_claim` | Judge | 提交判定 ACCEPT/REJECT/NEED_CONTEXT（必须是本轮最后动作） |
 | `workflow_inspect_git` / `workflow_inspect_github` | Judge | 只读检查 git / GitHub 现场 |
 
@@ -207,6 +207,12 @@ GitHub 列表按 `per_page=100` 翻页取全、PR 从 issues 结果中排除；�
   compactNow → dispose），token 得以受控但派发前有额外时延。
 - BLOCK：Actor 主动 `node_block`，或技术故障（Judge fault 等）自动进入；
   Manager 用 `node_resume` 恢复。
+- 模型热更新的生效语义（Issue #22）：`workflow_set_role_model` 只影响之后
+  新建的会话，正在运行的 live 会话不受影响。Worker 覆盖即删旧映射（下次派发
+  按新路由重建）；Judge 覆盖后 `node_resume` 在复用旧会话前比对该会话创建时
+  的绑定路由——已过期则自动走 fresh（释放旧会话 + 按新路由 spawn），不再把
+  同一个失败（如旧模型额度耗尽）再派一次。典型恢复：Judge 旧模型额度耗尽 →
+  覆盖为新模型 → 直接 `node_resume`（target=judge），无需先 `judge_respawn`。
 - Host 重启后 Run 可冷恢复：状态在 SQLite，会话在持久层，重进即可续跑。
 
 ## 8. v3 升级与回滚（停机切换）

@@ -2,6 +2,7 @@
 import type { WorkflowConfig, NodeClaim, NodeDef, Target, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
 import { WorkflowError, LIMITS, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
+import { resolveRoleModel } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
@@ -386,7 +387,7 @@ export class WorkflowEngine {
       const continuationSessionId = e.resolution?.target === 'judge' && e.resolution.judgeMode === 'followup'
         ? e.resolution.judgeSessionId : undefined
       if (!e.judge) {
-        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
         await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
         committedVersion = version + 1
       } else if (e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion
@@ -882,22 +883,38 @@ export class WorkflowEngine {
         : historicalNeedContext && !oldJudge ? e.previousJudge
           : restartRecovery && unjudgedCurrent ? oldJudge : undefined
       if ((restartRecovery || sameJudgeNeedContext) && judgeToContinue) {
-        const availability = await this.subagents.judgeSessionAvailability(judgeToContinue.sessionId)
-        if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge Session inspection')
-        if (availability !== 'missing') {
-          const verdict = await this.probeSessionIdle(judgeToContinue.sessionId, () => this.sameRow(ws, row))
-          if (verdict === 'safety-stale') return rejected('stale judge resume request after Judge safety inspection')
-          if (verdict === 'activity-stale') return rejected('stale judge resume request after Judge activity inspection')
-          // 原条件 !restartRecovery || activity !== 'unknown'：探针 safe 直接放行；
-          // 冷会话仅 restart 恢复放行，active 一律拒绝。
-          if (verdict === 'active' || (verdict === 'cold-safe' && !restartRecovery)) return rejected('previous Judge turn is not safely closed')
-          judgeMode = 'followup'
-          judgeSessionId = judgeToContinue.sessionId
-        } else {
+        // Issue #22：Judge 模型热更新后，旧会话仍绑定旧路由——followup 只会把同
+        // 一个失败再派一次。绑定快照与当前解析值不一致时自动偏好 fresh（释放旧
+        // 会话 + 新路由 spawn），与 Role Actor“覆盖即删映射”同行为；Manager 仍
+        // 可用 judge_respawn 显式重建。
+        const currentRoute = resolveRoleModel(run, 'judge', run.delegationRoute)
+        const bound = judgeToContinue.model
+        const routeChanged = bound === undefined
+          ? run.modelOverrides['judge'] !== undefined
+          : bound.provider !== currentRoute.provider || bound.modelId !== currentRoute.modelId
+        if (routeChanged) {
           try {
             if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')
           } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
           judgeMode = 'fresh'
+        } else {
+          const availability = await this.subagents.judgeSessionAvailability(judgeToContinue.sessionId)
+          if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge Session inspection')
+          if (availability !== 'missing') {
+            const verdict = await this.probeSessionIdle(judgeToContinue.sessionId, () => this.sameRow(ws, row))
+            if (verdict === 'safety-stale') return rejected('stale judge resume request after Judge safety inspection')
+            if (verdict === 'activity-stale') return rejected('stale judge resume request after Judge activity inspection')
+            // 原条件 !restartRecovery || activity !== 'unknown'：探针 safe 直接放行；
+            // 冷会话仅 restart 恢复放行，active 一律拒绝。
+            if (verdict === 'active' || (verdict === 'cold-safe' && !restartRecovery)) return rejected('previous Judge turn is not safely closed')
+            judgeMode = 'followup'
+            judgeSessionId = judgeToContinue.sessionId
+          } else {
+            try {
+              if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')
+            } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+            judgeMode = 'fresh'
+          }
         }
       } else {
         const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
@@ -951,7 +968,7 @@ export class WorkflowEngine {
     if (resolvedTarget === 'judge') {
       e.judge = {
         id: newNodeToken(), sessionId: judgeSessionId ?? newNodeToken(), claimId: e.claim!.id,
-        inputVersion: e.inputVersion, settled: false,
+        inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute),
       }
     }
     e.restartPending = false
@@ -996,7 +1013,7 @@ export class WorkflowEngine {
         decision: reason || 'Manager requested Judge respawn',
       }
       e.restartPending = false
-      const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+      const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
       arrangedId = arranged.id
       e.judge = arranged
       e.blockReason = null
