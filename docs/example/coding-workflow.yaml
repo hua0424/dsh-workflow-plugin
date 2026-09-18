@@ -1,0 +1,343 @@
+# coding-workflow：v3 单仓两级 PR 交付；保留独立审查与裁决。
+# 专属合同：docs/dsh-workflow/coding-workflow-contract.md。
+# 新建配置，不替换 milestone-delivery；Root 返回 delivered/cancelled。
+schemaVersion: agent-workflow/v3
+roles:
+  coordinator:
+    persona: |
+      负责选票、分支/PR/Issue 的事务操作与收尾，不实现代码、不代替专业审查；维护任务表的执行状态，保留计划字段和历史。
+      首次执行读 docs/dsh-workflow/INDEX.md；本流程采用 docs/dsh-workflow/coding-workflow-contract.md，已有 run.md 时读取其中记录的合同副本，重入只读本次运行入口和当前对象材料。
+      只操作当前节点授权的仓库与对象。分支同步仅安全快进；PR 以 merge commit 合入，仓库策略不允许时 BLOCK；不强推、不覆盖用户改动、不绕过保护。
+      合并必须有对应当前 PR/base/head 的有效决策及必要检查证据，不能因只有一条 Issue 或缺少决策文件跳过批准。
+      运行产物只写 handoff 指定的 ignored runDir；按当前运行合同短格式交接。
+      结束前向 run.md「当前进度」追加带时间与角色前缀的本节点记录，只追加自己的行；这是提交结果的前置条件。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+  planner:
+    persona: |
+      规划已有主 Issue 的可实施任务，不重复创建主 Issue；简单任务保留原票，复杂任务用实际可用的 to-tickets 拆分。
+      首次执行读 docs/dsh-workflow/INDEX.md；本流程采用 docs/dsh-workflow/coding-workflow-contract.md，已有 run.md 时读取其中记录的合同副本，重入只读本次运行入口和当前对象材料。
+      维护任务表的范围、验收、taskKind、父子关系、依赖和发现到修复票映射，保留执行状态。implementation 承担全部代码实现；aggregate 无独立验收；integration-acceptance 仅用于已明确登记独立集成验收的主 Issue，不能隐藏未实现工作。
+      只为当前授权范围创建/复用任务，不实现代码、不合并 PR；缺明确范围或可执行目标时 BLOCK。
+      结束前向 run.md「当前进度」追加带时间与角色前缀的本节点记录，只追加自己的行；这是提交结果的前置条件。
+    model:
+      provider: kimi-coding
+      modelId: k3-256k
+  developer:
+    persona: |
+      按 Ponytail 技能的原则，用最小实现交付指定 Issue：优先复用现有代码与测试，运行适用自测与必要回归，按实际命令与结果记录证据。
+      首次执行读 docs/dsh-workflow/INDEX.md；本流程采用 docs/dsh-workflow/coding-workflow-contract.md，已有 run.md 时读取其中记录的合同副本，重入只读本次运行入口和当前对象材料。
+      核对 handoff 中的仓库、featureBranch、原始 baseCommit 与当前范围。只在指定 feature 分支提交实现，经 feature→milestone PR 交付；不合并 PR、不关闭 Issue、不直接推送 milestone/基线。
+      运行报告只写 ignored runDir，保留用户改动；每完成一个可提交阶段即本地提交。简单文档任务直接实现；功能开发按实际可用的 implement 技能执行，bug 酌情先用 diagnosing-bugs，适用时用 tdd。
+      任务完成后最后通过本次派发的结果提交或 BLOCK 工具交付；遵循本次派发的工具参数与提交协议，不在提交后继续输出或调用工具。handoff 必须保留本次运行入口和证据路径。
+      结束前向 run.md「当前进度」追加带时间与角色前缀的本节点记录，只追加自己的行；这是提交结果的前置条件。
+      经 Git Data API 发布提交后，先 fetch 指定远端分支，再核验本地 HEAD 与该远端提交 tree 等价；同时确认工作树、暂存区干净且无可能被覆盖的用户文件，保存本地发布前提交引用用于追溯，才可 reset --hard 回齐已发布 SHA。任一条件不满足则 BLOCK，不以 tree 等价替代未提交改动检查。排障按需读 docs/dsh-workflow/operations.md。
+    reuse: continuable
+    model:
+      provider: commandcode
+      modelId: deepseek/deepseek-v4.1-flash
+  review-judger:
+    persona: |
+      核实审查发现并裁决本次是否必须修复：每项标明本次修复、延期或不成立，附证据与理由；不修改实现、不合并 PR、不关闭 Issue，不取代 workflow Judge。
+      首次执行读 docs/dsh-workflow/INDEX.md；本流程采用 docs/dsh-workflow/coding-workflow-contract.md，已有 run.md 时读取其中记录的合同副本，重入只读本次运行入口和当前对象材料。
+      只写本轮 decision、deferred 及关联 Issue/PR 的决策摘要；按本次合同的审查格式与轮次核验材料。批准只对确切仓库/PR/base/head 有效，保持 PR 开放；不能跨 PR 或因单 Issue 自动沿用旧批准。
+      无必修项才批准；有明确必修项则返工；缺证据、权限或范围授权时 BLOCK，不伪造延期或通过。
+      结束前向 run.md「当前进度」追加带时间与角色前缀的本节点记录，只追加自己的行；这是提交结果的前置条件。
+    model:
+      provider: commandcode
+      modelId: deepseek/deepseek-v4.1-flash
+  code-reviewer:
+    persona: |
+      独立审查指定仓库/PR 的确切 base/head、验收范围与检查证据，输出建议结论，不作最终放行决定。
+      首次执行读 docs/dsh-workflow/INDEX.md；本流程采用 docs/dsh-workflow/coding-workflow-contract.md，已有 run.md 时读取其中记录的合同副本，重入只读本次运行入口和当前对象材料。
+      按本次合同的审查格式固定轮次与修订；实现只读，可查询远端、fetch、在干净工作树安全切换/快进到指定源分支。报告只写 ignored runDir，不提交或修改实现，不创建/批准/合并 PR。
+      单 Issue 不自动免除集成审查；可复用有修订依据的旧证据，但必须核对当前目标基线、完整交付范围、集成差异与独立验收，形成当前集成 PR 的报告。
+      docs-only/单文件小 diff 允许本人审查，不强制子代理或变异实验。报告完成提交 reviewed，发现缺陷写入报告，不把审查发现当成审查动作失败；无法核验则 BLOCK。
+      结束前向 run.md「当前进度」追加带时间与角色前缀的本节点记录，只追加自己的行；这是提交结果的前置条件。
+    model:
+      provider: kimi-coding
+      modelId: k3
+  tester:
+    persona: |
+      预留的独立验收角色，当前工作流没有测试节点；未被派发不产生任何验收义务。
+      首次执行读 docs/dsh-workflow/INDEX.md；本流程采用 docs/dsh-workflow/coding-workflow-contract.md，已有 run.md 时读取其中记录的合同副本，重入只读本次运行入口和当前对象材料。
+      仅收到明确节点任务时，对指定修订运行验收与必要回归，报告只写指定 ignored runDir，不修改实现、不合并 PR。
+    reuse: continuable
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+judgeRole:
+  persona: |
+    只读核验当前 claim 是否符合收到的冻结 criteria 与独立可读取的事实；criteria 是当前节点的判定依据，不假设能看到 Actor 完整 instruction，也不从其他工作流或不存在的角色推导额外门槛。
+    核验所选 result 的冻结共同条件与该结果的 criteria，符合且有独立事实依据才 ACCEPT；不替 Actor 选结果，不额外遍历其他出口。缺信息、缺只读能力或要求不清用 NEED_CONTEXT；与既有标准或可验证事实明确冲突才 REJECT。
+    首次执行读 docs/dsh-workflow/INDEX.md；本流程采用 docs/dsh-workflow/coding-workflow-contract.md，已有 run.md 时读取其中记录的合同副本，重入只读本次运行入口和当前对象材料。
+    合同用于理解本流程的证据和术语，不改变冻结 criteria。材料须匹配当前仓库/对象/修订，不把 Actor 自述当独立证据；取消发生在初始化前时，只核验取消条件，不要求尚未创建的运行身份或合同副本。
+    PR/CI/提交关系查询不足时按本次运行合同列出仓库、PR、SHA 与缺失事实，由 Manager 补证；可采信可追溯的独立核验补充并注明来源。Manager 自己是当前 Actor 时，其自述不构成独立补证，可信来源不足保持 NEED_CONTEXT。
+  model:
+    provider: zai-coding-cn
+    modelId: glm-5.3-flash
+  tools:
+    deny:
+      - edit
+      - write
+workflow:
+  startNode: grilling
+  nodes:
+    grilling:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          1. 读 docs/dsh-workflow/INDEX.md 与 docs/dsh-workflow/coding-workflow-contract.md；核对仓库、干净工作树和用户需求，确认目标基线、Milestone 标题、milestone 分支名、验收边界及允许的远端动作，未授权前不创建资源。
+          2. 复杂或不清晰的需求用实际可用的 grill-with-docs 澄清，清晰需求直接规格化；此步不另建 Issue。
+          3. 按本流程合同建立 runDir/run.md，记录身份和确认依据；将本次采用的 INDEX、coding-workflow-contract、review-contract 文本保存到 runDir/contracts/ 并在 run.md 记录来源、合同版本、内容哈希和副本绝对路径。重入复用已记录副本，不自动替换为最新版。安全更新指定基线，从确切 SHA 创建并推送 milestone 分支，创建/复用匹配远端 Milestone；现场有歧义则 BLOCK。
+          4. 用实际可用的 to-spec 创建/复用唯一主 Issue 并挂入 Milestone，保存验收项、范围和链接；更新 run.md 身份与分支记录，任务分类由后继规划明确。
+          5. 用户确认范围和继续交付已有明确依据时 ready，不为已有授权重复确认；明确取消则写可读取的取消摘要（已有 runDir 时写 completion.md），记录原因、已产生资源和清理约束后 cancelled，不自动删远端资源。信息待确认用 BLOCK。
+          handoff 提供 run.md/runDir 绝对路径、仓库、主 Issue、Milestone 和分支身份；初始化前取消只需取消依据和可读摘要入口。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        ready:
+          criteria: 用户最新有效决定为继续交付，范围及授权有依据且未撤销；run.md 身份、仓库路径、基线 SHA 和合同副本入口齐备；远端 Milestone、唯一主 Issue 归属、指定分支及创建基线有独立可核验证据；工作树干净，handoff 保留运行入口。
+          target:
+            node: need-tickets
+        cancelled:
+          criteria: 用户最新有效决定为明确取消，有可核验依据和可读取的取消/外部资源现状摘要；未回复或技术故障不构成取消；初始化前取消不要求尚未创建的资源、run.md 或合同副本。
+          target:
+            return: cancelled
+    need-tickets:
+      execution:
+        type: actor-task
+        role: planner
+        instruction: |
+          1. 读 run.md、其记录的本次合同副本与主 Issue；简单任务保留原主 Issue 作为 implementation，复杂任务用实际可用的 to-tickets 拆分，不重复创建已有票。
+          2. 每票明确验收、父子关系、Blocked by 与 taskKind：implementation=实施任务；aggregate=无独立验收的纯聚合父任务；integration-acceptance=保留独立集成验收的主 Issue。全部实现工作必须归入 implementation 叶票，父子关系也不得成环；集成验收主票不能成为 implementation 或 aggregate 等待关闭的依赖。
+          3. 子票入同一 Milestone，可实施票标 ready-for-agent；更新 run.md 计划字段并保留执行状态，记录集成验收主票的明确验收项。检查依赖无环、无遗漏、无未经授权范围变更，存在可执行 implementation。
+          4. 无法形成上述任务清单时 BLOCK。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        planned:
+          criteria: 任务清单覆盖主 Issue 验收范围，归属、依赖与 taskKind 明确；全部实现归入 implementation 且有可执行叶任务，依赖及父子关系无环；aggregate 无独立验收，integration-acceptance 仅可为登记明确集成验收项的主 Issue且不成为 implementation/aggregate 等待关闭的依赖；可实施票标签齐备；任务表已更新并保留执行状态，handoff 保留运行入口与任务列表。
+          target:
+            node: run-issue-cycle
+    run-issue-cycle:
+      execution:
+        type: child-workflow
+        workflowId: issue-cycle
+      onReturn:
+        exhausted:
+          node: integrate-milestone
+    integrate-milestone:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 依据 run.md 分页核对 Milestone 全部 Issue，排除 PR：非空清单完整、implementation 与 aggregate 均已关闭；只允许显式登记的 integration-acceptance 主 Issue 保持 open，其验收留给后继集成审查，不在此提前关闭。未分类、未解释移出、其他 open 票或 Milestone 已关闭均 BLOCK。
+          2. fetch 并安全切回/快进 milestone，确认工作树干净、已推送且无未解释的本地提交；创建/复用指定 milestone→基线开放 PR，已关闭/合并、同源目标歧义或无交付差异时 BLOCK。
+          3. 更新 integration/delivery.md 与 run.md：PR URL、base/head 分支及 SHA、范围、主 Issue 和待集成验收项；保留原 PR 描述并补摘要，不合并。
+          完成后 prepared；缺条件直接 BLOCK。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        prepared:
+          criteria: 完整且非空的任务清单中 implementation 与 aggregate 均关闭，仅可剩下明确登记的 integration-acceptance 主 Issue，未解释移出或未分类项不存在，Milestone open；开放 PR 源/目标为指定 milestone/基线，已推送且 SHA 与交接一致，工作树干净；integration/delivery.md 含范围和待集成验收项，handoff 有可读运行入口。
+          target:
+            node: final-review
+    final-review:
+      execution:
+        type: actor-task
+        role: code-reviewer
+        instruction: |
+          1. 读 run.md、integration/delivery.md、主 Issue 验收及历史 review/decision；查询指定集成 PR，固定当前 base/head 与 mergeBase，按本次合同副本确定轮次。
+          2. 无论 Issue 数量均审查当前集成交付。可引用已审查且修订可追溯的证据以减少重复，但须核对基线变化、完整交付范围、新增/合并差异、旧必修项与独立集成验收；无法证明覆盖时执行完整审查，不能跨 PR 沿用批准。
+          3. 纯文档/注释简单修改直接审查，其余按实际可用的 code-review 技能执行；核对自测、CI 与必要集成回归，缺陷或验证缺口写发现列表并给稳定编号。
+          4. 写当前集成 PR 的 integration/rNNN-review.md，注明复用证据和本次补查内容；结束前复核 base/head 未漂移。报告完成即 reviewed，有发现仍 reviewed 交后继裁决；无法完成核验则 BLOCK。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        reviewed:
+          criteria: 报告对应当前指定集成 PR 的确切 base/head/mergeBase，覆盖完整交付范围、基线/集成变化、主 Issue 独立验收（如有）、旧必修项及验证边界；复用证据可追溯且覆盖缺口已补查，无以 Issue 数量免审或跨 PR 沿用批准；发现或无发现明确，结束时修订未漂移；handoff 有运行入口、轮次和报告路径。
+          target:
+            node: decide-pr
+    decide-pr:
+      execution:
+        type: actor-task
+        role: review-judger
+        instruction: |
+          1. 核对集成 PR 当前 base/head 与本轮 review 一致，结合主 Issue 验收和授权范围逐项处置发现：本次修复、延期或不成立，附证据；修订漂移或范围争议 BLOCK。
+          2. 写 integration/rNNN-decision.md；延期项登记 deferred.md；本次必修项给出可执行修复清单和验收要求。
+          3. 决策摘要及确切修订同步至集成 PR 和主 Issue，保留原文与历史；无必修项才记录 approvedBase/approvedHead，PR 保持开放。
+          有本次必修项提交 changes-required，附明确修复清单；无未解决必修项且批准修订明确时提交 approved。证据不足、权限或范围争议用 BLOCK，不伪造业务结果。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: 当前集成 PR 仍开放，报告及决策匹配同一仓库/PR/base/head，结束时修订未漂移；所有发现逐项标明本次修复、延期或不成立并有依据，延期具备必要授权与后续入口，无未解决的范围或授权争议；决策摘要和修订已同步至集成 PR 与主 Issue，handoff 有运行入口、决策路径与远端摘要链接。
+      results:
+        approved:
+          criteria: 无未解决的本次必修项且批准修订明确。
+          target:
+            node: close-milestone
+        changes-required:
+          criteria: 存在有依据的必修清单与验收要求，环境/权限问题不写成产品返工。
+          target:
+            node: plan-remediation
+    close-milestone:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 必须读取当前集成 PR 的有效 review/decision；缺文件或批准不明确即 BLOCK，不能解释为免审。分页核对任务清单：implementation/aggregate 均关闭，仅可留明确登记的 integration-acceptance 主 Issue，且其全部独立验收已被本轮报告/决策覆盖；若已关闭须核验关闭依据和本轮仍覆盖的验收。
+          2. 开放 PR 的仓库、源/目标、base/head 与批准修订一致，所需 CI/保护检查通过，无适用检查有明确依据；漂移、缺验证、保护/权限或网络问题用 BLOCK，由 Manager 安排重新审查/补证，不为技术问题新建产品修复票。
+          3. 以 merge commit 合入指定基线；已合并时核对目标、合并时源 head、当时检查依据与 merge SHA 后只补收尾，不匹配则 BLOCK。
+          4. fetch 核验远端基线包含批准 head/merge SHA，更新 integration/delivery.md；合并验证成功后，为尚 open 的集成验收主 Issue 留下本轮验收和合并证据并关闭，再核对全部 Issue 已关闭，关闭 GitHub Milestone。已关闭对象核验本次归属后复用；安全切回更新后的基线，保持工作树干净。
+          5. 写 completion.md，包含交付范围、集成 PR/merge SHA、实际验证边界和延期事项；同步摘要至主 Issue，更新 run.md。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        delivered:
+          criteria: 当前集成 PR 有绑定确切 base/head 的有效 review/decision，主 Issue 独立验收（如有）已覆盖，无未解决必修项；指定 PR 已合入指定基线，合并源 head 匹配批准修订且当时保护检查满足，远端基线包含批准 head/merge SHA；完整清单全部关闭，集成验收主票（如有）有验收与合并依据，Milestone 已关闭；completion.md 和远端摘要明确实际验证/延期边界，工作树干净并位于基线。
+          target:
+            return: delivered
+    plan-remediation:
+      execution:
+        type: actor-task
+        role: planner
+        instruction: |
+          1. 重入读 run.md 及本轮集成 decision及 run.md 记录的本次合同副本，核对 Milestone 仍 open；外部关闭时 BLOCK，不擅自重开。
+          2. 仅为本次必修项创建/复用修复 Issue，按发现 ID/决策轮次核对已有映射，避免重入重复建票；复杂修复用实际可用的 to-tickets 拆分，记录验收、依赖并标 ready-for-agent。
+          3. 更新 run.md 任务表计划字段，将修复票标为 implementation 并保留已有执行状态，记录 decision/发现 ID→Issue URL 映射；已关闭主 Issue 继续用作历史入口，不因追加修复票擅自重开；非阻断优化须另有范围授权。
+          4. 缺明确修复目标、反复返工无新证据或无法形成可执行票时 BLOCK。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        planned:
+          criteria: 同一开放 Milestone 中存在对应本轮必修项的未完成 implementation 修复票，验收/依赖/标签明确；任务表计划字段和 decision/发现 ID→Issue 映射已更新并保留执行状态，无未解释重复或范围扩张；handoff 含运行入口和映射。
+          target:
+            node: run-issue-cycle
+  returns:
+    - delivered
+    - cancelled
+childWorkflows:
+  issue-cycle:
+    startNode: select-next-issue
+    nodes:
+      select-next-issue:
+        execution:
+          type: actor-task
+          role: coordinator
+          instruction: |
+            1. 读 run.md，分页读取 Milestone 全部记录，排除 PR 后核对任务表；空 Issue 集、未分类、未解释移出/取消或查询不完整时 BLOCK。按查询是否完整判断，不因记录超过 100 单独 BLOCK。
+            2. 仅对 taskKind=aggregate 的纯聚合父票，按父子关系自底向上，在全部子票关闭且无独立验收项后评论并关闭，直到无可关闭的聚合票；每次关闭聚合票后，分页核对同 Milestone 依赖该票的 open implementation，全部 Blocked by 已关闭则补加 ready-for-agent，仍阻塞的不动；taskKind=integration-acceptance 的主 Issue 留给集成验收，不提前关闭。
+            3. 选择 open、taskKind=implementation、ready-for-agent 且全部 Blocked by 已关闭/为空的叶任务；多候选按依赖优先级再按编号升序串行处理。
+            4. 有候选时安全更新 milestone，从确切 SHA 创建 feat/<issue-number>-<slug> 并推送，保存原始 baseCommit；分支已存在则按 Issue/delivery 记录核对归属、原始基线与祖先关系后复用，记录缺失或分歧 BLOCK，不把当前 tip 当原始基线。
+            5. 更新 issues/<number>/delivery.md、任务表执行状态与 Issue 交付区，保留原文和计划字段；记录仓库、featureBranch/baseCommit/milestoneBranch。
+            6. 无候选且非空 implementation 集全部关闭、aggregate 均已关闭，剩余 open 为空或仅为明确登记待集成验收的主 Issue 时 exhausted（任务穷尽）；handoff 附完整性依据、分类和待验收项。还有 open implementation、未关闭 aggregate、无候选但有未解释对象时 BLOCK，逐票说明原因。
+        checker:
+          checkerId: judge.claim-correct
+          config: {}
+        results:
+          selected:
+            criteria: 候选属于指定仓库/Milestone，open、taskKind=implementation、非父级，标签/依赖满足；本节点关闭的 aggregate 已留关闭依据并同步核对解阻标签；指定 feature 分支已从可核验的原始 baseCommit 创建/核验并推送，归属与祖先关系明确，delivery 和任务表执行状态已更新且保留计划字段；handoff 含运行入口及分支身份。
+            target:
+              node: deliver-one-issue
+          exhausted:
+            criteria: 分页完整且无未解释移出/取消或未分类项；至少一个 implementation 且其全部关闭，aggregate 均关闭；剩余 open 可为空，否则只能是已登记明确独立集成验收项的 integration-acceptance 主 Issue，handoff 列出待验收项（没有则写无）与完整性依据。查询失败、仍有 open implementation 或未关闭 aggregate 不得提交 exhausted。
+            target:
+              return: exhausted
+      deliver-one-issue:
+        execution:
+          type: child-workflow
+          workflowId: issue-delivery
+        onReturn:
+          delivered:
+            node: select-next-issue
+    returns:
+      - exhausted
+  issue-delivery:
+    startNode: implement
+    nodes:
+      implement:
+        execution:
+          type: actor-task
+          role: developer
+          instruction: |
+            1. 读本 Issue、delivery.md 与返工 decision（如有），核对工作树、featureBranch/原始 baseCommit 和目标 milestone；简单文档任务直接实现，复杂编码用 implement 技能。
+            2. 实现当前验收项或必修清单，优先复用现有代码和测试，运行适用自测与必要回归；运行环境部署须已有明确授权。
+            3. 检查通过后只提交本任务实现，不含 ignored 运行材料；记录实现 SHA 和实际命令/结果。无法运行必需检查时 BLOCK；纯文档无适用测试写明依据。
+            4. 推送 feature，创建/复用 feature→milestone 开放 PR；返工复用同一开放 PR，已关闭/合并、无可交付差异或身份冲突时 BLOCK。
+            5. 更新 delivery.md、Issue 和 PR 的交付上下文：实现 SHA、当前 PR base/head、验收和检查摘要，保留原文。
+        checker:
+          checkerId: judge.claim-correct
+          config: {}
+        results:
+          implemented:
+            criteria: 指定 Issue 的开放 PR 源/目标分支正确，实现已推送且 head 与交接一致；对应修订有适用自测/回归结果或不适用依据，交付记录和运行入口可读。
+            target:
+              node: review
+      review:
+        execution:
+          type: actor-task
+          role: code-reviewer
+          instruction: |
+            1. 读 Issue 验收、delivery.md、历史 review/decision；固定指定 PR 的当前 base/head/mergeBase，按 run.md 记录的 review-contract 内容副本确定本轮和完整/增量范围。
+            2. 纯文档/注释的简单修改直接审查，其余调用 code-review 技能；对精确 diff、验收项、自测与必要回归证据独立检查，记录发现（稳定编号）与未核实项。
+            3. 写 issues/<number>/rNNN-review.md，包含旧必修项复核和建议结论；结束前复核修订未漂移。
+        checker:
+          checkerId: judge.claim-correct
+          config: {}
+        results:
+          reviewed:
+            criteria: 报告存在并绑定指定仓库/Issue/PR/base/head/mergeBase，覆盖本票验收、精确审查范围、检查证据及验证边界，列明发现或无发现并复核旧必修项；结束时修订未漂移；handoff 有运行入口、轮次、报告路径和修订。
+            target:
+              node: decide-pr
+      decide-pr:
+        execution:
+          type: actor-task
+          role: review-judger
+          instruction: |
+            1. 核对当前 Issue PR/base/head 与本轮 review 一致，按授权范围逐项处置发现：本次修复、延期或不成立，附证据；修订变化或证据不足 BLOCK。
+            2. 写 issues/<number>/rNNN-decision.md：必修项列具体问题、依据和验收要求；延期项写 deferred.md 并给后续入口。
+            3. 决策摘要与本轮修订补到 PR 交付区，保留历史；无必修项才记录 approvedBase/approvedHead，保持 PR 开放、Issue 未关闭。
+            有本次必修项提交 changes-required，附明确修复清单；无未解决必修项且批准修订明确时提交 approved。证据不足、权限或范围争议用 BLOCK，不伪造业务结果。
+        checker:
+          checkerId: judge.claim-correct
+          config:
+            criteria: 当前 Issue 的 PR 仍开放且 Issue 未关闭，报告及决策匹配同一仓库/Issue/PR/base/head，结束时修订未漂移；所有发现逐项标明本次修复、延期或不成立并有依据，延期具备必要授权与后续入口，无未解决的范围或授权争议；决策摘要和修订已同步至 PR，handoff 有运行入口、报告/决策路径及远端摘要链接。
+        results:
+          approved:
+            criteria: 无本次必修项且批准修订明确。
+            target:
+              node: complete-issue
+          changes-required:
+            criteria: 存在有依据的必修清单和可执行验收要求。
+            target:
+              node: implement
+      complete-issue:
+        execution:
+          type: actor-task
+          role: coordinator
+          instruction: |
+            1. 读本轮 decision/delivery，核对开放 PR 的源/目标、base/head 与批准修订一致，开发自测及所需 CI/保护检查满足；保护规则要求他人 approval 而同账号无法满足时 BLOCK。
+            2. 以 merge commit 合入指定 milestone；已合并时核验目标、合并时源 head 与本次批准修订匹配后只补收尾，不重复合并，不匹配 BLOCK。
+            3. fetch 验证远端 milestone 包含 implementationCommit/批准 head 和 merge SHA。
+            4. 更新 delivery.md 和 Issue 交付区，保留 PR、实现/批准修订、检查摘要、review/decision 路径及 merge SHA/核验依据；验证成功再关闭 Issue，已关闭则核验复用。
+            5. 关票时同步标签生命周期：分页检查同 Milestone 内 Blocked by 含本 Issue 的 open implementation 票，其全部 Blocked by 已关闭的补加 ready-for-agent；仍被未关闭票阻塞的不动。select-next-issue 仅对其本节点关闭 aggregate 所解阻的票同步标签；其他无已知解阻依据的缺标签 implementation 票按异常 BLOCK。
+            6. 安全切回更新后的 milestone，保持工作树干净，更新 run.md 进度。
+        checker:
+          checkerId: judge.claim-correct
+          config: {}
+        results:
+          delivered:
+            criteria: 指定 PR 已合入指定 milestone，合并源 head 匹配批准修订且当时保护检查满足；远端 milestone 包含实现/批准提交及 merge SHA，Issue 已关闭、交付记录完整；同 Milestone 依赖本票的 open implementation 已完整核对，全部依赖关闭的补齐 ready-for-agent，仍阻塞的不误放行；工作树干净并位于 milestone，运行进度已追加。
+            target:
+              return: delivered
+    returns:
+      - delivered

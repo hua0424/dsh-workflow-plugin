@@ -1,6 +1,19 @@
 # Domain Glossary
 
-> 当前实现已随 T1–T9 重构合入 `main` 并结算（`refact` 分支为历史）；目标架构见 `docs/design/node-execution-runtime.md`，A01–A30 证据见 `docs/testing/node-execution-runtime-acceptance.md`。本文件描述**当前**合同；验收运行不得操作真实 Run（正式使用需用户显式授权）。
+## 已确认的下一版领域术语（尚未实施）
+
+以下术语用于命名结果改造；其余现行合同尚未切换。方案见 `docs/specs/named-results-and-workflow-returns.md`。
+
+**Node Result（节点结果）**：节点定义的业务结论，一次交付只选择一个结果。不同结果的验收条件由工作流定义为互斥。
+_Avoid_: 把业务结果称为 Judge verdict；用“失败”统称返工、穷尽和取消。
+
+**Exit Contract（出口验收合同）**：确认某个节点结果成立所需的共同条件与该结果的验收条件。Judge 核验所选结果，不代替执行者选择另一结果。
+
+**Workflow Return（流程返回）**：流程结束时向调用方交付的业务结论。子流程返回与根流程终局均不等同于执行生命周期状态。
+
+**Return Mapping（返回映射）**：调用方对被调用流程各返回结果的后续处理约定。
+
+> 以下为现行实现合同（不含上方标注“尚未实施”的下一版术语）。T1–T9 重构已合入 `main` 并结算（`refact` 分支为历史）；目标架构见 `docs/design/node-execution-runtime.md`，A01–A30 证据见 `docs/testing/node-execution-runtime-acceptance.md`。验收运行不得操作真实 Run（正式使用需用户显式授权）。
 
 ## Agent Team Workflow / Manager
 

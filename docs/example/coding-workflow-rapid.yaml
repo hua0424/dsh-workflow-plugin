@@ -1,0 +1,129 @@
+# 单仓单任务：稳定约束在 persona，节点只写动作与结果交接；验收由 criteria 定义。
+schemaVersion: agent-workflow/v3
+roles:
+  coordinator:
+    persona: |
+      负责唯一任务 PR 的合并与 Issue 收尾，按合同「合并与重入」执行；只操作当前授权对象，保留用户改动和历史。
+      每次派发先读 handoff 指向的 run.md，核对任务身份；首次读 docs/dsh-workflow/INDEX.md 与 docs/dsh-workflow/coding-workflow-rapid-contract.md「共同行为与交接」，已有运行使用 run.md 中的合同副本，其余章节按当前职责读取。
+      合并须绑定有效批准 base/head 并满足仓库检查与保护；开放 PR 修订漂移返回审查。项目合并规定优先，未规定用 squash；已合并只补收尾，验证成功再关票。
+      采用安全快进和条件合并，保留分支；强推、硬重置、绕过保护、部署均不在授权内。技术/权限/范围或证据缺口 BLOCK。
+      先保存证据再交付；遵循派发提交协议，提交或 BLOCK 是本轮最后动作。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+  developer:
+    persona: |
+      以最小实现完成唯一 Issue 的既定验收；仅在指定任务分支提交推送，通过同一 PR 交付，合并与关票由后继负责。
+      每次派发先读 handoff 指向的 run.md，核对任务身份；首次读 docs/dsh-workflow/INDEX.md 与 docs/dsh-workflow/coding-workflow-rapid-contract.md「共同行为与交接」，已有运行使用 run.md 中的合同副本，其余章节按当前职责读取。
+      复用现有代码与测试，验证结果据实记录；只提交本任务实现及必要 .gitignore，运行材料保持 ignored。返工按最新审查必修清单执行。
+      保留用户改动；强推、硬重置、部署均不在授权内。需要扩大范围、拆票或修改子仓时 BLOCK；必需验证无法完成则 BLOCK，无适用测试说明依据。
+      先保存证据再交付；遵循派发提交协议，提交或 BLOCK 是本轮最后动作。
+    reuse: continuable
+    model:
+      provider: commandcode
+      modelId: deepseek/deepseek-v4.1-flash
+  code-reviewer:
+    persona: |
+      独立审查并裁决唯一 PR，实现只读；按合同「审查与裁决」把发现、处置与结论写入同一轮报告。
+      每次派发先读 handoff 指向的 run.md，核对任务身份；首次读 docs/dsh-workflow/INDEX.md 与 docs/dsh-workflow/coding-workflow-rapid-contract.md「共同行为与交接」，已有运行使用 run.md 中的合同副本，其余章节按当前职责读取。
+      审查绑定确切 base/head，覆盖完整验收、diff、验证和旧必修项；可复用可追溯证据并补查变化。小任务直接审查。
+      无必修项且验证充分才批准，否则给范围内必修清单。延期需必要授权与后续入口；证据/权限/范围争议 BLOCK。合并与关票由后继负责。
+      先保存证据再交付；遵循派发提交协议，提交或 BLOCK 是本轮最后动作。
+    model:
+      provider: kimi-coding
+      modelId: k3
+judgeRole:
+  persona: |
+    只读核验当前 claim 的共同与所选 result criteria：独立证据支持才 ACCEPT，明确不符 REJECT，信息或查询能力不足 NEED_CONTEXT。
+    从 handoff 定位 run.md 与确切对象；首次读 INDEX.md 和 coding-workflow-rapid-contract.md「共同行为与交接」「Judge 补证」，路径前缀 docs/dsh-workflow/，已有运行用合同副本，其余仅按核验项读取。
+    合同解释证据，不新增冻结 criteria 外的门槛；不假定能看到完整 instruction，不遍历其他结果或代 Actor 选结果。Actor 自述不等于独立证据；Manager 补证须提供可追溯的只读查询结果。
+  model:
+    provider: zai-coding-cn
+    modelId: glm-5.3-flash
+  tools:
+    deny:
+      - edit
+      - write
+workflow:
+  startNode: initialize
+  nodes:
+    initialize:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          读取 docs/dsh-workflow/INDEX.md 与 coding-workflow-rapid-contract.md（同目录）的「共同行为与交接」「启动与授权」「初始化与材料」；重入使用 run.md 的合同副本。本节点仅初始化。
+          1. 确认唯一开放 Issue、已定规格与验收、无子票/未解决依赖，以及仓库和目标分支。
+          2. 从核验后的目标 SHA 建立/复用任务分支；写材料前检查忽略与跟踪状态，必要时补 .gitignore 并在任务分支提交。
+          3. 建立/复用 run.md 和合同快照，记录身份、范围、分支起点、合并方式及忽略证据。
+          ready：产物为可读运行入口、合同快照和可实施任务分支。handoff＝合同的公共交接字段＋规格/验收入口、任务/目标分支、原始 baseCommit、忽略核验与 .gitignore 提交（如有）。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        ready:
+          criteria: 唯一开放 Issue 的规格/验收明确，无子 Issue或未解决依赖，范围仅当前仓库；仓库与任务/目标分支及原始起点已核验，无覆盖用户改动；运行目录已被 Git 忽略且无已跟踪产物，必要 .gitignore 改动仅在任务分支提交；run.md 和适用合同快照可读，身份/范围/验收/合并方式及授权记录完整；handoff 含绝对运行入口。
+          target:
+            node: implement
+    implement:
+      execution:
+        type: actor-task
+        role: developer
+        instruction: |
+          1. 按 Issue 验收实现；返工时处理最新报告必修项。
+          2. 完成适用自测/回归，提交推送，创建/更新任务分支到目标分支的唯一 PR。
+          3. 将实现与验证证据写入 run.md，关键摘要同步 PR。
+          implemented：产物为已推送的实现、开放 PR 和验证记录。handoff＝公共交接字段＋PR/base/head、实现 SHA、自测结果与未测边界、返工项处理情况。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        implemented:
+          criteria: 既定验收或必修清单已实现，唯一 Issue 仍开放；指定任务分支已提交推送且开放 PR 指向指定目标，当前 head 与证据一致；适用自测及必要回归有真实结果或不适用依据，无未完成必需检查；PR diff 无运行产物或无关用户改动；run.md 与 PR 交付摘要可读且含确切修订和验证边界，handoff 有绝对入口。
+          target:
+            node: review
+    review:
+      execution:
+        type: actor-task
+        role: code-reviewer
+        instruction: |
+          1. 固定当前 PR base/head/mergeBase，按合同「审查与裁决」核查验收、diff、验证和旧必修项。
+          2. 写本轮 rNNN-review.md，更新 run.md 索引，决策及修订摘要同步 PR；提交前确认修订一致。
+          approved：报告无未解决必修项，记录 approvedBase/approvedHead。handoff＝公共交接字段＋报告/远端摘要链接、批准修订、检查证据及延期项（如有）。
+          changes-required：报告含范围内可执行必修清单与验收要求，无有效批准。handoff＝公共交接字段＋报告/远端摘要链接、当前修订、必修清单及逐项验收要求。
+      checker:
+        checkerId: judge.claim-correct
+        config:
+          criteria: 当前 Issue 与指定 PR 均开放；本轮报告匹配仓库/Issue/PR/base/head/mergeBase且结束时修订未漂移，覆盖完整验收/diff/验证边界及旧必修项；复用证据的缺口已补查；所有发现均有处置与依据，延期具备必要授权与后续入口，无未解决范围争议；PR 有同修订决策摘要，handoff 含绝对运行入口和报告。
+      results:
+        approved:
+          criteria: 无未解决本次必修项，无缺失的必需验证，批准 base/head 明确，报告及 PR 摘要一致。
+          target:
+            node: merge
+        changes-required:
+          criteria: 存在既定范围内有依据且可执行的必修清单与验收要求，本轮没有有效批准；环境/权限或范围争议不得伪装为代码返工。
+          target:
+            node: implement
+    merge:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 按合同「合并与重入」核对当前 PR、批准报告及必要检查；开放 PR 修订漂移时返回审查。
+          2. 批准仍有效则按既定方式合并；核验实际合并起点与目标包含关系后关票，完成远端摘要和 run.md 收尾，安全回到更新后的目标分支。
+          stale-review：产物为 run.md 中新旧修订及批准失效记录。handoff＝公共交接字段＋PR、旧批准/当前 base/head、重审原因；本分支不合并或关票。
+          delivered：产物为已核验合并的 PR、已关闭 Issue 和收尾记录。handoff＝公共交接字段＋批准修订、合并方式/mergeCommit、实际合并起点/目标包含证据、验证与延期边界、远端摘要。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        stale-review:
+          criteria: 指定 PR 仍开放且仓库/Issue/源目标归属明确，存在原有效批准但当前 base 或 head 已变化，新旧修订及失效原因已记入 run.md；未执行合并或关闭 Issue，handoff 含入口和须重新审查的确切对象。
+          target:
+            node: review
+        delivered:
+          criteria: 指定 PR 已按项目允许方式合入目标，合并源 head 匹配本次批准修订且有匹配批准 base 的合并前核验及必要检查/保护证据，实际合并提交链起点已独立核验等于 approvedBase（squash/merge 第一父节点，rebase 可追溯链或可靠远端证据）；远端目标包含 PR mergeCommit（仅 merge commit 方式额外要求包含批准 head）；Issue 已关闭并有交付证据摘要；run.md 记录批准/合并修订、验证及延期边界和远端链接，工作树干净并已安全回到目标分支；重入无重复外部副作用。
+          target:
+            return: delivered
+  returns:
+    - delivered
