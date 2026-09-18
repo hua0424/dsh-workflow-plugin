@@ -30,11 +30,9 @@ const method = args.includes('--method') ? args[args.indexOf('--method') + 1] : 
 const path = args.find((a) => a.startsWith('repos/')) ?? '';
 
 if (args[0] === 'repo') {
-  // repo view --json nameWithOwner / sshUrl
-  const key = args.includes('sshUrl') ? 'sshUrl' : 'nameWithOwner';
-  const val = key === 'sshUrl' ? process.env.FAKE_GIT_DIR.replace(/\\/g, '/') : 't/r';
-  // 脚本带 -q '<key>'，jq 过滤后取原始值
-  console.log(val);
+  // repo view --json nameWithOwner（脚本仅请求该字段）
+  // 脚本带 -q '.nameWithOwner'，jq 过滤后取原始值
+  console.log('t/r');
   process.exit(0);
 }
 if (path.startsWith('repos/t/r/git/ref/heads/')) {
@@ -75,6 +73,17 @@ if (method === 'POST' && path === 'repos/t/r/git/commits') {
 }
 if (method === 'PATCH' && path.startsWith('repos/t/r/git/refs/heads/')) {
   const name = path.replace('repos/t/r/git/refs/heads/', '');
+  // F2 测试 seam：FAKE_PATCH_FAIL=error 模拟非缺失失败（ref 仍在）；
+  // =missing 模拟竞态（step1 后远端分支被删，PATCH 404 且重查亦缺失）
+  if (process.env.FAKE_PATCH_FAIL === 'error') {
+    console.error('HTTP 422: Update is not a fast forward');
+    process.exit(1);
+  }
+  if (process.env.FAKE_PATCH_FAIL === 'missing') {
+    const r = refs(); delete r[name]; writeRefs(r);
+    console.error('HTTP 404: Reference does not exist');
+    process.exit(1);
+  }
   const r = refs(); r[name] = readInput().sha; writeRefs(r);
   git('', 'update-ref', `refs/heads/${name}`, r[name]); // 物化到 bare，脚本 verify 的 fetch 才能看到
   log({ kind: 'ref-update', ref: name, sha: r[name] });

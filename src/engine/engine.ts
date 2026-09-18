@@ -2,6 +2,7 @@
 import type { WorkflowConfig, NodeClaim, NodeDef, Target, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
 import { WorkflowError, LIMITS, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
+import { resolveRoleModel } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
@@ -35,6 +36,11 @@ export type SessionAvailability = 'available' | 'missing' | 'unknown'
  * 唯一阻碍（等待中的正常空回合）；`unsafe` 收口未知，必须 fail-closed。
  */
 export type SafeInspection = 'safe' | 'waiting' | 'unsafe'
+/**
+ * probeSessionIdle 的判定结果（#74）：`safe` = 探针即安全；`cold-safe` = 探针不安全
+ * 但无可观测活动（冷会话）；`active` = 仍有活动；两种 stale = 对应阶段 CAS 复查失败。
+ */
+export type SessionIdleVerdict = 'safe' | 'cold-safe' | 'safety-stale' | 'activity-stale' | 'active'
 export interface SubagentHost {
   ensureRoleActor(run: RunState, roleKey: string, initialText: string): Promise<{ childId: string; messageId: string }>
   startJudge(run: RunState, input: JudgeSpawnInput): Promise<{ judgeSessionId: string; messageId: string }>
@@ -62,7 +68,9 @@ export interface StateHost {
   events(workspaceKey: string, executionId: string, after?: number, limit?: number): Promise<NodeExecutionEvent[]>
   historyOwner(workspaceKey: string, executionId: string): Promise<{ runId: string; managerSessionId: string } | undefined>
 }
-// `run` 缺席只表示「没有可返回的 Run」（#30 的幂等 reset）；失败分支不带 run。
+// EngineOutcome 契约（#82 定稿，语义另见 CONTEXT.md）：成功分支的 `run` 可缺席，全仓唯一
+// 「成功但无 run」的返回点是无活动 Run 的 reset 幂等成功（`no active run`，不写库/不产生事件）；
+// 失败分支不带 run。新增 `run` 读取点必须处理 `undefined`（strict 编译期可拦），不得假设成功必有 Run。
 export type EngineOutcome = { ok: true; run?: RunState; message: string } | { ok: false; reason: string }
 export function executorSessionOf(run: RunState): string {
   const frame = topFrame(run)
@@ -237,15 +245,12 @@ export class WorkflowEngine {
         if (predecessor?.judge && !predecessor.judge.settled) knownSessions.add(predecessor.judge.sessionId)
       }
       for (const sessionId of knownSessions) {
-        let safe: 'safe' | 'unsafe'
-        try { safe = await this.whenIdleProbe(sessionId) }
+        let verdict: SessionIdleVerdict
+        try { verdict = await this.probeSessionIdle(sessionId, () => this.sameRow(ws, previous)) }
         catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
-        if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run safety inspection')
-        if (safe !== 'safe') {
-          const activity = await this.actorActivity(sessionId)
-          if (!await this.sameRow(ws, previous)) return rejected('workspace history changed during terminated Run activity inspection')
-          if (activity !== 'unknown') return rejected(`terminated Run session ${sessionId} is not safely closed`)
-        }
+        if (verdict === 'safety-stale') return rejected('workspace history changed during terminated Run safety inspection')
+        if (verdict === 'activity-stale') return rejected('workspace history changed during terminated Run activity inspection')
+        if (verdict === 'active') return rejected(`terminated Run session ${sessionId} is not safely closed`)
       }
     }
     // #91: 默认路由按 Run 冻结，且在创建/hash/首次派发之前写入——冻结只影响之后
@@ -324,15 +329,11 @@ export class WorkflowEngine {
         if (role !== 'manager' && run.roleActors[role]) {
           if (!previousDispatchSettled) {
             const sessionId = run.roleActors[role]
-            const safe = await this.whenIdleProbe(sessionId)
-            if (!await this.stillCurrent(ws, e, arrangedVersion)) return
-            if (safe !== 'safe') {
-              const activity = await this.actorActivity(sessionId)
-              if (!await this.stillCurrent(ws, e, arrangedVersion)) return
-              // 冷会话（activity==='unknown'：无存活进程=无未收口执行）与 resume
-              // 路径同等安全，直接放行；只有仍可观测到活动的会话才是 dispatch fault。
-              if (activity !== 'unknown') throw new WorkflowError('previous Role execution is not safely closed')
-            }
+            // 冷会话（activity==='unknown'：无存活进程=无未收口执行）与 resume
+            // 路径同等安全，直接放行；只有仍可观测到活动的会话才是 dispatch fault。
+            const verdict = await this.probeSessionIdle(sessionId, async () => (await this.stillCurrent(ws, e, arrangedVersion)) !== undefined)
+            if (verdict === 'safety-stale' || verdict === 'activity-stale') return
+            if (verdict === 'active') throw new WorkflowError('previous Role execution is not safely closed')
           }
           if (!e.roleBoundaryPrepared) {
             const compact = await this.subagents.compactRoleActor(run, role)
@@ -388,7 +389,7 @@ export class WorkflowEngine {
       const continuationSessionId = e.resolution?.target === 'judge' && e.resolution.judgeMode === 'followup'
         ? e.resolution.judgeSessionId : undefined
       if (!e.judge) {
-        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
         await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
         committedVersion = version + 1
       } else if (e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion
@@ -412,6 +413,20 @@ export class WorkflowEngine {
   private async whenIdleProbe(sessionId: string): Promise<'safe' | 'unsafe'> {
     const result = await withTimeout(this.subagents.safeToInspect(sessionId), DISPATCH_TIMEOUTS.whenIdle, 'whenIdle')
     return result === 'safe' ? 'safe' : 'unsafe'
+  }
+  /**
+   * 「探针 → activity → CAS 复查」统一 helper（#74）：5 处复用同一顺序与判定——
+   * 探针 safe 直接放行，unsafe 才查 activity，只有仍可观测到活动才算 active；
+   * 每次跨 await 后都经调用方 CAS 复查（`isFresh`），任一阶段过期即报对应 stale。
+   * fail-closed 语义不变：各调用点的 stale/活动文案与失败动作仍由调用方决定。
+   */
+  private async probeSessionIdle(sessionId: string, isFresh: () => Promise<boolean>): Promise<SessionIdleVerdict> {
+    const safe = await this.whenIdleProbe(sessionId)
+    if (!await isFresh()) return 'safety-stale'
+    if (safe === 'safe') return 'safe'
+    const activity = await this.actorActivity(sessionId)
+    if (!await isFresh()) return 'activity-stale'
+    return activity === 'unknown' ? 'cold-safe' : 'active'
   }
   /**
    * 探针超时=技术故障，不是"不安全"：降级为携带阶段名的 BLOCK 并返回 undefined；
@@ -840,17 +855,14 @@ export class WorkflowEngine {
     let replaceRole = false
     if (role !== 'manager' && run.roleActors[role] && (resolvedTarget === 'actor' || !e.dispatch?.settled)) {
       const sessionId = run.roleActors[role]
-      const safe = await this.whenIdleProbe(sessionId)
-      if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role safety inspection')
-      if (safe !== 'safe') {
-        const activity = await this.actorActivity(sessionId)
-        if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role activity inspection')
-        if (activity !== 'unknown') return rejected('previous Role execution is not safely closed')
-        if (resolvedTarget === 'actor') {
-          const availability = await this.subagents.roleSessionAvailability(sessionId)
-          if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role Session inspection')
-          replaceRole = availability === 'missing'
-        }
+      const verdict = await this.probeSessionIdle(sessionId, () => this.sameRow(ws, row))
+      if (verdict === 'safety-stale') return rejected('stale resume request after Role safety inspection')
+      if (verdict === 'activity-stale') return rejected('stale resume request after Role activity inspection')
+      if (verdict === 'active') return rejected('previous Role execution is not safely closed')
+      if (verdict === 'cold-safe' && resolvedTarget === 'actor') {
+        const availability = await this.subagents.roleSessionAvailability(sessionId)
+        if (!await this.sameRow(ws, row)) return rejected('stale resume request after Role Session inspection')
+        replaceRole = availability === 'missing'
       }
     }
     const oldJudge = e.judge
@@ -873,23 +885,38 @@ export class WorkflowEngine {
         : historicalNeedContext && !oldJudge ? e.previousJudge
           : restartRecovery && unjudgedCurrent ? oldJudge : undefined
       if ((restartRecovery || sameJudgeNeedContext) && judgeToContinue) {
-        const availability = await this.subagents.judgeSessionAvailability(judgeToContinue.sessionId)
-        if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge Session inspection')
-        if (availability !== 'missing') {
-          const safe = await this.whenIdleProbe(judgeToContinue.sessionId)
-          if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge safety inspection')
-          if (safe !== 'safe') {
-            const activity = await this.actorActivity(judgeToContinue.sessionId)
-            if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge activity inspection')
-            if (!restartRecovery || activity !== 'unknown') return rejected('previous Judge turn is not safely closed')
-          }
-          judgeMode = 'followup'
-          judgeSessionId = judgeToContinue.sessionId
-        } else {
+        // Issue #22：Judge 模型热更新后，旧会话仍绑定旧路由——followup 只会把同
+        // 一个失败再派一次。绑定快照与当前解析值不一致时自动偏好 fresh（释放旧
+        // 会话 + 新路由 spawn），与 Role Actor“覆盖即删映射”同行为；Manager 仍
+        // 可用 judge_respawn 显式重建。
+        const currentRoute = resolveRoleModel(run, 'judge', run.delegationRoute)
+        const bound = judgeToContinue.model
+        const routeChanged = bound === undefined
+          ? run.modelOverrides['judge'] !== undefined
+          : bound.provider !== currentRoute.provider || bound.modelId !== currentRoute.modelId
+        if (routeChanged) {
           try {
             if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')
           } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
           judgeMode = 'fresh'
+        } else {
+          const availability = await this.subagents.judgeSessionAvailability(judgeToContinue.sessionId)
+          if (!await this.sameRow(ws, row)) return rejected('stale judge resume request after Judge Session inspection')
+          if (availability !== 'missing') {
+            const verdict = await this.probeSessionIdle(judgeToContinue.sessionId, () => this.sameRow(ws, row))
+            if (verdict === 'safety-stale') return rejected('stale judge resume request after Judge safety inspection')
+            if (verdict === 'activity-stale') return rejected('stale judge resume request after Judge activity inspection')
+            // 原条件 !restartRecovery || activity !== 'unknown'：探针 safe 直接放行；
+            // 冷会话仅 restart 恢复放行，active 一律拒绝。
+            if (verdict === 'active' || (verdict === 'cold-safe' && !restartRecovery)) return rejected('previous Judge turn is not safely closed')
+            judgeMode = 'followup'
+            judgeSessionId = judgeToContinue.sessionId
+          } else {
+            try {
+              if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')
+            } catch (error) { return rejected(`Judge drain failed: ${error instanceof Error ? error.message : String(error)}`) }
+            judgeMode = 'fresh'
+          }
         }
       } else {
         const judgeToDrain = oldJudge ?? (e.previousJudge?.claimId === e.claim.id ? e.previousJudge : undefined)
@@ -943,7 +970,7 @@ export class WorkflowEngine {
     if (resolvedTarget === 'judge') {
       e.judge = {
         id: newNodeToken(), sessionId: judgeSessionId ?? newNodeToken(), claimId: e.claim!.id,
-        inputVersion: e.inputVersion, settled: false,
+        inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute),
       }
     }
     e.restartPending = false
@@ -988,7 +1015,7 @@ export class WorkflowEngine {
         decision: reason || 'Manager requested Judge respawn',
       }
       e.restartPending = false
-      const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false }
+      const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
       arrangedId = arranged.id
       e.judge = arranged
       e.blockReason = null
@@ -1116,13 +1143,10 @@ export class WorkflowEngine {
     const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
     if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')
     if (mapped) {
-      const safe = await this.whenIdleProbe(mapped)
-      if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role safety inspection')
-      if (safe !== 'safe') {
-        const activity = await this.actorActivity(mapped)
-        if (!await this.sameRow(ws, row)) return rejected('stale model replacement after Role activity inspection')
-        if (activity !== 'unknown') return rejected('active actor cannot be replaced')
-      }
+      const verdict = await this.probeSessionIdle(mapped, () => this.sameRow(ws, row))
+      if (verdict === 'safety-stale') return rejected('stale model replacement after Role safety inspection')
+      if (verdict === 'activity-stale') return rejected('stale model replacement after Role activity inspection')
+      if (verdict === 'active') return rejected('active actor cannot be replaced')
     }
     row.run.modelOverrides[role] = route
     if (mapped) delete row.run.roleActors[role]

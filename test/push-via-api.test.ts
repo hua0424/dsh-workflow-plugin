@@ -12,9 +12,10 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const script = join(repoRoot, 'scripts', 'push-via-api.mjs');
 const fakeGh = join(repoRoot, 'test', 'push-via-api-fake-gh.mjs');
+const MAX_BUFFER = 256 * 1024 * 1024;
 
 function sh(cwd, cmd, ...args) {
-  return execFileSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+  return execFileSync(cmd, args, { cwd, encoding: 'utf8', maxBuffer: MAX_BUFFER });
 }
 function setup() {
   const work = mkdtempSync(join(tmpdir(), 'pva-work-'));
@@ -46,7 +47,7 @@ test('push-via-api 端到端：逐 blob 校验 + tree 级等价核验通过，�
   const { work, bare, refsFile, logFile } = setup();
   try {
     const out = execFileSync(process.execPath, [script, 'HEAD', 'topic'], {
-      cwd: work, encoding: 'utf8', maxBuffer: 256 * 1024 * 1024,
+      cwd: work, encoding: 'utf8', maxBuffer: MAX_BUFFER,
       env: { ...process.env, PUSH_VIA_API_GH: fakeGh, FAKE_GIT_DIR: bare, FAKE_REFS: refsFile, FAKE_LOG: logFile,
         GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
     });
@@ -104,5 +105,77 @@ test('push-via-api dry-run 不写远端；远端 ref 缺失时明确报错', () 
   } finally {
     rmSync(work, { recursive: true, force: true });
     rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+// F3：--skip-verify 为显式 opt-out——发布路径与默认一致，仅跳过脚本内 fetch 核验；
+// 本用例断言开关语义（跳过提示 + 远端仍落到孪生 commit），保留理由见脚本 --help 行
+test('push-via-api --skip-verify 跳过等价核验但仍发布远端', () => {
+  const { work, bare, refsFile } = setup();
+  try {
+    const out = execFileSync(process.execPath, [script, 'HEAD', 'topic', '--skip-verify'], {
+      cwd: work, encoding: 'utf8',
+      env: { ...process.env, PUSH_VIA_API_GH: fakeGh, FAKE_GIT_DIR: bare, FAKE_REFS: refsFile,
+        GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' },
+    });
+    assert.match(out, /\[skip\] 跳过 tree 级等价核验/);
+    const commit = /DONE ([0-9a-f]{40})/.exec(out)[1];
+    const remoteSha = JSON.parse(readFileSync(refsFile, 'utf8')).topic;
+    assert.equal(remoteSha, commit);
+    // 开关只跳过脚本内核验，不降低发布正确性：直接在 bare 远端库内比对 tree 等价
+    //（脚本跳过 fetch，故本地库无该对象，不能用 sh(work, ...) 查）
+    const remoteTree = execFileSync('git', ['--git-dir', bare, 'rev-parse', `${remoteSha}^{tree}`], { encoding: 'utf8' }).trim();
+    const localTree = sh(work, 'git', 'rev-parse', 'HEAD^{tree}').trim();
+    assert.equal(remoteTree, localTree);
+  } finally {
+    rmSync(work, { recursive: true, force: true });
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+// F2：PATCH 失败分类——非缺失失败 fail-closed（不 POST、不改远端）；
+// 竞态缺失（重查亦无 ref）才回退 POST 创建
+test('push-via-api PATCH 失败分类：非缺失不创建，竞态缺失才 POST', () => {
+  const baseEnv = (extra) => ({ ...process.env, PUSH_VIA_API_GH: fakeGh, FAKE_GIT_DIR: extra.bare, FAKE_REFS: extra.refsFile,
+    GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' });
+
+  { // 非缺失失败：ref 仍在 → fail-closed，远端 ref 不动且无 ref-create 请求
+    const { work, bare, refsFile, logFile } = setup();
+    try {
+      const before = readFileSync(refsFile, 'utf8');
+      let err = null;
+      try {
+        execFileSync(process.execPath, [script, 'HEAD', 'topic', '--skip-verify'], {
+          cwd: work, encoding: 'utf8', stdio: 'pipe',
+          env: { ...baseEnv({ bare, refsFile }), FAKE_PATCH_FAIL: 'error', FAKE_LOG: logFile },
+        });
+      } catch (e) { err = e; }
+      assert.ok(err, '非缺失 PATCH 失败应终止');
+      assert.match(err.stderr.toString(), /阶段: ref/);
+      assert.match(err.stderr.toString(), /不自动创建/);
+      assert.equal(readFileSync(refsFile, 'utf8'), before);
+      const reqs = readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      assert.equal(reqs.filter((r) => r.kind === 'ref-create').length, 0);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+      rmSync(bare, { recursive: true, force: true });
+    }
+  }
+
+  { // 竞态缺失：PATCH 404 且重查无 ref → POST 创建，远端落到孪生 commit
+    const { work, bare, refsFile, logFile } = setup();
+    try {
+      const out = execFileSync(process.execPath, [script, 'HEAD', 'topic', '--skip-verify'], {
+        cwd: work, encoding: 'utf8',
+        env: { ...baseEnv({ bare, refsFile }), FAKE_PATCH_FAIL: 'missing', FAKE_LOG: logFile },
+      });
+      const commit = /DONE ([0-9a-f]{40})/.exec(out)[1];
+      assert.equal(JSON.parse(readFileSync(refsFile, 'utf8')).topic, commit);
+      const reqs = readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+      assert.equal(reqs.filter((r) => r.kind === 'ref-create').length, 1);
+    } finally {
+      rmSync(work, { recursive: true, force: true });
+      rmSync(bare, { recursive: true, force: true });
+    }
   }
 });

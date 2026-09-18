@@ -77,8 +77,11 @@ judgeRole:                   # Judge
   主会话承担。
 - **运行时覆盖的限制**：目标 Worker 有活跃 turn、或当前节点的 actor 正在
   等待判定/修正（pendingClaim/pendingCorrection）时，override 被拒绝；
-  Worker 的覆盖在 actor 空闲时生效（删除旧映射，下次派发按新路由创建
-  replacement），Judge 的覆盖只影响下一次 Judge 重建。
+  覆盖只影响之后新建的会话——Worker 的覆盖在 actor 空闲时生效（删除旧映射，
+  下次派发按新路由创建 replacement），Judge 的覆盖后 `node_resume` 自动对旧
+  会话走 fresh（释放旧会话 + 按新路由 spawn，与 Worker 一致）；正在判定的
+  live Judge 会话不受影响，旧模型额度耗尽时用新模型覆盖后直接 `node_resume`
+  即可，无需先 `judge_respawn`（Issue #22）。
 - **只允许 provider + modelId**：不配置 maxTokens / temperature / fallback
   等 provider 属性；subagent 的 spawn provider（in-process continuable）
   也是固定的，YAML 不配置。
