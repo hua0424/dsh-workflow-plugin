@@ -60,6 +60,17 @@ function ghApiJson(method, path, body) {
   return gh('api', '--method', method, path, '--input', file);
 }
 
+// ls-tree 行解析（F4：blob 枚举与远端复用枚举共用同一解析器，避免两处手写漂移）
+function parseLsTree(output) {
+  const rows = [];
+  for (const line of output.split('\n').filter(Boolean)) {
+    const tabIndex = line.indexOf('\t');
+    const [mode, type, sha] = line.slice(0, tabIndex).split(' ');
+    rows.push({ path: line.slice(tabIndex + 1), mode, type, sha });
+  }
+  return rows;
+}
+
 function fail(stage, msg) {
   console.error(`[push-via-api] 失败（阶段: ${stage}）: ${msg}`);
   process.exit(1);
@@ -84,10 +95,8 @@ console.log(`远端 head（作为 commit parents）: ${remoteHead}`);
 
 // ---------- 2. 本地提交的完整条目表（坑③：整树提交，不做增量 base_tree）----------
 const entries = new Map(); // path -> { mode, type, sha }
-for (const line of git('ls-tree', '-r', '--full-tree', localCommit).split('\n').filter(Boolean)) {
-  const tabIndex = line.indexOf('\t');
-  const [mode, type, sha] = line.slice(0, tabIndex).split(' ');
-  entries.set(line.slice(tabIndex + 1), { mode, type, sha });
+for (const { path, mode, type, sha } of parseLsTree(git('ls-tree', '-r', '--full-tree', localCommit))) {
+  entries.set(path, { mode, type, sha });
 }
 const changed = git('diff-tree', '-r', '--name-status', remoteHead, localCommit)
   .split('\n').filter(Boolean)
@@ -99,8 +108,7 @@ console.log(`相对远端 head 变更 ${changed.length} 个路径；本地树共
 
 // ---------- 3. 逐 blob 发布并按 SHA 校验（坑①）----------
 const remoteBlobShas = new Set();
-for (const line of git('ls-tree', '-r', '--full-tree', remoteHead).split('\n').filter(Boolean)) {
-  const [mode, type, sha] = line.slice(0, line.indexOf('\t')).split(' ');
+for (const { type, sha } of parseLsTree(git('ls-tree', '-r', '--full-tree', remoteHead))) {
   if (type === 'blob') remoteBlobShas.add(sha);
 }
 const blobChecks = [];
@@ -137,8 +145,12 @@ function buildTree(paths, prefix = '') {
   const tree = [];
   for (const [dir, sub] of dirs) tree.push({ path: dir, mode: '040000', type: 'tree', sha: buildTree(sub, `${prefix}${dir}/`) });
   for (const p of files) {
-    const { mode, sha } = entries.get(prefix + p);
-    tree.push({ path: p, mode, type: 'blob', sha });
+    // F1：透传条目真实类型，非 blob（submodule 等 type commit）显式 fail-closed，
+    // 与 blob 阶段的 changed 路径检查同强度，不静默写坏远端树
+    const meta = entries.get(prefix + p);
+    if (!meta) fail('tree', `路径 ${prefix + p} 不在本地提交树中`);
+    if (meta.type !== 'blob') fail('tree', `路径 ${prefix + p} 为 ${meta.type} 类型（submodule 等）暂不支持经本脚本发布`);
+    tree.push({ path: p, mode: meta.mode, type: 'blob', sha: meta.sha });
   }
   if (dryRun) return 'dry-run-tree';
   return JSON.parse(ghApiJson('POST', `${api}/trees`, { tree })).sha;
@@ -161,15 +173,27 @@ console.log(`commit: ${newCommit}（tree 等价于本地 ${localCommit}）`);
 if (dryRun) {
   console.log('[dry-run] 未写远端；实际执行将 PATCH refs/heads/' + remoteRef + '（不存在则 POST refs）');
 } else {
+  // F2：PATCH 失败先重查 ref 是否存在——缺失才 POST 创建（gh 报错走 stdio 直出，
+  // 此处 catch 到的 message 不带 HTTP 状态，故不用正则分类，而以 GET 重查为准）；
+  // 其余失败 fail-closed 报真实原因。parents=[remoteHead] 使 PATCH 天然 fast-forward，
+  // 故不再传 spec 未要求的 force:true
   try {
-    ghApiJson('PATCH', `${api}/refs/heads/${remoteRef}`, { sha: newCommit, force: true });
+    ghApiJson('PATCH', `${api}/refs/heads/${remoteRef}`, { sha: newCommit });
   } catch {
-    ghApiJson('POST', `${api}/refs`, { ref: `refs/heads/${remoteRef}`, sha: newCommit });
+    let refMissing = false;
+    try { gh('api', `repos/${repo}/git/ref/heads/${remoteRef}`); } catch { refMissing = true; }
+    if (refMissing) {
+      ghApiJson('POST', `${api}/refs`, { ref: `refs/heads/${remoteRef}`, sha: newCommit });
+    } else {
+      fail('ref', `更新远端 ref 失败（ref 仍存在，不自动创建；请据上方 gh 报错排查后重跑）`);
+    }
   }
   console.log(`ref 更新: refs/heads/${remoteRef} → ${newCommit}`);
 }
 
 // ---------- 7. 核验：逐 blob（第 3 步）+ tree 级等价（fetch 后 diff --exit-code）----------
+// --skip-verify 保留理由：受限网络下 fetch 常被断，允许显式跳过脚本内核验
+//（发布路径不变，调用方自行核对 tree 等价）；默认仍走两级核验
 if (dryRun || skipVerify) {
   console.log('[skip] 跳过 tree 级等价核验');
 } else {
@@ -180,7 +204,9 @@ if (dryRun || skipVerify) {
   const localTree = git('rev-parse', `${localCommit}^{tree}`);
   if (remoteTree !== localTree) fail('verify', `tree SHA 不等价: 远端 ${remoteTree} vs 本地 ${localTree}`);
   console.log(`tree 级等价核验通过: ${remoteTree}`);
-  console.log('[回齐指引] 远端为孪生 commit（同 tree 不同 SHA），本地回齐需手动执行：');
-  console.log(`  git fetch ${remote} ${remoteRef} && git checkout ${localRef} && git reset --hard ${newCommit}`);
+  // F5：回齐指引不再假设 localRef 为分支名（SHA 时 checkout 无意义），
+  // 与 operations.md 口径一致：fetch + reset --hard 到已取回的远端头（先切到待回齐分支）
+  console.log('[回齐指引] 远端为孪生 commit（同 tree 不同 SHA），本地回齐需手动执行（先切到待回齐分支）：');
+  console.log(`  git fetch ${remote} ${remoteRef} && git reset --hard FETCH_HEAD`);
 }
 console.log(`DONE ${newCommit}`);
