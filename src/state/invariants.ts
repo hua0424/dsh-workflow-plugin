@@ -8,7 +8,8 @@ import { LIMITS, ID_PATTERN, declaredResults, type CallFrame, type NodeDef, type
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
 const dispatch = z.object({ id: text, sessionId: text.optional(), messageId: text.optional(), settled: z.boolean() }).strict()
-const judge = dispatch.extend({ sessionId: text, claimId: text, inputVersion: revision })
+const route = z.object({ provider: text.optional(), modelId: text.optional() }).strict()
+const judge = dispatch.extend({ sessionId: text, claimId: text, inputVersion: revision, model: route.optional() })
 // v3: claim 携带一个已声明的节点结果名（result），不再有 outcome。
 const claim = z.object({ id: text, dispatchId: text, result: z.string().regex(ID_PATTERN), handoff: z.string().trim().min(1).max(LIMITS.handoffMax) }).strict()
 const frame = z.object({ workflowId: text, nodeId: text, nodeToken: z.uuid(), executionId: text }).strict()
