@@ -14,6 +14,10 @@
 # 说明：本文件是 v3 示例，不是 docs/example/workflow-template.yaml 的替代——那份
 # v2 模板的迁移属于配置迁移 Issue #129。定向验证见 test/v3-combined-example.test.ts。
 schemaVersion: agent-workflow/v3
+# Issue #140：各 Role Actor 的共同 system 约定放这里（公共在前、角色 persona 在后，
+# 以单个空行分隔）；节点专属动作与 result/handoff 仍放各节点 instruction。
+# 不注入 judgeRole，也不注入 Manager 派发文本。
+actorCommonPersona: "All worker roles share this discipline: report exactly one named result per node."
 roles:
   reviewer: { persona: Review the delivery and report one named result. }
   worker: { persona: Do the assigned work and report one named result. }

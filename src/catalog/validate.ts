@@ -75,7 +75,23 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
   }
 }
 
+  // Issue #140：可选公共 persona。trim 后为空即拒绝（绕过 schema 手工构造的防御），
+  // 正常值只做 trim（组合函数读冻结快照，不在这里拼接，避免快照 role persona 被改写
+  // 导致重复拼接）。judgeRole / Manager 派发路径不读取该字段。
+  if (config.actorCommonPersona !== undefined) {
+    const trimmed = config.actorCommonPersona.trim()
+    if (trimmed === '') {
+      problems.push('actorCommonPersona must be a non-empty string when provided')
+    } else {
+      config.actorCommonPersona = trimmed
+    }
+  }
+
   // roles
+  // #140 的公共 persona 同样适用提交协议关键词警告（drift 风险提示，不阻塞）。
+  if (config.actorCommonPersona !== undefined) {
+    checkPersonaProtocol('actorCommonPersona', config.actorCommonPersona, warnings)
+  }
   for (const [roleKey, role] of Object.entries(config.roles)) {
     if (!ID_PATTERN.test(roleKey)) {
       problems.push(`role key "${roleKey}" is not a valid lowercase [a-z][a-z0-9-]* id`)

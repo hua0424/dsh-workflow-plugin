@@ -21,7 +21,7 @@ import type { DelegationRoute, RunState, SpawnAgentOptions } from '../types.ts'
 import { routeToAgentOptions, WorkflowError } from '../types.ts'
 import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
-import { JUDGE_REQUIRED_TOOLS, JUDGE_DEFAULT_DENY, judgeLabel, judgeSpawnPlan, knownDenyList, resolveRoleModel, roleDenyList } from '../roles/roles.ts'
+import { JUDGE_REQUIRED_TOOLS, JUDGE_DEFAULT_DENY, judgeLabel, judgeSpawnPlan, knownDenyList, resolveRoleModel, roleActorPersona, roleDenyList } from '../roles/roles.ts'
 import { topFrame } from '../state/invariants.ts'
 import { DISPATCH_TIMEOUTS, withTimeout } from '../engine/timeouts.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
@@ -336,7 +336,8 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
         request: {
           prompt: textBlocks(initialText),
           parent: manager,
-          persona: roleDef.persona,
+          // Issue #140：Role Actor persona 唯一组合点（公共 + 角色，缺省原样）。
+          persona: roleActorPersona(run, roleKey),
           toolFilter: deny.length > 0 ? { deny } : undefined,
           agentOptions: routeToAgentOptions(route),
         },

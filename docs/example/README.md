@@ -150,6 +150,7 @@ Judge 与其他 Role 一样继承**全量工具目录**，插件只把写类/副
 | --- | --- | --- |
 | `schemaVersion` | ✓ | v2 示例为 `agent-workflow/v2`；**当前运行时要求 `agent-workflow/v3`** |
 | `roles` | ✓ | worker Role 定义表；key 即 roleKey |
+| `actorCommonPersona` | ✗ | 工作流级公共 persona：可选非空字符串，见「工作流级公共 persona（Issue #140）」 |
 | `judgeRole` | ✓ | Judge 定义（persona 必填，model / tools.deny 可选，见「Judge 工具面」） |
 | `workflow` | ✓ | 根工作流图 |
 | `childWorkflows` | ✗ | 子工作流图（按 workflowId 引用） |
@@ -162,6 +163,37 @@ Role 定义：
 | `model` | ✗ | `{ provider, modelId }`，见上文 |
 | `tools.deny` | ✗ | 非空列表；在插件默认 deny 清单（`edit`/`write` + workflow 控制工具）之上再收紧，受保护工具不可 deny |
 | `reuse` | ✗ | `node`（缺省）或 `continuable`；会话复用粒度，见「会话复用粒度（Issue #60）」 |
+
+## 工作流级公共 persona（Issue #140）
+
+顶层可选字段 `actorCommonPersona`：各 Role Actor 共同遵守的 system 约定。
+
+```yaml
+schemaVersion: agent-workflow/v3
+actorCommonPersona: |
+  本工作流所有执行角色共同遵守的 system 约定。
+roles:
+  developer:
+    persona: |
+      开发角色专属职责。
+```
+
+要点：
+
+- **可选非空**：缺省时行为与旧版完全一致（角色 persona 原样用作 system
+  prompt）；提供时 trim 后存储，空白值与非字符串被严格拒绝（含绕过 schema
+  的手工构造，静态校验同样拒绝）。
+- **组合顺序固定**：`actorCommonPersona` 在前、角色专属 persona 在后，中间以
+  单个空行（`\n\n`）分隔；原始角色 persona 的语义不被修改。
+- **唯一组合点**：角色会话创建（spawn）与冷恢复后的一切读取都走
+  `roleActorPersona`（`src/roles/roles.ts`），只读冻结快照、不改写快照，
+  重复组合不会叠加；冷物化本身不重设 persona，沿用 spawn 时的会话。
+- **不注入 Judge 与 Manager**：`judgeRole.persona` 与 Manager 派发的文本不受
+  影响（除非作者在各自专属字段/节点 instruction 中明确写入）。
+- **冻结进快照**：含该字段的配置与缺省配置的 `definitionHash` 不同，Run 启动
+  时冻结；手写提交协议关键词（`node_claim` 等）只告警、不阻塞。
+- **共同约定放这里，节点动作放 instruction**：result 的验收条件仍进各结果
+  `criteria`，不能只依赖 persona 上下文。
 
 节点（`workflow.nodes.<nodeId>`）三种 execution：
 
