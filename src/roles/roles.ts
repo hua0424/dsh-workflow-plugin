@@ -101,6 +101,23 @@ export function roleDenyList(run: RunState, roleKey: string): string[] {
 }
 
 /**
+ * Issue #140：公共 persona 与角色专属 persona 的组合分隔符（单源）。
+ * 公共规则先建立上下文，角色专属职责紧随其后；缺省（未配置）时不拼接。
+ */
+export const ACTOR_PERSONA_SEPARATOR = '\n\n'
+
+/**
+ * Issue #140：Role Actor system persona 的唯一组合函数。spawn 路径（host.ts
+ * ensureRoleActor）与冷恢复后的一切读取都走这里：只读冻结快照，
+ * 不改写快照中的 role persona，因此重复调用不会叠加。
+ */
+export function roleActorPersona(run: RunState, roleKey: string): string {
+  const rolePersona = run.definitionSnapshot.roles[roleKey]?.persona ?? ''
+  const common = run.definitionSnapshot.actorCommonPersona
+  return common === undefined ? rolePersona : `${common}${ACTOR_PERSONA_SEPARATOR}${rolePersona}`
+}
+
+/**
  * Judge spawn plan: fresh continuable (A1 R8) whose tool surface is the full
  * catalog minus the effective deny list. The plugin adapter MUST verify the
  * child's final visible schema contains no denied tool before dispatching

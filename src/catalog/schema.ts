@@ -209,6 +209,8 @@ const workflowDef = z
 export const workflowConfigSchema = z
   .object({
     schemaVersion: z.literal('agent-workflow/v3'),
+    // Issue #140：可选非空字符串；trim 后存，空白值在此被拒（min 1 在 trim 后生效）。
+    actorCommonPersona: nonEmptyTrimmed.optional(),
     roles: z.record(z.string(), roleDefinition),
     judgeRole: judgeRoleDefinition,
     workflow: workflowDef,

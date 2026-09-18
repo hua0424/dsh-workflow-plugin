@@ -244,6 +244,12 @@ export interface WorkflowDef {
 /** Normalized full catalog file contents (definition snapshot). */
 export interface WorkflowConfig {
   schemaVersion: typeof SCHEMA_VERSION
+  /**
+   * Issue #140：工作流级公共 persona，可选。配置时与各 Role Actor 的专属 persona
+   * 组合后作为该 Actor 的 system prompt；缺省时行为与旧版一致。冻结进快照，
+   * 不注入 judgeRole 与 Manager 派发文本。
+   */
+  actorCommonPersona?: string
   roles: Record<string, RoleDefinition>
   judgeRole: JudgeRoleDefinition
   workflow: WorkflowDef
