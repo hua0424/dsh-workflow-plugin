@@ -68,7 +68,9 @@ export interface StateHost {
   events(workspaceKey: string, executionId: string, after?: number, limit?: number): Promise<NodeExecutionEvent[]>
   historyOwner(workspaceKey: string, executionId: string): Promise<{ runId: string; managerSessionId: string } | undefined>
 }
-// `run` 缺席只表示「没有可返回的 Run」（#30 的幂等 reset）；失败分支不带 run。
+// EngineOutcome 契约（#82 定稿，语义另见 CONTEXT.md）：成功分支的 `run` 可缺席，全仓唯一
+// 「成功但无 run」的返回点是无活动 Run 的 reset 幂等成功（`no active run`，不写库/不产生事件）；
+// 失败分支不带 run。新增 `run` 读取点必须处理 `undefined`（strict 编译期可拦），不得假设成功必有 Run。
 export type EngineOutcome = { ok: true; run?: RunState; message: string } | { ok: false; reason: string }
 export function executorSessionOf(run: RunState): string {
   const frame = topFrame(run)
