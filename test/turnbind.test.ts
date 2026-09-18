@@ -4,7 +4,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { callerTurnUserMessageIds, type TurnBindEvent } from '../src/plugin/turnbind.ts'
+import { callerSessionUserMessageIds, callerTurnUserMessageIds, endedSessionUserMessageIds, type TurnBindEvent } from '../src/plugin/turnbind.ts'
 
 function ev(seq: number, type: string, data: unknown): TurnBindEvent {
   return { type, seq, data }
@@ -140,4 +140,66 @@ test('fail-closed: log truncated before the turn start', () => {
 
 test('fail-closed: empty log', () => {
   assert.equal(callerTurnUserMessageIds([], 'call-1', 'call-1'), undefined)
+})
+
+// ---- #139: cumulative session lineage ----
+
+test('#139 lineage: a later turn of the same session still carries the dispatch id', () => {
+  const events = [
+    ev(1, 'turn/start', { turn: 1 }),
+    ev(2, 'user/message', { id: 'u-dispatch', source: { kind: 'user' } }),
+    ev(3, 'tool/call', { turn: 1, step: 1, callId: 'c1', name: 'node_claim', arguments: '{}' }),
+    ev(4, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+    // 后台子代理结算通知把会话推进到新 turn：严格集里已没有派发 ID。
+    ev(5, 'turn/start', { turn: 2 }),
+    ev(6, 'user/message', { id: 'u-settle-notice', source: { kind: 'system' } }),
+    ev(7, 'tool/call', { turn: 2, step: 1, callId: 'c2', name: 'node_claim', arguments: '{}' }),
+  ]
+  assert.deepEqual(idsOf(callerTurnUserMessageIds(events, 'c2', 'c2')), ['u-settle-notice'])
+  assert.deepEqual(new Set(idsOf(callerSessionUserMessageIds(events, 'c2', 'c2'))), new Set(['u-dispatch', 'u-settle-notice']))
+})
+
+test('#139 lineage: a caller predating the dispatch misses both sets (stale visit)', () => {
+  const events = [
+    ev(1, 'turn/start', { turn: 3 }),
+    ev(2, 'user/message', { id: 'u-old-dispatch' }),
+    ev(3, 'tool/call', { turn: 3, step: 1, callId: 'c-old', name: 'node_claim', arguments: '{}' }),
+    ev(4, 'turn/end', { turn: 3, reason: { kind: 'completed' } }),
+    ev(5, 'turn/start', { turn: 4 }),
+    ev(6, 'user/message', { id: 'u-new-dispatch' }),
+  ]
+  assert.deepEqual(idsOf(callerSessionUserMessageIds(events, 'c-old', 'c-old')), ['u-old-dispatch'])
+})
+
+test('#139 lineage: fail-closed together with the strict set', () => {
+  const events = [
+    ev(1, 'turn/start', { turn: 2 }),
+    ev(2, 'user/message', { id: 'u1' }),
+    ev(3, 'tool/call', { turn: 2, step: 1, callId: 'root-1', name: 'run_code', arguments: '{}' }),
+  ]
+  assert.equal(callerSessionUserMessageIds(events, 'x:code:1', 'root-1'), undefined)
+  assert.equal(callerSessionUserMessageIds([], 'call-1', 'call-1'), undefined)
+})
+
+test('#139 lineage: ended turn carries session history past the dispatch turn', () => {
+  const events = [
+    ev(1, 'turn/start', { turn: 1 }),
+    ev(2, 'user/message', { id: 'u-dispatch' }),
+    ev(3, 'turn/end', { turn: 1, reason: { kind: 'completed' } }),
+    ev(4, 'turn/start', { turn: 2 }),
+    ev(5, 'user/message', { id: 'u-settle-notice' }),
+    ev(6, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+  ]
+  const end = events[5]!
+  assert.deepEqual(idsOf(endedSessionUserMessageIds(events, end)), ['u-dispatch', 'u-settle-notice'])
+})
+
+test('#139 lineage: ended validation still fail-closed (wrong turn / not an end)', () => {
+  const events = [
+    ev(1, 'turn/start', { turn: 2 }),
+    ev(2, 'user/message', { id: 'u1' }),
+    ev(3, 'turn/end', { turn: 2, reason: { kind: 'completed' } }),
+  ]
+  assert.equal(endedSessionUserMessageIds(events, ev(9, 'turn/end', { turn: 3 })), undefined)
+  assert.equal(endedSessionUserMessageIds(events, events[0]!), undefined)
 })

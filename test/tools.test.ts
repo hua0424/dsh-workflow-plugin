@@ -242,13 +242,13 @@ test('target host Session snapshot binds native claim to its dispatch, excluding
     ...EXEC, agent: { session }, callId: 'native-claim', rootCallId: 'native-claim',
   } as never)
   assert.deepEqual((host.calls[0]!.args as { caller: unknown }).caller, {
-    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
+    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]), sessionUserMessageIds: new Set([dispatch.id]),
   })
   await findTool(host, 'judge_claim').execute({ nodeToken: randomUUID(), result: 'ACCEPT', reason: 'verified' }, {
     ...EXEC, agent: { session }, callId: 'judge-call', rootCallId: 'judge-call',
   } as never)
   assert.deepEqual((host.calls[1]!.args as { caller: unknown }).caller, {
-    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]),
+    sessionId: 'native-caller', turnUserMessageIds: new Set([dispatch.id]), sessionUserMessageIds: new Set([dispatch.id]),
   })
 })
 
@@ -270,8 +270,8 @@ test('target host Code Mode snapshot binds claim/block only with the real root a
   await findTool(host, 'node_claim').execute({ result: 'succeeded', handoff: 'forged root' }, { ...exec, rootCallId: 'other-root' } as never)
   await findTool(host, 'node_claim').execute({ result: 'succeeded', handoff: 'forged subcall' }, { ...exec, callId: 'root:code:2' } as never)
   assert.deepEqual(callers, [
-    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
-    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]) },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]), sessionUserMessageIds: new Set([dispatch.id]) },
+    { sessionId: 'code-caller', turnUserMessageIds: new Set([dispatch.id]), sessionUserMessageIds: new Set([dispatch.id]) },
     { sessionId: 'code-caller', turnUserMessageIds: new Set() },
     { sessionId: 'code-caller', turnUserMessageIds: new Set() },
   ])

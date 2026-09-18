@@ -71,8 +71,15 @@ export function executorSessionOf(run: RunState): string {
   return execution?.type === 'actor-task' && execution.role !== 'manager' ? run.roleActors[execution.role] ?? '' : run.managerSessionId
 }
 const rejected = (reason: string): EngineOutcome => ({ ok: false, reason })
+/**
+ * #139 派发绑定 = 同一存活会话的血统归属：派发消息 ID 必须命中调用方当前
+ * turn 的严格集，或命中调用方会话 up-to-call 的累积血统集（后台子代理结算
+ * 通知推进一步 turn 后，派发 ID 只留在历史里）。会话不同、新派发晚于调用方
+ * 快照（陈旧 visit）一律失配；settled 派发不再授予资格由各调用点另行判定。
+ */
 const matches = (dispatch: ExecutionDispatch | undefined, caller: ClaimCaller): boolean =>
-  dispatch?.sessionId === caller.sessionId && dispatch.messageId !== undefined && caller.turnUserMessageIds.has(dispatch.messageId)
+  dispatch?.sessionId !== undefined && dispatch.sessionId === caller.sessionId && dispatch.messageId !== undefined
+  && (caller.turnUserMessageIds.has(dispatch.messageId) || caller.sessionUserMessageIds?.has(dispatch.messageId) === true)
 const executionHandoff = (execution: NodeExecution): string | undefined => execution.claim?.handoff
   ?? (execution.program?.result?.kind === 'PASS' || execution.program?.result?.kind === 'FAIL' ? execution.program.result.handoff : undefined)
   ?? execution.child?.result?.handoff

@@ -6,7 +6,7 @@
 import { defineTool, ToolArgsError } from '@deepseek-ai/dsh-tools'
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools'
 import { LIMITS, normalizeNodeClaim, type ClaimCaller, type NodeClaim } from '../types.ts'
-import { callerTurnUserMessageIds } from '../plugin/turnbind.ts'
+import { callerSessionUserMessageIds, callerTurnUserMessageIds } from '../plugin/turnbind.ts'
 
 /** Length-check a tool text argument per the design bounds. */
 function lengthError(field: string, value: string | undefined, min: number, max: number, required: boolean): string | undefined {
@@ -27,6 +27,10 @@ interface CallerAgentLike {
  * turn's user-message id set only grows, so the snapshot stays valid for the
  * admission decision. Fail-closed: an un-derivable turn yields an EMPTY set,
  * which no dispatch message id can match (claim rejected downstream).
+ *
+ * #139: on a derivable turn also snapshot the cumulative session lineage
+ * (every user/message id up to the call). A strict-set failure poisons the
+ * lineage too — log anomalies never bind through the history arm.
  */
 function claimCallerOf(exec: { agent?: unknown; callId?: string; rootCallId?: string }): ClaimCaller {
   const agent = typeof exec.agent === 'object' && exec.agent !== null && 'session' in exec.agent
@@ -36,10 +40,13 @@ function claimCallerOf(exec: { agent?: unknown; callId?: string; rootCallId?: st
   const events = typeof agent?.session.snapshotEvents === 'function' ? agent.session.snapshotEvents() : undefined
   const callId = typeof exec.callId === 'string' ? exec.callId : ''
   const rootCallId = typeof exec.rootCallId === 'string' ? exec.rootCallId : callId
-  const ids = Array.isArray(events) && callId !== ''
-    ? callerTurnUserMessageIds(events as ReadonlyArray<{ type: string; seq: number; data: unknown }>, callId, rootCallId)
+  const log = Array.isArray(events) && callId !== ''
+    ? events as ReadonlyArray<{ type: string; seq: number; data: unknown }>
     : undefined
-  return { sessionId, turnUserMessageIds: ids ?? new Set<string>() }
+  const ids = log === undefined ? undefined : callerTurnUserMessageIds(log, callId, rootCallId)
+  if (ids === undefined) return { sessionId, turnUserMessageIds: new Set<string>() }
+  const lineage = callerSessionUserMessageIds(log!, callId, rootCallId) ?? new Set<string>()
+  return { sessionId, turnUserMessageIds: ids, sessionUserMessageIds: lineage }
 }
 
 /** Host services the tools need (wired by the plugin). */

@@ -10,7 +10,7 @@ import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
-import { endedTurnUserMessageIds } from './plugin/turnbind.ts'
+import { endedSessionUserMessageIds, endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { turnEndFailure, type TurnEndFact } from './plugin/turn-end.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
 import { checkCatalogProviders, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
@@ -365,14 +365,16 @@ export function apply(ctx: Context) {
   // 也不再触发一次全表 Store.list（#99 AC7）。判定与推进都不在 append 回调内发生。
   ctx.on('session/event', (session, event) => {
     if (stateAccess.maintenanceDiagnostic() || event.type !== 'turn/end') return
-    const capture = (): { caller: { sessionId: string; turnUserMessageIds: ReadonlySet<string> }; turnFailure: string | undefined } | undefined => {
+    const capture = (): { caller: { sessionId: string; turnUserMessageIds: ReadonlySet<string>; sessionUserMessageIds: ReadonlySet<string> }; turnFailure: string | undefined } | undefined => {
       const snapshot = session.snapshotEvents()
       const ids = endedTurnUserMessageIds(snapshot, event)
       if (ids === undefined) return undefined
+      // #139: strict-set failure poisons the lineage too — anomalous ends bind nothing.
+      const lineage = endedSessionUserMessageIds(snapshot, event) ?? new Set<string>()
       // #29：同一次读取里取该 Turn 的失败事实（正常结束为 undefined）。诊断在这里
       // 定格，引擎只收到成品文本——它不需要理解 Host 的 TurnEndReason 形状。
       return {
-        caller: { sessionId: session.id, turnUserMessageIds: ids },
+        caller: { sessionId: session.id, turnUserMessageIds: ids, sessionUserMessageIds: lineage },
         turnFailure: turnEndFailure(snapshot as ReadonlyArray<TurnEndFact>, event as TurnEndFact),
       }
     }
