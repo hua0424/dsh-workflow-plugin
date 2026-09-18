@@ -474,10 +474,20 @@ export interface StateRow {
  * snapshot of the CURRENT turn's user/message ids (taken by the tool layer
  * from the caller's session log BEFORE enqueuing the mutation; ids only grow
  * within a turn, so the snapshot is stable for the admission decision).
+ *
+ * #139: the current-turn set alone strands an Actor whose dispatch turn was
+ * closed by a background-subagent settlement notice (the dispatch message id
+ * then lives only in an earlier turn). `sessionUserMessageIds` carries the
+ * cumulative lineage — every user/message id visible in the caller session up
+ * to the calling turn — so the gate can accept a later turn of the SAME
+ * session while still rejecting callers whose history predates the dispatch
+ * (stale visits) and callers from other sessions. Absent = pre-#139 caller;
+ * the gate falls back to the strict turn-only check.
  */
 export interface ClaimCaller {
   sessionId: string
   turnUserMessageIds: ReadonlySet<string>
+  sessionUserMessageIds?: ReadonlySet<string>
 }
 
 /**
