@@ -1,0 +1,170 @@
+# 多仓单 Issue 敏捷：无 Milestone，五节点，按需复用独立验证，先子仓后伞仓发布。
+schemaVersion: agent-workflow/v3
+actorCommonPersona: |
+  只处理伞仓 trackerRepo 中一个明确授权的 Issue，可小范围修改多个指定子仓及伞仓；不管理 Milestone、子票或选票循环。每个实际变更仓用任务分支→本仓基线 PR；gitlink 变化算伞仓变更。需要分阶段开发/发布或拆票时交 Manager 改用完整流程，不自行扩范围。
+  信任前序已验收结果，按 handoff 执行本节点，不重审上游或巡检全流程；只核对当前操作对象、修订和结果。git 显式 -C、gh 显式 --repo，Issue/PR 用完整身份。项目质量与授权要求保留，已知冲突/必需证据缺口 BLOCK。
+  保护用户文件，写操作串行，不强推/硬重置/绕过保护/自动删分支。只暂存本任务内容，子仓切换产生的伞仓指针偏移单独识别，不靠清理消除。只有实现节点可在伞仓任务分支更新候选 gitlink；发布先子仓后伞仓，固定候选 SHA，不追逐最新 tip 或 merge SHA。统一用 merge commit 保留候选提交，策略不支持则交 Manager。
+  项目必需的开发自检、独立合并前验证与合并后部署/E2E按初始化时点执行，敏捷不免除质量门槛。部署/环境由 Manager 按有效授权和实际技能准备，不用旧环境冒充候选；共享客户端核实例归属，不结束他人进程。全部代码发布及必需验收完成才关闭唯一 Issue。
+  普通证据集中写 Issue，绑定 runId、阶段、仓库/修订和前序链接；PR 留摘要及 Implements 完整 Issue 引用，禁止提前自动关票。只有长篇复杂报告写 ignored、未跟踪 run 目录，Issue 留摘要/版本/路径；多行正文用 --body-file，不泄露凭据。重试仅查询本节点操作，成功复用、遗漏补齐。
+  handoff 传 runId、Issue/初始化/本节点评论链接、仓库分支表、manifest；验证时附 verificationStage=premerge 或 postmerge，发布后附 publication 与验证入口。只传链接和必要对象，不复制全历史。
+roles:
+  coordinator:
+    persona: |
+      负责本 Issue 多仓发布及关闭；消费代码批准和所需阶段验证，不重复审查。先子仓后伞仓，发布不改候选指针；每仓成功留痕，已发布只补遗漏。若计划需要合并后验收，全部仓发布后交 tester，再回来关票；未通过不得关闭。任何仓已发布后禁止 stale-review 回实现。
+    model:
+      provider: zai-coding-cn
+      modelId: glm-5.3-flash
+  developer:
+    persona: |
+      实现唯一 Issue 的授权跨仓小改，在各仓任务分支提交；在伞仓任务分支组装候选 gitlink 和 manifest。自测后开 PR，不合并或关票。返工复用尚未合并的任务 PR；已发布问题交 Manager，不修改已合并 PR 假装返工。
+    reuse: continuable
+    model:
+      provider: commandcode
+      modelId: deepseek/deepseek-v4.1-flash
+  code-reviewer:
+    persona: |
+      独立审查本 Issue 的全部候选 PR、gitlink 和跨仓交互，结论绑定完整 manifest；实现只读，不合并、不代独立测试。只审当前改动及本轮发现，不重复初始化。根据计划的合并前验证要求选择出口。
+    model:
+      provider: kimi-coding
+      modelId: k3
+  tester:
+    model:
+      provider: kimi-coding
+      modelId: k3
+    persona: |
+      按 handoff 的 verificationStage 和对应验收范围独立测试，不读取开发自测结论充当独立验证。premerge 测固定候选，postmerge 测实际交付/部署版本；报告绑定阶段、manifest、必要的 publication 与实际制品。已发布后的失败/版本变化只能 BLOCK，不能返回旧 PR 开发。不改产品代码、部署或关票。
+judgeRole:
+  persona: |
+    只读核验当前结果 criteria 与本节点实际证据，信任已验收的上游结果，不重新验收全流程。事实支持 ACCEPT，明确不符 REJECT，必要信息不足 NEED_CONTEXT。区分代码批准、premerge/postmerge 验证、部分发布与最终 delivered；只有尚未发布时能返回实现，已发布阶段失败不得伪装普通返工。不因 gitlink 不等于基线最新 tip 否定精确版本交付。
+  model:
+    provider: zai-coding-cn
+    modelId: glm-5.3-flash
+  tools:
+    deny:
+      - edit
+      - write
+workflow:
+  startNode: initialize
+  nodes:
+    initialize:
+      execution:
+        type: actor-task
+        role: manager
+        instruction: |
+          1. 核对伞仓唯一开放 Issue 的范围/验收和未解决依赖；简单关联改动可涉及多个指定仓，但不调度子票、不管理 Milestone。读取仓库拓扑、GitHub 身份和项目质量要求，确认工作区/索引干净。需要拆票或分批发布则先协调，不能硬塞进快速链路。
+          2. 明确本次修改仓、各仓已有目标基线和任务分支及操作授权；沿用已明确的用户决定，不重复询问。子仓基线与伞仓记录的版本不同则明确本次采用版本，不静默升级。仅给实际修改仓及需要更新指针的伞仓创建/复用任务分支，记录原始 baseCommit；未改依赖保留原 gitlink SHA，不建分支/PR。缺基线或分支归属不明交 Manager 处理，不重置已有分支。
+          3. 按项目要求记录开发自检、premergeRequired/postmergeRequired 及各阶段独立验证范围/环境与部署授权入口。不需要独立验证须有适用依据；既要求合并前客户端验证又要求合并后部署 E2E 时两项都登记。开发期开 PR 前自检若依赖本票尚未发布的后端，必须具备获准的候选环境；否则先协调或改分阶段完整流程，后置验证不能替代该前提。
+          4. 在 Issue 发布初始化评论：真实 runId、仓库/分支/起点表、验收及不做范围、版本依赖、合并方式 merge commit、阶段门槛和授权。GitHub Issue 跟踪，长报告才落 ignored run 目录；rapid-multi 版本 2026-09-19.1。交接上述入口，保存成功后 ready。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        ready:
+          criteria: |
+            唯一 Issue 范围及仓库授权明确，任务分支/原始起点可追溯，未覆盖用户内容；初始化评论包含仓库分支表、固定依赖、开发检查和两个独立验证时点的要求，所需开发期前提可满足。无需 Milestone/子票，handoff 完整。
+          target:
+            node: implement
+    implement:
+      execution:
+        type: actor-task
+        role: developer
+        instruction: |
+          1. 按当前 Issue 验收和本轮必修项完成授权仓的最小改动；每仓在自己的任务分支提交，必要时安全同步本仓基线。只处理当前任务，不重查上游规划。
+          2. 先准备子仓候选并推送，再在伞仓任务分支提交对应精确 head 的 gitlink 及本票伞仓代码。未改依赖保留原指针；有授权但无内容变化的目标仓固定基线 SHA/tree，记 no-change，不造空 PR。候选 head 包含固定 base；冲突或已发布事实交 Manager，不自行重置或回滚。
+          3. 运行项目要求的开发自检/回归；要求真实客户端开 PR 前自检时必须先通过。为每个实际有变化的仓创建/更新任务分支→基线 PR，伞仓指针变化也须 PR。各 PR 使用 Implements 同一个伞仓 Issue。
+          4. Issue 发布实现与 manifest：各 PR repo/path/base/head/tree、no-change 或未改依赖 SHA、伞仓 gitlink、验收覆盖和自测结果；返工记录修复/反证。基线/head变化须重组 manifest 并失效旧批准/验证，交完整集合审查。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        implemented:
+          criteria: |
+            本 Issue 的授权改动已推送并形成完整候选集合：各变更仓 PR 源/目标正确，head 包含固定 base，伞仓 gitlink 精确引用子仓候选，未改依赖无越权升级。开发必需检查完成，Issue 实现评论及 manifest 已发布；没有提前合并关票。
+          target:
+            node: review
+    review:
+      execution:
+        type: actor-task
+        role: code-reviewer
+        instruction: |
+          审查本次 manifest 的全部 PR、Issue 验收及跨仓交互，核验本轮自测/发现处置，结论绑定确切 base/head/tree/gitlink。有必修 changes-required 回实现；候选修订变化 stale-review 回实现重组；技术/环境缺口 BLOCK。代码通过后，premergeRequired=true 则 verification-required，交 tester 阶段 premerge 的验收/版本/环境入口，不传开发自测结论；否则 approved 交发布，合并后门槛仍保留。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        approved:
+          criteria: |
+            当前 manifest 全部代码审查通过、无未解决必修；计划 premergeRequired=false 且有符合项目要求的依据，结论已发布。即使 postmergeRequired=true 也只批准代码发布，不提前宣布交付。
+          target:
+            node: merge
+        verification-required:
+          criteria: |
+            当前 manifest 代码审查通过，premergeRequired=true 尚需独立合并前验证；handoff 指定 verificationStage=premerge，含验收/候选/环境入口，不含开发自测结论。
+          target:
+            node: verify
+        changes-required:
+          criteria: |
+            尚未发布的候选存在具体必修清单、修复依据与验收，已记录到唯一 Issue。
+          target:
+            node: implement
+        stale-review:
+          criteria: |
+            候选 PR/base/head/gitlink 改变，已记录新旧对象；所有仓尚未发布，需重组 manifest 后重新审查。
+          target:
+            node: implement
+    verify:
+      execution:
+        type: actor-task
+        role: tester
+        instruction: |
+          只执行 handoff 指定阶段的独立验收。premerge 使用已批准候选及合并前检查范围；postmerge 使用 publication 中的实际交付版本，按项目要求确认部署就绪并执行 E2E。源码→制品→服务版本须有对应关系，候选 head 与实际 merge SHA 不同要按 publication 的 tree/包含映射解释，不能拿旧服务代替。
+          Issue 报告标阶段、manifest/交付入口、用例和实际结果；完成 passed 回 merge。premerge 且所有仓未发布时，产品缺陷 changes-required，修订变化 stale-review；postmerge 或已有发布时的失败/漂移 BLOCK 交 Manager 保留事实处理，不返回旧 PR 实现。缺必需环境/部署权限同样 BLOCK，不擅自跳过或自行部署。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        passed:
+          criteria: |
+            指定阶段的独立验证已实际完成并通过，报告绑定 verificationStage、当前 manifest 和实际运行版本；postmerge 还绑定 publication/实际部署就绪证据。所需检查无缺口，未用另一阶段或开发自测结论替代。
+          target:
+            node: merge
+        changes-required:
+          criteria: |
+            当前阶段为 premerge 且本次所有仓尚未发布，实际验证发现具体产品缺陷，Issue 有复现和修复验收。
+          target:
+            node: implement
+        stale-review:
+          criteria: |
+            当前阶段为 premerge 且所有仓尚未发布，候选修订变化使当前验证失效，差异已记录。
+          target:
+            node: implement
+    merge:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 消费当前代码批准和计划需要的 premerge 通过结果，先区分已发布与待发布仓。已合并按原批准及实际合并结果补记录，不因正常基线前进重新发布；紧邻每个待发布 PR 的合并核对当前 base/head、检查与保护，no-change 目标仓核对固定基线 SHA/tree。尚无任何仓发布时修订/新实质反证使批准失效则 stale-review 回实现；已有部分发布则 BLOCK，不将批次退回旧 PR。
+          2. 每个待发布 PR 先记录本次合并前核验，再条件合并；按依赖先子仓后伞仓，使用 merge commit。核对源 head/合并起点匹配批准、实际 merge tree=候选 tree、基线包含候选 head，并逐仓记录结果。根 gitlink 保持候选 SHA，不换成 merge SHA；未改依赖只确认固定提交可获取，不要求它等于最新基线。结果未知先查，重试只补遗漏。
+          3. 所有仓发布完成后按同一 manifest 和实际发布映射在 Issue 创建/复用唯一 publication：每仓候选→实际 merge SHA/tree、PR/no-change、伞仓指针、批准及验证链接。postmergeRequired=true 且该 publication 尚无对应独立验收通过时，保持 Issue open，verification-required 交 tester，标 verificationStage=postmerge；不可沿用 premerge 报告代替。postmerge 返回后直接消费原 publication URL 和通过报告进入收尾，不新建 publication、不重查已发布 no-change 仓的最新基线、不重复发布。
+          4. 全部发布和计划所需阶段验证完成后，记录最终交付摘要并关闭唯一 Issue，安全恢复约定工作状态、保留分支与用户内容。关票/网络失败只补收尾；已发布后新缺陷或验收失败 BLOCK，不能返工旧 PR 或提前关闭。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        delivered:
+          criteria: |
+            全部仓已按批准候选完成发布，publication 记录实际 merge tree/包含关系且伞仓指针未变；项目要求的 premerge/postmerge 验证各有本阶段通过证据，未遗漏部署或独立验收。唯一 Issue 已关闭，最终摘要及工作区收尾完成，无重复发布或越权改动。
+          target:
+            return: delivered
+        verification-required:
+          criteria: |
+            所有仓发布完成并记录 publication，postmergeRequired=true 但对应合并后独立验收尚未完成；Issue 仍开放，handoff 标 verificationStage=postmerge 并提供验收、manifest、publication 和环境入口。
+          target:
+            node: verify
+        stale-review:
+          criteria: |
+            本次所有仓均未发布，待发布 PR/base/head 或 no-change 目标基线已变化，或出现批准未覆盖的新实质反证；失效原因已记录，未合并关票，需重组候选。
+          target:
+            node: implement
+  returns:
+    - delivered

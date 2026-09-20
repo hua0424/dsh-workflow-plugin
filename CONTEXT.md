@@ -79,6 +79,12 @@ Role 首次使用创建 Session；再次承担新 visit 前先确认无冲突活
 
 T5 已把 `jobs`、`compaction` 设为标准 Web composition 的 required service，并在 Host Adapter 内用正式接口完成 cold resume（无 prompt）、idle maintenance、释放和原 Session Queue 续接。成功与合法 no-range 可继续；busy、压缩/resume/dispose 失败均不伪装成功，工作单保留并 BLOCK。T6 的 Session availability 为 `available|missing|unknown`：live 或持久读取成功为 available，只有正式 `SessionPersistenceNotFoundError` 是 missing，服务缺失/损坏/读取异常保持 unknown；仅 missing 自动 fresh replacement，unknown 保留原身份并在 Manager 明确确认后尝试 cold 续接，失败继续 BLOCK。
 
+## Model Route / 思考强度
+
+Role（含 judgeRole）的模型路由由 provider、modelId 与可选思考强度（Reasoning Effort）组成；未配置模型的角色运行时继承 Manager 路由。思考强度是路由的组成部分：档位 id 由 provider 适配器本地声明（如 off/minimal/low/medium/high/xhigh/max），不同模型档位集不同；不配置即不传，由适配器回落其默认档位。运行期更换角色模型时思考强度不随行：清空并回落新模型默认档位。
+
+本地模型列表（Local Model Catalog）是当前 profile 实际声明的模型集合：适配器内置目录与 settings/config 显式声明合并而成，与供应商接口的动态发现无关。catalog 配置的 modelId 必须落在所属 provider 的本地模型列表内，思考强度必须落在该模型的档位列表内；列表为空视为该 provider 未配置任何模型。
+
 ## Judge Role / Judge Agent
 
 Judge 是独立只读检查者，不补做 Actor 工作，不改写 claim outcome。首次判断和 respawn 创建 continuable Judge；NEED_CONTEXT 补充可复用同一 Session，但每次都先登记新的 Judge dispatch，再以 Host queue 开新真实 Turn，并在真实 message ID 返回后才允许该 Turn 提交。T6 将恢复决定持久化为 `followup|fresh`：historical NEED_CONTEXT 或重启后未判定且 available/unknown 的当前 Judge 可在同 Session 预安排新 dispatch 并 followup；只有 missing 或明确 respawn 才 fresh，旧 Turn/inputVersion 均失权。

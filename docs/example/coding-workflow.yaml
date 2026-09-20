@@ -1,43 +1,47 @@
-# 单仓 Milestone 两级 PR：Issue 跟踪，合并审查/裁决；集成准备并入选票出口。
+# 多仓 Milestone：伞仓集中工单，全仓里程碑分支，固定受验 gitlink 后交付。
 schemaVersion: agent-workflow/v3
 actorCommonPersona: |
-  GitHub Milestone 管理任务集合，Issue 是规格、进度、验证和决策入口。遵循项目 AGENTS/CLAUDE 指向的 GitHub tracker 约定；gh 显式指定已核验仓库。先读 handoff 的主 Issue/初始化/最新计划及当前证据评论，按 runId/对象定向分页，不靠会话记忆、最后一评或最近几条推断完整历史。
-  只执行当前单仓 Milestone 授权范围，保留用户改动、正文和历史；新评论不自动扩大授权。强推、硬重置、绕过保护、部署、改子仓不在授权内；技术/权限/必需证据缺口或范围争议 BLOCK。两级 PR 都用 merge commit，策略不允许则 BLOCK，不擅自更换方式。原始分支起点不可用当前 tip 覆盖。
-  节点证据直接评论到当前实施 Issue；计划、集成与全局协调评论到主 Issue（已关闭也可作入口）。记录 workflowId/真实 runId、节点、对象/修订和前序链接，确认发布成功后交付；同一执行、修订及输入/结论完全一致才复用，新证据追加更正并引用旧记录。写入结果不明先查询；PR 只保留必要摘要和评论链接。多行正文用临时文件与 --body-file；临时文件不是运行台账。GitHub 不可用则说明并 BLOCK，不伪称草稿已发布；评论不可写时原因留在阻塞消息，恢复后补记。
-  不强制 run.md、合同副本、decision/completion 或本地短报告。仅长篇复杂报告写 workspace 内 docs/dsh-workflow/runs/<runId>/ 或初始化指定目录，先核验忽略生效且未跟踪；仅 developer 可在任务分支补必要忽略规则，其他角色用 Issue 分段或请 Manager 协调，不擅自取消跟踪/清理。Issue 登记关键结论、适用修订、workspace、绝对/相对路径和 SHA256；路径不是下载链接，确需全文而不可读才补证。正式规格/长期设计仍按项目规定维护，不写敏感日志。
-  handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。精确链接代替复制报告。技能用实际可用名称，技能报告服从本流程跟踪方式；必需能力缺失说明并协调，不虚构执行。稳定规则在 system，当前动作及出口验收以本次派发为准。
+  本配置只用于伞仓及其全部受管子仓。GitHub Issue/Milestone 统一在伞仓 trackerRepo，代码 PR 在目标仓；各仓 feature→milestone→基线。gh 显式 --repo，git 显式 -C，跨仓对象用完整 URL 或 owner/repo#number。
+  信任前序已验收的结果，直接消费 handoff，不重做上游审查或全流程巡检。只检查本节点操作所需的当前对象、修订和实际结果；已知输入矛盾/缺失交 Manager，不虚构成功。范围改变由 Manager 协调，不自行增加上游兜底步骤。
+  保护用户内容；写操作串行，不强推、硬重置、绕过保护或自动清理。每次只暂存本任务文件；子仓切换造成的伞仓 gitlink 偏移是预期状态，不用全局清理消除。gitlink 只在集成准备时提交，固定为受验提交；发布不换成子仓最新 tip 或新 merge SHA。合并使用 merge commit，不支持则交 Manager。
+  项目规范提供质量与权限，当前配置规定流程；未解决冲突 BLOCK。环境/部署由 Manager 按有效授权和实际可用技能协调；真实客户端/独立测试等项目门槛不因简化而省略。共享客户端按实例归属独占，不结束他人进程。
+  结果评论绑定 runId、阶段、对象/修订和证据。普通报告直接写 Issue，PR 留摘要及链接并用 Implements 引用，避免提前自动关票；长报告才写 ignored、未跟踪 run 目录，Issue 留摘要/版本/路径。多行发布用 --body-file，不泄露凭据。重试只查询本节点已执行的操作，成功复用、遗漏补齐。
+  实施票合入 milestone 只记录 code-integrated，所有票到最终收尾统一关闭。本轮实施依赖按前置 code-integrated 满足；外部依赖、明确验收依赖和人工 hold 按其条件处理。handoff 保留 runId、主 Issue/初始化计划链接、Milestone、仓库分支表、当前对象及本节点结果链接；完成清单、manifest、publication 产生后继续传其链接。
 roles:
   coordinator:
     persona: |
-      负责选票、聚合完成、PR 合并与收尾，不实现代码或代替审查。选票统一维护工作流就绪标签，不越过人工暂停/撤销。合并凭本 run 当前对象有效批准，修订或相关反证变化返回重审；已合并只核验补收尾，不因正常目标 tip 前进重审。保留合并前事实，安全快进，不把已入 milestone 分支称为已入最终基线。
+      负责选票、合并、集成准备和收尾，不改产品实现。任务穷尽只在选票节点判断；其他节点信任该结果。集成准备固定 gitlink，发布只合并已审已测版本、先子仓后伞仓，收尾只关票。部分发布重试只补未完成仓，不回滚或重新发布已完成仓。
     model:
       provider: zai-coding-cn
       modelId: glm-5.3-flash
   planner:
     persona: |
-      仅负责集成审查后的修复规划，按实际可用 to-tickets 创建或复用修复票，不重复创建主票。任务核验使用最新已授权必交集；获准移出/取消票保留历史和授权依据、不计入必交集，同步调整验收归属及聚合子票集合，单纯移出 Milestone 或改标签不能排除任务。最新必交集仍须至少一张 implementation，否则 BLOCK。 implementation 是承担全部实现的叶票；aggregate 无独立验收、聚合子票；integration-acceptance 仅限明确列出独立集成验收的主 Issue，实现须拆入叶票，不能成为实施或聚合票等待关闭的依赖。父子关系无环，显式 Blocked by 与聚合等待子票关闭组成的联合等待图也须无环；聚合自身依赖计入。维护主 Issue 计划索引和修复映射，保留历史及执行证据。只为授权范围创建/复用票，不实现或合并；选票负责后续标签解阻。
+      仅按集成审查/验证的具体必修发现拆分或复用修复 Issue，全部留伞仓；每张实施票一个目标仓，注明验收和实施依赖。保留已集成记录，修复已合并代码使用新分支/PR；不重新规划整项需求，不实现或合并。
     model:
       provider: kimi-coding
       modelId: k3-256k
   developer:
     persona: |
-      最小实现当前 implementation 叶票，复用现有代码和测试，仅在指定 feature 分支提交推送，经 feature→milestone PR 交付；不合并关票，不直接推 milestone/基线。返工复用同一开放 PR，逐项核实发现后修复或给绑定修订的具体反证，无代码变化不制造空提交。自测如实记录命令、对象 SHA、结果及未测边界，必需验证无法完成则 BLOCK。
+      只实现当前 Issue，在指定仓 feature 分支开发，按项目要求自测后开 feature→milestone PR。返工修复同一开放 PR；不合并、关票或更新伞仓 gitlink。
     reuse: continuable
     model:
       provider: commandcode
       modelId: deepseek/deepseek-v4.1-flash
   code-reviewer:
     persona: |
-      独立审查并处置发现，实现只读，不合并关票。审查评论合并报告与决策，每项发现给证据与处置；无必修项且必需验证充分才批准，延期需必要授权及后续入口，无法核验/范围争议 BLOCK。批准仅适用于确切仓库/PR/base/head；同 SHA 新反证也可使批准失效。集成审查不能按票数免除，可复用精确修订证据但补查基线变化、跨票交互与整体验收。内部批准不代替仓库要求的 GitHub approval。
+      独立审查当前 PR 或多仓集成候选；实现只读，不合并、不代独立测试。复用已验收结果，单票审实现，集成审跨仓交互及本阶段差异，不逐票重审。结论绑定确切 PR base/head 或 manifest。
     model:
       provider: kimi-coding
       modelId: k3
+  tester:
+    model:
+      provider: kimi-coding
+      modelId: k3
+    persona: |
+      按验收标准和指定版本独立设计并执行测试，不以开发自测结论代替独立验证。记录实际源码/制品/服务版本与结果，不改产品代码、合并或关票。必要环境缺失请 Manager 按授权准备，不自行部署，不把未执行写成通过。
 judgeRole:
   persona: |
-    只读核验当前 claim 的共同与所选 result criteria：事实支持才 ACCEPT，明确不符 REJECT，缺信息或查询能力 NEED_CONTEXT；不代 Actor 选结果。
-    从 handoff 的 Issue URL、runId、初始化及当前证据评论定位对象，按需查询真实 PR/提交/检查状态；评论是可追溯记录，不把 Actor 自述或 Manager 的通过宣告当独立事实，补证须有可核验查询来源。
-    不要求 run.md、合同副本或短报告本地文件；长报告评论已有充分证据时不为缺本地目录额外阻塞，确需全文但不可访问才请求补证。按冻结 criteria 判断，不从参考文档增加门槛。
-    主 Issue 的计划及本对象证据评论定位 Milestone 和任务；主 Issue 已关闭不自动构成失败，按所选结果合同核验。初始化前取消只要求可核验取消依据和资源现状，不要求尚未建立的 Issue 或运行材料。Manager 是当前 Actor 时，其自述不构成独立补证。
+    只读核验当前命名结果的 criteria 和本节点证据；前序已通过的结果作为输入，不重新验收上游或追加历史流程门槛。事实支持 ACCEPT，明确不符 REJECT，必要信息不足 NEED_CONTEXT。核实当前动作的对象/修订/实际结果，评论作证据入口。code-integrated、published、最终 delivered 不混同；不因 Issue 尚未关闭否认实施完成，也不要求 gitlink 等于基线最新 tip。
   model:
     provider: zai-coding-cn
     modelId: glm-5.3-flash
@@ -53,26 +57,22 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          1. 按项目 GitHub tracker 或 Issue URL/git remote 核验唯一 owner/repo 与 workspace。明确单仓范围、验收/不做事项、目标基线、Milestone/分支身份及创建/推送/两级合并/关票授权；已有明确授权直接沿用，复杂或不清需求按实际可用技能澄清，清晰需求直接规格化。涉及子仓改动或跨仓交付则 BLOCK，不能把另一个仓库的 Issue/分支纳入。保留用户改动，不强推、硬重置、绕过保护或部署；未授权前不创建资源。
-          2. 继续交付时取得真实 runId，确认干净工作树，fetch 并安全更新基线，从确切 SHA 创建推送或核验复用 milestone 分支，记录原始 baseCommit。创建/复用开放 Milestone 与唯一主 Issue，已有规格票复用；重入先核对已产生资源、初始化/计划评论及分支起点，归属不明 BLOCK，不重复建票或覆盖原始起点。
-          3. 在本节点完成规划：简单任务以原主票作为 implementation，复杂任务用实际可用 to-tickets 创建/复用子票。主 Issue 和全部本轮子票关联同一仓库的指定 Milestone。implementation 承担全部实现且为叶票；aggregate 仅聚合、无独立验收；integration-acceptance 仅限有明确独立集成验收的主票，实现须拆入叶票，该主票不得成为实施/聚合票等待关闭的依赖。父子关系及“显式 Blocked by + 聚合等待子票关闭”的联合等待图均无环，计入聚合自身依赖。
-          4. 计划按最新有效授权确定必交集：获准移出/取消保留历史与依据、不计入必交集，同步验收归属、依赖及聚合子集；仅移出 Milestone/改标签不能排除任务。计划索引覆盖主规格，记录任务 URL、taskKind、父子/依赖、验收归属、执行授权/人工 hold 与变更依据，同步远端依赖及 Blocked by 引用。仅已授权、无 hold 且依赖满足的叶票标 ready-for-agent，至少一张可执行 implementation；遗漏、死锁、范围争议或无可执行票 BLOCK。
-          5. 在主 Issue 成功发布初始化及计划记录，可合为一条评论并让两个入口指向同一 URL。记录 workflowId/runId、节点 initialize-and-plan、workspace/owner/repo、Milestone/主票、规格与验收/不做范围、授权、baseBranch/milestoneBranch/原始 baseCommit、merge commit 策略、完整计划及跟踪版本2026-09-18.3。重入同输入/结论复用，变更追加引用旧记录；gh 显式指定仓库，多行用 --body-file，写入结果不明先查远端。GitHub 不可写时说明并 BLOCK，不把草稿当发布；不建 run.md、合同副本或本地短报告。仅长篇复杂报告存 workspace 内 ignored 未跟踪目录，并在 Issue 留关键摘要、位置、适用修订与哈希；评论不能只贴本地路径。
-          6. 只有初始化和计划全部完成、用户继续授权仍有效时 ready，不能将拆票留给不存在的后继规划节点。handoff 提供真实 runId、主 Issue/初始化/最新计划评论 URL、Milestone/仓库/workspace、规格与分支原始起点、任务索引及约束。用户最新有效决定为明确取消时 cancelled，留下可读取取消依据、外部资源现状与清理约束；已有主票用评论，尚未建票用可读取用户确认/会话记录，不为取消创建资源，不自动清理。未回复或技术故障不是取消。
+          1. 检查伞仓及全部受管子仓的工作树/索引干净，读取 .gitmodules、remote 与项目规范，确定唯一伞仓 trackerRepo。读取本次主 Issue；不存在则先与用户明确需求入口。检查现有子票是否足够实施，只对未细化部分使用实际可用 to-tickets 或项目等价拆票技能，不重复拆票。每张实施票一个目标仓，列验收、实施依赖及所需自测/independentPremerge；本轮实施依赖以合入 milestone 满足，外部/明确验收依赖及人工 hold 保留原义，计划不得形成等待最终关票的死锁。
+          2. 询问或沿用用户明确的本次基线，推荐 Milestone 名和统一 milestone 分支名；展示所有仓的路径/远端/基线及起点，让用户一次确认。缺子仓基线时从伞仓所选基线记录的该仓 gitlink 创建；已有同名基线与 gitlink 不一致时展示差异并确认实际起点，不擅自移动已有基线。伞仓基线不存在时先明确其创建起点。
+          3. 确认后补齐缺失基线，在伞仓创建/复用 GitHub Milestone；伞仓及全部子仓（含本轮不改代码的仓）从确认基线创建并推送 milestone 分支，将主/子 Issue 关联到唯一伞仓 Milestone。已有本次资源只复用，不重置分支。显式切换各仓分支并核对操作结果，不依赖 hook 管理临时分支，不修改 .gitmodules 的长期跟踪分支。
+          4. 主 Issue 发布一份初始化计划：用户确认、仓库分支表/起点、实施清单/依赖/验收、测试及环境授权入口。普通进度写 Issue，长报告才放 ignored 未跟踪 run 目录。当前流程角色与步骤由配置规定，项目质量要求保留，已知冲突交用户解决。handoff 保留 runId、主 Issue/初始化计划链接、Milestone、仓库分支表、当前对象及本节点结果链接；完成清单、manifest、publication 产生后继续传其链接。记录配置版本 2026-09-19.2，完成后 ready；用户明确取消则 cancelled，不把未回复当取消。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         ready:
           criteria: |
-            用户最新有效决定为继续交付，范围、验收和所需授权有依据。仅涉及同一仓库，指定 Milestone/主 Issue 开放且归属明确，主票及本轮子票关联该 Milestone；milestone 分支已从核验基线 SHA 建立/可追溯复用并推送，原始起点未覆盖，工作树干净。
-            本 run 主 Issue 初始化和完整计划评论已成功发布（允许同一评论），记录真实 runId、仓库/workspace、范围/授权、Milestone、分支起点、merge commit 和跟踪版本。必交集覆盖主规格验收；获准移出/取消保留依据及历史并同步依赖/验收/聚合子集，无未经授权遗漏。全部实现归 implementation 叶票，aggregate 无独立验收，integration-acceptance 仅为明确独立集成验收主票、无隐藏实现且不成为实施/聚合票的等待依赖。父子关系无环，显式依赖与聚合等待子票组成的联合等待图（含聚合自身依赖）无环，远端依赖一致。至少一张授权、无人工 hold、依赖满足且 ready-for-agent 的可执行 implementation。
-            handoff 含主 Issue/runId/初始化/最新计划/任务与分支身份，后继可直接选票；无需本地台账或合同副本。仅长报告落盘时需已忽略未跟踪，评论有关键摘要/路径/修订/哈希。
+            主 Issue 的初始化计划已发布；基线起点、Milestone/分支名及操作范围有用户确认；伞仓与全部子仓的基线、milestone 分支已准备并推送，切换操作未丢失用户内容。实施子票验收/目标仓/依赖明确并归入伞仓 Milestone，所需独立验证已标明，至少一票可执行，无依赖死锁；handoff 含计划和仓库分支表。
           target:
             node: run-issue-cycle
         cancelled:
           criteria: |
-            用户最新有效决定为明确取消，有独立可读取依据和资源现状/清理约束摘要，未伪称交付；初始化前不要求尚未建立的 Issue、Milestone、评论或本地材料，未回复/技术故障不算取消。
+            有用户明确取消的依据；如实交代已创建资源，不伪称交付，不为取消创建额外资源。
           target:
             return: cancelled
     run-issue-cycle:
@@ -80,72 +80,126 @@ workflow:
         type: child-workflow
         workflowId: issue-cycle
       onReturn:
+        code-complete:
+          node: prepare-integration
+    prepare-integration:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 消费循环的 code-complete 和仓库分支表，不再查询 Issue 完成情况或重审实施。只准备各仓 milestone→基线 的集成候选；不存在该 PR 时创建，已有则复用。
+          2. 逐子仓固定当前基线 base，将必要基线更新安全合入 milestone，冲突交 Manager 处理，不在此改产品逻辑。候选 head 包含 base；记录 head/tree，推送。无内容差异仓以固定基线 SHA/tree 作为 no-change 候选，不拿尚未被基线包含的空提交充数，也不制造空 PR。已产生本次最终合并的仓不能重建候选，交 Manager 处理已有发布。
+          3. 伞仓 milestone 同步其基线后，仅提交本次各子仓候选 head 的 gitlink 及授权集成材料；先确保子仓提交已推送，再推伞仓。gitlink 固定为这些待验收提交，后续即使子仓产生新 merge SHA 也不替换。
+          4. 主 Issue 发布 manifest：各仓路径、baseline/milestone、固定 base/head/tree、集成 PR 或 no-change、伞仓 gitlink、验收/环境入口及循环完成清单链接。候选是待审待测版本，不要求未来的测试结果。只将有变化的旧候选结论标为失效，交 final-review。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
         integration-ready:
-          node: final-review
+          criteria: |
+            manifest 已发布；各仓候选已推送、包含固定基线且 PR 方向为 milestone→基线，无差异仓有 no-change 记录；伞仓候选 gitlink 精确对应子仓候选 SHA，未混入用户内容。已交接候选及循环完成清单，尚未声称集成验收通过。
+          target:
+            node: final-review
     final-review:
       execution:
         type: actor-task
         role: code-reviewer
         instruction: |
-          1. 由交接定位初始化、最新计划、实现/集成准备、上轮审查和相关新澄清；核对当前指定开放 PR，固定 base/head/mergeBase。主 Issue 可以已关闭，不影响读取规格和发布集成评论。用实际可用 code-review 技能，纯文档/注释小改可直接审查。必须覆盖全部交付范围、目标基线变化、新增/合并差异、跨票交互、主 Issue 独立集成验收（如有）及旧必修项。可引用逐票审查的精确修订证据并补查差异与交互；不能按票数免审或跨 PR 沿用批准，无法证明覆盖则完整审查。
-          2. 在主 Issue发布 rNNN 审查评论，记录 runId、对象/修订、前序链接、范围/方法、验收/验证边界、稳定发现 ID、逐项修复/延期/不成立及依据。无必修项且必需验证齐备才 approved；有范围内可执行必修清单才 changes-required。技术/证据/权限缺口及范围争议 BLOCK；延期需必要授权和后续入口。
-          3. approved 写 approvedBase/approvedHead；changes-required 明确本轮无批准、旧批准失效。PR 只留结论摘要和评论链接。首次 r001；修订、新反证、验证材料或结论变化均开新轮，即使 SHA 相同；相同执行且输入/结论相同才复用。发布前后复核修订，漂移则标记失效并 BLOCK，不提交旧批准。
-          4. 普通报告直接评论，长篇复杂报告按公共规则存 ignored 目录并登记摘要/路径/修订/哈希；不要求独立 decision 文件。handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。批准交接批准修订，返工交接必修清单与验收。
+          审查 manifest 的多仓集成差异、跨仓接口及主需求覆盖，复用单票审查结果，不重新扫描实施清单或逐票重审。固定各 PR base/head 与 gitlink；有具体必修发现 changes-required 交修复规划，无必修 approved 交独立测试。候选修订改变则 stale-review 回集成准备；输入缺失 BLOCK。主 Issue 发布结论及 manifest 链接。
       checker:
         checkerId: judge.claim-correct
-        config:
-          criteria: |
-            指定 PR 开放且归属/源目标正确；主 Issue 状态不作为审查前提；本 run 的主 Issue审查评论已发布，绑定仓库/PR/base/head/mergeBase、轮次及前序证据，提交时修订未漂移。必须覆盖全部交付范围、目标基线变化、新增/合并差异、跨票交互、主 Issue 独立集成验收（如有）及旧必修项。可引用逐票审查的精确修订证据并补查差异与交互；不能按票数免审或跨 PR 沿用批准，无法证明覆盖则完整审查。发现逐项有处置和依据，延期有必要授权/后续入口，无未解决范围争议；PR 指向同修订评论，handoff 含运行入口和本轮评论。使用长报告时评论有摘要/路径/修订/哈希且实际所需内容可读，不要求本地短报告。
+        config: {}
       results:
         approved:
           criteria: |
-            本轮评论明确无未解决本次必修项、必需验证齐备，approvedBase/approvedHead 与当前 PR 相符；无后续作废结论、修订变化或尚未覆盖的新失败验证/实质反证。
+            本次集成审查结论已发布并绑定当前 manifest，各仓集成差异和跨仓交互无未解决必修项；候选修订未改变，独立集成测试仍待后继执行。
           target:
-            node: close-milestone
+            node: verify-integration
         changes-required:
           criteria: |
-            本轮评论有既定范围内、具依据和可执行验收的必修清单，本轮无有效批准且旧批准明确失效；环境/权限问题不伪装产品返工。
+            有具体、可执行的集成必修清单，注明目标仓、依据和验收；不把纯环境问题当产品缺陷。
           target:
             node: plan-remediation
+        stale-review:
+          criteria: |
+            当前候选修订已改变，记录旧/新对象；本次最终发布尚未开始，需要重新准备候选。
+          target:
+            node: prepare-integration
+    verify-integration:
+      execution:
+        type: actor-task
+        role: tester
+        instruction: |
+          基于已批准 manifest 和验收标准独立执行集成测试，核对本次实际运行的源码/制品/服务版本。按项目要求进行真实客户端、部署就绪及全栈验证；纯文档执行适用检查，不假称 E2E。缺环境或部署能力 BLOCK，由 Manager 按授权准备指定版本，不能拿其他分支部署成功代替。主 Issue 记录用例、版本与结果；通过 passed，产品缺陷 changes-required，候选修订改变 stale-review。不重做代码审查，不合并关票。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        passed:
+          criteria: |
+            独立集成测试报告绑定当前 manifest 和实际运行版本，全部适用验收通过；必需真实环境/部署就绪有对应证据，候选未改变，无未解决失败或必需验证缺口。
+          target:
+            node: publish-integration
+        changes-required:
+          criteria: |
+            指定版本的实际验证发现可复现产品缺陷，已记录受影响仓及修复验收，交规划修复。
+          target:
+            node: plan-remediation
+        stale-review:
+          criteria: |
+            待验候选的修订发生变化，已记录对象差异；最终发布尚未开始，原测试不能覆盖新候选。
+          target:
+            node: prepare-integration
+    publish-integration:
+      execution:
+        type: actor-task
+        role: coordinator
+        instruction: |
+          1. 消费已批准且独立验收通过的 manifest，只做发布，不重新审查需求/代码/测试。先区分已完成与待发布仓；已合并 PR 只按原批准核验本次合并结果、补记遗漏，不把合并造成的基线前进当作漂移。紧邻每个待发布仓的操作核对当前 PR base/head 与受验版本及仓库保护；待确认 no-change 仓核对固定基线 SHA/tree。尚无任何最终合并时发现修订变化，stale-review 回准备；已有部分仓发布则保留事实 BLOCK 交 Manager，不将整个批次退回准备。
+          2. 按依赖顺序先子仓后伞仓，将有差异仓的 milestone PR 以 merge commit 合回基线；无差异仓只核验登记版本已在基线。每仓合并后确认实际 tree 等于受验 head tree、源 head/基线匹配本次批准且基线包含受验提交，记录实际 merge SHA。伞仓 gitlink 始终保留受验子仓 head，不改成 merge SHA 或最新 tip。
+          3. 每仓成功立即记主 Issue 发布进度；结果未知先查本次 PR，已合并的按原发布记录核验，重试只补未完成仓。实际合并内容不符或发布后新缺陷 BLOCK，不自动回滚。全部完成后汇总 publication：manifest、每仓受验 SHA→实际交付 SHA/tree、PR/no-change、伞仓指针及完成清单链接；published 交收尾，不关票。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        published:
+          criteria: |
+            全部仓的发布结果已记录为 publication：有差异 PR 已合回对应基线，实际 merge tree 与受验 tree 一致且基线包含受验提交；无差异仓已在基线。伞仓最后完成，gitlink 保持受验 SHA，子仓提交远端可达；无需等于子仓最新 tip 或实际 merge SHA。handoff 含 publication 与完成清单，无未完成发布，Issue 收尾尚待执行。
+          target:
+            node: close-milestone
+        stale-review:
+          criteria: |
+            发布操作前发现候选 PR base/head 或待确认 no-change 基线 SHA/tree 与受验版本不一致，已记录差异；本次所有仓均尚未执行最终合并，无部分发布被隐藏。
+          target:
+            node: prepare-integration
     close-milestone:
       execution:
         type: actor-task
         role: coordinator
         instruction: |
-          1. 读初始化、最新计划、当前对象有效批准及后续相关证据；查真实 PR 状态，缺证据、冲突、检查待完成、技术/权限或保护不足 BLOCK。合并前完整核对最新已授权必交集和获准移出/取消依据，仅允许已登记且本轮验收覆盖的集成验收主票仍开放；Milestone 应开放，若 PR 已合并则按后续步骤核验并补收尾。
-          2. 开放 PR 的 base/head 偏离批准，或批准未覆盖与既定验收相关的新失败验证/实质反证：在主 Issue发布失效评论，引用原批准、新旧修订/新证据和原因，提交 stale-review，不合并关票。超出范围仍 BLOCK。已合并不因正常目标 tip 前进重审，不把事后检查冒充合并前证据。
-          3. 批准有效则在主 Issue先成功发布合并前核验评论：runId、PR、批准链接、approvedBase/approvedHead、merge commit 方式、时间及所需 checks/保护证据或不适用依据。紧邻合并重查 base/head，以工具 head 条件保护合入指定基线；不绕过保护，仓库不允许 merge commit 则 BLOCK。重查变化转 stale-review；结果不明先查询不重复操作。
-          4. 已合并时读取当时批准与合并前记录，独立核验实际源 head 匹配批准 head、mergeCommit 第一父节点等于 approvedBase，fetch 后远端目标包含批准 head/mergeCommit，实施 PR 还核验包含本票实现提交。不能证明或不匹配则记录事实并 BLOCK，不自动回滚或手动关票；自动关票如实记录。分页核对计划及 Milestone 全部 Issue，以最新已授权必交集验收，获准移出/取消保留依据且不计入必交集；implementation/aggregate 已关闭且有本 run 交付/聚合完成证据，仅可留已登记的 integration-acceptance 主 Issue，其全部独立验收已由本轮批准覆盖。实际集成验证成功后，在主 Issue 发布交付评论，记录范围、验证/延期边界、批准/合并前核验链接和 merge SHA；为仍开放的集成验收主票留下依据并关闭。再次完整核对最新必交任务已完成关闭，Milestone 无剩余未解释开放票（获准移出票应已移出）、无未解释移出，才关闭 Milestone。已关闭对象核验归属和依据后复用。
-          5. 安全切回并快进指定基线，工作树干净；保留分支和用户内容。handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。delivered 附交付/合并前评论与合并证据；stale-review 附失效评论与重审输入。
+          消费 publication 和循环完成清单，不重验上游实现/审查/测试，不再合并或更新 gitlink。按清单给子 Issue 记录交付链接并统一关闭，再关闭聚合父票、主 Issue 和 Milestone，按项目既有标签词义维护；部分关票失败只补未完成项。发布最终摘要，保留分支并安全恢复约定工作状态；子仓可保留在受验 milestone 分支，不强制检出基线最新 tip。新增范围或已知交付缺陷交 Manager，不擅自补入本次收尾。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         delivered:
           criteria: |
-            指定 PR 已以 merge commit 合入指定基线，实际源 head 匹配有效批准；本 run 在合并前已发布核验评论，含批准链接、approvedBase/approvedHead、时间、方式和当时必要检查/保护依据，无尚未覆盖的新失败验证/实质反证。mergeCommit 第一父节点独立核验等于 approvedBase，远端目标包含批准 head/mergeCommit，实施 PR 还包含本票实现提交。最新已授权必交集非空且有 implementation、全部有完成依据并关闭，移出/取消有授权且保留历史，主票独立集成验收（如有）已覆盖并有关闭依据，无未解释移出，Milestone 无剩余未解释开放票且已关闭；主 Issue 集成交付评论含范围、合并证据、实际验证与延期边界。handoff 保留主 Issue、runId、初始化/计划及本次证据入口；工作树干净且位于指定基线，重入无重复副作用。
+            清单内所有子票、父票/主票和 Milestone 已完成关闭，最终摘要链接 publication；工作区收尾完成且用户内容保留。没有在收尾阶段新增代码、变更指针或重复发布。
           target:
             return: delivered
-        stale-review:
-          criteria: |
-            指定 PR 仍开放且归属明确，Milestone 开放，主 Issue 可已关闭；存在原有效批准，但 base/head 变化或出现批准未覆盖的既定验收内新失败验证/实质反证。主 Issue失效评论已发布，含原批准、新旧修订、新证据（如有）、原因；未执行合并或关票，handoff 保留运行入口及重审对象。
-          target:
-            node: final-review
     plan-remediation:
       execution:
         type: actor-task
         role: planner
         instruction: |
-          1. 读本 run 最新计划与本轮集成 changes-required 评论，核对 Milestone 和集成 PR 仍开放，缺明确必修目标/外部关闭/范围争议则 BLOCK，不擅自重开。旧主票可已关闭，继续作入口。
-          2. 仅为当前范围内必修项创建/复用 implementation 修复票，按集成 PR/发现 ID/已有映射核对，避免同一未解决发现跨轮重复建票；已有关闭修复票有新复发事实则引用历史新建后续票。复杂修复按需拆分，记录验收与依赖，明确无 hold 的可实施票标 ready-for-agent。任务核验使用最新已授权必交集；获准移出/取消票保留历史和授权依据、不计入必交集，同步调整验收归属及聚合子票集合，单纯移出 Milestone 或改标签不能排除任务。最新必交集仍须至少一张 implementation，否则 BLOCK。 implementation 是承担全部实现的叶票；aggregate 无独立验收、聚合子票；integration-acceptance 仅限明确列出独立集成验收的主 Issue，实现须拆入叶票，不能成为实施或聚合票等待关闭的依赖。父子关系无环，显式 Blocked by 与聚合等待子票关闭组成的联合等待图也须无环；聚合自身依赖计入。
-          3. 主 Issue 的计划评论保留完整任务索引：Issue URL、taskKind、父子/依赖、验收归属、执行授权/人工 hold、已批准移出/取消及原因，修复票另记发现 ID→Issue 映射。评论追加并指向前版，不维护另一份实时状态表。保留已完成票、历史批准/合并及移出依据，追加本轮修复范围和映射；不能仅改分类绕过实现，不为技术失败或无授权优化建产品票。至少一张可执行修复票，反复返工无新证据则 BLOCK。handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。
+          只处理本轮集成审查/测试的具体必修发现，在伞仓创建或复用修复实施票并关联同一 Milestone。每票指定目标仓、验收和实施依赖，使用原 milestone 分支继续交付；保留已完成票的 code-integrated 记录。主 Issue 追加发现→修复票映射及计划变更，至少一票可执行，交回实施循环；外部环境缺口交 Manager，不造产品修复票。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         planned:
           criteria: |
-            同一开放 Milestone/集成 PR 下，主 Issue 新计划评论绑定本轮集成审查与发现 ID→修复票映射，至少一张授权、无 hold、依赖满足且 ready-for-agent 的未完成 implementation 修复票；验收清楚，无未解释重复/范围扩张，保留历史和已完成范围。任务核验使用最新已授权必交集；获准移出/取消票保留历史和授权依据、不计入必交集，同步调整验收归属及聚合子票集合，单纯移出 Milestone 或改标签不能排除任务。最新必交集仍须至少一张 implementation，否则 BLOCK。 implementation 是承担全部实现的叶票；aggregate 无独立验收、聚合子票；integration-acceptance 仅限明确列出独立集成验收的主 Issue，实现须拆入叶票，不能成为实施或聚合票等待关闭的依赖。父子关系无环，显式 Blocked by 与聚合等待子票关闭组成的联合等待图也须无环；聚合自身依赖计入。handoff 含初始化/最新计划/必修来源与映射。
+            本轮必修发现已映射到伞仓修复票，目标仓/验收/实施依赖明确且归入本 Milestone，至少一票可执行；旧实施记录保留，修复计划已交接。
           target:
             node: run-issue-cycle
   returns:
@@ -160,34 +214,33 @@ childWorkflows:
           type: actor-task
           role: coordinator
           instruction: |
-            1. 读初始化和最新计划，核对指定 Milestone 开放。以最新已授权必交集为完成范围，核对移出/取消的授权及保留历史，不将这些票误列为待交付； 分页完整核对 Milestone Issue（排除 PR）与本 run 最新计划，非空且至少一张 implementation；未分类、无授权移出/取消、成员冲突或查询不全均 BLOCK。关闭不等于交付：必交集中的 implementation 必须有对应批准/合并/目标包含证据；无依据的外部关闭 BLOCK。检查联合等待图及授权/人工暂停无新冲突。
-            2. 自底向上关闭无独立验收的 aggregate，仅在最新必交子票全部有完成依据并关闭、自身显式依赖也关闭且无有效 hold 后评论留依据并关闭，直至无可关闭聚合票。就绪标签由本节点集中核对：仅对已授权且全部依赖关闭、无人工 hold/needs-info/ready-for-human 的 implementation 修复工作流管理的 ready-for-agent；人工移除标签/撤销授权或来源不明不能自动恢复，记录阻塞并协调。
-            3. 有 open、授权、ready-for-agent 且依赖全关闭/为空的 implementation 叶票，按依赖优先级再编号升序选择。安全更新 milestone，从确切 SHA 建立推送 feat/<issue-number>-<slug>；已有分支按原领取评论核验归属、原始 baseCommit 及祖先关系，不以当前 tip 代替起点，不明则 BLOCK。当前票发布领取评论绑定 runId、初始化/计划、仓库、feature/milestone、原始 baseCommit；selected 交接此入口。
-            4. 无候选时，以最新已授权必交集为准，只有非空 implementation 全部有交付依据且关闭、aggregate 全部完成关闭、剩余开放票为空或仅已登记独立验收的 integration-acceptance 主票，才准备集成。仍有未完成票/hold 或无法解释的对象则逐项说明 BLOCK，不能冒充耗尽。
-            5. 耗尽时安全回到更新后的 milestone，确认工作树干净、已推送且无未解释本地提交；创建/复用唯一指定 milestone→基线开放 PR，保留正文，不合并。已关闭/合并、身份歧义或无交付差异 BLOCK。主 Issue 发布集成准备评论，含完整任务核验依据、PR/base/head、范围/实现审查链接和待集成验收项（无则明确无）。integration-ready 返回 root 审查。handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。
+            1. 本节点独占任务选择与循环结束判断。按计划和 Milestone 完整分页检查实施票集合，消费已验收的 code-integrated 记录，不重新核验历史 PR 的代码/测试。已集成票虽 open 也不再领取；未纳入计划的对象交 Manager，不擅自扩范围。
+            2. 选一张未集成且实施依赖已满足的票；本轮前置合入 milestone 即满足实施依赖，不等待关票，外部/明确验收依赖与人工 hold 仍按条件处理。有剩余工作但无可执行票则 BLOCK，不能声称完成。
+            3. 从目标仓当前 milestone 建立/复用本票 feature 分支，领取评论记录目标仓、分支起点、验收及独立合并前验证要求；selected 交实现。不提交伞仓指针。
+            4. 全部实施票均已有 code-integrated 时，在主 Issue 发布完成清单和证据索引，列待最终统一关闭的主/子票，code-complete 返回集成准备。这里只判断代码完成，不构建集成候选。
         checker:
           checkerId: judge.claim-correct
           config: {}
         results:
           selected:
             criteria: |
-              Milestone 开放，完整分页成员与计划相符，无未解释移出/取消/未分类或联合等待冲突。本票 open、implementation 叶票、已授权且无人工 hold、ready-for-agent、依赖均满足；本次聚合关闭有子票完成/自身依赖满足证据，标签未越过人工限制。feature 分支已从可追溯原始 baseCommit 建立/复用并推送，身份/祖先关系明确，未覆盖用户改动；本票领取评论已发布，handoff 保留本 run 初始化/最新计划/领取与分支身份。
+              已选出本次计划内尚未集成、依赖满足且无人工阻塞的实施票；目标仓 feature 从 milestone 建立并记录起点，领取入口和验收已交接。
             target:
               node: deliver-one-issue
-          integration-ready:
+          code-complete:
             criteria: |
-              Milestone 开放，完整分页核对最新已授权必交集与计划一致且非空，获准移出/取消保留历史与依据且不计入必交集，至少一张 implementation、全部有合并/目标包含交付依据并关闭，aggregate 有子票/自身依赖完成依据并关闭；无未解释移出/取消或未分类，剩余开放票仅可为已登记独立验收的主票，无隐匿实现。唯一集成 PR 开放，源/目标为指定 milestone/基线，SHA 已推送且与证据一致，工作树干净且无未解释本地提交。主 Issue 集成准备评论含上述依据、范围/逐票证据、PR/base/head、待集成验收项，handoff 保留本 run 初始化/最新计划/准备入口。
+              本轮非空实施集合全部已有已验收的 code-integrated，无遗漏的计划内实施票；完成清单/待关票索引已发布并交接。Issue 保持开放，不代表实施未完成。
             target:
-              return: integration-ready
+              return: code-complete
       deliver-one-issue:
         execution:
           type: child-workflow
           workflowId: issue-delivery
         onReturn:
-          delivered:
+          code-integrated:
             node: select-next-issue
     returns:
-      - integration-ready
+      - code-complete
   issue-delivery:
     startNode: implement
     nodes:
@@ -196,17 +249,14 @@ childWorkflows:
           type: actor-task
           role: developer
           instruction: |
-            1. 读本票、初始化/最新计划/领取及最新审查评论，核对工作树、featureBranch、原始 baseCommit 与目标 milestone。简单文档直接实现，编码用实际可用 implement，按需 diagnosing-bugs/tdd；技能产物按本流程留远端证据。范围或身份不明 BLOCK。
-            2. 交付本票验收或本轮必修项；逐项核实发现，成立则修复，不成立给具体反证交 reviewer，不自行视为批准；无代码变化可复用 head，不制造空提交。完成适用自测/必要回归，必需验证不能执行 BLOCK，无适用测试说明依据。
-            3. 只提交本任务实现及必要忽略规则，推送 feature，创建/复用唯一 feature→milestone 开放 PR；返工复用原 PR，已关闭/合并、无差异或归属冲突 BLOCK，不合并关票、不部署。运行材料不得提交。
-            4. 本票发布实现评论，含 runId、领取/初始化/计划/前轮审查链接、PR/base/head/实现 SHA、验收覆盖、命令/结果/未测边界与修复/反证；PR 仅附摘要与评论链接。长报告按公共规则忽略并登记摘要/路径/修订/哈希。handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。
+            按当前票验收和返工发现实现，仅修改指定仓 feature 分支。同步必要 milestone 更新，执行项目要求的开发检查/自测；要求真实客户端自检时通过后才开 PR。提交推送 feature→milestone PR，在伞仓 Issue 记录实现、自测结果、PR base/head 及版本；返工复用原开放 PR，已合并修复使用新 PR。不合并、关票或更新 gitlink。
         checker:
           checkerId: judge.claim-correct
           config: {}
         results:
           implemented:
             criteria: |
-              本 implementation Issue 及 Milestone 开放，授权范围内验收实现有证据；必修项逐项有修复或待 reviewer 核验的具体反证。指定 feature 已提交推送，唯一开放 PR 源/目标为 feature/milestone，head 与交接一致，diff 无无关用户改动/运行产物；适用自测/必要回归有命令、对象 SHA、真实结果或不适用依据，无未完成必需验证。Issue 实现评论已发布并被 PR 引用，含验收/修订/验证边界及前序链接；长报告如有已忽略未跟踪且评论有摘要/路径/修订/哈希。handoff 保留主 Issue/runId/初始化/最新计划/领取/实现入口。
+              当前票实现及返工已交付为目标仓 feature→milestone PR，head 包含当前 milestone 基线，所需开发自测已执行并记录真实结果；Issue 有实现/PR 修订与证据链接，未提前合并关票。
             target:
               node: review
       review:
@@ -214,49 +264,70 @@ childWorkflows:
           type: actor-task
           role: code-reviewer
           instruction: |
-            1. 由交接定位初始化、最新计划、实现/集成准备、上轮审查和相关新澄清；核对当前指定开放 PR，固定 base/head/mergeBase。本实施 Issue 应开放。用实际可用 code-review 技能，纯文档/注释小改可直接审查。覆盖本票验收、完整 PR diff、自测/回归及旧必修项，逐项核验开发者反证；增量复用必须补查所有变化和交互影响。
-            2. 在本实施 Issue发布 rNNN 审查评论，记录 runId、对象/修订、前序链接、范围/方法、验收/验证边界、稳定发现 ID、逐项修复/延期/不成立及依据。无必修项且必需验证齐备才 approved；有范围内可执行必修清单才 changes-required。技术/证据/权限缺口及范围争议 BLOCK；延期需必要授权和后续入口。
-            3. approved 写 approvedBase/approvedHead；changes-required 明确本轮无批准、旧批准失效。PR 只留结论摘要和评论链接。首次 r001；修订、新反证、验证材料或结论变化均开新轮，即使 SHA 相同；相同执行且输入/结论相同才复用。发布前后复核修订，漂移则标记失效并 BLOCK，不提交旧批准。
-            4. 普通报告直接评论，长篇复杂报告按公共规则存 ignored 目录并登记摘要/路径/修订/哈希；不要求独立 decision 文件。handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。批准交接批准修订，返工交接必修清单与验收。
+            审查当前 PR 的实现与本票验收，核对自测证据及本轮修改，不复查初始化/拆票。结论绑定当前 base/head；必修或必要基线同步 changes-required 回实现。无必修时，计划要求独立合并前验证则 verification-required，否则 approved。Issue 发布结论；给 tester 只传验收/源码版本/环境入口，不传开发自测结论。
         checker:
           checkerId: judge.claim-correct
-          config:
-            criteria: |
-              指定 PR 开放且归属/源目标正确；本实施 Issue 开放；本 run 的本实施 Issue审查评论已发布，绑定仓库/PR/base/head/mergeBase、轮次及前序证据，提交时修订未漂移。覆盖本票验收、完整 PR diff、自测/回归及旧必修项，逐项核验开发者反证；增量复用必须补查所有变化和交互影响。发现逐项有处置和依据，延期有必要授权/后续入口，无未解决范围争议；PR 指向同修订评论，handoff 含运行入口和本轮评论。使用长报告时评论有摘要/路径/修订/哈希且实际所需内容可读，不要求本地短报告。
+          config: {}
         results:
           approved:
             criteria: |
-              本轮评论明确无未解决本次必修项、必需验证齐备，approvedBase/approvedHead 与当前 PR 相符；无后续作废结论、修订变化或尚未覆盖的新失败验证/实质反证。
+              本票当前 base/head 审查通过，无未解决必修，开发检查充分，计划未要求独立合并前验证；结论已发布。
+            target:
+              node: complete-issue
+          verification-required:
+            criteria: |
+              本票当前 base/head 代码审查通过，按计划尚需独立合并前验证；已交接验收、版本和环境入口。
+            target:
+              node: verify-issue
+          changes-required:
+            criteria: |
+              本轮有具体实现缺陷或必要基线同步要求，Issue 已记录可执行修复及验收清单。
+            target:
+              node: implement
+      verify-issue:
+        execution:
+          type: actor-task
+          role: tester
+          instruction: |
+            按本票验收独立执行计划要求的合并前测试，绑定当前 PR base/head，记录实际用例/版本/结果。全部通过 passed；产品缺陷 changes-required 回实现；PR 修订变化 stale-review 回审查。必要环境缺口交 Manager，不重新做代码审查或重复开发自测报告。
+        checker:
+          checkerId: judge.claim-correct
+          config: {}
+        results:
+          passed:
+            criteria: |
+              本票所需独立合并前验证已实际通过，报告绑定当前 PR base/head，无必需验证缺口。
             target:
               node: complete-issue
           changes-required:
             criteria: |
-              本轮评论有既定范围内、具依据和可执行验收的必修清单，本轮无有效批准且旧批准明确失效；环境/权限问题不伪装产品返工。
+              实际验证发现本票产品缺陷，记录版本、复现和修复验收。
             target:
               node: implement
+          stale-review:
+            criteria: |
+              待合并 PR 修订发生变化，当前验证不能覆盖新修订，已交接差异。
+            target:
+              node: review
       complete-issue:
         execution:
           type: actor-task
           role: coordinator
           instruction: |
-            1. 读初始化、最新计划、当前对象有效批准及后续相关证据；查真实 PR 状态，缺证据、冲突、检查待完成、技术/权限或保护不足 BLOCK。开放 PR 要求本票仍开放、Milestone 开放；已合并 PR 按当时记录核验并补收尾。
-            2. 开放 PR 的 base/head 偏离批准，或批准未覆盖与既定验收相关的新失败验证/实质反证：在本实施 Issue发布失效评论，引用原批准、新旧修订/新证据和原因，提交 stale-review，不合并关票。超出范围仍 BLOCK。已合并不因正常目标 tip 前进重审，不把事后检查冒充合并前证据。
-            3. 批准有效则在本实施 Issue先成功发布合并前核验评论：runId、PR、批准链接、approvedBase/approvedHead、merge commit 方式、时间及所需 checks/保护证据或不适用依据。紧邻合并重查 base/head，以工具 head 条件保护合入指定 milestone 分支；不绕过保护，仓库不允许 merge commit 则 BLOCK。重查变化转 stale-review；结果不明先查询不重复操作。
-            4. 已合并时读取当时批准与合并前记录，独立核验实际源 head 匹配批准 head、mergeCommit 第一父节点等于 approvedBase，fetch 后远端目标包含批准 head/mergeCommit，实施 PR 还核验包含本票实现提交。不能证明或不匹配则记录事实并 BLOCK，不自动回滚或手动关票；自动关票如实记录。实际合并验证成功后，在本实施 Issue 发布交付评论，记录批准/合并前核验链接、实现与 merge SHA、目标包含证据、验证/延期边界，然后关闭 Issue；自动或已有关闭如实核验。此处不扫描其他票或维护解阻标签，交下一轮选票统一处理。
-            5. 安全切回并快进指定 milestone 分支，工作树干净；保留分支和用户内容。handoff 保留真实 runId、主 Issue/初始化评论/最新计划评论 URL、Milestone 身份、本对象 Issue/证据评论 URL、PR/修订与后续约束；子流程进出也保留这些入口。delivered 附交付/合并前评论与合并证据；stale-review 附失效评论与重审输入。
+            消费本票批准及所需独立验证，只负责 feature→milestone 合并。紧邻操作核对 PR base/head 与批准一致、满足仓库保护，记录合并前核验后用 head 条件保护 merge commit；变化则 stale-review 回审查。合并后确认源 head、实际 tree 与批准相符且 milestone 包含实现，Issue 记录 code-integrated/merge SHA，保持 open。结果未知先查本 PR，重试只补遗漏。安全切回目标仓 milestone，伞仓预期指针偏移不提交；交回循环，不扫描其他票。
         checker:
           checkerId: judge.claim-correct
           config: {}
         results:
-          delivered:
+          code-integrated:
             criteria: |
-              指定 PR 已以 merge commit 合入指定 milestone 分支，实际源 head 匹配有效批准；本 run 在合并前已发布核验评论，含批准链接、approvedBase/approvedHead、时间、方式和当时必要检查/保护依据，无尚未覆盖的新失败验证/实质反证。mergeCommit 第一父节点独立核验等于 approvedBase，远端目标包含批准 head/mergeCommit，实施 PR 还包含本票实现提交。本实施 Issue 已关闭，交付评论保留批准/核验/合并与验证边界，未越权维护其他票。handoff 保留主 Issue、runId、初始化/计划及本次证据入口；工作树干净且位于指定 milestone 分支，重入无重复副作用。
+              本票 PR 已按批准版本合入目标仓 milestone，实际合并结果与批准相符，Issue 已记录 code-integrated 且保持开放；当前操作与工作区状态已交接。
             target:
-              return: delivered
+              return: code-integrated
           stale-review:
             criteria: |
-              指定 PR 仍开放且归属明确，本实施 Issue 与 Milestone 开放；存在原有效批准，但 base/head 变化或出现批准未覆盖的既定验收内新失败验证/实质反证。本实施 Issue失效评论已发布，含原批准、新旧修订、新证据（如有）、原因；未执行合并或关票，handoff 保留运行入口及重审对象。
+              PR 尚未合并，当前 base/head 或新实质反证使本票批准失效，差异已交接；未提前关票。
             target:
               node: review
     returns:
-      - delivered
+      - code-integrated

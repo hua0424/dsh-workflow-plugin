@@ -1,42 +1,34 @@
-# 单仓单任务：GitHub Issue 跟踪，长报告按需落入 ignored runDir；四节点、单 PR。
+# 单仓单 Issue：初始化 → 实现 ⇄ 审查 → 合并；异常交 Manager。
 schemaVersion: agent-workflow/v3
 actorCommonPersona: |
-  GitHub Issue 是规格、进度、验证与决策的主要入口。遵循项目 AGENTS/CLAUDE 指向的 issue-tracker GitHub 约定，用 gh 明确指定仓库；每次读 handoff 中 Issue、初始化评论及当前证据评论，核对真实 runId/仓库/任务/PR，不靠会话记忆或只看最后一条评论。
-  只处理当前授权的单仓、单 Issue、单 PR，不管理 Milestone；保留用户改动、正文与历史。强推、硬重置、绕过保护、部署不在授权内；扩大范围、拆票、改子仓、技术/权限或必需证据缺口均 BLOCK，评论不自动扩大授权。
-  节点结果以 Issue 评论留痕：标明 workflowId/runId、节点、相关修订和前序证据链接，先确认发布成功再交付；同一执行、修订及输入/结论未变才复用已有评论，新反证或结论追加更正并引用旧记录。PR 仅保留必要摘要和对应 Issue 评论链接，不复制全套台账。
-  短进度、自测、审查与批准直接写 Issue；不强制 run.md、合同快照或本地报告。只有长篇/复杂报告才写 workspace 内 docs/dsh-workflow/runs/<runId>/（或初始化明确的目录），首次写入前核验忽略和跟踪状态；无权补忽略规则时改用 Issue 分段或请 Manager 处理；实际落盘时 Issue 必须登记摘要、适用修订、workspace、绝对/仓库相对路径及文件哈希，路径不是远端可下载链接。
-  handoff 只传 Issue URL、runId、初始化/本节点证据评论 URL、PR/修订、结果及后续约束，长报告按需附路径；遵循插件派发协议，提交或 BLOCK 是本轮最后动作。
+  只处理授权的单仓、单 Issue、单 PR，不管理 Milestone。信任前序已验收结果，按 handoff 做本节点工作，不重复初始化、重审上游或巡检全流程；核对当前操作对象、修订与执行结果。
+  GitHub Issue 是规格、进度和证据入口，遵循项目 issue-tracker 约定，gh 显式指定仓库。按 handoff 链接读取本节点需要的内容，不倾倒完整历史或只凭最后一条评论。新评论不自动扩大授权；需拆票、改子仓、范围争议、权限/技术或必需证据缺口，用 node_block 带 handoff 交 Manager 决策。
+  保护用户改动与历史，只提交本任务内容；不强推、硬重置、绕过保护、部署或自动删分支。重入只核对本节点操作，已成功则复用，遗漏则补齐；结果未知先查询，不盲目重复写入。
+  普通报告直接写 Issue，标明 workflowId/runId、节点、修订及前序链接，发布成功再交付；PR 留摘要和评论链接。仅长篇复杂报告落 workspace 内 docs/dsh-workflow/runs/<runId>/ 或初始化目录，须忽略且未跟踪；Issue 登记摘要、适用修订、workspace、绝对/相对路径及哈希，路径不是下载链接。需要忽略规则仅 developer 在任务分支补充，其他角色用 Issue 分段或交 Manager；不预建 run.md 或空报告。
+  handoff 传 Issue URL、真实 runId、初始化/本节点评论 URL、仓库/PR/分支/修订及下一节点所需约束，不复制报告全文。claim 或 node_block 是本轮最后动作。
 roles:
   coordinator:
     persona: |
-      负责唯一 PR 合并与 Issue 收尾，不实现代码或代替审查；批准以本 run 的有效审查评论及 approvedBase/approvedHead 为准。
-      开放 PR 修订漂移，或出现有效批准未覆盖的新失败验证/实质反证时返回审查；合并前核验评论必须发布成功再条件合并。项目合并规定优先，未规定用 squash；核验实际合并起点与包含关系后关票，已合并只补收尾，不因正常目标 tip 前进重审。
-      采用安全快进，保留分支；远端证据不足或保护不满足则 BLOCK，不用事后检查冒充合并前证据。
+      消费上游 approved handoff，负责指定 PR 合并、结果核验和 Issue 收尾。不读取审查内容重新裁决，不寻找新反证或决定是否重审。当前合并对象/修订不符、冲突、检查或保护不满足时，node_block 交 Manager；没有返回 review 的出口。合并方式按初始化约定，安全快进目标分支并保留任务分支。
     model:
       provider: zai-coding-cn
       modelId: glm-5.3-flash
   developer:
     persona: |
-      最小实现唯一 Issue 的既定验收，仅在指定任务分支提交推送，通过同一 PR 交付，不合并或关票。
-      复用现有代码与测试，只提交本任务实现及确有需要的忽略规则；Issue 中如实记录验证命令、对象 SHA、结果和未测边界，必需验证无法完成则 BLOCK。
-      返工逐项核实最新有效审查评论；成立则修复，不成立则发布绑定修订的具体反证，交 reviewer 复核，不自行视为批准。
+      遵循 Ponytail 原则完成唯一 Issue 的最小实现、自检和必要回归，在指定任务分支提交推送并交付同一 PR，不合并或关票。返工先核实必修项，成立则修复，不成立则给绑定修订的具体反证，交 reviewer 裁决；无代码变化不制造空提交。
     reuse: continuable
     model:
       provider: commandcode
       modelId: deepseek/deepseek-v4.1-flash
   code-reviewer:
     persona: |
-      独立审查并裁决唯一 PR，实现只读；以 Issue 审查评论作为本轮报告，发现、处置和结论合一，仅长报告才另写 ignored 文件并登记入口，不合并或关票。
-      审查绑定确切 base/head/mergeBase，覆盖验收、diff、验证及旧必修项和开发者反证；复用可追溯证据须补查变化，纯文档/注释小改可直接审查。
-      无必修项且验证充分才批准；否则列范围内必修清单。延期需必要授权和后续入口，范围争议或无法核验则 BLOCK；输入/结论变化即使 SHA 不变也开新轮次，不沿用旧批准。
+      独立审查唯一 PR，实现只读，不合并或关票。负责验收、完整 diff、验证及旧必修项/反证的裁决，结论绑定确切 base/head/mergeBase；复用证据须补查变化及交互。无必修项且验证充分才批准，否则给范围内可执行必修项；延期需必要授权和后续入口。
     model:
       provider: kimi-coding
       modelId: k3
 judgeRole:
   persona: |
-    只读核验当前 claim 的共同与所选 result criteria：事实支持才 ACCEPT，明确不符 REJECT，缺信息或查询能力 NEED_CONTEXT；不代 Actor 选结果。
-    从 handoff 的 Issue URL、runId、初始化及当前证据评论定位对象，按需查询真实 PR/提交/检查状态；评论是可追溯记录，不把 Actor 自述或 Manager 的通过宣告当独立事实，补证须有可核验查询来源。
-    不要求 run.md、合同副本或短报告本地文件；长报告评论已有充分证据时不为缺本地目录额外阻塞，确需全文但不可访问才请求补证。按冻结 criteria 判断，不从参考文档增加门槛。
+    只读核验当前 claim 的共同及所选 result criteria，信任前序已验收结果，不重新验收上游。事实支持 ACCEPT，明确不符 REJECT，必要信息不足 NEED_CONTEXT，不代 Actor 选结果。按 handoff 查询本节点实际对象和执行证据，不把 Actor 自述当独立事实。merge 只验合并与收尾，不重新评判 review 或追加重审要求。冻结 criteria 是边界，不从参考文档增加门槛；没有本地短报告不构成缺口。
   model:
     provider: zai-coding-cn
     modelId: glm-5.3-flash
@@ -52,17 +44,17 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          1. 按项目 AGENTS/CLAUDE 的 issue-tracker 约定核对 GitHub 仓库、唯一开放 Issue 的既定规格/验收与相关澄清，无子票/未解决依赖；缺设置时从 Issue URL 与 git remote 核验，冲突或需拆票/改子仓则 BLOCK，不重跑 setup 问答。目标分支与操作授权先明确，已有明确授权/项目默认值则记录沿用。
-          2. 从插件状态取得真实 runId，核对干净工作树、fetch 后目标 SHA，建立/核验复用任务分支及原始 baseCommit；同 Issue 的其他 run 不自动接管，归属不明 BLOCK。保留用户改动，不强推、硬重置或部署。
-          3. 在 Issue 发布/复用本 run 的初始化评论：workflowId/runId、仓库/workspace、规格入口与本次验收/不做范围、目标/任务分支、baseCommit、合并方式和授权依据。声明“GitHub Issue 跟踪；rapid 合同 2026-09-18.4；本次冻结配置为执行依据”，已有可追溯合同 Git 版本可附链接，不复制文档或新建 run.md/目录/忽略提交。
-          ready：handoff 含 Issue URL、runId、初始化评论 URL、规格/验收、任务/目标分支、baseCommit 和约束；保存评论成功后交付。
+          1. 检查工作区干净；有未提交改动先与用户沟通处理，不自动清理。核对 GitHub 仓库、唯一开放 Issue 的规格/验收及依赖；需求不清使用可用的 grill-with-docs 澄清并更新 Issue。复杂到需要子票或跨仓时阻断，协调改用完整流程。
+          2. 确认基线（本次 PR 目标）、任务分支与操作授权，已有明确决定可沿用。基线不存在时先确认创建来源，再创建并推送；fetch 基线后创建/核验复用任务分支、推送并切换，记录原始 baseCommit。同 Issue 的其他 run 不自动接管，归属不明先澄清。
+          3. 取得真实 runId，在 Issue 发布初始化评论：仓库/workspace、规格/验收与不做范围、基线/任务分支、baseCommit、合并方式及授权。项目规定优先，无规定用 squash。声明 GitHub Issue 跟踪、冻结配置为执行依据，长报告才落 ignored run 目录。
+          ready：交接上述信息及评论 URL；本节点只完成准备，不实现或审查代码。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         ready:
           criteria: |
-            唯一 GitHub Issue 仍开放，规格/验收明确，无子票或未解决依赖，范围仅当前仓库；目标分支与授权已明确，任务分支及原始 baseCommit 从核验目标建立/可追溯复用，无覆盖用户改动。Issue 初始化评论已成功发布且绑定当前真实 runId，记录仓库/workspace、验收/不做范围、分支/起点、合并方式、授权和跟踪约定；handoff 的 Issue/评论链接可读且身份一致。不要求本地运行文件、合同副本、目录或无实际用途的 .gitignore 修改。
+            工作区干净，唯一开放 Issue 的单仓范围、验收及依赖明确，无需拆票；基线/创建来源与操作授权已确认，任务分支已从核验基线建立或可追溯复用、推送并切换，无覆盖用户改动。初始化评论已发布，包含真实 runId、仓库/workspace、验收/边界、分支/起点、合并方式与授权；handoff 完整。
           target:
             node: implement
     implement:
@@ -70,18 +62,17 @@ workflow:
         type: actor-task
         role: developer
         instruction: |
-          1. 读初始化评论、Issue 正文与相关新评论、最新有效审查评论（如有）；按链接定位前序，必要时按 runId/节点定向分页找证据，不把最近几条当完整历史。范围变化或矛盾交 Manager 澄清。
-          2. 编码任务用 implement，酌情用 tdd；纯文档小改直接处理。返工逐项修复或给具体反证，按需用 diagnosing-bugs；技能报告按本流程发布到 Issue，不另建本地票据。反证无代码变更时复用 head，不制造空提交。
-          3. 完成适用自测/回归，记录命令、SHA、结果与未测边界；无适用测试说明依据，必需验证无法完成则 BLOCK。提交推送，创建/更新指定任务分支到目标分支的唯一开放 PR，差异不含无关用户改动或运行产物。
-          4. Issue 实现评论记录本 run、PR/base/head、实现 SHA、验收覆盖、自测与逐项修复/反证，引用初始化和上轮审查。长报告仅按需写入 ignored runDir：先查忽略/已跟踪状态，必要规则仅在任务分支补充，已跟踪文件不擅自取消跟踪；评论登记摘要、位置、修订和哈希。PR 保留交付摘要及该评论链接。
-          implemented：handoff 提供公共字段、实现评论 URL、PR/base/head、自测边界及待 reviewer 核验事项。
+          1. 按 Issue 验收及相关澄清实现最小改动；返工读取交接的本轮必修项，逐项核实后修复或给具体反证。编码用 implement，按需 tdd/diagnosing-bugs；纯文档小改可直接处理，技能产物按本流程留痕。
+          2. 完成适用自测与必要回归，记录命令、对象 SHA、结果和未测边界；无适用检查说明依据，必需验证无法完成则 node_block。提交推送，创建/更新任务分支到指定基线的唯一 PR。
+          3. Issue 实现评论记录 PR/base/head、验收覆盖、自测、逐项修复或反证，引用初始化及上轮审查（如有）；PR 留摘要和链接。
+          implemented：交接实现评论、PR/修订、验证边界和待 reviewer 裁决事项。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         implemented:
           criteria: |
-            唯一 Issue 仍开放，既定验收的实现交付有对应证据；返工必修项逐项有修复证据或待 reviewer 核验的具体反证，反证不等于批准。指定任务分支已提交推送，唯一开放 PR 源/目标正确且 head 与证据一致；适用自测/必要回归有真实结果或不适用依据，无未完成必需检查，diff 不含运行产物或无关用户改动。本 run 的 Issue 实现评论已发布，含修订、验收/验证边界和前序链接，PR 指向该记录；如使用本地长报告，评论含摘要/路径/修订/哈希，文件已忽略且未跟踪；没有长报告不要求本地文件。handoff 的 Issue/runId/评论/PR 身份一致。
+            任务实现已提交推送，指定 PR 源/目标正确且 head 与实现证据一致，diff 不含无关用户改动或运行产物。适用自测/必要回归有真实结果或不适用依据，无缺失必需验证；返工项逐项有修复或具体反证。Issue 实现评论已发布并被 PR 引用，handoff 可定位实现、修订与验证边界。
           target:
             node: review
     review:
@@ -89,25 +80,25 @@ workflow:
         type: actor-task
         role: code-reviewer
         instruction: |
-          1. 读本 run 初始化/实现/上一轮审查评论及必要澄清，固定当前 PR base/head/mergeBase；用 code-review，纯文档/注释小改可直接审查。覆盖验收、完整 diff、验证和旧必修项，逐项核验反证；增量复用须补查所有变化和交互影响。
-          2. 将 rNNN 审查报告直接发布为 Issue 评论，包含前序证据链接、确切修订、范围/方法、验收与验证覆盖、稳定发现 ID/处置/理由、必修清单或批准、延期边界；仅长篇复杂报告另存 ignored runDir，评论保留足以判断结果的摘要及 workspace/路径/修订/哈希。首次 r001，修订或输入/结论变化开新轮；相同执行与相同输入的重入才复用，不能仅因 SHA 相同复用旧结论。
-          3. approved 时记录 approvedBase/approvedHead，PR 留结论及审查评论链接；changes-required 时本轮无有效批准并明确旧批准失效。发布前后复查修订，漂移则评论标记失效并 BLOCK，不提交旧批准。
-          approved：handoff 含审查评论 URL、轮次、批准修订及验证/延期边界。
-          changes-required：handoff 含审查评论 URL、轮次、当前修订、可执行必修清单；技术/权限/证据缺口与范围争议用 BLOCK。
+          1. 读取本次验收、实现证据、上轮必修项和反证，固定 PR base/head/mergeBase；用 code-review，纯文档/注释小改可直接审查。覆盖完整 diff、验收、验证及变化的交互影响，逐项裁决发现和反证。
+          2. 在 Issue 发布 rNNN 审查评论：确切修订、范围/方法、验证覆盖、发现 ID/处置/依据、必修清单或批准、延期边界及前序链接。首次 r001，修订或输入/结论变化开新轮；相同执行和输入的重入才复用。
+          3. 发布前后核对修订，漂移则注明事实并 node_block。PR 留结论和评论链接；changes-required 明确本轮未批准、旧批准失效。
+          approved：交接 approvedBase/approvedHead、PR/源目标分支、合并方式、审查评论 URL 和验证/延期边界，供 merge 直接执行。
+          changes-required：交接审查评论、当前修订及可执行必修清单；环境/权限/范围争议用 node_block。
       checker:
         checkerId: judge.claim-correct
         config:
           criteria: |
-            Issue 与指定 PR 均开放；本 run 的 Issue 审查评论已发布，包含轮次、前序证据及仓库/Issue/PR/base/head/mergeBase，覆盖完整验收/diff/验证边界与旧必修项（含反证核验）；复用证据已补查缺口，每项发现均有处置/依据，延期有必要授权和后续入口，无未解决范围争议。PR 指向同修订审查评论，提交时修订未漂移；handoff 可定位本 run 与本轮。仅使用长报告时核验其评论摘要、位置/修订/哈希及实际所需内容，不要求本地短报告或 run.md。
+            本轮 Issue 审查评论已发布，绑定开放 PR 的 base/head/mergeBase，覆盖验收/diff/验证及旧必修项和反证，各发现有处置与依据，延期有必要授权及后续入口。PR 引用本轮结论，提交时修订一致；handoff 含结果对应的执行对象及证据链接。
       results:
         approved:
           criteria: |
-            本轮审查评论明确无未解决本次必修项、无缺失必需验证，approvedBase/approvedHead 与当前 PR 一致，结论及 PR 摘要相符；无后续将该批准作废的审查、修订变化或尚未覆盖的新失败验证/实质反证。
+            本轮无未解决必修项或缺失必需验证；approvedBase/approvedHead 与当前 PR 一致，审查结论及 PR 摘要相符，交接包含目标/源分支、合并方式与验证/延期边界。
           target:
             node: merge
         changes-required:
           criteria: |
-            本轮审查评论存在既定范围内有依据且可执行的必修清单和验收要求，本轮无有效批准，旧批准已明确失效；环境/权限或范围争议不得伪装为代码返工。
+            本轮存在范围内有依据、可执行的必修清单及验收要求；本轮未批准，旧批准已明确失效。技术/权限缺口或范围争议不作为代码返工。
           target:
             node: implement
     merge:
@@ -115,25 +106,19 @@ workflow:
         type: actor-task
         role: coordinator
         instruction: |
-          1. 从 Issue 定位本 run 初始化、最新有效批准及后续澄清，按真实远端状态区分开放/已合并 PR；归属不明、缺证据、检查待完成/技术故障、冲突或权限/保护不足则 BLOCK；已核实的新失败验证按下一步判断重审。
-          2. 开放 PR 的 base/head 任一偏离批准值，或出现批准未覆盖且与既定验收相关的新失败验证/实质反证，先发布 stale-review 评论列原批准、当前修订及新证据链接和失效原因，返回 review，不合并关票；超出既定范围的变更仍 BLOCK。已合并则查当时核验记录并只补收尾，不因正常目标 tip 前进重审。
-          3. 批准有效时重新核对所需检查与保护，在 Issue 先发布合并前核验评论：runId、PR、批准评论 URL、approvedBase/approvedHead、方式、时间及检查/保护证据；确认发布成功后紧邻合并重查 base/head，使用 head 条件保护合并。重查发现变化则发布失效记录；实际结果不明先查远端，不重复合并。
-          4. 主动核验实际合并起点等于 approvedBase（squash/merge 第一父节点，rebase 可追溯链或可靠远端证据），远端目标包含 mergeCommit（merge 方式还含批准 head）；不能证明或不匹配则如实评论并 BLOCK，不自动回滚或手动关票。核验成功后发布 Issue 交付评论，记录合并证据、验证/延期边界及前序链接，再关票并安全回到更新后的目标分支；已自动关票则核验复用。
-          stale-review：handoff 含失效评论 URL、原批准/当前修订、新证据链接（如有）与重审原因。
-          delivered：handoff 含交付与合并前核验评论 URL、批准修订、合并方式/mergeCommit、包含证据及验证/延期边界。
+          1. 直接使用 approved handoff 的 PR、源/目标分支、approvedBase/approvedHead 和合并方式；审查评论 URL 仅作追溯引用，不重读审查内容或重新裁决。查询本 PR 的当前操作状态；已合并只核验实际结果并补遗漏收尾，不拿合并后的目标 tip 与 approvedBase 比较。
+          2. 开放 PR：核对操作对象、base/head 与交接一致，满足仓库当前必需检查和保护后，在 Issue 留合并前记录（PR、源/目标修订、方式、时间、检查/保护证据及上游链接），发布成功后使用 head 条件保护执行合并。紧邻执行发现修订变化、冲突、检查/权限问题则 node_block 带事实交 Manager，不决定重审；条件保护不等于原子锁住 base。
+          3. 核验实际合并源与交接 head 一致、实际起点等于 approvedBase（squash/merge 第一父节点，rebase 可追溯链或可靠远端证据），远端目标包含 mergeCommit；merge 方式还须包含交接 head。结果未知先查远端，不能证明或不匹配则 node_block，不自动回滚或手动关票。
+          4. 发布交付评论记录合并结果、上游验证/延期边界（原样传递）及证据链接，再关闭 Issue；已自动关闭则复用。安全切回并快进目标分支，保留任务分支。重入仅补本节点未完成动作。
+          delivered：交接交付/合并前评论 URL、合并方式、源/起点/mergeCommit 和目标包含证据。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         delivered:
           criteria: |
-            指定 PR 已按允许方式合入指定目标，合并源 head 匹配批准修订，合并前无尚未被有效批准覆盖的新失败验证/实质反证；本 run 的 Issue 合并前核验评论已在合并前发布，含有效批准评论、approvedBase/approvedHead、时间、方式及必要检查/保护证据。实际合并起点独立核验等于 approvedBase（squash/merge 第一父节点，rebase 可追溯链或可靠远端证据）；远端目标包含 mergeCommit（仅 merge 方式额外要求包含批准 head）。Issue 已关闭且交付评论记录上述依据、验证/延期边界和前序链接，handoff 指向这些远端记录；工作树干净并安全回到目标分支，重入无重复副作用。不要求本地收尾文件。
+            指定 PR 已按交接方式合入指定目标，合并源 head 与交接一致；合并前记录包含对象/修订、时间、方式与必要检查/保护证据。实际合并起点等于 approvedBase，远端目标包含 mergeCommit（merge 方式还包含交接 head），均有可核验依据。Issue 交付评论已发布、Issue 已关闭，上游验证/延期边界已传递；工作区干净并安全回到目标分支，重入无重复副作用。只验本节点执行结果，不重新验收审查内容。
           target:
             return: delivered
-        stale-review:
-          criteria: |
-            指定 PR 与 Issue 仍开放且归属明确，存在原有效批准，但 base/head 已变化或有既定验收内尚未被有效批准覆盖的新失败验证/实质反证；本 run 的 Issue 失效评论记录批准评论链接、新旧修订、新证据链接（如有）及失效原因，未执行合并或关票，handoff 指向该评论和须重审的确切对象。
-          target:
-            node: review
   returns:
     - delivered
