@@ -1,22 +1,29 @@
 /**
- * Catalog 模型路由静态检查（Issue #23 provider 注册；#151 T2 modelId 本地列表）。
+ * Catalog 模型路由静态检查（Issue #23 provider 注册；#151 T2 modelId 本地列表；
+ * #152 T3 reasoningEffort 档位支持）。
  *
  * 纯静态、无网络发现：把 catalog 每个角色（含 judgeRole）的显式路由与宿主
  * 本地事实比对。两层装配：
  *
  * - 判定层（纯函数、同步、可注入）：`checkCatalogProviders`，调用边界把宿主
- *   查询结果装配成 `ModelListFacts` 再传入；check/start 共用同一规则。
+ *   查询结果装配成 `ModelListFacts` + `EffortFacts` 再传入；check/start 共用同一规则。
  * - 查询层（异步）：`queryModelLists` 按 provider 去重查询一次
- *   `ctx.llm.listModels`，同步抛错与异步拒绝一律转为故障事实（绝不误报空列表）；
- *   `checkCatalogProvidersWithModelLists` 把两层串起来供命令入口使用。
+ *   `ctx.llm.listModels`，`queryEffortInfo` 按显式路由去重查询一次
+ *   `ctx.llm.resolveModelInfo`；同步抛错与异步拒绝一律转为故障事实（绝不误判）；
+ *   `checkCatalogProvidersWithModelListsAndEfforts` 把两层串起来供命令入口使用。
  *
  * 组合语义（#149 矩阵）：
  *
  * - provider 未注册：确定误配，阻断，跳过该角色后续模型/档位查询。
  * - listModels 成功为空或不含 modelId：确定误配，阻断，不进入档位查询。
  * - listModels 抛错/拒绝：fail-open，跳过 modelId 与后续档位两维，不再
- *   resolveModelInfo；行内注明“无法解析本地模型列表”及原因。T2 只建立该故障
- *   事实（`modelList: 'list-unavailable'`），T3 消费它决定是否进入档位检查。
+ *   resolveModelInfo；行内注明“无法解析本地模型列表”及原因。
+ * - 模型已确认在列表（listed）且未配置 effort：无需档位检查，不查询思考元数据。
+ * - 模型已确认在列表且配置 effort：resolve 成功但 reasoning 缺失 → 阻断
+ *   （宿主对这类带档位请求必然抛 UNSUPPORTED_REASONING_EFFORT）；reasoning
+ *   存在且配置值在 efforts 的 id 集中 → 通过；不在集中 → 阻断。
+ * - resolveModelInfo 抛错/拒绝（含宿主 INVALID_MODEL_REASONING 等元数据异常）：
+ *   fail-open，跳过档位检查并注明元数据解析失败。
  * - 未配置 model 的角色保留既有继承，跳过显式路由检查。
  * - 某角色查询失败不掩盖其他角色确定误配；后者仍阻断 start。
  * - 跳过只表示允许尝试，不表示模型已验证或运行必然成功。
@@ -43,6 +50,41 @@ export interface ProviderCheckRow {
   reason: string
   /** T2：本角色 modelId 列表维度的结论；provider 维度的误配仍由 ok/reason 表达。 */
   modelList: ModelListStatus
+  /** T3：本角色 reasoningEffort 档位维度的结论；档位阻断同样由 ok/reason 表达。 */
+  effort: EffortStatus
+  /**
+   * T3：档位维度的补充说明——阻断时为 null（原因已写入 reason 点名），
+   * 跳过时为具体跳过原因（渲染必须展示，不得被 OK 文案吞掉）。
+   */
+  effortDetail: string | null
+}
+
+/**
+ * T3 reasoningEffort 档位检查结论：
+ * - `not-applicable`：未走到档位阶段（继承/未注册/列表失败/空列表/unlisted）。
+ * - `not-configured`：listed 但未配置 effort，无需检查，不查询思考元数据。
+ * - `passed`：resolve 成功，配置值在 efforts 的 id 集中。
+ * - `blocked`：确定误配（reasoning 缺失或档位越界），阻断，原因写入 reason。
+ * - `skipped`：resolve 抛错/拒绝或历史调用方未查询，fail-open 跳过，
+ *   具体原因写入 effortDetail。
+ */
+export type EffortStatus =
+  | 'not-applicable'
+  | 'not-configured'
+  | 'passed'
+  | 'blocked'
+  | 'skipped'
+
+/**
+ * T3 档位事实：调用边界把宿主 `resolveModelInfo` 结果装配成的最小形状，
+ * 与宿主 `LlmResolvedModelInfo` 的 reasoning 子集同构（按 effort.id 比较；
+ * 宿主的 branded id 在此拍平成 plain string）。
+ */
+export interface EffortModelInfo {
+  reasoning?: {
+    efforts: ReadonlyArray<{ id: string }>
+    defaultEffort?: string
+  }
 }
 
 export interface ProviderCheckReport {
@@ -61,42 +103,60 @@ export interface ModelListFacts {
   failures?: ReadonlyMap<string, string>
 }
 
+/**
+ * 调用边界装配好的档位查询事实：`info` 为各显式路由的思考元数据（键为
+ * `effortRouteKey(provider, modelId)`），`failures` 为解析失败的路由与原因
+ * （同步抛错/异步拒绝/宿主 INVALID_MODEL_REASONING 等都在此处归一）。
+ * 只有 `modelList: 'listed'` 且配置了 effort 的角色才消费该表；其余角色
+ * 不查也不读（`effort: 'not-applicable' | 'not-configured'`）。
+ */
+export interface EffortFacts {
+  info?: ReadonlyMap<string, EffortModelInfo>
+  failures?: ReadonlyMap<string, string>
+}
+
+/** 档位事实的路由键：provider/modelId 均为任意字符串，JSON 数组编码避免分隔符碰撞。 */
+export function effortRouteKey(provider: string, modelId: string): string {
+  return JSON.stringify([provider, modelId])
+}
+
 /** 收集 catalog 全部待查角色：roles 各键 + judgeRole（键名固定 `judge`）。def 层读取走共享单源。 */
-export function collectRoleRoutes(config: WorkflowConfig): Array<{ role: string; provider?: string; modelId?: string }> {
-  const routes: Array<{ role: string; provider?: string; modelId?: string }> = []
+export function collectRoleRoutes(config: WorkflowConfig): Array<{ role: string; provider?: string; modelId?: string; effort?: string }> {
+  const routes: Array<{ role: string; provider?: string; modelId?: string; effort?: string }> = []
   for (const roleKey of Object.keys(config.roles)) {
     const def = readRoleDefModel(config, roleKey)
-    routes.push({ role: roleKey, provider: def?.provider, modelId: def?.modelId })
+    routes.push({ role: roleKey, provider: def?.provider, modelId: def?.modelId, effort: def?.reasoningEffort })
   }
   const judge = readRoleDefModel(config, 'judge')
-  routes.push({ role: 'judge', provider: judge?.provider, modelId: judge?.modelId })
+  routes.push({ role: 'judge', provider: judge?.provider, modelId: judge?.modelId, effort: judge?.reasoningEffort })
   return routes
 }
 
 /**
- * 对给定 provider 清单 + 本地模型列表事实做静态判定；available 为已注册
- * provider id 集。纯函数：同一输入同一报告，check/start 共用。
+ * 对给定 provider 清单 + 本地模型列表事实 + 档位事实做静态判定；available
+ * 为已注册 provider id 集。纯函数：同一输入同一报告，check/start 共用。
  */
 export function checkCatalogProviders(
   workflowId: string,
   config: WorkflowConfig,
   available: ReadonlySet<string> | readonly string[],
   lists?: ModelListFacts,
+  efforts?: EffortFacts,
 ): ProviderCheckReport {
   const known = available instanceof Set ? available : new Set(available)
-  const rows: ProviderCheckRow[] = collectRoleRoutes(config).map(({ role, provider, modelId }) => {
+  const rows: ProviderCheckRow[] = collectRoleRoutes(config).map(({ role, provider, modelId, effort }) => {
     if (provider === undefined) {
-      return { role, provider: null, modelId: modelId ?? null, ok: true, reason: '未配置 model，运行时继承 Manager route', modelList: 'inherited' as const }
+      return { role, provider: null, modelId: modelId ?? null, ok: true, reason: '未配置 model，运行时继承 Manager route', modelList: 'inherited' as const, effort: 'not-applicable' as const, effortDetail: null }
     }
     if (!known.has(provider)) {
-      return { role, provider, modelId: modelId ?? null, ok: false, reason: `provider "${provider}" 未在当前 profile 注册`, modelList: 'provider-unregistered' as const }
+      return { role, provider, modelId: modelId ?? null, ok: false, reason: `provider "${provider}" 未在当前 profile 注册`, modelList: 'provider-unregistered' as const, effort: 'not-applicable' as const, effortDetail: null }
     }
     const failure = lists?.failures?.get(provider)
     if (failure !== undefined) {
       return {
         role, provider, modelId: modelId ?? null, ok: true,
         reason: `无法解析 provider "${provider}" 的本地模型列表（${failure}）；已跳过 modelId 与后续档位检查，允许尝试启动（不代表模型可用）`,
-        modelList: 'list-unavailable' as const,
+        modelList: 'list-unavailable' as const, effort: 'not-applicable' as const, effortDetail: null,
       }
     }
     const models = lists?.models?.get(provider)
@@ -104,26 +164,87 @@ export function checkCatalogProviders(
       return {
         role, provider, modelId: modelId ?? null, ok: true,
         reason: `未查询 provider "${provider}" 的本地模型列表；已跳过 modelId 与后续档位检查，允许尝试启动（不代表模型可用）`,
-        modelList: 'list-unavailable' as const,
+        modelList: 'list-unavailable' as const, effort: 'not-applicable' as const, effortDetail: null,
       }
     }
     if (models.length === 0) {
       return {
         role, provider, modelId: modelId ?? null, ok: false,
         reason: `provider "${provider}" 的本地模型列表为空（未实现 listModels 的适配器视为不可用）；请检查该 provider 的本地配置`,
-        modelList: 'empty-list' as const,
+        modelList: 'empty-list' as const, effort: 'not-applicable' as const, effortDetail: null,
       }
     }
     if (modelId !== undefined && !models.includes(modelId)) {
       return {
         role, provider, modelId, ok: false,
         reason: `modelId "${modelId}" 不在 provider "${provider}" 的本地模型列表中；请先在本地 settings/config 声明该模型后再 start`,
-        modelList: 'unlisted' as const,
+        modelList: 'unlisted' as const, effort: 'not-applicable' as const, effortDetail: null,
       }
     }
-    return { role, provider, modelId: modelId ?? null, ok: true, reason: 'provider 已注册；modelId 在本地模型列表中', modelList: 'listed' as const }
+    // T3：只有 listed 才进入档位阶段；未配置 effort 不查询思考元数据。
+    if (effort === undefined) {
+      return { role, provider, modelId: modelId ?? null, ok: true, reason: 'provider 已注册；modelId 在本地模型列表中', modelList: 'listed' as const, effort: 'not-configured' as const, effortDetail: null }
+    }
+    return judgeEffort(role, provider, modelId as string, effort, efforts)
   })
   return { workflowId, ok: rows.every(row => row.ok), rows }
+}
+
+/**
+ * T3 档位纯判定：调用方保证路由已 listed 且配置了 effort。
+ * 成功但缺 reasoning → 阻断（宿主对此类带档位请求必然拒绝）；
+ * 解析失败（含非法元数据）→ fail-open 跳过；空 efforts 成功返回视为
+ * 非法元数据（宿主基线会抛 INVALID_MODEL_REASONING），同样 fail-open，
+ * 不得误判成不支持或通过。
+ */
+function judgeEffort(role: string, provider: string, modelId: string, effort: string, efforts: EffortFacts | undefined): ProviderCheckRow {
+  const route = `${provider}/${modelId}`
+  const failure = efforts?.failures?.get(effortRouteKey(provider, modelId))
+  if (failure !== undefined) {
+    return {
+      role, provider, modelId, ok: true,
+      reason: `provider 已注册；modelId 在本地模型列表中`,
+      modelList: 'listed' as const, effort: 'skipped' as const,
+      effortDetail: `无法解析模型 ${route} 的思考元数据（${failure}）；已跳过档位检查，允许尝试启动（不代表档位可用）`,
+    }
+  }
+  const info = efforts?.info?.get(effortRouteKey(provider, modelId))
+  if (info === undefined) {
+    return {
+      role, provider, modelId, ok: true,
+      reason: `provider 已注册；modelId 在本地模型列表中`,
+      modelList: 'listed' as const, effort: 'skipped' as const,
+      effortDetail: `未查询模型 ${route} 的思考元数据；已跳过档位检查，允许尝试启动（不代表档位可用）`,
+    }
+  }
+  if (info.reasoning === undefined) {
+    return {
+      role, provider, modelId, ok: false,
+      reason: `模型 ${route} 未声明 reasoning 元数据，显式档位 "${effort}" 会被宿主拒绝（UNSUPPORTED_REASONING_EFFORT）；请去掉该角色的 reasoningEffort 或更换支持思考的模型`,
+      modelList: 'listed' as const, effort: 'blocked' as const, effortDetail: null,
+    }
+  }
+  if (info.reasoning.efforts.length === 0) {
+    return {
+      role, provider, modelId, ok: true,
+      reason: `provider 已注册；modelId 在本地模型列表中`,
+      modelList: 'listed' as const, effort: 'skipped' as const,
+      effortDetail: `模型 ${route} 的思考元数据非法（efforts 为空，宿主基线抛 INVALID_MODEL_REASONING）；已跳过档位检查，允许尝试启动（不代表档位可用）`,
+    }
+  }
+  if (info.reasoning.efforts.some(candidate => candidate.id === effort)) {
+    return {
+      role, provider, modelId, ok: true,
+      reason: `provider 已注册；modelId 在本地模型列表中`,
+      modelList: 'listed' as const, effort: 'passed' as const,
+      effortDetail: `思考档位 "${effort}" 在模型 ${route} 的支持列表中`,
+    }
+  }
+  return {
+    role, provider, modelId, ok: false,
+    reason: `思考档位 "${effort}" 不在模型 ${route} 的支持列表中；请改用该模型支持的档位或去掉该角色的 reasoningEffort`,
+    modelList: 'listed' as const, effort: 'blocked' as const, effortDetail: null,
+  }
 }
 
 /**
@@ -148,6 +269,31 @@ export async function queryModelLists(
 }
 
 /**
+ * T3 异步装配：对给定显式路由逐个查询思考元数据（按路由去重，一条只查一次）。
+ * 查询函数的同步抛错与返回 promise 的异步拒绝一律转为 `failures` 事实——
+ * 调用方不得把故障误判成不支持或通过。成功结果原样收录。
+ */
+export async function queryEffortInfo(
+  routes: ReadonlyArray<{ provider: string; modelId: string }>,
+  resolveModelInfo: (provider: string, modelId: string) => Promise<EffortModelInfo>,
+): Promise<{ info: Map<string, EffortModelInfo>; failures: Map<string, string> }> {
+  const info = new Map<string, EffortModelInfo>()
+  const failures = new Map<string, string>()
+  const seen = new Set<string>()
+  for (const route of routes) {
+    const key = effortRouteKey(route.provider, route.modelId)
+    if (seen.has(key)) continue
+    seen.add(key)
+    try {
+      info.set(key, await resolveModelInfo(route.provider, route.modelId))
+    } catch (error) {
+      failures.set(key, error instanceof Error ? error.message : String(error))
+    }
+  }
+  return { info, failures }
+}
+
+/**
  * 命令入口装配体：已注册且配置了显式路由的 provider 才需查询（未注册的阻断在
  * 先，继承角色不查），查完走同一纯判定。`listModels` 在此把宿主
  * `LlmModelInfo[]` 拍平成 id 数组。
@@ -166,6 +312,33 @@ export async function checkCatalogProvidersWithModelLists(
   return checkCatalogProviders(workflowId, config, available, { models, failures })
 }
 
+/**
+ * T3 命令入口装配体：两阶段——先走列表装配确定哪些路由 listed，只有
+ * listed 且配置了 effort 的显式路由才查询思考元数据（未配置 effort 不查；
+ * 列表失败的路由跳过两维，不再 resolveModelInfo），再走同一纯判定。
+ */
+export async function checkCatalogProvidersWithModelListsAndEfforts(
+  workflowId: string,
+  config: WorkflowConfig,
+  available: ReadonlySet<string> | readonly string[],
+  listModels: (provider: string) => Promise<readonly string[]>,
+  resolveModelInfo: (provider: string, modelId: string) => Promise<EffortModelInfo>,
+): Promise<ProviderCheckReport> {
+  const known = available instanceof Set ? available : new Set(available)
+  const toQuery = collectRoleRoutes(config)
+    .filter(route => route.provider !== undefined && known.has(route.provider))
+    .map(route => route.provider as string)
+  const { models, failures } = await queryModelLists(toQuery, listModels)
+  const listed = checkCatalogProviders(workflowId, config, available, { models, failures })
+  const listedRoles = new Set(listed.rows.filter(row => row.modelList === 'listed').map(row => row.role))
+  const effortRoutes = collectRoleRoutes(config)
+    .filter(route => route.provider !== undefined && route.modelId !== undefined
+      && route.effort !== undefined && listedRoles.has(route.role))
+    .map(route => ({ provider: route.provider as string, modelId: route.modelId as string }))
+  const { info, failures: effortFailures } = await queryEffortInfo(effortRoutes, resolveModelInfo)
+  return checkCatalogProviders(workflowId, config, available, { models, failures }, { info, failures: effortFailures })
+}
+
 /** T2：行内 modelId 维度后缀；跳过行必须带具体原因，不得只写 OK。 */
 function modelListSuffix(row: ProviderCheckRow): string {
   switch (row.modelList) {
@@ -175,6 +348,21 @@ function modelListSuffix(row: ProviderCheckRow): string {
     case 'list-unavailable': return `（modelId 检查已跳过：${row.reason}）`
     case 'empty-list': return ''
     case 'unlisted': return ''
+  }
+}
+
+/**
+ * T3：行内档位维度后缀。未走到档位阶段或未配置 effort 不新增输出（与 T2
+ * 行为一致）；通过注明支持的档位；跳过必须带具体原因，不得被 OK 文案吞掉；
+ * 阻断行的原因已写入 reason（逐角色点名），此处不再重复。
+ */
+function effortSuffix(row: ProviderCheckRow): string {
+  switch (row.effort) {
+    case 'not-applicable': return ''
+    case 'not-configured': return ''
+    case 'passed': return `（${row.effortDetail}）`
+    case 'skipped': return `（档位检查已跳过：${row.effortDetail}）`
+    case 'blocked': return ''
   }
 }
 
@@ -197,16 +385,21 @@ export function renderProviderCheckReport(report: ProviderCheckReport): string {
   const lines = report.rows.map(row => {
     const route = row.provider === null ? '(inherit)' : `${row.provider}${row.modelId === null ? '' : `/${row.modelId}`}`
     if (!row.ok) return `- ${row.role}: ${route} — 不可用（${row.reason}）`
-    return `- ${row.role}: ${route} — OK${modelListSuffix(row)}`
+    return `- ${row.role}: ${route} — OK${modelListSuffix(row)}${effortSuffix(row)}`
   })
   const bad = report.rows.filter(row => !row.ok).length
   if (bad > 0) {
     lines.push(`check ${report.workflowId}: ${bad}/${report.rows.length} 个角色不可用（仅报告，不阻断加载）`)
     return lines.join('\n')
   }
-  const skipped = report.rows.filter(row => row.modelList === 'list-unavailable').length
-  lines.push(skipped === 0
-    ? `check ${report.workflowId}: 全过（${report.rows.length} 个角色）`
-    : `check ${report.workflowId}: 全过（${report.rows.length} 个角色；其中 ${skipped} 个跳过 modelId 检查，见行内原因，仅报告）`)
+  const skippedLists = report.rows.filter(row => row.modelList === 'list-unavailable').length
+  const skippedEfforts = report.rows.filter(row => row.effort === 'skipped').length
+  if (skippedLists === 0 && skippedEfforts === 0) {
+    lines.push(`check ${report.workflowId}: 全过（${report.rows.length} 个角色）`)
+    return lines.join('\n')
+  }
+  const skippedParts = [`其中 ${skippedLists} 个跳过 modelId 检查`]
+  if (skippedEfforts > 0) skippedParts.push(`${skippedEfforts} 个跳过档位检查`)
+  lines.push(`check ${report.workflowId}: 全过（${report.rows.length} 个角色；${skippedParts.join('，')}，见行内原因，仅报告）`)
   return lines.join('\n')
 }

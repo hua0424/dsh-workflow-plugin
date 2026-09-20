@@ -22,7 +22,7 @@ export interface CommandHost {
   start(agent: Agent, workspaceKey: string, workflowId: string, extraText: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; status?: unknown }>
   reset(agent: Agent, workspaceKey: string | undefined, mode: 'compatible' | 'incompatible-store'): Promise<{ ok: boolean; reason?: string; message?: string }>
-  /** provider 注册 + modelId 本地列表静态检查：逐角色报告，永不阻断加载。 */
+  /** provider 注册 + modelId 本地列表 + reasoningEffort 档位静态检查：逐角色报告，永不阻断加载。 */
   check(workflowId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
 }
 
@@ -128,7 +128,7 @@ const USAGE = `用法：
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）
 /dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store
-/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表（只报告，不阻断）`
+/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表 + 思考档位（只报告，不阻断）`
 
 export function makeDshFlowCommand(host: CommandHost, activate?: SessionActivator): CommandDefinition {
   const command: CommandDefinition = {

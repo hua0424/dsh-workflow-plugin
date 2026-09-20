@@ -5,6 +5,9 @@ import { validateAndNormalize } from '../src/catalog/validate.ts'
 import {
   checkCatalogProviders,
   checkCatalogProvidersWithModelLists,
+  checkCatalogProvidersWithModelListsAndEfforts,
+  effortRouteKey,
+  queryEffortInfo,
   queryModelLists,
   renderProviderCheckReport,
   renderStartProviderBlock,
@@ -183,4 +186,173 @@ test('T2 装配体串联：judgeRole unlisted 同样被点名阻断', async () =
   const judge = report.rows.find(r => r.role === 'judge')!
   assert.equal(judge.modelList, 'unlisted')
   assert.match(renderStartProviderBlock(report), /judge.*jm/)
+})
+
+// ---- #152 T3：reasoningEffort 档位判定矩阵（纯函数，注入事实）----
+
+const EFFORT_CONFIG = CONFIG
+  .replace(
+    'model: { provider: "good-provider", modelId: "m1" }',
+    'model: { provider: "good-provider", modelId: "m1", reasoningEffort: "high" }')
+  .replace(
+    'model: { provider: "good-provider", modelId: "jm" }',
+    'model: { provider: "good-provider", modelId: "jm", reasoningEffort: "low" }')
+
+function loadEffortConfig() {
+  return validateAndNormalize(parseCatalogConfig(EFFORT_CONFIG), { workflowId: 'check-me' })
+}
+
+/** 档位事实 helper：与宿主 LlmResolvedModelInfo.reasoning 子集同构（efforts 按 id 比较）。 */
+function effortInfo(efforts: string[], noReasoning = false) {
+  return noReasoning ? {} : { reasoning: { efforts: efforts.map(id => ({ id })) } }
+}
+
+const LISTS = { models: new Map([['good-provider', ['m1', 'jm']], ['no-such-provider', ['m2']]]) }
+
+test('T3 档位通过：listed + 配置值在 efforts id 集中；未配置 effort 无新增输出', () => {
+  const report = checkCatalogProviders('check-me', loadEffortConfig(), ['good-provider', 'no-such-provider'],
+    LISTS,
+    { info: new Map([[effortRouteKey('good-provider', 'm1'), effortInfo(['low', 'high'])], [effortRouteKey('good-provider', 'jm'), effortInfo(['low'])]]) })
+  assert.equal(report.ok, true)
+  const developer = report.rows.find(r => r.role === 'developer')!
+  assert.equal(developer.effort, 'passed')
+  assert.match(renderProviderCheckReport(report), /developer.*OK.*思考档位 "high"/)
+  // 未配置 effort 的 ghost（listed）不新增档位输出，与 T2 行为一致。
+  assert.equal(report.rows.find(r => r.role === 'ghost')!.effort, 'not-configured')
+  assert.equal(report.rows.find(r => r.role === 'plain')!.effort, 'not-applicable')
+  assert.match(renderProviderCheckReport(report), /ghost.*OK.*本地列表/)
+  assert.doesNotMatch(renderProviderCheckReport(report), /ghost.*档位/)
+})
+
+test('T3 档位越界阻断：点名角色/模型/档位，start 渲染可定位修复', () => {
+  const report = checkCatalogProviders('check-me', loadEffortConfig(), ['good-provider', 'no-such-provider'],
+    LISTS,
+    { info: new Map([[effortRouteKey('good-provider', 'm1'), effortInfo(['low'])], [effortRouteKey('good-provider', 'jm'), effortInfo(['low'])]]) })
+  assert.equal(report.ok, false)
+  const developer = report.rows.find(r => r.role === 'developer')!
+  assert.equal(developer.effort, 'blocked')
+  assert.match(developer.reason, /思考档位 "high"/)
+  assert.match(developer.reason, /good-provider\/m1/)
+  assert.match(developer.reason, /reasoningEffort/)
+  const block = renderStartProviderBlock(report)
+  assert.match(block, /developer.*high/)
+  assert.match(block, /已拒绝/)
+})
+
+test('T3 成功但缺 reasoning 阻断：与解析失败区分，点名宿主必然拒绝', () => {
+  const report = checkCatalogProviders('check-me', loadEffortConfig(), ['good-provider', 'no-such-provider'],
+    LISTS,
+    { info: new Map([[effortRouteKey('good-provider', 'm1'), effortInfo([], true)], [effortRouteKey('good-provider', 'jm'), effortInfo(['low'])]]) })
+  assert.equal(report.ok, false)
+  const developer = report.rows.find(r => r.role === 'developer')!
+  assert.equal(developer.effort, 'blocked')
+  assert.match(developer.reason, /未声明 reasoning 元数据/)
+  assert.match(developer.reason, /UNSUPPORTED_REASONING_EFFORT/)
+  // 缺 reasoning 是确定误配，不是可兼容放行。
+  assert.match(renderStartProviderBlock(report), /developer.*high/)
+})
+
+test('T3 解析失败 fail-open：跳过档位检查并注明，不误判成不支持或通过', () => {
+  const report = checkCatalogProviders('check-me', loadEffortConfig(), ['good-provider', 'no-such-provider'],
+    LISTS,
+    {
+      info: new Map([[effortRouteKey('good-provider', 'jm'), effortInfo(['low'])]]),
+      failures: new Map([[effortRouteKey('good-provider', 'm1'), 'INVALID_MODEL_REASONING']]),
+    })
+  assert.equal(report.ok, true)
+  const developer = report.rows.find(r => r.role === 'developer')!
+  assert.equal(developer.effort, 'skipped')
+  assert.match(developer.effortDetail ?? '', /无法解析模型 good-provider\/m1 的思考元数据.*INVALID_MODEL_REASONING/)
+  assert.match(developer.effortDetail ?? '', /已跳过档位检查/)
+  const text = renderProviderCheckReport(report)
+  assert.match(text, /developer.*OK.*档位检查已跳过.*INVALID_MODEL_REASONING/)
+  assert.match(text, /1 个跳过档位检查/)
+})
+
+test('T3 未传档位事实：listed + 已配置 effort 按跳过处理（历史调用兼容）', () => {
+  const report = checkCatalogProviders('check-me', loadEffortConfig(), ['good-provider', 'no-such-provider'], LISTS)
+  assert.equal(report.ok, true)
+  const developer = report.rows.find(r => r.role === 'developer')!
+  assert.equal(developer.effort, 'skipped')
+  assert.match(developer.effortDetail ?? '', /未查询模型.*思考元数据/)
+})
+
+test('T3 列表失败 + 已配置 effort：跳过两维，effort 不再进入判定', () => {
+  const report = checkCatalogProviders('check-me', loadEffortConfig(), ['good-provider', 'no-such-provider'],
+    { models: new Map([['no-such-provider', ['m2']]]), failures: new Map([['good-provider', 'boom']]) },
+    { info: new Map([[effortRouteKey('good-provider', 'm1'), effortInfo(['high'])]]) })
+  assert.equal(report.ok, true)
+  const developer = report.rows.find(r => r.role === 'developer')!
+  assert.equal(developer.modelList, 'list-unavailable')
+  // 即使档位事实存在，未过列表关的路由也不消费它。
+  assert.equal(developer.effort, 'not-applicable')
+  assert.equal(developer.effortDetail, null)
+})
+
+test('T3 确定误配与档位跳过并存：后者不掩盖前者，前者仍阻断', () => {
+  const report = checkCatalogProviders('check-me', loadEffortConfig(), ['good-provider'],
+    { models: new Map([['good-provider', ['m1', 'jm']]]) },
+    { failures: new Map([[effortRouteKey('good-provider', 'm1'), 'boom']]) })
+  assert.equal(report.ok, false)
+  assert.equal(report.rows.find(r => r.role === 'ghost')!.ok, false)
+  assert.equal(report.rows.find(r => r.role === 'developer')!.effort, 'skipped')
+  assert.match(renderStartProviderBlock(report), /ghost.*no-such-provider/)
+})
+
+test('T3 装配层：同步抛错与异步拒绝都转为故障事实，同路由去重只查一次', async () => {
+  const calls: Array<[string, string]> = []
+  const { info, failures } = await queryEffortInfo(
+    [
+      { provider: 'p', modelId: 'sync-boom' },
+      { provider: 'p', modelId: 'async-boom' },
+      { provider: 'p', modelId: 'ok' },
+      { provider: 'p', modelId: 'ok' },
+    ],
+    async (provider, modelId) => {
+      calls.push([provider, modelId])
+      if (modelId === 'sync-boom') throw new Error('sync fail')
+      if (modelId === 'async-boom') return await Promise.reject(new Error('async fail'))
+      return { reasoning: { efforts: [{ id: 'high' }] } }
+    },
+  )
+  assert.deepEqual(calls, [['p', 'sync-boom'], ['p', 'async-boom'], ['p', 'ok']])
+  assert.equal(failures.get(effortRouteKey('p', 'sync-boom')), 'sync fail')
+  assert.equal(failures.get(effortRouteKey('p', 'async-boom')), 'async fail')
+  assert.deepEqual(info.get(effortRouteKey('p', 'ok')), { reasoning: { efforts: [{ id: 'high' }] } })
+  assert.equal(info.has(effortRouteKey('p', 'sync-boom')), false)
+})
+
+test('T3 装配体串联：judgeRole 越界同样被点名阻断；未配置 effort 不查询元数据', async () => {
+  const resolved: Array<[string, string]> = []
+  const report = await checkCatalogProvidersWithModelListsAndEfforts('check-me', loadEffortConfig(),
+    ['good-provider', 'no-such-provider'],
+    async provider => (provider === 'good-provider' ? ['m1', 'jm'] : ['m2']),
+    async (provider, modelId) => {
+      resolved.push([provider, modelId])
+      return effortInfo(['low'])
+    })
+  assert.equal(report.ok, false)
+  // developer 配置 high 但 efforts 只有 low → 阻断；judge 配置 low 且在集中 → 通过。
+  assert.equal(report.rows.find(r => r.role === 'judge')!.effort, 'passed')
+  assert.equal(report.rows.find(r => r.role === 'developer')!.effort, 'blocked')
+  assert.match(renderStartProviderBlock(report), /developer.*high/)
+  // ghost 未配置 effort：不查询其元数据。
+  assert.deepEqual(resolved, [['good-provider', 'm1'], ['good-provider', 'jm']])
+})
+
+test('T3 装配体串联：列表失败的路由不再 resolveModelInfo', async () => {
+  const resolved: Array<[string, string]> = []
+  const report = await checkCatalogProvidersWithModelListsAndEfforts('check-me', loadEffortConfig(),
+    ['good-provider', 'no-such-provider'],
+    async provider => {
+      if (provider === 'good-provider') throw new Error('connection refused')
+      return ['m2']
+    },
+    async (provider, modelId) => {
+      resolved.push([provider, modelId])
+      return effortInfo(['high'])
+    })
+  assert.equal(report.ok, true)
+  assert.deepEqual(resolved, [])
+  assert.equal(report.rows.find(r => r.role === 'developer')!.effort, 'not-applicable')
 })
