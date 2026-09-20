@@ -50,12 +50,25 @@ export const LIMITS = {
   /** A1 D3: model-route component caps (characters, after trim). */
   providerMax: 64,
   modelIdMax: 128,
+  /**
+   * #149 T1: reasoning-effort component cap (characters, after trim).档位 id
+   * 是适配器自有 opaque 字符串，不 hardcode 枚举；与 provider/modelId 共用
+   * 同一套“trim 后非空 + 长度上限”规则（catalog schema 双角色共用）。
+   */
+  reasoningEffortMax: 64,
   programParametersMax: 8000,
 } as const
 
 export interface RoleModel {
   provider: string
   modelId: string
+  /**
+   * #149 T1: 可选思考强度（适配器自有 opaque 档位 id）。显式 model + 显式
+   * effort 用该值；显式 model + 省略 effort 走模型默认（派发边界主动清除
+   * 继承值）；完全未配置 model 保留既有 Manager 路由继承。不支持只填
+   * effort 而不提供 provider/modelId。
+   */
+  reasoningEffort?: string
 }
 
 /**
@@ -72,19 +85,39 @@ export type DelegationRoute = Partial<RoleModel>
 export interface SpawnAgentOptions {
   provider?: string
   model?: string
+  /**
+   * #149 T1: 与 `model` 同行的显式档位。关键语义：当路由显式给出 provider/
+   * model 而省略档位时，这里必须带**显式 `reasoningEffort: undefined` 键**
+   * （而非缺键）——宿主 `resolveChildAgentOptions` 对同路由子会话会保留父
+   * effort，只有显式 undefined 能经展开覆盖清除继承值、回落模型默认；
+   * 路由整体缺席（undefined）则保留既有 Manager 继承行为。
+   */
+  reasoningEffort?: string
 }
 
-/** 唯一的 modelId→model 交界：路由 → DSH agentOptions；两个分量都缺即 undefined（宿主继承）。 */
+/**
+ * 唯一的 modelId→model 交界：路由 → DSH agentOptions。
+ * - 路由缺席或三个分量全缺即 undefined（宿主继承，既有行为）。
+ * - 显式路由（provider/modelId 至少其一在场）无 effort 时，返回带显式
+ *   `reasoningEffort: undefined` 键的对象，在宿主边界清除同路由继承的父
+ *   effort（`resolveChildAgentOptions` 展开覆盖语义），回落模型默认；
+ *   “缺键”在此处不等于“恢复默认”，不得用缺键断言默认生效。
+ */
 export function routeToAgentOptions(route: DelegationRoute | undefined): SpawnAgentOptions | undefined {
-  if (route === undefined || (route.provider === undefined && route.modelId === undefined)) return undefined
-  return { provider: route.provider, model: route.modelId }
+  if (route === undefined || (route.provider === undefined && route.modelId === undefined && route.reasoningEffort === undefined)) return undefined
+  return { provider: route.provider, model: route.modelId, reasoningEffort: route.reasoningEffort }
 }
 
-/** 唯一的 model→modelId 交界：DSH agentOptions → 冻结进 Run row 的路由。 */
+/**
+ * 唯一的 model→modelId 交界：DSH agentOptions → 冻结进 Run row 的路由。
+ * 只收录在场的分量（冻结值经 SQLite JSON 往返，显式 undefined 无意义；
+ * 显式清除只发生在派发边界的 `routeToAgentOptions`）。
+ */
 export function agentOptionsToRoute(options: SpawnAgentOptions): DelegationRoute {
   const route: DelegationRoute = {}
   if (options.provider !== undefined) route.provider = options.provider
   if (options.model !== undefined) route.modelId = options.model
+  if (options.reasoningEffort !== undefined) route.reasoningEffort = options.reasoningEffort
   return route
 }
 
@@ -301,6 +334,13 @@ export interface CallFrame {
 export interface ModelOverride {
   provider: string
   modelId: string
+  /**
+   * #149 T1: 持久化兼容字段（可选）。T1 的 `workflow_set_role_model` 只写入
+   * provider/modelId（换模型清空旧档位的完整语义由 #153 T4 交付），此处预留
+   * effort 位使带档位的 Judge/previousJudge 快照与未来 override 可落库；
+   * 旧行无该键照常读取（state 格式版本不变）。
+   */
+  reasoningEffort?: string
 }
 
 /** Run只管位置/控制/固定Snapshot/Role映射；节点材料属于NodeExecution。 */

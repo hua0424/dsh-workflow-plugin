@@ -66,11 +66,18 @@ function makeRun(config = loadConfig()): RunState {
 }
 
 /** 真实 apply + 可控 llm 清单：start 前置检查走 production 代码路径。 */
-function applyWithProviders(home: string, providerIds: string[]) {
+function applyWithProviders(
+  home: string,
+  providerIds: string[],
+  lists?: { models?: Record<string, string[]>; failures?: Record<string, string> },
+  resolutions?: { info?: Record<string, string[] | { noReasoning: true }>; failures?: Record<string, string> },
+) {
   const cleanups: Array<() => void> = []
   let command: CommandDefinition | undefined
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = home
+  /** T3：resolveModelInfo 调用记录（断言“未配置 effort 不查 / 列表失败不再 resolve”）。 */
+  const resolveCalls: Array<[string, string]> = []
   const ctx = {
     effect(register: () => void | (() => void)) { const cleanup = register(); if (cleanup) cleanups.push(cleanup) },
     get() { return undefined },
@@ -87,11 +94,28 @@ function applyWithProviders(home: string, providerIds: string[]) {
     subagents: {},
     compaction: {},
     sessions: {},
-    llm: { listProviders: () => providerIds.map(id => ({ id })) },
+    llm: {
+      listProviders: () => providerIds.map(id => ({ id })),
+      listModels: async (provider: string) => {
+        if (lists?.failures?.[provider] !== undefined) throw new Error(lists.failures[provider])
+        return (lists?.models?.[provider] ?? []).map(id => ({ provider, id, name: id }))
+      },
+      // T3：思考元数据桩，形状与宿主 LlmResolvedModelInfo.reasoning 子集一致。
+      resolveModelInfo: async (provider: string, model: string) => {
+        resolveCalls.push([provider, model])
+        const key = `${provider}/${model}`
+        if (resolutions?.failures?.[key] !== undefined) throw new Error(resolutions.failures[key])
+        const entry = resolutions?.info?.[key]
+        if (entry === undefined) return { provider, id: model, name: model }
+        if (!Array.isArray(entry)) return { provider, id: model, name: model }
+        return { provider, id: model, name: model, reasoning: { efforts: entry.map(id => ({ id, name: id })) } }
+      },
+    },
   }
   apply(ctx as never)
   return {
     command: command!,
+    resolveCalls,
     restore() {
       for (const cleanup of cleanups) cleanup()
       if (previousHome === undefined) delete process.env.DSH_HOME
@@ -100,16 +124,19 @@ function applyWithProviders(home: string, providerIds: string[]) {
   }
 }
 
-function seedCatalog(home: string) {
+function seedCatalog(home: string, catalog: string = CATALOG) {
   mkdirSync(join(home, 'workflows'), { recursive: true })
-  writeFileSync(join(home, 'workflows', 'guard-me.yaml'), CATALOG)
+  writeFileSync(join(home, 'workflows', 'guard-me.yaml'), catalog)
 }
+
+/** T2：catalog 变体按需替换路由；GOOD_LISTS 为合法 catalog 的本地列表事实。 */
+const GOOD_LISTS = { models: { 'good-provider': ['m1', 'jm'] } }
 
 test('start 前置检查：误配 provider 被拒，逐角色点名且不创建 Run', async () => {
   const home = mkdtempSync(join(tmpdir(), 'workflow-t41-'))
   try {
     seedCatalog(home)
-    const { command, restore } = applyWithProviders(home, ['good-provider'])
+    const { command, restore } = applyWithProviders(home, ['good-provider'], GOOD_LISTS)
     try {
       const agent = { session: { id: 'manager', header: { cwd: home } } }
       const result = await command.handler({ commandId: 'x' as never, agent: agent as never, rawInput: 'start guard-me go', attachments: [], signal: new AbortController().signal })
@@ -131,7 +158,8 @@ test('start 前置检查：合法 catalog 正常启动，未配 model 角色不�
   const home = mkdtempSync(join(tmpdir(), 'workflow-t41-'))
   try {
     seedCatalog(home)
-    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'])
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      { models: { 'good-provider': ['m1', 'jm'], 'no-such-provider': ['m2'] } })
     const store = new StateStore(home)
     try {
       const agent = { session: { id: 'manager', header: { cwd: home } } }
@@ -148,7 +176,7 @@ test('check 命令保持非阻断纯诊断（Issue #41 Out of Scope 回归）', 
   const home = mkdtempSync(join(tmpdir(), 'workflow-t41-'))
   try {
     seedCatalog(home)
-    const { command, restore } = applyWithProviders(home, ['good-provider'])
+    const { command, restore } = applyWithProviders(home, ['good-provider'], GOOD_LISTS)
     try {
       const agent = { session: { id: 'manager', header: { cwd: home } } }
       const result = await command.handler({ commandId: 'x' as never, agent: agent as never, rawInput: 'check guard-me', attachments: [], signal: new AbortController().signal })
@@ -182,4 +210,217 @@ test('三方共用同一 def 读取单源：override > def > frozen 不变', () 
   assert.deepEqual(resolveRoleModel(noJudgeModel, 'judge', { provider: 'frozen-p', modelId: 'frozen-m' }), { provider: 'frozen-p', modelId: 'frozen-m' })
   run.modelOverrides['developer'] = { provider: 'p2', modelId: 'm2' }
   assert.deepEqual(resolveRoleModel(run, 'developer'), { provider: 'p2', modelId: 'm2' })
+})
+
+// ---- #151 T2：真实命令入口的 modelId 列表守卫（非纯函数矩阵代替）----
+
+async function runRaw(command: CommandDefinition, home: string, rawInput: string) {
+  const agent = { session: { id: 'manager', header: { cwd: home } } }
+  return command.handler({ commandId: 'x' as never, agent: agent as never, rawInput, attachments: [], signal: new AbortController().signal })
+}
+
+async function withHome(catalog: string, fn: (home: string) => Promise<void>) {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-t2-'))
+  try {
+    seedCatalog(home, catalog)
+    await fn(home)
+  } finally { rmSync(home, { recursive: true, force: true }) }
+}
+
+test('T2 命令入口：unlisted modelId 被拒，逐角色点名+修复指引且无新 Run', async () => {
+  await withHome(CATALOG.replace('"m1"', '"m-typo"'), async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      { models: { 'good-provider': ['m1', 'jm'], 'no-such-provider': ['m2'] } })
+    const store = new StateStore(home)
+    try {
+      const result = await runRaw(command, home, 'start guard-me go')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /developer/)
+      assert.match(result.text ?? '', /m-typo/)
+      assert.match(result.text ?? '', /settings\/config/)
+      assert.equal(await store.get(home), undefined)
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T2 命令入口：成功空列表被拒且无新 Run', async () => {
+  await withHome(CATALOG, async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      { models: { 'good-provider': [], 'no-such-provider': ['m2'] } })
+    const store = new StateStore(home)
+    try {
+      const result = await runRaw(command, home, 'start guard-me go')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /developer/)
+      assert.match(result.text ?? '', /本地模型列表为空/)
+      assert.equal(await store.get(home), undefined)
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T2 命令入口：judgeRole unlisted 同样被点名拒绝', async () => {
+  await withHome(CATALOG.replace('"jm"', '"jm-missing"'), async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      { models: { 'good-provider': ['m1', 'jm'], 'no-such-provider': ['m2'] } })
+    const store = new StateStore(home)
+    try {
+      const result = await runRaw(command, home, 'start guard-me go')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /judge/)
+      assert.match(result.text ?? '', /jm-missing/)
+      assert.equal(await store.get(home), undefined)
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T2 命令入口：listModels 拒绝则 fail-open——check 注明跳过原因，可启动且档位检查被跳过', async () => {
+  // 列表失败 + 配置 effort 的组合：T2 只建立跳过事实，组合验收由 T3 完成。
+  const effortCatalog = CATALOG.replace(
+    'model: { provider: "good-provider", modelId: "m1" }',
+    'model: { provider: "good-provider", modelId: "m1", reasoningEffort: "high" }')
+  await withHome(effortCatalog, async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      { models: { 'no-such-provider': ['m2'] }, failures: { 'good-provider': 'connection refused' } })
+    const store = new StateStore(home)
+    try {
+      const check = await runRaw(command, home, 'check guard-me')
+      assert.equal(check.kind, 'success')
+      assert.match(check.text ?? '', /developer.*跳过/)
+      assert.match(check.text ?? '', /无法解析.*本地模型列表.*connection refused/)
+      const started = await runRaw(command, home, 'start guard-me go')
+      assert.equal(started.kind, 'success')
+      assert.match(started.text ?? '', /started guard-me/)
+      assert.equal((await store.get(home))?.run.catalogWorkflowId, 'guard-me')
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T2 命令入口：查询失败不掩盖其他角色的确定误配', async () => {
+  await withHome(CATALOG, async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider'],
+      { failures: { 'good-provider': 'boom' } })
+    const store = new StateStore(home)
+    try {
+      const result = await runRaw(command, home, 'start guard-me go')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /ghost/)
+      assert.equal(await store.get(home), undefined)
+      const check = await runRaw(command, home, 'check guard-me')
+      assert.equal(check.kind, 'success')
+      assert.match(check.text ?? '', /ghost.*不可用/)
+      assert.match(check.text ?? '', /developer.*跳过/)
+    } finally { store.close(); restore() }
+  })
+})
+
+// ---- #152 T3：真实命令入口的档位守卫（非纯函数矩阵代替）----
+
+const EFFORT_CATALOG = CATALOG.replace(
+  'model: { provider: "good-provider", modelId: "m1" }',
+  'model: { provider: "good-provider", modelId: "m1", reasoningEffort: "high" }')
+const EFFORT_LISTS = { models: { 'good-provider': ['m1', 'jm'], 'no-such-provider': ['m2'] } }
+
+test('T3 命令入口：档位越界被拒，点名角色/模型/档位且无新 Run', async () => {
+  await withHome(EFFORT_CATALOG, async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      EFFORT_LISTS, { info: { 'good-provider/m1': ['low', 'medium'] } })
+    const store = new StateStore(home)
+    try {
+      const result = await runRaw(command, home, 'start guard-me go')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /developer/)
+      assert.match(result.text ?? '', /good-provider\/m1/)
+      assert.match(result.text ?? '', /思考档位 "high"/)
+      assert.equal(await store.get(home), undefined)
+      const check = await runRaw(command, home, 'check guard-me')
+      assert.equal(check.kind, 'success')
+      assert.match(check.text ?? '', /developer.*不可用.*high/)
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T3 命令入口：成功但缺 reasoning 被拒（宿主必然拒绝），无新 Run', async () => {
+  await withHome(EFFORT_CATALOG, async (home) => {
+    // resolutions 未给 m1 档位信息 → 桩返回无 reasoning 的元数据（宿主真实形状）。
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'], EFFORT_LISTS)
+    const store = new StateStore(home)
+    try {
+      const result = await runRaw(command, home, 'start guard-me go')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /developer/)
+      assert.match(result.text ?? '', /UNSUPPORTED_REASONING_EFFORT/)
+      assert.equal(await store.get(home), undefined)
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T3 命令入口：judgeRole 档位越界同样被点名拒绝', async () => {
+  const judgeEffortCatalog = CATALOG.replace(
+    'model: { provider: "good-provider", modelId: "jm" }',
+    'model: { provider: "good-provider", modelId: "jm", reasoningEffort: "xhigh" }')
+  await withHome(judgeEffortCatalog, async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      EFFORT_LISTS, { info: { 'good-provider/jm': ['low'] } })
+    const store = new StateStore(home)
+    try {
+      const result = await runRaw(command, home, 'start guard-me go')
+      assert.equal(result.kind, 'error')
+      assert.match(result.text ?? '', /judge/)
+      assert.match(result.text ?? '', /xhigh/)
+      assert.equal(await store.get(home), undefined)
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T3 命令入口：resolveModelInfo 异步拒绝则 fail-open——check 注明跳过，可启动', async () => {
+  await withHome(EFFORT_CATALOG, async (home) => {
+    const { command, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      EFFORT_LISTS, { failures: { 'good-provider/m1': 'INVALID_MODEL_REASONING' } })
+    const store = new StateStore(home)
+    try {
+      const check = await runRaw(command, home, 'check guard-me')
+      assert.equal(check.kind, 'success')
+      assert.match(check.text ?? '', /developer.*OK.*档位检查已跳过.*INVALID_MODEL_REASONING/)
+      assert.match(check.text ?? '', /1 个跳过档位检查/)
+      const started = await runRaw(command, home, 'start guard-me go')
+      assert.equal(started.kind, 'success')
+      assert.match(started.text ?? '', /started guard-me/)
+      assert.equal((await store.get(home))?.run.catalogWorkflowId, 'guard-me')
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T3 命令入口：listModels 失败 + 已配置 effort——跳过两维且不再 resolveModelInfo', async () => {
+  await withHome(EFFORT_CATALOG, async (home) => {
+    const { command, resolveCalls, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'],
+      { models: { 'no-such-provider': ['m2'] }, failures: { 'good-provider': 'connection refused' } },
+      { info: { 'good-provider/m1': ['high'] } })
+    const store = new StateStore(home)
+    try {
+      const check = await runRaw(command, home, 'check guard-me')
+      assert.equal(check.kind, 'success')
+      assert.match(check.text ?? '', /developer.*跳过.*connection refused/)
+      // 列表失败的路由不再进入档位查询：即使档位事实存在也不消费。
+      assert.deepEqual(resolveCalls, [])
+      const started = await runRaw(command, home, 'start guard-me go')
+      assert.equal(started.kind, 'success')
+      assert.equal((await store.get(home))?.run.catalogWorkflowId, 'guard-me')
+    } finally { store.close(); restore() }
+  })
+})
+
+test('T3 命令入口：未配置 effort 不查询思考元数据；档位通过可启动', async () => {
+  await withHome(CATALOG, async (home) => {
+    const { command, resolveCalls, restore } = applyWithProviders(home, ['good-provider', 'no-such-provider'], EFFORT_LISTS)
+    const store = new StateStore(home)
+    try {
+      const check = await runRaw(command, home, 'check guard-me')
+      assert.equal(check.kind, 'success')
+      assert.deepEqual(resolveCalls, [])
+      assert.doesNotMatch(check.text ?? '', /档位/)
+      const started = await runRaw(command, home, 'start guard-me go')
+      assert.equal(started.kind, 'success')
+      assert.equal((await store.get(home))?.run.catalogWorkflowId, 'guard-me')
+    } finally { store.close(); restore() }
+  })
 })

@@ -13,7 +13,7 @@ import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceD
 import { endedSessionUserMessageIds, endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { turnEndFailure, type TurnEndFact } from './plugin/turn-end.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
-import { checkCatalogProviders, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
+import { checkCatalogProvidersWithModelListsAndEfforts, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
 import type { RunState, NodeExecution } from './types.ts'
@@ -278,6 +278,17 @@ export function apply(ctx: Context) {
   })
 
   // ---- Command host ----
+  // #152 T3：宿主 resolveModelInfo 的 reasoningEffort id 是 branded 类型，
+  // 在此拍平成 plain string 再送纯判定；start/check 共用同一装配。
+  const effortInfoOf = async (provider: string, modelId: string) => {
+    const info = await ctx.llm.resolveModelInfo(provider, modelId)
+    return {
+      reasoning: info.reasoning === undefined ? undefined : {
+        efforts: info.reasoning.efforts.map(effort => ({ id: effort.id as string })),
+        defaultEffort: info.reasoning.defaultEffort as string | undefined,
+      },
+    }
+  }
   const commandHost: CommandHost = {
     currentWorkspaceKey: async (agent) => {
       return workspaceKeyOf(agent.session.header.cwd)
@@ -293,10 +304,13 @@ export function apply(ctx: Context) {
       try {
         const entry = await loadCatalogEntry(home, workflowId)
         if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
-        // Issue #41：静态校验通过后、创建 Run 前做纯静态 provider 比对（本地
-        // 注册表读取，无网络）；任一角色不可用即拒绝启动，不创建 Run。
+        // Issue #41 + #151 T2 + #152 T3：静态校验通过后、创建 Run 前做 provider 注册 +
+        // modelId 本地列表比对 + reasoningEffort 档位支持检查（本地注册表/适配器查询，
+        // 无网络发现）；任一角色确定误配即拒绝启动，不创建 Run。查询失败的维度 fail-open 跳过。
         const available = ctx.llm.listProviders().map(provider => provider.id)
-        const report = checkCatalogProviders(workflowId, entry.config, available)
+        const report = await checkCatalogProvidersWithModelListsAndEfforts(workflowId, entry.config, available,
+          async provider => (await ctx.llm.listModels(provider)).map(model => model.id),
+          effortInfoOf)
         if (!report.ok) return { ok: false, reason: renderStartProviderBlock(report) }
         const run = engine.buildInitialRun(agent.session.id, workflowId, entry.config, entry.definitionHash)
         // Manager 启动：该 Session 就是本 Run 的 Manager（工作单行即将引用它），是参与事实。
@@ -321,9 +335,13 @@ export function apply(ctx: Context) {
       try {
         const entry = await loadCatalogEntry(home, workflowId)
         if (entry === undefined) return { ok: false, reason: `workflow "${workflowId}" not found in the catalog` }
-        // 纯静态比对：宿主已注册 provider 清单是本地注册表读取，无网络调用。
+        // provider 注册 + modelId 本地列表比对 + reasoningEffort 档位支持：
+        // 宿主本地查询，无网络发现；确定误配只报告（check 永不阻断），
+        // 查询失败的维度行内注明跳过原因。
         const available = ctx.llm.listProviders().map(provider => provider.id)
-        const report = checkCatalogProviders(workflowId, entry.config, available)
+        const report = await checkCatalogProvidersWithModelListsAndEfforts(workflowId, entry.config, available,
+          async provider => (await ctx.llm.listModels(provider)).map(model => model.id),
+          effortInfoOf)
         return { ok: true, message: renderProviderCheckReport(report) }
       } catch (error) {
         return { ok: false, reason: String(error) }

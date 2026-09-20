@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
-import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
+import { parentAgentOptionsForDelegation, resolveChildAgentOptions } from '@deepseek-ai/dsh-subagent'
 import { deliverSubagentPrompt, type HostPromptDeliverer } from '@deepseek-ai/dsh-subagent/internal'
 import { MessageId } from '@deepseek-ai/dsh-llm'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
@@ -21,7 +21,7 @@ import { WorkflowEngine, type JudgeSpawnInput, type SubagentHost } from '../src/
 import { makeStateHost, makeSubagentHost, managerRouteOf, type HostAdapters } from '../src/plugin/host.ts'
 import { testParticipants } from './helpers/participants.ts'
 import { judgeSpawnPlan, JUDGE_REQUIRED_TOOLS, resolveRoleModel } from '../src/roles/roles.ts'
-import { routeToAgentOptions, type RunState, type SpawnAgentOptions, type WorkflowConfig } from '../src/types.ts'
+import { agentOptionsToRoute, routeToAgentOptions, type RunState, type SpawnAgentOptions, type WorkflowConfig } from '../src/types.ts'
 import { StateStore } from '../src/state/store.ts'
 
 const CONFIG: WorkflowConfig = validateAndNormalize(parseCatalogConfig(`
@@ -144,10 +144,10 @@ test('两个 workspace 交错 start：每个 Run 的默认路由只来自自己�
     await advance(engine, store, 'ws-a')
     await advance(engine, store, 'ws-b')
     assert.deepEqual(spawns, [
-      { label: 'judge', agentOptions: { provider: 'provider-a', model: 'model-a' } },
-      { label: 'role:worker', agentOptions: { provider: 'provider-a', model: 'model-a' } },
-      { label: 'judge', agentOptions: { provider: 'provider-b', model: 'model-b' } },
-      { label: 'role:worker', agentOptions: { provider: 'provider-b', model: 'model-b' } },
+      { label: 'judge', agentOptions: { provider: 'provider-a', model: 'model-a', reasoningEffort: undefined } },
+      { label: 'role:worker', agentOptions: { provider: 'provider-a', model: 'model-a', reasoningEffort: undefined } },
+      { label: 'judge', agentOptions: { provider: 'provider-b', model: 'model-b', reasoningEffort: undefined } },
+      { label: 'role:worker', agentOptions: { provider: 'provider-b', model: 'model-b', reasoningEffort: undefined } },
     ], 'B start 后 A 的新 Judge / 新 Role 必须仍用 A 的冻结路由')
     const a = (await store.get('ws-a'))!.run
     const b = (await store.get('ws-b'))!.run
@@ -172,16 +172,16 @@ test('Store 关闭重开（host 重启）后，新 Engine 仍用本 Run 的冻�
     managers.set('manager-a', managerAgent('manager-a', 'provider-drifted', 'model-drifted'))
     await advance(reopened, store, 'ws')
     assert.deepEqual(spawns, [
-      { label: 'judge', agentOptions: { provider: 'provider-a', model: 'model-a' } },
-      { label: 'role:worker', agentOptions: { provider: 'provider-a', model: 'model-a' } },
+      { label: 'judge', agentOptions: { provider: 'provider-a', model: 'model-a', reasoningEffort: undefined } },
+      { label: 'role:worker', agentOptions: { provider: 'provider-a', model: 'model-a', reasoningEffort: undefined } },
     ], '重开后尚未创建的 Role/Judge 使用冻结值')
     // 新 Run 走自己的 Manager 路由，且不改写旧 Run 的冻结值。
     assert.equal(reopened.buildInitialRun('manager-a', 'model-route-freeze', CONFIG, 'hash').delegationRoute, undefined, '新 Run 在 start 前没有路由')
     assert.equal((await startRun(reopened, 'ws-2', 'manager-a')).ok, true)
     await advance(reopened, store, 'ws-2')
     assert.deepEqual(spawns.slice(2), [
-      { label: 'judge', agentOptions: { provider: 'provider-drifted', model: 'model-drifted' } },
-      { label: 'role:worker', agentOptions: { provider: 'provider-drifted', model: 'model-drifted' } },
+      { label: 'judge', agentOptions: { provider: 'provider-drifted', model: 'model-drifted', reasoningEffort: undefined } },
+      { label: 'role:worker', agentOptions: { provider: 'provider-drifted', model: 'model-drifted', reasoningEffort: undefined } },
     ], '新 Run 用自己的 Manager 当前路由（漂移后即漂移值）')
     assert.deepEqual((await store.get('ws'))!.run.delegationRoute, { provider: 'provider-a', modelId: 'model-a' }, '旧 Run 的冻结值不被新 Run 改写')
   } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
@@ -317,9 +317,11 @@ test('host 侧 Role 派发使用本 Run 冻结的路由', async () => {
   const { host, spawns } = realHost(managers)
   await host.ensureRoleActor(hostRun('manager-a', { provider: 'provider-a', modelId: 'model-a' }), 'worker', 'first dispatch')
   await host.ensureRoleActor(hostRun('manager-b', { provider: 'provider-b', modelId: 'model-b' }), 'worker', 'first dispatch')
+  // #149 T1: 显式路由无档位时派发边界带显式 reasoningEffort: undefined 键（清除
+  // 同路由继承），而非缺键——strict 断言保留该键存在。
   assert.deepEqual(spawns.map(s => s.agentOptions), [
-    { provider: 'provider-a', model: 'model-a' },
-    { provider: 'provider-b', model: 'model-b' },
+    { provider: 'provider-a', model: 'model-a', reasoningEffort: undefined },
+    { provider: 'provider-b', model: 'model-b', reasoningEffort: undefined },
   ])
 })
 
@@ -331,7 +333,7 @@ test('host 侧 Judge spawn 使用本 Run 冻结的路由', async () => {
   const { host, spawns } = realHost(managers, { judgeSessionId: 'judge-a' })
   const run = hostRun('manager-a', { provider: 'provider-a', modelId: 'model-a' })
   assert.deepEqual(await host.startJudge(run, judgeInput(run, 'judge-a')), { judgeSessionId: 'judge-a', messageId: 'message-1' })
-  assert.deepEqual(spawns, [{ label: 'workflow-judge:work', agentOptions: { provider: 'provider-a', model: 'model-a' } }],
+  assert.deepEqual(spawns, [{ label: 'workflow-judge:work', agentOptions: { provider: 'provider-a', model: 'model-a', reasoningEffort: undefined } }],
     'Judge 拿本 Run 的冻结值，而不是另一个 Run 的当前 Manager 路由')
 })
 
@@ -340,7 +342,7 @@ test('host 侧 compact fallback 使用本 Run 冻结的路由', async () => {
   const { host, resumes } = realHost(managers)
   const run = { ...hostRun('manager-b', { provider: 'provider-a', modelId: 'model-a' }), roleActors: { worker: 'sess-worker' } }
   assert.deepEqual(await host.compactRoleActor(run, 'worker'), { ok: true, detail: 'no compaction backend; boundary compact skipped' })
-  assert.deepEqual(resumes, [{ resumeSessionId: 'sess-worker', agentOptions: { provider: 'provider-a', model: 'model-a' } }],
+  assert.deepEqual(resumes, [{ resumeSessionId: 'sess-worker', agentOptions: { provider: 'provider-a', model: 'model-a', reasoningEffort: undefined } }],
     'cold compact 的 resume 走本 Run 冻结值')
 })
 
@@ -359,4 +361,258 @@ test('旧 Run（无冻结值）+ 两个 Run 的 Manager 都在场：派发与 co
   assert.deepEqual(await host.compactRoleActor({ ...legacy, roleActors: { worker: 'sess-worker' } }, 'worker'),
     { ok: true, detail: 'no compaction backend; boundary compact skipped' })
   assert.deepEqual(resumes, [{ resumeSessionId: 'sess-worker', agentOptions: undefined }], '旧 Run 的 compact fallback 保持不注入')
+})
+
+// ===== #153 T4: workflow_set_role_model 清空思考强度（换模型/同模型），后续派发回落模型默认 =====
+
+test('#153 T4: 换到与 Manager 相同路由：不继承 Manager 显式档位，后续派发回落模型默认', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-route-t4-same-'))
+  const managers = new Map<string, Agent>([['manager-high', effortfulManager('manager-high')]])
+  const parent = managers.get('manager-high')!
+  const spawns: Spawn[] = []
+  const store = new StateStore(home)
+  const engine = engineFor(store, managers, spawns)
+  try {
+    assert.equal((await engine.startRun('ws', engine.buildInitialRun('manager-high', 'model-route-freeze', CONFIG, 'hash'), undefined, 'root request')).ok, true)
+    await advance(engine, store, 'ws')
+    // 冻结 high 被继承：首个 worker 会话携带 high（即待清除的旧档位）。
+    assert.deepEqual(spawns.map(s => s.label), ['judge', 'role:worker'])
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(spawns[1]!.agentOptions), 1).reasoningEffort, 'high')
+    const work = (await store.get('ws'))!
+    const oldSession = work.run.roleActors.worker!
+    const workerCaller = { sessionId: work.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([work.execution.dispatch!.messageId!]) }
+    assert.equal((await engine.handleBlock('ws', work.execution.nodeToken, 'switch to the same route to clear effort', workerCaller)).ok, true)
+    // 换到与 Manager 相同的路由：override 整体替换为干净路由（不是删除键），
+    // 后续派发沿 #150 明确恢复默认语义，不重新继承 Manager effort。
+    const set = await engine.handleSetRoleModel('ws', 'worker', 'provider-a', 'model-a', 'manager-high')
+    assert.equal(set.ok, true)
+    assert.equal(set.message, 'model override saved for worker')
+    const afterSet = (await store.get('ws'))!
+    assert.deepEqual(afterSet.run.modelOverrides.worker, { provider: 'provider-a', modelId: 'model-a' })
+    assert.equal(afterSet.run.roleActors.worker, undefined, '旧 high 会话映射已删')
+    assert.equal((await engine.handleResume('ws', afterSet.execution.nodeToken, 'Use the cleared route.', 'manager-high', 'actor')).ok, true)
+    const replaced = (await store.get('ws'))!
+    assert.notEqual(replaced.run.roleActors.worker, oldSession, '不沿用旧 high 会话')
+    const redispatched = spawns[spawns.length - 1]!
+    assert.equal(redispatched.label, 'role:worker')
+    assert.equal('reasoningEffort' in redispatched.agentOptions!, true, '派发带显式清除键')
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(redispatched.agentOptions), 1).reasoningEffort, undefined,
+      '与 Manager 同路由也不重新继承 high：后续实际请求回落模型默认')
+    // 同模型再次 set：存活映射仍须退役（仅 override 无 effort 不足以 no-op）。
+    const live = (await store.get('ws'))!
+    const liveCaller = { sessionId: live.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([live.execution.dispatch!.messageId!]) }
+    assert.equal((await engine.handleBlock('ws', live.execution.nodeToken, 'retire the same-model session', liveCaller)).ok, true)
+    const again = await engine.handleSetRoleModel('ws', 'worker', 'provider-a', 'model-a', 'manager-high')
+    assert.equal(again.ok, true)
+    assert.equal(again.message, 'model override saved for worker')
+    assert.equal((await store.get('ws'))!.run.roleActors.worker, undefined, 'T4: 同模型 set 有存活映射时仍退役')
+    const blockedAgain = (await store.get('ws'))!
+    assert.equal((await engine.handleResume('ws', blockedAgain.execution.nodeToken, 'Use the cleared route again.', 'manager-high', 'actor')).ok, true)
+    const redispatchedAgain = spawns[spawns.length - 1]!
+    assert.equal(redispatchedAgain.label, 'role:worker')
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(redispatchedAgain.agentOptions), 1).reasoningEffort, undefined)
+  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+})
+
+test('#153 T4: 换到不同模型：原 catalog 显式档位不再生效，后续派发回落模型默认', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-route-t4-move-'))
+  const managers = new Map<string, Agent>([['manager-high', effortfulManager('manager-high')]])
+  const parent = managers.get('manager-high')!
+  const spawns: Spawn[] = []
+  const store = new StateStore(home)
+  const engine = engineFor(store, managers, spawns)
+  try {
+    assert.equal((await engine.startRun('ws', engine.buildInitialRun('manager-high', 'model-route-freeze', EFFORT_CONFIG, 'hash'), undefined, 'root request')).ok, true)
+    await advance(engine, store, 'ws')
+    // 首个 worker 派发用 catalog 显式档位 low。
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(spawns[1]!.agentOptions), 1).reasoningEffort, 'low')
+    const work = (await store.get('ws'))!
+    const oldSession = work.run.roleActors.worker!
+    const workerCaller = { sessionId: work.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([work.execution.dispatch!.messageId!]) }
+    assert.equal((await engine.handleBlock('ws', work.execution.nodeToken, 'move to a different model', workerCaller)).ok, true)
+    const set = await engine.handleSetRoleModel('ws', 'worker', 'provider-c', 'model-c', 'manager-high')
+    assert.equal(set.ok, true)
+    const afterSet = (await store.get('ws'))!
+    assert.deepEqual(afterSet.run.modelOverrides.worker, { provider: 'provider-c', modelId: 'model-c' })
+    assert.equal(afterSet.run.roleActors.worker, undefined)
+    assert.equal((await engine.handleResume('ws', afterSet.execution.nodeToken, 'Use the new model default.', 'manager-high', 'actor')).ok, true)
+    const replaced = (await store.get('ws'))!
+    assert.notEqual(replaced.run.roleActors.worker, oldSession, '不沿用旧 low 会话')
+    const redispatched = spawns[spawns.length - 1]!
+    assert.equal(redispatched.label, 'role:worker')
+    assert.equal('reasoningEffort' in redispatched.agentOptions!, true, '派发带显式清除键')
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(redispatched.agentOptions), 1).reasoningEffort, undefined,
+      '原 catalog low 与 Manager high 都不再生效：后续实际请求使用新模型默认')
+  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+})
+
+// ===== #149 T1: reasoningEffort 派发（显式档位 / 模型默认回落 / 继承保留）=====
+
+/** 宿主请求 options 位：插件交界输出直喂宿主正式决议函数（运行期类型擦除后即字符串）。 */
+function asHostRequested(options: SpawnAgentOptions | undefined): Parameters<typeof resolveChildAgentOptions>[1] {
+  return options as unknown as Parameters<typeof resolveChildAgentOptions>[1]
+}
+
+/** 与 Manager 同路由且带显式档位的父会话（header config 拥有 provider/model/reasoningEffort）。 */
+function effortfulManager(sessionId: string): Agent {
+  return {
+    id: sessionId,
+    options: { provider: 'provider-a', model: 'model-a' },
+    session: {
+      id: sessionId, header: {},
+      requestHeader: () => ({ config: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'high' } }),
+      snapshotEvents: () => [],
+    },
+  } as unknown as Agent
+}
+
+test('#149 T1: 交界往返无损；显式路由无档位带显式 undefined 键', () => {
+  // 显式档位在两个命名交界函数之间往返无损。
+  assert.deepEqual(routeToAgentOptions({ provider: 'p', modelId: 'm', reasoningEffort: 'high' }),
+    { provider: 'p', model: 'm', reasoningEffort: 'high' })
+  assert.deepEqual(agentOptionsToRoute({ provider: 'p', model: 'm', reasoningEffort: 'high' }),
+    { provider: 'p', modelId: 'm', reasoningEffort: 'high' })
+  // 显式路由无档位：带显式 reasoningEffort: undefined 键——宿主对同路由子会话
+  // 会保留父 effort，只有显式键能经展开覆盖清除它；缺键不等于恢复默认。
+  const cleared = routeToAgentOptions({ provider: 'p', modelId: 'm' })
+  assert.equal('reasoningEffort' in cleared!, true, '必须带显式键')
+  assert.equal(cleared!.reasoningEffort, undefined)
+  // 冻结不收录缺席分量（经 SQLite JSON 往返干净）；整体缺席即 undefined（宿主继承）。
+  assert.deepEqual(agentOptionsToRoute({ provider: 'p', model: 'm' }), { provider: 'p', modelId: 'm' })
+  assert.equal(routeToAgentOptions(undefined), undefined)
+  assert.equal(routeToAgentOptions({}), undefined)
+})
+
+test('#149 T1: 显式 model 省略 effort 实际使用模型默认（含与 Manager 同路由）', () => {
+  const parent = effortfulManager('manager-high')
+  // 插件交界输出（显式 model P/M，无 effort）直喂宿主正式决议函数：有效请求无档位。
+  const resolved = resolveChildAgentOptions(parent, asHostRequested(routeToAgentOptions({ provider: 'provider-a', modelId: 'model-a' })), 1)
+  assert.equal(resolved.reasoningEffort, undefined, '有效请求无档位：回落模型默认，而非继承 high')
+  // 机制注记：显式 undefined 键经宿主展开保留（值为 undefined，下游 `!== undefined`
+  // / `??` 一律按缺席处理）；基线 pin 0.1.5-rc.2，宿主升级改展开语义时此处先响。
+  assert.equal('reasoningEffort' in resolved, true, '显式清除键到达宿主决议函数')
+  // 反证（非空断言）：同样路由若缺键，宿主会保留父 high——证明显式键才是清除动作。
+  const omitted = resolveChildAgentOptions(parent, asHostRequested({ provider: 'provider-a', model: 'model-a' }), 1)
+  assert.equal(omitted.reasoningEffort, 'high', '缺键在同路由下继承父档位，故必须显式清除')
+  // 变体路由：宿主的路由变化分支本就自动清除，插件输出同样有效。
+  const moved = resolveChildAgentOptions(parent, asHostRequested(routeToAgentOptions({ provider: 'p2', modelId: 'm2' })), 1)
+  assert.equal(moved.reasoningEffort, undefined)
+  // 显式档位无损。
+  const explicit = resolveChildAgentOptions(parent, asHostRequested(routeToAgentOptions({ provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'low' })), 1)
+  assert.equal(explicit.reasoningEffort, 'low')
+  // 完全未配 model：保留既有继承行为（high）。
+  const inherited = resolveChildAgentOptions(parent, asHostRequested(routeToAgentOptions(undefined)), 1)
+  assert.equal(inherited.reasoningEffort, 'high')
+})
+
+test('#149 T1: Judge 与 Role 同等支持显式档位与同路由回落', () => {
+  const parent = effortfulManager('manager-high')
+  const frozen = { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' } as const
+  // Judge 显式档位：同一交界无损，有效请求即该值。
+  const judgeCfg = structuredClone(CONFIG)
+  judgeCfg.judgeRole.model = { provider: 'jp', modelId: 'jm', reasoningEffort: 'high' }
+  const judgeRun = { ...hostRun('manager-high', frozen), definitionSnapshot: judgeCfg }
+  const plan = judgeSpawnPlan(judgeRun, judgeRun.delegationRoute)
+  assert.deepEqual(plan.agentOptions, { provider: 'jp', modelId: 'jm', reasoningEffort: 'high' })
+  assert.equal(resolveChildAgentOptions(parent, asHostRequested(routeToAgentOptions(plan.agentOptions)), 1).reasoningEffort, 'high')
+  // Judge 与 Manager 同路由但省略档位：有效请求回落模型默认（Judge 同等支持）。
+  const sameCfg = structuredClone(CONFIG)
+  sameCfg.judgeRole.model = { provider: 'provider-a', modelId: 'model-a' }
+  const sameRun = { ...hostRun('manager-high', frozen), definitionSnapshot: sameCfg }
+  const sameRequested = routeToAgentOptions(judgeSpawnPlan(sameRun, sameRun.delegationRoute).agentOptions)
+  assert.equal('reasoningEffort' in sameRequested!, true, 'Judge 同路由省略档位同样带显式清除键')
+  assert.equal(resolveChildAgentOptions(parent, asHostRequested(sameRequested), 1).reasoningEffort, undefined,
+    'Judge 有效请求回落模型默认')
+  // Role 同路由省略档位：经 resolveRoleModel 同一路径回落（Role 侧全链路）。
+  const roleCfg = structuredClone(CONFIG)
+  roleCfg.roles['worker'] = { persona: 'Worker persona.', model: { provider: 'provider-a', modelId: 'model-a' } }
+  const roleRun = { ...hostRun('manager-high', frozen), definitionSnapshot: roleCfg }
+  const roleRequested = routeToAgentOptions(resolveRoleModel(roleRun, 'worker', roleRun.delegationRoute))
+  assert.equal(resolveChildAgentOptions(parent, asHostRequested(roleRequested), 1).reasoningEffort, undefined,
+    'Role 有效请求回落模型默认')
+})
+
+/** #149 T1 端到端：冻结携带档位 → Role/Judge 派发 → 快照落库和关库重开。 */
+const EFFORT_CONFIG: WorkflowConfig = validateAndNormalize(parseCatalogConfig(`
+schemaVersion: agent-workflow/v3
+roles:
+  worker:
+    persona: Worker persona.
+    model: { provider: provider-b, modelId: model-b, reasoningEffort: low }
+judgeRole:
+  persona: Judge persona.
+workflow:
+  startNode: plan
+  returns: [done]
+  nodes:
+    plan:
+      execution: { type: actor-task, role: manager, instruction: Plan. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      results:
+        succeeded: { criteria: The plan is complete., target: { node: work } }
+    work:
+      execution: { type: actor-task, role: worker, instruction: Work. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
+      results:
+        succeeded: { criteria: The work is complete., target: { return: done } }
+`), { workflowId: 'model-route-freeze' })
+
+test('#149 T1: 冻结携带档位，Role/Judge 派发与快照落库和关库重开', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-route-effort-'))
+  const managers = new Map<string, Agent>([['manager-high', effortfulManager('manager-high')]])
+  const spawns: Spawn[] = []
+  const store = new StateStore(home)
+  const engine = engineFor(store, managers, spawns)
+  try {
+    assert.equal((await engine.startRun('ws-effort',
+      engine.buildInitialRun('manager-high', 'model-route-freeze', EFFORT_CONFIG, 'hash'), undefined, 'root request')).ok, true)
+    // 冻结值携带 Manager 档位（未配 model 的 Judge 沿继承拿到 high）。
+    assert.deepEqual((await store.get('ws-effort'))!.run.delegationRoute,
+      { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' })
+    await advance(engine, store, 'ws-effort')
+    assert.deepEqual(spawns, [
+      { label: 'judge', agentOptions: { provider: 'provider-a', model: 'model-a', reasoningEffort: 'high' } },
+      { label: 'role:worker', agentOptions: { provider: 'provider-b', model: 'model-b', reasoningEffort: 'low' } },
+    ], 'Judge 继承冻结档位 high；Role 用显式档位 low')
+    // 带档位的 Judge 快照可落库（Judge 属于已 ACCEPT 的前驱 plan execution）。
+    const workRow = (await store.get('ws-effort'))!
+    const planExec = (await store.execution('ws-effort', workRow.execution.predecessorId!))!
+    assert.deepEqual(planExec.judge!.model,
+      { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' })
+    // previousJudge 与 Judge 共用同一严格路由 schema：在当前 work execution 上
+    // 安排一次历史 NEED_CONTEXT 交接，带档位的历史 Judge 同样可落库。
+    const current = structuredClone(workRow.execution)
+    current.inputVersion = 2
+    current.phase = 'checking'
+    current.claim = { id: 'claim-work-1', dispatchId: current.dispatch!.id, result: 'succeeded', handoff: 'work candidate' }
+    current.judge = {
+      id: 'judge-work-2', sessionId: 'judge-work-fresh', claimId: 'claim-work-1',
+      inputVersion: 2, settled: false,
+      model: { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' },
+    }
+    current.previousJudge = {
+      id: 'judge-work-1', sessionId: 'judge-work-old', claimId: 'claim-work-1',
+      inputVersion: 1, settled: true,
+      model: { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' },
+    }
+    current.judgment = {
+      result: 'NEED_CONTEXT', reason: 'need more context', claimId: 'claim-work-1',
+      judgeDispatchId: 'judge-work-1', judgeSessionId: 'judge-work-old', inputVersion: 1,
+    }
+    await store.updateRow('ws-effort', workRow.run, workRow.stateVersion,
+      [{ execution: current, expectedRevision: current.revision, events: [] }])
+    assert.deepEqual((await store.get('ws-effort'))!.execution.previousJudge!.model,
+      { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' })
+  } finally { store.close() }
+  // 关库重开：冻结路由与 Judge/previousJudge 快照稳定。
+  const reopened = new StateStore(home)
+  try {
+    const row = (await reopened.get('ws-effort'))!
+    assert.deepEqual(row.run.delegationRoute,
+      { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' })
+    assert.deepEqual(row.execution.judge!.model,
+      { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' })
+    assert.deepEqual(row.execution.previousJudge!.model,
+      { provider: 'provider-a', modelId: 'model-a', reasoningEffort: 'high' })
+  } finally { reopened.close(); rmSync(home, { recursive: true, force: true }) }
 })

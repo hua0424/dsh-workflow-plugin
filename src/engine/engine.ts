@@ -258,7 +258,7 @@ export class WorkflowEngine {
     // 解析不出值（Manager 不在场）时不猜：保持 undefined，由宿主 spawn 的正式继承
     // 语义从本 Run 自己的 Manager 兜底，绝不借其他 Run 的值。
     const frozen = await this.managerRoute(run.managerSessionId)
-    if (frozen.provider !== undefined || frozen.model !== undefined) {
+    if (frozen.provider !== undefined || frozen.model !== undefined || frozen.reasoningEffort !== undefined) {
       run.delegationRoute = agentOptionsToRoute(frozen)
     }
     if (configPath) {
@@ -894,6 +894,9 @@ export class WorkflowEngine {
         const routeChanged = bound === undefined
           ? run.modelOverrides['judge'] !== undefined
           : bound.provider !== currentRoute.provider || bound.modelId !== currentRoute.modelId
+            // #149 T1: 绑定快照自本票起携带 effort，比较须覆盖三元件；T1 内档位
+            // 运行中不变（set 换档位由 #153 交付），此处为零行为变化的一致性补齐。
+            || bound.reasoningEffort !== currentRoute.reasoningEffort
         if (routeChanged) {
           try {
             if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')
@@ -1137,8 +1140,15 @@ export class WorkflowEngine {
     let route
     try { route = normalizeModelRoute(provider, model) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
     const existing = row.run.modelOverrides[role]
-    if (existing?.provider === route.provider && existing.modelId === route.modelId) return { ok: true, run: row.run, message: 'model override already applied' }
     const mapped = role === 'judge' ? undefined : row.run.roleActors[role]
+    // #153 T4：仅比较 provider/modelId 不足以判定无变化——存活会话可能仍携带
+    // 旧档位（def/冻结的显式 effort，或升级前从 Manager 继承的档位），override
+    // 自身也可能带 effort（set 从不写入，但旧行不保证）。有存活映射或既有
+    // override 带 effort 时走正常替换生命周期（探针 + 删映射 + 重存干净 override，
+    // 后续派发经显式 undefined 回落模型默认）；Judge 恒无映射（Judge 会话复用由
+    // resume 的三元件比较决定，#22/T1），无映射且 override 干净时才可 no-op。
+    if (existing?.provider === route.provider && existing.modelId === route.modelId
+      && existing.reasoningEffort === undefined && mapped === undefined) return { ok: true, run: row.run, message: 'model override already applied' }
     const currentNode = this.nodeAt(row.run, topFrame(row.run))
     const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
     if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')

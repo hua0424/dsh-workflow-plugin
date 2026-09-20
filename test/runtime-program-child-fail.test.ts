@@ -347,8 +347,17 @@ test('model override safely replaces one blocked Role once and leaves Judge repl
     assert.equal(replacement.run.roleActors.worker, 'worker-replacement-2')
     assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'late old Role' }, oldActor)).ok, false)
 
-    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'next-provider', 'next-model', 'manager')).ok, true)
-    assert.equal((await h.row()).run.roleActors.worker, 'worker-replacement-2', 'same override is idempotent and does not replace again')
+    // #153 T4：同模型 set 不再是无条件 no-op——存活映射可能仍携带旧档位，
+    // 仅 snapshot/override 无 effort 字段不足以判定无变化。working 中的会话先
+    // 走既有安全生命周期（block 后才能替换，不强行中断）。
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'next-provider', 'next-model', 'manager')).ok, false)
+    const replacementActor = h.caller(replacement.execution.dispatch!)
+    assert.equal((await h.engine.handleBlock('ws', replacement.execution.nodeToken, 'retire the same-model session', replacementActor)).ok, true)
+    const sameSet = await h.engine.handleSetRoleModel('ws', 'worker', 'next-provider', 'next-model', 'manager')
+    assert.equal(sameSet.ok, true)
+    assert.equal(sameSet.message, 'model override saved for worker')
+    assert.deepEqual((await h.row()).run.modelOverrides.worker, { provider: 'next-provider', modelId: 'next-model' })
+    assert.equal((await h.row()).run.roleActors.worker, undefined, 'T4: 同模型 set 有存活映射时仍退役旧会话，后续派发回落模型默认')
     const beforeJudgeOverride = await h.row()
     assert.equal((await h.engine.handleSetRoleModel('ws', 'judge', 'judge-provider', 'judge-model', 'manager')).ok, true)
     const judgeOverride = await h.row()

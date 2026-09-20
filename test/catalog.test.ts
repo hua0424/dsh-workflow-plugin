@@ -115,6 +115,40 @@ test('model route caps: provider ≤64 / modelId ≤128 after trim (A1 D3)', () 
   assert.deepEqual(capped.roles['developer']!.model, { provider: 'p2', modelId: 'm2' })
 })
 
+test('#149 T1: reasoningEffort 可选、trim/非空/限长，Role/Judge 对称，旧 YAML 可加载', () => {
+  const withRoleEffort = (effort: string) => parseCatalogConfig(configWith(
+    '  developer:\n    persona: Implement.',
+    `  developer:\n    persona: Implement.\n    model: { provider: "p", modelId: "m", reasoningEffort: "${effort}" }`,
+  ))
+  const withJudgeEffort = (effort: string) => parseCatalogConfig(configWith(
+    'judgeRole:\n  persona: Judge.',
+    `judgeRole:\n  persona: Judge.\n  model: { provider: "p", modelId: "m", reasoningEffort: "${effort}" }`,
+  ))
+  // 长度上限与 provider 共用同一显式约束风格：64 可过，65 拒绝（Role/Judge 同源）。
+  assert.throws(() => withRoleEffort('e'.repeat(65)), /reasoningEffort.*64/)
+  assert.throws(() => withJudgeEffort('e'.repeat(65)), /reasoningEffort.*64/)
+  // trim 后空白即拒绝（不 hardcode 档位枚举，任意非空字符串可过）。
+  assert.throws(() => withRoleEffort('   '), /reasoningEffort/)
+  // 边界值可过且存的是 trim 结果；Role/Judge 对称。
+  const role = validateAndNormalize(withRoleEffort(' high '), { workflowId: 'effort-wf' })
+  assert.deepEqual(role.roles['developer']!.model, { provider: 'p', modelId: 'm', reasoningEffort: 'high' })
+  const judge = validateAndNormalize(withJudgeEffort(' low '), { workflowId: 'effort-wf' })
+  assert.deepEqual(judge.judgeRole.model, { provider: 'p', modelId: 'm', reasoningEffort: 'low' })
+  // 旧 YAML（无 effort）仍可加载，且归一化不补默认档位。
+  const legacy = validateAndNormalize(parseCatalogConfig(VALID_CONFIG), { workflowId: 'effort-wf' })
+  assert.equal(legacy.roles['developer']!.model, undefined)
+  assert.equal(legacy.judgeRole.model, undefined)
+})
+
+test('#149 T1: 旧快照归一化不补档位、不重写 hash', () => {
+  const first = validateAndNormalize(parseCatalogConfig(VALID_CONFIG), { workflowId: 'effort-wf' })
+  const hash = computeDefinitionHash(first)
+  // 已持久化的快照再次归一化（模拟重读）：不得注入 effort 键，hash 不变。
+  const second = validateAndNormalize(structuredClone(first), { workflowId: 'effort-wf' })
+  assert.equal(computeDefinitionHash(second), hash)
+  assert.equal('reasoningEffort' in (second.roles['developer']!.model ?? {}), false)
+})
+
 test('#60: role reuse defaults to node and survives into the frozen snapshot', () => {
   const withReuse = (line: string) => parseCatalogConfig(configWith(
     '  developer:\n    persona: Implement.',

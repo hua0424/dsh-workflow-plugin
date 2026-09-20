@@ -45,7 +45,8 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
 2. 文件名去掉 `.yaml` 即 workflowId，必须匹配 `[a-z][a-z0-9-]*`（拒绝 `.yml`）。
 3. YAML 是受限单文档 1.2：禁止 duplicate key、anchor/alias/merge、custom tag、
    模板插值。invalid 文件**只阻塞自身**，`/dsh-flow list` 会给出诊断。
-4. 角色模型路由用可选的 `model: { provider, modelId }` 块；角色可用
+4. 角色模型路由用可选的 `model: { provider, modelId }` 块，可再加可选的
+   `reasoningEffort`（思考档位，语义见 §3.3）；角色可用
    `tools: { deny: [...] }` 收紧工具面。Judge 的工具面 = 全量工具目录减去
    （插件默认 deny 清单 ∪ `judgeRole.tools.deny`）；默认 deny 覆盖 `edit`/`write`
    与 Run 控制工具，`gh`/`git`/`pwsh` 等查询工具默认可用，详见
@@ -92,6 +93,36 @@ worker Role 可选 `reuse: node | continuable`，决定该 Role 的会话在节�
   `${DSH_HOME}/workflows/state.sqlite3`：旧 Run 照旧跑到结束，新 Run 从一开始就
   带着冻结值。
 
+### 3.3 思考强度 `reasoningEffort`（#149 T1 起）
+
+`roles.<role>.model` / `judgeRole.model` 可再加可选的 `reasoningEffort`
+（档位 id 由 provider 适配器本地声明，如 `high`；只做 trim/非空/长度约束，
+不校验枚举，旧 YAML 无该键照常加载）：
+
+```yaml
+roles:
+  developer:
+    persona: |
+      ……
+    model:
+      provider: deepseek
+      modelId: deepseek-chat
+      reasoningEffort: high   # 可选：省略见下；Judge 的 model 块同样可选
+```
+
+- **显式 model + 显式档位**：实际请求用该值。
+- **显式 model + 省略档位**：**回落该模型默认**，不继承 Manager 的显式档位
+  （即使路由与 Manager 相同）。“省略键”不等于“恢复默认”，插件在派发边界
+  主动清除继承值。
+- **完全未配置 `model`**：保留既有继承——沿用本 Run 冻结的 Manager 路由（含档位）。
+- **旧快照兼容**：可读取、可继续、无需迁移；不补默认档位，不改旧定义 hash，
+  state 格式不变，不为升级重建存量会话。
+- 档位是否被模型支持的静态检查与 `check`/`start` 阻断语义（T3 已生效，
+  判定矩阵见 §5）：只有 `modelId` 已在本地列表确认且配置了档位才查思考
+  元数据；档位越界或模型无 reasoning 元数据（宿主对此类带档位请求必然
+  抛 `UNSUPPORTED_REASONING_EFFORT`）会阻断 `start`；元数据查询失败则
+  fail-open 跳过档位维并在行内注明。运行期换模型清空档位（T4）待后续票据。
+
 ## 4. 提交协议单源化：旧 catalog 迁移指引
 
 提交协议只有引擎一个来源：每次派发末尾的 `[提交要求]` 段（含
@@ -134,13 +165,35 @@ instruction**（结果验收条件进各结果 `criteria`，不依赖 persona �
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）
 /dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store
-/dsh-flow check <workflow-id>         静态检查该 catalog 各角色的 provider 是否已注册（只报告，不阻断）
+/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表 + 思考档位（只报告，不阻断）
 ```
 
-- `check` 把 catalog 每个角色（含 Judge）的 `model.provider` 与当前
-  profile 已注册 provider 清单做纯静态比对（无网络调用），逐角色输出
-  OK/不可用 + 原因；不可用只报告，不影响正常加载与运行。未配置 model
-  的角色视为运行时继承 Manager route，不报错。
+- `check` 把 catalog 每个角色（含 Judge）的显式模型路由与当前
+  profile 做三段式本地比对（无网络发现）：`model.provider` 是否已注册；
+  已注册 provider 的 `modelId` 是否在其 `listModels` 本地列表内（成功
+  空列表与 unlisted 同属确定误配）；列表查询抛错/拒绝则该维度 fail-open
+  跳过并在行内注明原因（含后续档位检查一并跳过）。逐角色输出
+  OK/不可用/跳过 + 原因；不可用与跳过只报告，不影响正常加载与运行。
+  未配置 model 的角色视为运行时继承 Manager route，不报错。
+  `start` 对确定误配前置拒绝且不创建 Run（消息含角色/路由/原因/修复指引），
+  无确定误配时允许启动——跳过不代表模型已验证或运行必然成功。
+
+  **兼容性（T2 起）**：以前可运行的 unlisted DeepSeek 路由现在会被 `start`
+  拒绝——需先在本地 settings/config 声明该模型 id；`listModels` 查询故障
+  时允许尝试启动，但 check 行会明确标注跳过原因。
+
+- 档位检查（T3 起）只在前两段都通过（listed）且角色显式配置了
+  `reasoningEffort` 时进入，未配置档位的角色不查询思考元数据、输出与
+  T2 一致。判定按宿主 `resolveModelInfo` 返回的思考元数据（比较
+  `reasoning.efforts` 的 `id`）：
+  配置值在集中则通过；不在集中则阻断（`start` 点名角色/模型/档位，
+  不创建 Run）；成功返回但缺 `reasoning` 同样阻断——宿主对此类带档位
+  请求必然抛 `UNSUPPORTED_REASONING_EFFORT`，去掉档位或换支持思考的
+  模型即可。`resolveModelInfo` 抛错/拒绝（含宿主 `INVALID_MODEL_REASONING`
+  这类非法元数据）时 fail-open 跳过档位维并在行内注明解析失败：
+  允许尝试启动，但实际请求仍可能失败，且不掩盖同报告中其他角色的
+  确定误配。排障时先看 `check` 行内原因区分“已验证通过 / 已跳过 /
+  确定误配”，不要把带跳过标注的 OK 读成全维度已验证。
 
 - `start` 的附加文本会作为初始指令的一部分交给 Manager（比如本次目标）。
 - `reset` / `terminated` 只表示**控制面终止**：它撤销旧推进资格、保留工作单与事件，
@@ -167,7 +220,7 @@ instruction**（结果验收条件进各结果 `criteria`，不依赖 persona �
 | `node_resume` | Manager | 恢复 BLOCK 节点（target=auto/actor/judge，轮换新 nodeToken） |
 | `node_run_program` | Manager | 为 builtin-program 节点提交 typed parameters 并运行 |
 | `node_resolve_program` | Manager | BLOCK 的 program 节点现场检查后手工提交 PASS/FAIL |
-| `workflow_set_role_model` | Manager | 给某 Role / Judge 切换模型（有活动 Actor 时拒绝；只影响之后新建的会话，Judge 覆盖后 `node_resume` 自动对旧会话走 fresh） |
+| `workflow_set_role_model` | Manager | 给某 Role / Judge 切换模型（有活动 Actor 时拒绝；成功后原思考强度即清空，同模型再次设置同样清空，后续派发用目标模型默认；只影响之后新建的会话，Judge 覆盖后 `node_resume` 自动对旧会话走 fresh） |
 | `judge_respawn` | Manager | 重建当前节点的 Judge（drain 旧的 + spawn 新的；Judge 模型覆盖后也可直接 `node_resume`，见 §7） |
 | `judge_claim` | Judge | 提交判定 ACCEPT/REJECT/NEED_CONTEXT（必须是本轮最后动作） |
 | `workflow_inspect_git` / `workflow_inspect_github` | Judge | 只读检查 git / GitHub 现场 |
@@ -213,6 +266,13 @@ GitHub 列表按 `per_page=100` 翻页取全、PR 从 issues 结果中排除；�
   的绑定路由——已过期则自动走 fresh（释放旧会话 + 按新路由 spawn），不再把
   同一个失败（如旧模型额度耗尽）再派一次。典型恢复：Judge 旧模型额度耗尽 →
   覆盖为新模型 → 直接 `node_resume`（target=judge），无需先 `judge_respawn`。
+- 思考强度清空（Issue #153 T4）：`workflow_set_role_model` 成功即清空该角色
+  原有效档位（catalog/override 配置的与继承来的旧值都不再携带），后续派发
+  使用目标模型默认——换到与 Manager 相同的路由不重新继承 Manager 显式档位，
+  同模型再次设置同样清空。Worker 有存活会话时，同模型覆盖同样走替换重建
+  （仅 override 里没有档位字段不算"无变化"）；Judge 旧 high 会话在
+  `node_resume` 比对出档位变化后走 fresh。生效点都是之后新建的会话，正在
+  运行的 live 会话仍不受影响（目标 Role 有 active Actor 时 set 直接拒绝）。清空只保证不再携带旧档位，不解决目标模型自身的不可用、凭据或网络问题。
 - Host 重启后 Run 可冷恢复：状态在 SQLite，会话在持久层，重进即可续跑。
 
 ## 8. v3 升级与回滚（停机切换）
