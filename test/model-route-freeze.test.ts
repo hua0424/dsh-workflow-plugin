@@ -363,6 +363,89 @@ test('旧 Run（无冻结值）+ 两个 Run 的 Manager 都在场：派发与 co
   assert.deepEqual(resumes, [{ resumeSessionId: 'sess-worker', agentOptions: undefined }], '旧 Run 的 compact fallback 保持不注入')
 })
 
+// ===== #153 T4: workflow_set_role_model 清空思考强度（换模型/同模型），后续派发回落模型默认 =====
+
+test('#153 T4: 换到与 Manager 相同路由：不继承 Manager 显式档位，后续派发回落模型默认', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-route-t4-same-'))
+  const managers = new Map<string, Agent>([['manager-high', effortfulManager('manager-high')]])
+  const parent = managers.get('manager-high')!
+  const spawns: Spawn[] = []
+  const store = new StateStore(home)
+  const engine = engineFor(store, managers, spawns)
+  try {
+    assert.equal((await engine.startRun('ws', engine.buildInitialRun('manager-high', 'model-route-freeze', CONFIG, 'hash'), undefined, 'root request')).ok, true)
+    await advance(engine, store, 'ws')
+    // 冻结 high 被继承：首个 worker 会话携带 high（即待清除的旧档位）。
+    assert.deepEqual(spawns.map(s => s.label), ['judge', 'role:worker'])
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(spawns[1]!.agentOptions), 1).reasoningEffort, 'high')
+    const work = (await store.get('ws'))!
+    const oldSession = work.run.roleActors.worker!
+    const workerCaller = { sessionId: work.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([work.execution.dispatch!.messageId!]) }
+    assert.equal((await engine.handleBlock('ws', work.execution.nodeToken, 'switch to the same route to clear effort', workerCaller)).ok, true)
+    // 换到与 Manager 相同的路由：override 整体替换为干净路由（不是删除键），
+    // 后续派发沿 #150 明确恢复默认语义，不重新继承 Manager effort。
+    const set = await engine.handleSetRoleModel('ws', 'worker', 'provider-a', 'model-a', 'manager-high')
+    assert.equal(set.ok, true)
+    assert.equal(set.message, 'model override saved for worker')
+    const afterSet = (await store.get('ws'))!
+    assert.deepEqual(afterSet.run.modelOverrides.worker, { provider: 'provider-a', modelId: 'model-a' })
+    assert.equal(afterSet.run.roleActors.worker, undefined, '旧 high 会话映射已删')
+    assert.equal((await engine.handleResume('ws', afterSet.execution.nodeToken, 'Use the cleared route.', 'manager-high', 'actor')).ok, true)
+    const replaced = (await store.get('ws'))!
+    assert.notEqual(replaced.run.roleActors.worker, oldSession, '不沿用旧 high 会话')
+    const redispatched = spawns[spawns.length - 1]!
+    assert.equal(redispatched.label, 'role:worker')
+    assert.equal('reasoningEffort' in redispatched.agentOptions!, true, '派发带显式清除键')
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(redispatched.agentOptions), 1).reasoningEffort, undefined,
+      '与 Manager 同路由也不重新继承 high：后续实际请求回落模型默认')
+    // 同模型再次 set：存活映射仍须退役（仅 override 无 effort 不足以 no-op）。
+    const live = (await store.get('ws'))!
+    const liveCaller = { sessionId: live.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([live.execution.dispatch!.messageId!]) }
+    assert.equal((await engine.handleBlock('ws', live.execution.nodeToken, 'retire the same-model session', liveCaller)).ok, true)
+    const again = await engine.handleSetRoleModel('ws', 'worker', 'provider-a', 'model-a', 'manager-high')
+    assert.equal(again.ok, true)
+    assert.equal(again.message, 'model override saved for worker')
+    assert.equal((await store.get('ws'))!.run.roleActors.worker, undefined, 'T4: 同模型 set 有存活映射时仍退役')
+    const blockedAgain = (await store.get('ws'))!
+    assert.equal((await engine.handleResume('ws', blockedAgain.execution.nodeToken, 'Use the cleared route again.', 'manager-high', 'actor')).ok, true)
+    const redispatchedAgain = spawns[spawns.length - 1]!
+    assert.equal(redispatchedAgain.label, 'role:worker')
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(redispatchedAgain.agentOptions), 1).reasoningEffort, undefined)
+  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+})
+
+test('#153 T4: 换到不同模型：原 catalog 显式档位不再生效，后续派发回落模型默认', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-route-t4-move-'))
+  const managers = new Map<string, Agent>([['manager-high', effortfulManager('manager-high')]])
+  const parent = managers.get('manager-high')!
+  const spawns: Spawn[] = []
+  const store = new StateStore(home)
+  const engine = engineFor(store, managers, spawns)
+  try {
+    assert.equal((await engine.startRun('ws', engine.buildInitialRun('manager-high', 'model-route-freeze', EFFORT_CONFIG, 'hash'), undefined, 'root request')).ok, true)
+    await advance(engine, store, 'ws')
+    // 首个 worker 派发用 catalog 显式档位 low。
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(spawns[1]!.agentOptions), 1).reasoningEffort, 'low')
+    const work = (await store.get('ws'))!
+    const oldSession = work.run.roleActors.worker!
+    const workerCaller = { sessionId: work.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([work.execution.dispatch!.messageId!]) }
+    assert.equal((await engine.handleBlock('ws', work.execution.nodeToken, 'move to a different model', workerCaller)).ok, true)
+    const set = await engine.handleSetRoleModel('ws', 'worker', 'provider-c', 'model-c', 'manager-high')
+    assert.equal(set.ok, true)
+    const afterSet = (await store.get('ws'))!
+    assert.deepEqual(afterSet.run.modelOverrides.worker, { provider: 'provider-c', modelId: 'model-c' })
+    assert.equal(afterSet.run.roleActors.worker, undefined)
+    assert.equal((await engine.handleResume('ws', afterSet.execution.nodeToken, 'Use the new model default.', 'manager-high', 'actor')).ok, true)
+    const replaced = (await store.get('ws'))!
+    assert.notEqual(replaced.run.roleActors.worker, oldSession, '不沿用旧 low 会话')
+    const redispatched = spawns[spawns.length - 1]!
+    assert.equal(redispatched.label, 'role:worker')
+    assert.equal('reasoningEffort' in redispatched.agentOptions!, true, '派发带显式清除键')
+    assert.equal(resolveChildAgentOptions(parent, asHostRequested(redispatched.agentOptions), 1).reasoningEffort, undefined,
+      '原 catalog low 与 Manager high 都不再生效：后续实际请求使用新模型默认')
+  } finally { store.close(); rmSync(home, { recursive: true, force: true }) }
+})
+
 // ===== #149 T1: reasoningEffort 派发（显式档位 / 模型默认回落 / 继承保留）=====
 
 /** 宿主请求 options 位：插件交界输出直喂宿主正式决议函数（运行期类型擦除后即字符串）。 */

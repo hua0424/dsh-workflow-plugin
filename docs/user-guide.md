@@ -220,7 +220,7 @@ instruction**（结果验收条件进各结果 `criteria`，不依赖 persona �
 | `node_resume` | Manager | 恢复 BLOCK 节点（target=auto/actor/judge，轮换新 nodeToken） |
 | `node_run_program` | Manager | 为 builtin-program 节点提交 typed parameters 并运行 |
 | `node_resolve_program` | Manager | BLOCK 的 program 节点现场检查后手工提交 PASS/FAIL |
-| `workflow_set_role_model` | Manager | 给某 Role / Judge 切换模型（有活动 Actor 时拒绝；只影响之后新建的会话，Judge 覆盖后 `node_resume` 自动对旧会话走 fresh） |
+| `workflow_set_role_model` | Manager | 给某 Role / Judge 切换模型（有活动 Actor 时拒绝；成功后原思考强度即清空，同模型再次设置同样清空，后续派发用目标模型默认；只影响之后新建的会话，Judge 覆盖后 `node_resume` 自动对旧会话走 fresh） |
 | `judge_respawn` | Manager | 重建当前节点的 Judge（drain 旧的 + spawn 新的；Judge 模型覆盖后也可直接 `node_resume`，见 §7） |
 | `judge_claim` | Judge | 提交判定 ACCEPT/REJECT/NEED_CONTEXT（必须是本轮最后动作） |
 | `workflow_inspect_git` / `workflow_inspect_github` | Judge | 只读检查 git / GitHub 现场 |
@@ -266,6 +266,13 @@ GitHub 列表按 `per_page=100` 翻页取全、PR 从 issues 结果中排除；�
   的绑定路由——已过期则自动走 fresh（释放旧会话 + 按新路由 spawn），不再把
   同一个失败（如旧模型额度耗尽）再派一次。典型恢复：Judge 旧模型额度耗尽 →
   覆盖为新模型 → 直接 `node_resume`（target=judge），无需先 `judge_respawn`。
+- 思考强度清空（Issue #153 T4）：`workflow_set_role_model` 成功即清空该角色
+  原有效档位（catalog/override 配置的与继承来的旧值都不再携带），后续派发
+  使用目标模型默认——换到与 Manager 相同的路由不重新继承 Manager 显式档位，
+  同模型再次设置同样清空。Worker 有存活会话时，同模型覆盖同样走替换重建
+  （仅 override 里没有档位字段不算"无变化"）；Judge 旧 high 会话在
+  `node_resume` 比对出档位变化后走 fresh。生效点都是之后新建的会话，正在
+  运行的 live 会话仍不受影响（目标 Role 有 active Actor 时 set 直接拒绝）。清空只保证不再携带旧档位，不解决目标模型自身的不可用、凭据或网络问题。
 - Host 重启后 Run 可冷恢复：状态在 SQLite，会话在持久层，重进即可续跑。
 
 ## 8. v3 升级与回滚（停机切换）
