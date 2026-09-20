@@ -100,6 +100,13 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
       problems.push(`role key "${roleKey}" is reserved and cannot be configured`)
     }
     role.persona = role.persona.trim()
+    // #149 T1: 防御性 trim（绕过 schema 手工构造的配置）：schema 已对 catalog
+    // 路径 trim + 非空 + 限长；此处只做 trim，空白值按问题拒绝，不补默认档位。
+    if (role.model?.reasoningEffort !== undefined) {
+      const trimmed = role.model.reasoningEffort.trim()
+      if (trimmed === '') problems.push(`role "${roleKey}" reasoningEffort must be a non-empty string when provided`)
+      else role.model.reasoningEffort = trimmed
+    }
     // #60: 缺省 reuse 在此归一化为 `node`，随 definitionSnapshot 一并冻结；
     // 之后修改 YAML 只影响新启动的 Run。
     role.reuse = roleReuseMode(role)
@@ -108,6 +115,11 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
 
   // judge role
   config.judgeRole.persona = config.judgeRole.persona.trim()
+  if (config.judgeRole.model?.reasoningEffort !== undefined) {
+    const trimmed = config.judgeRole.model.reasoningEffort.trim()
+    if (trimmed === '') problems.push('judgeRole reasoningEffort must be a non-empty string when provided')
+    else config.judgeRole.model.reasoningEffort = trimmed
+  }
   checkPersonaProtocol('judgeRole', config.judgeRole.persona, warnings)
 
   // workflows (root + children)

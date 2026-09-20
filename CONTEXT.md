@@ -81,9 +81,13 @@ T5 已把 `jobs`、`compaction` 设为标准 Web composition 的 required servic
 
 ## Model Route / 思考强度
 
-Role（含 judgeRole）的模型路由由 provider、modelId 与可选思考强度（Reasoning Effort）组成；未配置模型的角色运行时继承 Manager 路由。思考强度是路由的组成部分：档位 id 由 provider 适配器本地声明（如 off/minimal/low/medium/high/xhigh/max），不同模型档位集不同；不配置即不传，由适配器回落其默认档位。运行期更换角色模型时思考强度不随行：清空并回落新模型默认档位。
+Role（含 judgeRole）的模型路由由 provider、modelId 与可选思考强度（Reasoning Effort）组成，配置位置为 `roles.<role>.model.reasoningEffort` / `judgeRole.model.reasoningEffort`，与 provider/modelId 同级；不支持只填档位而不提供模型路由。档位 id 是 provider 适配器自有 opaque 字符串（如 off/minimal/low/medium/high/xhigh/max，不同模型档位集不同），schema 只做 trim/非空/长度约束，不 hardcode 档位枚举。
 
-本地模型列表（Local Model Catalog）是当前 profile 实际声明的模型集合：适配器内置目录与 settings/config 显式声明合并而成，与供应商接口的动态发现无关。catalog 配置的 modelId 必须落在所属 provider 的本地模型列表内，思考强度必须落在该模型的档位列表内；列表为空视为该 provider 未配置任何模型。
+默认与继承必须区分：显式 model + 显式档位用该值；显式 model + 省略档位**主动回落模型默认**（派发边界显式清除继承值——宿主对同路由子会话会保留父档位，“省略键”不等于“恢复默认”，不断言 options 缺键即默认生效）；完全未配置 model 保留既有 Manager 路由继承（含冻结档位）。运行期更换角色模型时思考强度不随行：清空并回落新模型默认档位（#153 T4）。
+
+旧快照兼容 = 可读取、可继续、无需迁移：不向旧定义补默认档位，不重写旧定义 hash，state 格式版本不变；显式路由缺档位的后续新建/重建派发采用上述默认语义，不为升级主动重建存量会话。
+
+本地模型列表（Local Model Catalog）是当前 profile 实际声明的模型集合：适配器内置目录与 settings/config 显式声明合并而成，与供应商接口的动态发现无关。modelId 本地列表校验与档位支持矩阵按 #149 执行（含明确的 fail-open 跳过维度与 start 前置阻断，由 T2/T3 交付）；基线空列表按不可用处理，unlisted 阻断为有意严格策略。
 
 ## Judge Role / Judge Agent
 

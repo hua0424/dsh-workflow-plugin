@@ -265,7 +265,8 @@ test('cold actor: materialize → compactNow → dispose, role route passed to r
   // 破坏「物化不开 turn、只压不派」的前提（src/plugin/host.ts compactOnce 注释），并让维护窗口撞 busy。
   assert.equal('prompt' in f.resumes[0]!, false, 'cold maintenance resume must not carry a prompt')
   assert.equal(f.resumes[0]!.signal?.aborted, false, '本次 attempt 的 signal 直达 resume，且此刻仍可用')
-  assert.deepEqual(f.resumes[0]!.agentOptions, { provider: 'p1', model: 'm1' })
+  assert.deepEqual(f.resumes[0]!.agentOptions, { provider: 'p1', model: 'm1', reasoningEffort: undefined },
+    '#149 T1: 显式路由无档位的 resume 带显式 undefined 键（宿主边界清除继承，回落模型默认）')
   assert.equal(f.compacts[0]!.agent, materialized)
 })
 

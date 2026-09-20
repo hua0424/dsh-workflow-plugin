@@ -8,19 +8,23 @@ import { LIMITS, ID_PATTERN, declaredResults, type CallFrame, type NodeDef, type
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
 const dispatch = z.object({ id: text, sessionId: text.optional(), messageId: text.optional(), settled: z.boolean() }).strict()
-const route = z.object({ provider: text.optional(), modelId: text.optional() }).strict()
+// #149 T1: 严格路由 schema 接受可选 effort（Judge/previousJudge 快照、冻结默认
+// 路由）。旧行无该键照常读取；不向旧定义补默认档位，state 格式版本不变。
+const route = z.object({ provider: text.optional(), modelId: text.optional(), reasoningEffort: text.optional() }).strict()
 const judge = dispatch.extend({ sessionId: text, claimId: text, inputVersion: revision, model: route.optional() })
 // v3: claim 携带一个已声明的节点结果名（result），不再有 outcome。
 const claim = z.object({ id: text, dispatchId: text, result: z.string().regex(ID_PATTERN), handoff: z.string().trim().min(1).max(LIMITS.handoffMax) }).strict()
 const frame = z.object({ workflowId: text, nodeId: text, nodeToken: z.uuid(), executionId: text }).strict()
-const model = z.object({ provider: text, modelId: text }).strict()
+const model = z.object({ provider: text, modelId: text, reasoningEffort: text.optional() }).strict()
 const runSchema = z.object({
   runId: text, managerSessionId: text, catalogWorkflowId: text, definitionHash: text,
   definitionSnapshot: workflowConfigSchema, status: z.enum(['running', 'blocked', 'completed', 'terminated']),
   callStack: z.array(frame), roleActors: z.record(z.string(), text), modelOverrides: z.record(z.string(), model),
   blockReason: text.nullable(), currentExecutionId: text, traceLogPath: text.optional(),
   // #91: 启动时冻结的默认模型路由；旧 Run 无该字段（不得由运行时补造）。
-  delegationRoute: z.object({ provider: text.optional(), modelId: text.optional() }).strict().optional(),
+  // #149 T1: 冻结值携带 Manager 档位（有则收录），使未配 model 的角色沿既有
+  // 继承行为拿到同一档位；显式 model 省略 effort 的清除只发生在派发边界。
+  delegationRoute: z.object({ provider: text.optional(), modelId: text.optional(), reasoningEffort: text.optional() }).strict().optional(),
   // v3: 已确认的业务终局（名字 + 终局来源 executionId）；handoff 不做第二份镜像。
   businessReturn: z.object({ name: z.string().regex(ID_PATTERN), source: text }).strict().optional(),
 }).strict()

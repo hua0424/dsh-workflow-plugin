@@ -15,6 +15,10 @@ const roleModel = z
     // A1 D3 caps, enforced after the trim transform (stored values are trimmed).
     provider: nonEmptyTrimmed.max(LIMITS.providerMax),
     modelId: nonEmptyTrimmed.max(LIMITS.modelIdMax),
+    // #149 T1: 可选思考强度——适配器自有 opaque 档位 id，只做 trim/非空/长度
+    // 约束，不 hardcode 档位枚举。Role 与 JudgeRole 共用同一 schema（对称支持）；
+    // 旧 YAML 无该键照常加载。
+    reasoningEffort: nonEmptyTrimmed.max(LIMITS.reasoningEffortMax).optional(),
   })
   .strict()
 
