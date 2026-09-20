@@ -117,8 +117,9 @@ roles:
 - **完全未配置 `model`**：保留既有继承——沿用本 Run 冻结的 Manager 路由（含档位）。
 - **旧快照兼容**：可读取、可继续、无需迁移；不补默认档位，不改旧定义 hash，
   state 格式不变，不为升级重建存量会话。
-- 档位是否被模型支持的静态检查与 `check`/`start` 阻断语义由 T2/T3 按 #149
-  交付；运行期换模型清空档位由 T4 交付。
+- 档位是否被模型支持的静态检查与 `check`/`start` 阻断语义按 #149
+  交付：modelId 本地列表校验（T2）已生效，档位矩阵（T3）与运行期换模型
+  清空档位（T4）待后续票据。
 
 ## 4. 提交协议单源化：旧 catalog 迁移指引
 
@@ -162,13 +163,22 @@ instruction**（结果验收条件进各结果 `criteria`，不依赖 persona �
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）
 /dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store
-/dsh-flow check <workflow-id>         静态检查该 catalog 各角色的 provider 是否已注册（只报告，不阻断）
+/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表（只报告，不阻断）
 ```
 
-- `check` 把 catalog 每个角色（含 Judge）的 `model.provider` 与当前
-  profile 已注册 provider 清单做纯静态比对（无网络调用），逐角色输出
-  OK/不可用 + 原因；不可用只报告，不影响正常加载与运行。未配置 model
-  的角色视为运行时继承 Manager route，不报错。
+- `check` 把 catalog 每个角色（含 Judge）的显式模型路由与当前
+  profile 做三段式本地比对（无网络发现）：`model.provider` 是否已注册；
+  已注册 provider 的 `modelId` 是否在其 `listModels` 本地列表内（成功
+  空列表与 unlisted 同属确定误配）；列表查询抛错/拒绝则该维度 fail-open
+  跳过并在行内注明原因（含后续档位检查一并跳过）。逐角色输出
+  OK/不可用/跳过 + 原因；不可用与跳过只报告，不影响正常加载与运行。
+  未配置 model 的角色视为运行时继承 Manager route，不报错。
+  `start` 对确定误配前置拒绝且不创建 Run（消息含角色/路由/原因/修复指引），
+  无确定误配时允许启动——跳过不代表模型已验证或运行必然成功。
+
+  **兼容性（T2 起）**：以前可运行的 unlisted DeepSeek 路由现在会被 `start`
+  拒绝——需先在本地 settings/config 声明该模型 id；`listModels` 查询故障
+  时允许尝试启动，但 check 行会明确标注跳过原因。
 
 - `start` 的附加文本会作为初始指令的一部分交给 Manager（比如本次目标）。
 - `reset` / `terminated` 只表示**控制面终止**：它撤销旧推进资格、保留工作单与事件，
