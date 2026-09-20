@@ -117,9 +117,11 @@ roles:
 - **完全未配置 `model`**：保留既有继承——沿用本 Run 冻结的 Manager 路由（含档位）。
 - **旧快照兼容**：可读取、可继续、无需迁移；不补默认档位，不改旧定义 hash，
   state 格式不变，不为升级重建存量会话。
-- 档位是否被模型支持的静态检查与 `check`/`start` 阻断语义按 #149
-  交付：modelId 本地列表校验（T2）已生效，档位矩阵（T3）与运行期换模型
-  清空档位（T4）待后续票据。
+- 档位是否被模型支持的静态检查与 `check`/`start` 阻断语义（T3 已生效，
+  判定矩阵见 §5）：只有 `modelId` 已在本地列表确认且配置了档位才查思考
+  元数据；档位越界或模型无 reasoning 元数据（宿主对此类带档位请求必然
+  抛 `UNSUPPORTED_REASONING_EFFORT`）会阻断 `start`；元数据查询失败则
+  fail-open 跳过档位维并在行内注明。运行期换模型清空档位（T4）待后续票据。
 
 ## 4. 提交协议单源化：旧 catalog 迁移指引
 
@@ -163,7 +165,7 @@ instruction**（结果验收条件进各结果 `criteria`，不依赖 persona �
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）
 /dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store
-/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表（只报告，不阻断）
+/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表 + 思考档位（只报告，不阻断）
 ```
 
 - `check` 把 catalog 每个角色（含 Judge）的显式模型路由与当前
@@ -179,6 +181,19 @@ instruction**（结果验收条件进各结果 `criteria`，不依赖 persona �
   **兼容性（T2 起）**：以前可运行的 unlisted DeepSeek 路由现在会被 `start`
   拒绝——需先在本地 settings/config 声明该模型 id；`listModels` 查询故障
   时允许尝试启动，但 check 行会明确标注跳过原因。
+
+- 档位检查（T3 起）只在前两段都通过（listed）且角色显式配置了
+  `reasoningEffort` 时进入，未配置档位的角色不查询思考元数据、输出与
+  T2 一致。判定按宿主 `resolveModelInfo` 返回的思考元数据（比较
+  `reasoning.efforts` 的 `id`）：
+  配置值在集中则通过；不在集中则阻断（`start` 点名角色/模型/档位，
+  不创建 Run）；成功返回但缺 `reasoning` 同样阻断——宿主对此类带档位
+  请求必然抛 `UNSUPPORTED_REASONING_EFFORT`，去掉档位或换支持思考的
+  模型即可。`resolveModelInfo` 抛错/拒绝（含宿主 `INVALID_MODEL_REASONING`
+  这类非法元数据）时 fail-open 跳过档位维并在行内注明解析失败：
+  允许尝试启动，但实际请求仍可能失败，且不掩盖同报告中其他角色的
+  确定误配。排障时先看 `check` 行内原因区分“已验证通过 / 已跳过 /
+  确定误配”，不要把带跳过标注的 OK 读成全维度已验证。
 
 - `start` 的附加文本会作为初始指令的一部分交给 Manager（比如本次目标）。
 - `reset` / `terminated` 只表示**控制面终止**：它撤销旧推进资格、保留工作单与事件，
