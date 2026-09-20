@@ -258,7 +258,7 @@ export class WorkflowEngine {
     // 解析不出值（Manager 不在场）时不猜：保持 undefined，由宿主 spawn 的正式继承
     // 语义从本 Run 自己的 Manager 兜底，绝不借其他 Run 的值。
     const frozen = await this.managerRoute(run.managerSessionId)
-    if (frozen.provider !== undefined || frozen.model !== undefined) {
+    if (frozen.provider !== undefined || frozen.model !== undefined || frozen.reasoningEffort !== undefined) {
       run.delegationRoute = agentOptionsToRoute(frozen)
     }
     if (configPath) {
@@ -894,6 +894,9 @@ export class WorkflowEngine {
         const routeChanged = bound === undefined
           ? run.modelOverrides['judge'] !== undefined
           : bound.provider !== currentRoute.provider || bound.modelId !== currentRoute.modelId
+            // #149 T1: 绑定快照自本票起携带 effort，比较须覆盖三元件；T1 内档位
+            // 运行中不变（set 换档位由 #153 交付），此处为零行为变化的一致性补齐。
+            || bound.reasoningEffort !== currentRoute.reasoningEffort
         if (routeChanged) {
           try {
             if (!await this.drainJudgeAndRevalidate(ws, row, oldJudge ?? judgeToContinue)) return rejected('stale judge resume request after missing Judge drain')

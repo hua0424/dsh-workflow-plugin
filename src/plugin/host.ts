@@ -3,7 +3,7 @@
  * interfaces (design §2.3 deployment / §4 runtime).
  */
 import { setTimeout as delay } from 'node:timers/promises'
-import type { Agent, AgentHandle, AgentSetup } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, AgentOptions, AgentSetup } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-compaction'
 // Type-only：让 ctx.get('agentPresets') 解析到 preset 服务类型。运行期该服务
@@ -269,15 +269,32 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
 }
 
 /**
+ * #149 T1: 插件路由 → 宿主 spawn/resume 请求 options（`routeToAgentOptions`
+ * 的宿主侧出口，三处派发共用）。档位是适配器自有 opaque id——catalog 边界已
+ * trim/非空/限长，宿主侧 nominal brand（`ReasoningEffortId`，运行时即字符串）
+ * 在此交界一次性确认；域内一律保持纯 `DelegationRoute`/`SpawnAgentOptions`。
+ */
+function spawnAgentOptions(route: DelegationRoute | undefined): AgentOptions | undefined {
+  return routeToAgentOptions(route) as AgentOptions | undefined
+}
+
+/**
  * #118 D-91-3：Manager 默认路由取源的唯一生产实现（`engine.managerRoute` 的
  * 装配体与测试断言共用此处，替身不再复刻取源语义）。取源走 DSH 固定版本的
  * 正式委派 helper——最新 request header 拥有 provider/model，创建该会话时的
  * options 兜底——这样冻结值与新建子会话真正会继承到的路由一致。
+ * #149 T1：连带收录 Manager 档位（`reasoningEffort`，有则冻结），未配 model
+ * 的 Role/Judge 沿既有继承行为拿到同一档位；显式 model 省略 effort 的回落
+ * 由派发边界的 `routeToAgentOptions` 显式清除完成，不在此处丢弃。
  */
 export function managerRouteOf(agent: Agent | undefined): SpawnAgentOptions {
   if (agent === undefined) return {}
   const options = parentAgentOptionsForDelegation(agent)
-  return { provider: options.provider, model: options.model }
+  return {
+    provider: options.provider,
+    model: options.model,
+    ...(options.reasoningEffort === undefined ? {} : { reasoningEffort: options.reasoningEffort }),
+  }
 }
 
 /**
@@ -339,7 +356,7 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
           // Issue #140：Role Actor persona 唯一组合点（公共 + 角色，缺省原样）。
           persona: roleActorPersona(run, roleKey),
           toolFilter: deny.length > 0 ? { deny } : undefined,
-          agentOptions: routeToAgentOptions(route),
+          agentOptions: spawnAgentOptions(route),
         },
       }, `spawn role ${roleKey}`)
       // Record the session mapping IMMEDIATELY at creation — the child's first
@@ -375,7 +392,7 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
           parent: manager,
           persona: plan.persona,
           toolFilter: deny.length > 0 ? { deny } : undefined,
-          agentOptions: routeToAgentOptions(plan.agentOptions),
+          agentOptions: spawnAgentOptions(plan.agentOptions),
         },
       }, 'spawn judge')
 
@@ -530,7 +547,7 @@ async function compactOnce(
       // fallback (compaction summarization* config > the session's own
       // latest routed request), so the summary model may differ from the
       // actor's model.
-      agentOptions: routeToAgentOptions(route),
+      agentOptions: spawnAgentOptions(route),
       // Maintenance materialization must join the parent preset too: the
       // compaction backend (and every model-facing row) lives in the
       // preset's isolate domain, and an unjoined agent resolves no backend

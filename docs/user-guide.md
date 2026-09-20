@@ -45,7 +45,8 @@ inject 它，否则 `dsh web` 会永久 pending 卡死
 2. 文件名去掉 `.yaml` 即 workflowId，必须匹配 `[a-z][a-z0-9-]*`（拒绝 `.yml`）。
 3. YAML 是受限单文档 1.2：禁止 duplicate key、anchor/alias/merge、custom tag、
    模板插值。invalid 文件**只阻塞自身**，`/dsh-flow list` 会给出诊断。
-4. 角色模型路由用可选的 `model: { provider, modelId }` 块；角色可用
+4. 角色模型路由用可选的 `model: { provider, modelId }` 块，可再加可选的
+   `reasoningEffort`（思考档位，语义见 §3.3）；角色可用
    `tools: { deny: [...] }` 收紧工具面。Judge 的工具面 = 全量工具目录减去
    （插件默认 deny 清单 ∪ `judgeRole.tools.deny`）；默认 deny 覆盖 `edit`/`write`
    与 Run 控制工具，`gh`/`git`/`pwsh` 等查询工具默认可用，详见
@@ -91,6 +92,33 @@ worker Role 可选 `reuse: node | continuable`，决定该 Role 的会话在节�
   Manager 解析），边界 compact fallback 保持不注入。因此升级**不需要清空或迁移**
   `${DSH_HOME}/workflows/state.sqlite3`：旧 Run 照旧跑到结束，新 Run 从一开始就
   带着冻结值。
+
+### 3.3 思考强度 `reasoningEffort`（#149 T1 起）
+
+`roles.<role>.model` / `judgeRole.model` 可再加可选的 `reasoningEffort`
+（档位 id 由 provider 适配器本地声明，如 `high`；只做 trim/非空/长度约束，
+不校验枚举，旧 YAML 无该键照常加载）：
+
+```yaml
+roles:
+  developer:
+    persona: |
+      ……
+    model:
+      provider: deepseek
+      modelId: deepseek-chat
+      reasoningEffort: high   # 可选：省略见下；Judge 的 model 块同样可选
+```
+
+- **显式 model + 显式档位**：实际请求用该值。
+- **显式 model + 省略档位**：**回落该模型默认**，不继承 Manager 的显式档位
+  （即使路由与 Manager 相同）。“省略键”不等于“恢复默认”，插件在派发边界
+  主动清除继承值。
+- **完全未配置 `model`**：保留既有继承——沿用本 Run 冻结的 Manager 路由（含档位）。
+- **旧快照兼容**：可读取、可继续、无需迁移；不补默认档位，不改旧定义 hash，
+  state 格式不变，不为升级重建存量会话。
+- 档位是否被模型支持的静态检查与 `check`/`start` 阻断语义由 T2/T3 按 #149
+  交付；运行期换模型清空档位由 T4 交付。
 
 ## 4. 提交协议单源化：旧 catalog 迁移指引
 

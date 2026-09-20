@@ -44,8 +44,8 @@ catalog 目录后按需修改，不要从零手写。
 ## model 如何配置（subagent Role 与 judgeRole）
 
 worker subagent 和 Judge 的模型路由配置格式相同，都是一个**可选**的
-`model` 块，只有 `provider` + `modelId` 两个必填字段（unknown 字段会被
-strict schema 拒绝）：
+`model` 块：`provider` + `modelId` 必填，`reasoningEffort`（思考档位，#149 T1 起）
+可选（unknown 字段会被 strict schema 拒绝）：
 
 ```yaml
 roles:
@@ -55,11 +55,12 @@ roles:
     model:                   # 可选：省略则继承 Manager 路由
       provider: deepseek     # trim 后 1..64 字符
       modelId: glm-4.7       # trim 后 1..128 字符
+      reasoningEffort: high  # 可选：适配器自有档位 id，trim 后 1..64 字符，不校验枚举
 
 judgeRole:                   # Judge
   persona: |
     ……
-  model:                     # 同样可选
+  model:                     # 同样可选，同样可配 reasoningEffort
     provider: deepseek
     modelId: glm-4.7
   tools:                     # 可选：在插件默认 deny 清单之上再收紧
@@ -77,7 +78,12 @@ judgeRole:                   # Judge
 要点：
 
 - **省略 `model` = 继承 Manager**：Run 启动时把当前 Manager 的模型路由
-  冻结进 Run State，之后修改主会话模型不影响进行中的 Run。
+  （含档位）冻结进 Run State，之后修改主会话模型不影响进行中的 Run。
+- **显式 `model` 省略档位 = 回落模型默认**：不继承 Manager 的显式档位，
+  即使路由与 Manager 相同（派发边界主动清除继承值）；“省略键”不等于
+  “恢复默认”。完全未配 `model` 才走上一条继承。
+- **旧快照兼容**：无档位键的旧 YAML/旧 Run 照常加载运行，不补默认档位，
+  不改旧定义 hash，state 格式不变。
 - **Manager 本身不可配 model**：`manager` 是保留 roleKey，禁止出现在
   `roles` 中，YAML 不伪装修改它的 persona/model/tools——它始终由当前
   主会话承担。
@@ -88,7 +94,7 @@ judgeRole:                   # Judge
   会话走 fresh（释放旧会话 + 按新路由 spawn，与 Worker 一致）；正在判定的
   live Judge 会话不受影响，旧模型额度耗尽时用新模型覆盖后直接 `node_resume`
   即可，无需先 `judge_respawn`（Issue #22）。
-- **只允许 provider + modelId**：不配置 maxTokens / temperature / fallback
+- **只允许 provider + modelId + reasoningEffort**：不配置 maxTokens / temperature / fallback
   等 provider 属性；subagent 的 spawn provider（in-process continuable）
   也是固定的，YAML 不配置。
 - provider/modelId 会写入 trace log 的 `MODEL` 行（见 README「Run trace
@@ -170,7 +176,7 @@ Role 定义：
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `persona` | ✓ | 非空，trim 后存储 |
-| `model` | ✗ | `{ provider, modelId }`，见上文 |
+| `model` | ✗ | `{ provider, modelId }` + 可选 `reasoningEffort`，见上文 |
 | `tools.deny` | ✗ | 非空列表；在插件默认 deny 清单（`edit`/`write` + workflow 控制工具）之上再收紧，受保护工具不可 deny |
 | `reuse` | ✗ | `node`（缺省）或 `continuable`；会话复用粒度，见「会话复用粒度（Issue #60）」 |
 
