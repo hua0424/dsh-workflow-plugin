@@ -19,6 +19,7 @@ import { WorkflowError } from './types.ts'
 import type { RunState, NodeExecution } from './types.ts'
 import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
+import { registerEditorRpc } from './editor/rpc.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, managerRouteOf, programHost, type HostAdapters } from './plugin/host.ts'
 import {
@@ -375,6 +376,10 @@ export function apply(ctx: Context) {
   // #94：工具集在本实例装配时绑定本实例的 toolHost，dispose 只撤销本实例的注册。
   const workflowTools = makeWorkflowTools(toolHost)
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
+  // #160 T1：配置编辑器同源 RPC（parse/validate/preview/layout，只收受限文本/JSON，
+  // 不接受路径、不访问 catalog/Run/状态库）。无 `connection` 服务（非 Web 加载）
+  // 时跳过注册，插件其余功能不受影响。
+  const editorRpc = registerEditorRpc(ctx as unknown as { get(name: string): unknown })
 
   // ---- Turn settlement ----
   // 同步回调只捕获事实（#99 AC6）：路由已确定的参与者在这里立即定格该 Turn 的消息
@@ -412,6 +417,7 @@ export function apply(ctx: Context) {
   ctx.effect(() => () => {
     disposeCommand()
     for (const dispose of disposeTools) dispose()
+    if (editorRpc.status === 'registered') void editorRpc.dispose()
   })
 
   // ---- Host restart reconciliation (design §4.2 H1) ----

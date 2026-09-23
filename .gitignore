@@ -22,4 +22,7 @@ review-*.txt
 /docs/dsh-workflow/runs/
 /docs/dsh-workflow/issues/
 
+# Web-client factory bundle output (built on demand, never committed)
+/web-client/dist/
+
 .scratch
