@@ -11,7 +11,7 @@
  *   不检查外部修改；布局与业务分别报告写入结果。
  */
 import { stringify } from 'yaml'
-import type { BuiltinProgramNode, RoleDefinition, RoleModel, RoleReuseMode, Target, WorkflowConfig, WorkflowDef } from '../types.ts'
+import type { BuiltinProgramNode, ChildWorkflowNode, RoleDefinition, RoleModel, RoleReuseMode, Target, WorkflowConfig, WorkflowDef } from '../types.ts'
 import { ID_PATTERN, LIMITS, nodeOnReturn, nodeResults, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, roleReuseMode, WorkflowError } from '../types.ts'
 import { parseCatalogConfig } from '../catalog/parse.ts'
 import { parseWorkflowConfig } from '../catalog/schema.ts'
@@ -496,6 +496,26 @@ export function parseNewFilename(yamlName: string): { ok: true; workflowId: stri
 }
 
 /**
+ * 最小合法流程起点：Manager 入口单节点 + 单返回（新建主流程与新增子流程共用；
+ * 不依赖任何 roles，Judge 取最小 persona；构造期即走真实校验链）。
+ */
+function minimalFlowDef(): WorkflowDef {
+  return {
+    startNode: 'main',
+    returns: ['done'],
+    nodes: {
+      main: {
+        execution: { type: 'actor-task', role: 'manager', instruction: '统筹本工作流：拆解任务并组织后续节点。' },
+        checker: { checkerId: 'judge.claim-correct', config: {} },
+        results: {
+          done: { criteria: '工作流目标已达成。', target: { return: 'done' } },
+        },
+      },
+    },
+  }
+}
+
+/**
  * 最小合法 v3 起点：Manager 入口单节点 + 单返回。
  * 不依赖任何 roles（新建闭环无需等待 T2），Judge 取最小 persona。
  */
@@ -505,19 +525,7 @@ export function newDraftSession(workflowId: string): DraftSession {
     schemaVersion: 'agent-workflow/v3',
     roles: {},
     judgeRole: { persona: '确认 Actor 结果是否可信；只做 ACCEPT/REJECT/NEED_CONTEXT 判定，不选择业务结果。' },
-    workflow: {
-      startNode: 'main',
-      returns: ['done'],
-      nodes: {
-        main: {
-          execution: { type: 'actor-task', role: 'manager', instruction: '统筹本工作流：拆解任务并组织后续节点。' },
-          checker: { checkerId: 'judge.claim-correct', config: {} },
-          results: {
-            done: { criteria: '工作流目标已达成。', target: { return: 'done' } },
-          },
-        },
-      },
-    },
+    workflow: minimalFlowDef(),
   }
   // 构造期即走真实校验链：最小起点自身必须合法（有问题是实现 bug，早爆）。
   validateAndNormalize(parseWorkflowConfig(structuredClone(config)), { workflowId, warnings: [] })
@@ -650,7 +658,7 @@ function actorNodeOf(flow: WorkflowDef, nodeId: string): { ok: true; node: impor
   const node = flow.nodes[nodeId]
   if (node === undefined) return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
   if (node.execution.type !== 'actor-task') {
-    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不是 Actor 节点（Program 请用 Program 配置编辑，Child 留给 T5；其字段保持不丢失）` }
+    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不是 Actor 节点（Program 请用 Program 配置编辑，Child 请用子流程与返回映射编辑）` }
   }
   return { ok: true, node: node as import('../types.ts').ActorTaskNode }
 }
@@ -669,7 +677,7 @@ export interface NewActorNodeFields {
 /** 新增 Actor 节点（简单网格摆放；可暂时不可达，保存前校验裁决）。 */
 export function addActorNode(session: DraftSession, flowId: string | undefined, nodeId: string, fields: NewActorNodeFields): RoleEditResult {
   const flow = flowOf(session, flowId)
-  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（子流程定义的新增留给 T5）` }
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（新建子流程请用子流程管理）` }
   if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
   if (Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
     return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
@@ -1038,7 +1046,7 @@ function programNodeOf(flow: WorkflowDef, nodeId: string): { ok: true; node: Bui
   const node = flow.nodes[nodeId]
   if (node === undefined) return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
   if (node.execution.type !== 'builtin-program') {
-    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不是 Program 节点（Actor 请用结果路由编辑，Child 留给 T5）` }
+    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不是 Program 节点（Actor 请用结果路由编辑，Child 请用子流程与返回映射编辑）` }
   }
   return { ok: true, node: node as BuiltinProgramNode }
 }
@@ -1098,7 +1106,7 @@ export interface NewProgramNodeFields {
 /** 新增 Program 节点（PASS/FAIL 成对声明；简单网格摆放；可暂时不可达）。 */
 export function addProgramNode(session: DraftSession, flowId: string | undefined, nodeId: string, fields: NewProgramNodeFields): RoleEditResult {
   const flow = flowOf(session, flowId)
-  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（子流程定义的新增留给 T5）` }
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（新建子流程请用子流程管理）` }
   if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
   if (Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
     return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
@@ -1262,6 +1270,298 @@ export function setProgramResult(session: DraftSession, flowId: string | undefin
   pushHistory(session)
   result.criteria = nextCriteria
   result.target = nextTarget
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/* ------------------------------------------------------------------ *
+ * T5（#164）子流程与返回映射编辑。
+ *
+ * 全部作用于同一草稿、经 pushHistory 接入撤销/重做并置 dirtyBusiness
+ * （新增子流程/节点同时补布局坐标，一并置 dirtyLayout；布局键按流程身份
+ * 隔离，同名节点互不覆盖）。每个流程单独维护 startNode、returns、nodes，
+ * Actor/Program 编辑能力直接复用（addActorNode 等本就接受 flowId）。
+ *
+ * - Child 只引用本文件允许的子流程：不存在/外部文件/root 引用拒绝；
+ *   不添加 results 或 Checker（Child 无自有结果集、无 Checker 字段，
+ *   相关 op 遇到非 Child 节点明确拒绝，不触碰其字段）。
+ * - onReturn 键集合创建时即须与被调用流程 returns 精确匹配（一次配齐，
+ *   不静默猜测）；换被调用方保留原映射（错配由保存前校验诊断）；
+ *   单键设置兼做增键（须在合同内）、undefined 删键；返回增删后的未完成
+ *   映射由 validateDraft 明确诊断并阻止保存。
+ * - 递归守卫：自调用与间接调用环在编辑期直接拒绝（validator 的 DAG 检查
+ *   是保存前第二道）；直接自环拦截沿用 checkFlowTarget，多节点回路允许。
+ * - 删除不静默修补：悬空调用/映射保留，由 validator 明确诊断并阻止保存。
+ * - Program 数据原样保留：本节 op 只读写子流程表与 Child 节点字段。
+ * ------------------------------------------------------------------ */
+
+/** 仅 Child 节点可编辑（Actor/Program 用各自编辑，字段不得丢失）。 */
+function childNodeOf(flow: WorkflowDef, nodeId: string): { ok: true; node: ChildWorkflowNode } | { ok: false; reason: string } {
+  const node = flow.nodes[nodeId]
+  if (node === undefined) return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
+  if (node.execution.type !== 'child-workflow') {
+    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不是 Child 节点（Actor 请用结果路由编辑，Program 请用 Program 配置编辑；其字段保持不丢失）` }
+  }
+  return { ok: true, node: node as ChildWorkflowNode }
+}
+
+/**
+ * 当前草稿的 Child 调用邻接（主流程 + 全部子流程；键为主流程 workflowId
+ * 或子流程 id，值为被调用的子流程 id 列表）。
+ */
+function childCallGraph(session: DraftSession): Record<string, string[]> {
+  const graph: Record<string, string[]> = {}
+  const put = (key: string, def: WorkflowDef): void => {
+    graph[key] = []
+    for (const node of Object.values(def.nodes)) {
+      if (node.execution.type === 'child-workflow') graph[key]!.push(node.execution.workflowId)
+    }
+  }
+  put(session.draft.workflowId, session.draft.config.workflow)
+  for (const [id, def] of Object.entries(session.draft.config.childWorkflows ?? {})) put(id, def)
+  return graph
+}
+
+/** 从 from 出发经 Child 调用能否到达 target（调用环预判用；小图 DFS）。 */
+function childReaches(session: DraftSession, from: string, target: string): boolean {
+  const graph = childCallGraph(session)
+  const seen = new Set<string>()
+  const stack = [from]
+  while (stack.length > 0) {
+    const current = stack.pop()!
+    if (current === target) return true
+    if (seen.has(current)) continue
+    seen.add(current)
+    for (const next of graph[current] ?? []) stack.push(next)
+  }
+  return false
+}
+
+/**
+ * 被调用方守卫：须是本文件已声明的子流程（不存在/外部/root 拒绝），
+ * 且不得形成直接或间接调用环。callerKey 为调用方身份（主流程即 workflowId）。
+ */
+function checkChildCallee(session: DraftSession, callerKey: string, callee: unknown): { ok: true; value: string } | { ok: false; reason: string } {
+  if (typeof callee !== 'string' || !ID_PATTERN.test(callee)) {
+    return { ok: false, reason: `子流程 "${String(callee)}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  }
+  if (session.draft.config.childWorkflows?.[callee] === undefined) {
+    return { ok: false, reason: `子流程 "${callee}" 不存在（Child 只引用本文件允许的子流程，不支持外部文件调用，也不允许调用 root；新建子流程请用子流程管理）` }
+  }
+  if (callee === callerKey) {
+    return { ok: false, reason: `子流程 "${callee}" 不能调用自身（直接递归拒绝，不改变 Runtime 递归合同）` }
+  }
+  if (childReaches(session, callee, callerKey)) {
+    return { ok: false, reason: `调用子流程 "${callee}" 将形成调用环（间接递归拒绝，不改变 Runtime 递归合同）` }
+  }
+  return { ok: true, value: callee }
+}
+
+/** 新增子流程（最小合法起点，可直接保存；入口节点同步补布局坐标）。 */
+export function addSubflow(session: DraftSession, flowId: string): RoleEditResult {
+  if (!ID_PATTERN.test(flowId)) return { ok: false, reason: `子流程 id "${flowId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (flowId === session.draft.workflowId) {
+    return { ok: false, reason: `子流程 "${flowId}" 与主流程 id 相同（Child 不能调用 root，同名将致校验歧义）` }
+  }
+  if (session.draft.config.childWorkflows?.[flowId] !== undefined) {
+    return { ok: false, reason: `子流程 "${flowId}" 已存在（重命名请使用改名操作）` }
+  }
+  pushHistory(session)
+  session.draft.config.childWorkflows ??= {}
+  session.draft.config.childWorkflows[flowId] = minimalFlowDef()
+  // ponytail：固定步长网格补位，不引入自动布局引擎（与 addActorNode 同规则）。
+  setPosition(session.draft.layout, flowId, 'main', gridPosition(0))
+  session.draft.dirtyBusiness = true
+  session.draft.dirtyLayout = true
+  return { ok: true }
+}
+
+export type SubflowRenameResult = { ok: true; updated: number } | { ok: false; reason: string }
+
+/**
+ * 子流程改名：同步全部调用方的 execution.workflowId 与布局坐标表。
+ * 调用方 onReturn 映射键只关联返回名，不受子流程改名影响。
+ */
+export function renameSubflow(session: DraftSession, oldId: string, newId: string): SubflowRenameResult {
+  const table = session.draft.config.childWorkflows
+  if (table?.[oldId] === undefined) return { ok: false, reason: `子流程 "${oldId}" 不存在` }
+  if (oldId === newId) return { ok: true, updated: 0 }
+  if (!ID_PATTERN.test(newId)) return { ok: false, reason: `子流程 id "${newId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (newId === session.draft.workflowId) {
+    return { ok: false, reason: `子流程 "${newId}" 与主流程 id 相同（Child 不能调用 root）` }
+  }
+  if (table[newId] !== undefined) return { ok: false, reason: `子流程 "${newId}" 已存在` }
+  pushHistory(session)
+  table[newId] = table[oldId]!
+  delete table[oldId]
+  let updated = 0
+  const allFlows = [session.draft.config.workflow, ...Object.values(session.draft.config.childWorkflows ?? {})]
+  for (const flow of allFlows) {
+    for (const node of Object.values(flow.nodes)) {
+      if (node.execution.type === 'child-workflow' && node.execution.workflowId === oldId) {
+        node.execution.workflowId = newId
+        updated++
+      }
+    }
+  }
+  const positions = session.draft.layout.children[oldId]
+  if (positions !== undefined) {
+    session.draft.layout.children[newId] = positions
+    delete session.draft.layout.children[oldId]
+    session.draft.dirtyLayout = true
+  }
+  session.draft.dirtyBusiness = true
+  return { ok: true, updated }
+}
+
+/** 子流程调用方位置（删除前提示用；悬空引用由保存前校验诊断）。 */
+export interface SubflowCaller {
+  flowId: string | undefined
+  node: string
+}
+
+export function findSubflowCallers(session: DraftSession, flowId: string): SubflowCaller[] {
+  const callers: SubflowCaller[] = []
+  const flows: Array<{ id: string | undefined; def: WorkflowDef }> = [
+    { id: undefined, def: session.draft.config.workflow },
+  ]
+  for (const [id, def] of Object.entries(session.draft.config.childWorkflows ?? {})) {
+    flows.push({ id, def })
+  }
+  for (const flow of flows) {
+    for (const [nodeId, node] of Object.entries(flow.def.nodes)) {
+      if (node.execution.type === 'child-workflow' && node.execution.workflowId === flowId) {
+        callers.push({ flowId: flow.id, node: nodeId })
+      }
+    }
+  }
+  return callers
+}
+
+/**
+ * 删除子流程：调用方引用刻意保留悬空（不静默重定向），未修正时
+ * validateDraft 以“references unknown child workflow”明确诊断并阻止保存；
+ * 布局坐标表随定义移除（撤销可恢复）。
+ */
+export function deleteSubflow(session: DraftSession, flowId: string): RoleEditResult {
+  if (session.draft.config.childWorkflows?.[flowId] === undefined) {
+    return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  }
+  pushHistory(session)
+  delete session.draft.config.childWorkflows![flowId]
+  if (session.draft.layout.children[flowId] !== undefined) {
+    delete session.draft.layout.children[flowId]
+    session.draft.dirtyLayout = true
+  }
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+export interface NewChildNodeFields {
+  workflowId: string
+  /** 返回映射初值：键集合须与被调用流程 returns 精确匹配（创建时一次配齐）。 */
+  targets: Record<string, unknown>
+}
+
+/**
+ * 新增 Child 节点（简单网格摆放；可暂时不可达，保存前校验裁决）。
+ * 不声明 results/Checker——Child 的裁决名即被调用流程的返回名。
+ */
+export function addChildNode(session: DraftSession, flowId: string | undefined, nodeId: string, fields: NewChildNodeFields): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（新建子流程请用子流程管理）` }
+  if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
+    return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
+  }
+  const callee = checkChildCallee(session, flowKeyOf(session, flowId), fields.workflowId)
+  if (!callee.ok) return callee
+  const calleeDef = session.draft.config.childWorkflows![callee.value]!
+  if (typeof fields.targets !== 'object' || fields.targets === null || Array.isArray(fields.targets)) {
+    return { ok: false, reason: 'Child 返回映射须为对象（键为被调用流程的返回名，值为本流程目标）' }
+  }
+  const expected = [...calleeDef.returns].sort()
+  const given = Object.keys(fields.targets).sort()
+  const missing = expected.filter(name => !given.includes(name))
+  if (missing.length > 0) {
+    return { ok: false, reason: `返回映射缺少返回 ${missing.join('、')} 的目标（创建时须一次配齐，不静默猜测目标）` }
+  }
+  const extra = given.filter(name => !expected.includes(name))
+  if (extra.length > 0) {
+    return { ok: false, reason: `返回映射多了未知返回 ${extra.join('、')}（须与子流程 "${callee.value}" 的 returns 精确匹配）` }
+  }
+  const onReturn: Record<string, Target> = {}
+  for (const name of expected) {
+    const checked = checkFlowTarget(flow, fields.targets[name], nodeId)
+    if (!checked.ok) return checked
+    onReturn[name] = checked.value
+  }
+  pushHistory(session)
+  flow.nodes[nodeId] = {
+    execution: { type: 'child-workflow', workflowId: callee.value },
+    onReturn,
+  }
+  // ponytail：固定步长网格补位，不引入自动布局引擎（与 addActorNode 同规则）。
+  setPosition(session.draft.layout, flowId, nodeId, gridPosition(Object.keys(flow.nodes).length - 1))
+  session.draft.dirtyBusiness = true
+  session.draft.dirtyLayout = true
+  return { ok: true }
+}
+
+/**
+ * 修改 Child 调用的子流程（onReturn 原样保留，不静默猜测新映射；
+ * 缺/多键由保存前校验明确诊断并阻止保存，调用方据此补映射）。
+ */
+export function setChildWorkflowId(session: DraftSession, flowId: string | undefined, nodeId: string, callee: unknown): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = childNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  const checked = checkChildCallee(session, flowKeyOf(session, flowId), callee)
+  if (!checked.ok) return checked
+  if (found.node.execution.workflowId === checked.value) return { ok: true }
+  pushHistory(session)
+  found.node.execution.workflowId = checked.value
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/**
+ * 设置/删除单个返回映射（target === undefined = 删除该键，须存在；
+ * 新增键须在被调用流程 returns 内；目标守卫复用 T3 同流程规则，
+ * 直接自环拦截，多节点回路允许）。
+ */
+export function setChildReturnTarget(session: DraftSession, flowId: string | undefined, nodeId: string, returnName: string, target: unknown): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = childNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  const node = found.node
+  const calleeDef = session.draft.config.childWorkflows?.[node.execution.workflowId]
+  if (calleeDef === undefined) {
+    return { ok: false, reason: `节点 "${nodeId}" 调用的子流程 "${node.execution.workflowId}" 不存在：先修正调用目标，再编辑返回映射` }
+  }
+  if (!ID_PATTERN.test(returnName)) {
+    return { ok: false, reason: `返回名 "${returnName}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  }
+  if (target === undefined) {
+    if (!Object.prototype.hasOwnProperty.call(node.onReturn, returnName)) {
+      return { ok: false, reason: `节点 "${nodeId}" 返回映射 "${returnName}" 不存在（无可删除内容）` }
+    }
+    pushHistory(session)
+    delete node.onReturn[returnName]
+    session.draft.dirtyBusiness = true
+    return { ok: true }
+  }
+  if (!calleeDef.returns.includes(returnName)) {
+    return { ok: false, reason: `返回 "${returnName}" 未在子流程 "${node.execution.workflowId}" 声明（映射键须与被调用流程 returns 精确匹配）` }
+  }
+  const checked = checkFlowTarget(flow, target, nodeId)
+  if (!checked.ok) return checked
+  const current = node.onReturn[returnName]
+  if (current !== undefined && JSON.stringify(current) === JSON.stringify(checked.value)) return { ok: true }
+  pushHistory(session)
+  node.onReturn[returnName] = checked.value
   session.draft.dirtyBusiness = true
   return { ok: true }
 }
