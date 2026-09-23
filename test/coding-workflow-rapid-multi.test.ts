@@ -76,86 +76,60 @@ async function implement(h: Harness) {
   await h.step('implement', 'implemented')
 }
 
-test('rapid-multi 直接路径：实现、批准、合并后才返回 delivered', async () => {
+test('rapid-multi 主链：审查、合并、集成验证通过后才返回 delivered', async () => {
   const h = harness()
   try {
     await implement(h)
     const approved = await h.step('review', 'approved')
     assert.equal(approved.execution.nodeId, 'merge')
     assert.match(approved.execution.dispatch?.sessionId ?? '', /^coordinator-/)
-    assert.equal(approved.run.status, 'running')
     assert.equal(approved.run.businessReturn, undefined)
-    const delivered = await h.step('merge', 'delivered')
+    const merged = await h.step('merge', 'merged')
+    assert.equal(merged.execution.nodeId, 'verify')
+    assert.match(merged.execution.dispatch?.sessionId ?? '', /^tester-/)
+    assert.equal(merged.run.status, 'running')
+    assert.equal(merged.run.businessReturn, undefined)
+    const delivered = await h.step('verify', 'passed')
     assert.equal(delivered.run.status, 'completed')
     assert.equal(delivered.run.businessReturn?.name, 'delivered')
   } finally { h.close() }
 })
 
-test('rapid-multi 条件验证：审查要求独立 tester 时，通过验证才进入合并', async () => {
-  const h = harness()
-  try {
-    await implement(h)
-    const testing = await h.step('review', 'verification-required')
-    assert.equal(testing.execution.nodeId, 'verify')
-    assert.match(testing.execution.dispatch?.sessionId ?? '', /^tester-/)
-    assert.equal(testing.run.businessReturn, undefined)
-    const passed = await h.step('verify', 'passed')
-    assert.equal(passed.execution.nodeId, 'merge')
-    assert.equal(passed.run.businessReturn, undefined)
-    const delivered = await h.step('merge', 'delivered')
-    assert.equal(delivered.run.businessReturn?.name, 'delivered')
-  } finally { h.close() }
-})
-
-test('rapid-multi 发布后需要验收时回到 verify，通过后返回 merge 完成收尾', async () => {
-  const h = harness()
-  try {
-    await implement(h)
-    await h.step('review', 'approved')
-    // 本测试只覆盖回边；真实发布事实与 verificationStage 由 Actor/Judge 核验。
-    const testing = await h.step('merge', 'verification-required')
-    assert.equal(testing.execution.nodeId, 'verify')
-    assert.match(testing.execution.dispatch?.sessionId ?? '', /^tester-/)
-    assert.equal(testing.run.status, 'running')
-    assert.equal(testing.run.businessReturn, undefined)
-    const passed = await h.step('verify', 'passed')
-    assert.equal(passed.execution.nodeId, 'merge')
-    assert.equal(passed.run.businessReturn, undefined)
-    const delivered = await h.step('merge', 'delivered')
-    assert.equal(delivered.run.status, 'completed')
-    assert.equal(delivered.run.businessReturn?.name, 'delivered')
-  } finally { h.close() }
-})
-
-test('rapid-multi 审查或验证必修项均返回实现，重新批准与验证后交付', async () => {
+test('rapid-multi 审查与合并后集成测试返工均重新经过实现、审查、合并、验证', async () => {
   const h = harness()
   try {
     await implement(h)
     const reviewRework = await h.step('review', 'changes-required')
     assert.equal(reviewRework.execution.nodeId, 'implement')
     assert.equal(reviewRework.run.businessReturn, undefined)
+    const firstImplement = reviewRework.execution
     await h.step('implement', 'implemented')
-    await h.step('review', 'verification-required')
+    await h.step('review', 'approved')
+    await h.step('merge', 'merged')
+    // 受控路由不执行 Git；新修复 PR 和完整版本组合由 Actor/Judge 按合同核验。
     const testRework = await h.step('verify', 'changes-required')
     assert.equal(testRework.execution.nodeId, 'implement')
+    assert.notEqual(testRework.execution.executionId, firstImplement.executionId)
+    assert.notEqual(testRework.execution.nodeToken, firstImplement.nodeToken)
+    assert.equal(testRework.run.status, 'running')
     assert.equal(testRework.run.businessReturn, undefined)
     await h.step('implement', 'implemented')
-    await h.step('review', 'verification-required')
-    await h.step('verify', 'passed')
-    const delivered = await h.step('merge', 'delivered')
+    await h.step('review', 'approved')
+    await h.step('merge', 'merged')
+    const delivered = await h.step('verify', 'passed')
+    assert.equal(delivered.run.status, 'completed')
     assert.equal(delivered.run.businessReturn?.name, 'delivered')
   } finally { h.close() }
 })
 
-for (const node of ['review', 'verify', 'merge'] as const) {
-  test(`rapid-multi ${node} 漂移必须返回实现重组候选，重新审查后才交付`, async () => {
+for (const node of ['review', 'merge'] as const) {
+  test(`rapid-multi ${node} 候选失效或合并冲突返回实现，重审重合并后才能验收`, async () => {
     const h = harness()
     try {
       await implement(h)
-      if (node === 'verify') await h.step('review', 'verification-required')
       if (node === 'merge') await h.step('review', 'approved')
       const before = await h.row()
-      // 只验证结果路由；实际漂移、部分合并及候选树由 Actor/Judge 按合同核验。
+      // 只验证结果路由；实际冲突、部分合并与版本事实由 Actor/Judge 按合同核验。
       const stale = await h.step(node, 'stale-review')
       assert.equal(stale.execution.nodeId, 'implement')
       assert.notEqual(stale.execution.executionId, before.execution.executionId)
@@ -163,39 +137,52 @@ for (const node of ['review', 'verify', 'merge'] as const) {
       assert.equal(stale.run.status, 'running')
       assert.equal(stale.run.businessReturn, undefined)
       await h.step('implement', 'implemented')
-      await h.step('review', 'verification-required')
-      await h.step('verify', 'passed')
-      const delivered = await h.step('merge', 'delivered')
+      await h.step('review', 'approved')
+      await h.step('merge', 'merged')
+      const delivered = await h.step('verify', 'passed')
       assert.equal(delivered.run.businessReturn?.name, 'delivered')
     } finally { h.close() }
   })
 }
 
-test('rapid-multi 非法结果与 Judge REJECT 不能绕过验证；合并拒绝留在 merge 重试', async () => {
+test('rapid-multi 旧验证出口与 merge.delivered 均非法，不能跳过合并后集成测试', async () => {
   const h = harness()
   try {
     await implement(h)
-    const reviewing = await h.row()
-    const invalidReview = await h.engine.handleClaim('ws', { result: 'delivered', handoff: '不能绕过验证与合并' }, h.caller(reviewing.execution.dispatch!))
-    assert.equal(invalidReview.ok, false)
-    const reviewRejected = await h.step('review', 'verification-required', 'REJECT')
-    assert.equal(reviewRejected.execution.nodeId, 'review')
-    assert.equal(reviewRejected.execution.successorId, undefined)
-    await h.step('review', 'verification-required')
-    const testing = await h.row()
-    const invalidTest = await h.engine.handleClaim('ws', { result: 'approved', handoff: 'tester 不能替代审查或宣布交付' }, h.caller(testing.execution.dispatch!))
-    assert.equal(invalidTest.ok, false)
-    const testRejected = await h.step('verify', 'passed', 'REJECT')
-    assert.equal(testRejected.execution.nodeId, 'verify')
-    assert.equal(testRejected.execution.successorId, undefined)
-    assert.equal(testRejected.run.businessReturn, undefined)
-    await h.step('verify', 'passed')
-    const mergeRejected = await h.step('merge', 'delivered', 'REJECT')
-    assert.equal(mergeRejected.execution.nodeId, 'merge')
-    assert.equal(mergeRejected.execution.successorId, undefined)
-    assert.equal(mergeRejected.run.status, 'running')
-    assert.equal(mergeRejected.run.businessReturn, undefined)
-    const delivered = await h.step('merge', 'delivered')
+    for (const [node, invalidResults, validResult] of [
+      ['review', ['verification-required', 'delivered'], 'approved'],
+      ['merge', ['verification-required', 'delivered'], 'merged'],
+      ['verify', ['stale-review', 'approved'], 'passed'],
+    ] as const) {
+      for (const result of invalidResults) {
+        const before = await h.row()
+        assert.equal(before.execution.nodeId, node)
+        const invalid = await h.engine.handleClaim('ws', { result, handoff: '旧出口或其他节点结果不可使用' }, h.caller(before.execution.dispatch!))
+        assert.equal(invalid.ok, false)
+        const after = await h.row()
+        assert.equal(after.execution.executionId, before.execution.executionId)
+        assert.equal(after.execution.claim, undefined)
+        assert.equal(after.run.businessReturn, undefined)
+      }
+      await h.step(node, validResult)
+    }
+    assert.equal((await h.row()).run.businessReturn?.name, 'delivered')
+  } finally { h.close() }
+})
+
+test('rapid-multi Judge REJECT 留在当前节点，不能跳过审查、合并或集成验收', async () => {
+  const h = harness()
+  try {
+    await implement(h)
+    for (const [node, result] of [['review', 'approved'], ['merge', 'merged'], ['verify', 'passed']] as const) {
+      const rejected = await h.step(node, result, 'REJECT')
+      assert.equal(rejected.execution.nodeId, node)
+      assert.equal(rejected.execution.successorId, undefined)
+      assert.equal(rejected.run.status, 'running')
+      assert.equal(rejected.run.businessReturn, undefined)
+      await h.step(node, result)
+    }
+    const delivered = await h.row()
     assert.equal(delivered.run.status, 'completed')
     assert.equal(delivered.run.businessReturn?.name, 'delivered')
   } finally { h.close() }

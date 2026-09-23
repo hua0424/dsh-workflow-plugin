@@ -255,19 +255,24 @@ roles:
 ## 完整示例
 
 - **v3 生产配置（#129 起，可直接加载）**：
-  [`coding-workflow.yaml`](coding-workflow.yaml)（2026-09-19.2：仅伞仓多仓 Milestone，含子流程；
+  [`coding-workflow.yaml`](coding-workflow.yaml)（2026-09-23.1：仅伞仓多仓 Milestone，含子流程；
   用户一次确认 baseline、Milestone 名、统一 milestone 分支名及每仓起点，全部仓走 feature → milestone → baseline。
-  Issue/Milestone 只在伞仓；实施票合入 milestone 后保持 open，独立整体验收与逐仓发布后统一关闭）与
+  Issue/Milestone 只在伞仓；每票完整跨仓实现、审查、合入 milestone、独立集成测试通过后关闭）与
   [`coding-workflow-rapid.yaml`](coding-workflow-rapid.yaml)（单仓轻量任务，四节点无子流程；
   GitHub Issue 评论跟踪，仅长报告按需写 ignored run 目录。merge 消费上游 approved，只执行合并与收尾，
   对象/修订变化或当前操作异常 BLOCK 交 Manager，不自行重审或回 review；无项目规定时默认 squash）——
   配套参考合同见 `docs/dsh-workflow/` 对应 `*-contract.md`；两者均以 Issue 评论跟踪，
   不要求本地 run.md、合同副本或普通审查文件。完整流程用主 Issue 保存运行身份、
-  计划、候选集合与 publication，用实施/修复 Issue 保存本票证据。选票独占穷尽判定；prepare-integration
-  信任 code-complete，提交伞仓 milestone gitlink 并准备各仓集成 PR，不重扫工单。先整体审查和独立测试，
-  再 publish-integration 发布子仓、伞仓最后；gitlink 保持受验 SHA，逐仓核验 merge tree 一致与包含关系。
-  无差异仓记 no-change，不造空 PR；部分发布只补未完成仓，已合并不回 prepare。close-milestone 只统一关闭收尾。
-  Actor/Judge 信任已验收上游，只检查本阶段动作；环境由 Manager 按需授权准备，不设必经环境节点或标签状态机。
+  计划、候选集合与合并记录，用功能/Bug Issue 保存本票证据。每票 developer 更新伞仓候选 gitlink，
+  合入 milestone 后 tester 按精确伞仓提交及 gitlink 在授权测试环境部署并验收；缺陷在当前开放票返工，新修改用新 PR。
+  选票独占穷尽判定，仅以有效验收完成且已关闭的功能/Bug 票为完成，排除主/聚合票；prepare-integration 信任 issues-complete。
+  全部票完成后整体审查、对已合并 milestone 组合进行整体验收，通过才 merge-integration 合入 baseline。
+  整体缺陷新建同 Milestone 的 Bug，不重开或追加已关闭原票；同一发现已有开放 Bug 可复用，已关闭 Bug 复发另建新票。
+  Bug 再走完整单票循环，全部完成后重做整体验收。必要 baseline 同步改变候选须重审重测；需代码解决的冲突交 Bug 修复。
+  两级合并均先子仓后伞仓、保持受验 gitlink，核验 merge tree 与包含关系；无差异不造空 PR。
+  最终部分合并出现实质异常保留事实 BLOCK，重试只补遗漏；close-milestone 只关主/聚合票和 Milestone，不向已关闭子票补评论。
+  全流程仅开发测试环境，禁止生产操作及合并触发生产 CI；没有 baseline 合并后的第二轮验证。
+  Actor/Judge 信任已验收上游，只检查本阶段动作；环境由 Manager 明确授权，tester 可按授权部署，不设必经环境节点或标签状态机。
   配置沿用已有 GitHub tracker，无须重新 setup；实际验收以冻结 YAML 为准。
   单仓完整流程见 [`coding-workflow-single.yaml`](coding-workflow-single.yaml)（2026-09-20.1，十节点、两级 merge commit）：
   选票独占穷尽判断并交接 completionSummary/pendingClosure，集成审查复用单票结果；两级合并只消费批准、
@@ -276,11 +281,15 @@ roles:
   新多仓配置尚未完成真实 GitHub 多仓交付、部署或 E2E 实测；AIChat 旧项目流程文档解耦见
   [优化提案](../dsh-workflow/aichatoverview-workflow-decoupling-proposal.md)，本次未改目标伞仓文件。
 - **多仓单 Issue 快速模板**：[`coding-workflow-rapid-multi.yaml`](coding-workflow-rapid-multi.yaml)
-  （2026-09-19.1）：initialize → implement → review → 按需 verify → merge，五节点、无子流程。
+  （2026-09-23.1）：initialize → implement → review → merge → verify → delivered，五节点、无子流程。
   一个伞仓 Issue 覆盖获准的小范围多仓改动，不管理 Milestone/子票/选票。实现阶段提交完整候选 gitlink，
-  各任务 feature 直接 PR 到各仓基线；merge commit 先子仓后伞仓，保持受验 SHA，部分发布仅补遗漏。
-  verify 按初始化 premergeRequired/postmergeRequired 在发布前后复用（无返工时零至两次），发布后必需验证通过才关票；
-  发布后失败 BLOCK 保留事实，不回旧 PR。环境不支持同票跨仓的开发前置验证时，应拆阶段或改完整流程。
+  每轮 implement 完成完整 Issue 的多仓实现与开发自检；各任务 feature 直接 PR 到各仓基线。
+  review 批准后以 merge commit 先子仓后伞仓合并，保持候选 SHA，记录实际伞仓合并提交；merge 不关票。
+  verify 按该提交的 gitlink 部署开发测试环境、执行独立集成测试，通过后关票并返回 delivered。
+  产品缺陷回 implement：尚未合并 PR 可更新，已合并部分需改动则开新修复 PR，每轮重组完整候选并重新审查、合并、验证。
+  合并冲突需改代码时回实现；网络/权限问题暂停或重试，保留已合并事实；测试环境漂移先恢复或 BLOCK，不冒充产品缺陷。
+  全流程禁止生产环境操作，也不得通过目标分支 CI 间接触发生产部署。当前安装名 coding-workflow-rapid 可为此模板别名，
+  应核对实际内容；本目录同名 coding-workflow-rapid.yaml 仍为单仓模板。新配置不改变已有 Run 的冻结定义。
   见[使用说明](../dsh-workflow/coding-workflow-rapid-multi.md)。
   尚未完成真实多仓 GitHub 交付、部署或 E2E 实测。
 - **完整 v3 组合示例**：[`docs/example/v3-combined-example.yaml`](v3-combined-example.yaml)

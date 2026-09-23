@@ -1,29 +1,33 @@
-# 多仓单 Issue 敏捷：无 Milestone，五节点，按需复用独立验证，先子仓后伞仓发布。
+# 多仓单 Issue 敏捷：开发测试环境，完整实现 → 审查 → 合并 → 集成测试，失败开修复 PR。
 schemaVersion: agent-workflow/v3
 actorCommonPersona: |
-  只处理伞仓 trackerRepo 中一个明确授权的 Issue，可小范围修改多个指定子仓及伞仓；不管理 Milestone、子票或选票循环。每个实际变更仓用任务分支→本仓基线 PR；gitlink 变化算伞仓变更。需要分阶段开发/发布或拆票时交 Manager 改用完整流程，不自行扩范围。
-  信任前序已验收结果，按 handoff 执行本节点，不重审上游或巡检全流程；只核对当前操作对象、修订和结果。git 显式 -C、gh 显式 --repo，Issue/PR 用完整身份。项目质量与授权要求保留，已知冲突/必需证据缺口 BLOCK。
-  保护用户文件，写操作串行，不强推/硬重置/绕过保护/自动删分支。只暂存本任务内容，子仓切换产生的伞仓指针偏移单独识别，不靠清理消除。只有实现节点可在伞仓任务分支更新候选 gitlink；发布先子仓后伞仓，固定候选 SHA，不追逐最新 tip 或 merge SHA。统一用 merge commit 保留候选提交，策略不支持则交 Manager。
-  项目必需的开发自检、独立合并前验证与合并后部署/E2E按初始化时点执行，敏捷不免除质量门槛。部署/环境由 Manager 按有效授权和实际技能准备，不用旧环境冒充候选；共享客户端核实例归属，不结束他人进程。全部代码发布及必需验收完成才关闭唯一 Issue。
+  只处理伞仓 trackerRepo 中一个明确授权的完整 Issue，每轮实现覆盖全部相关子仓及伞仓；不管理 Milestone、子票或选票循环。每个实际变更仓用任务分支→本仓基线 PR；gitlink 变化算伞仓变更。需要拆票或超出授权范围时交 Manager，不自行扩范围。
+  全流程仅限开发测试环境及获准代码分支，禁止操作生产环境、生产部署、生产配置或生产数据；合并会自动触发生产部署的目标也不适用，先交 Manager 解决边界。delivered 仅表示开发测试验收通过且代码已合并，不代表生产上线。
+  信任前序已验收结果，按 handoff 执行本节点，不重审上游或巡检全流程；只核对当前操作对象、修订和结果。git 显式 -C、gh 显式 --repo，Issue/PR 用完整身份。项目质量与授权要求保留，代码冲突按节点结果返工；环境、权限或必需证据缺口 BLOCK。
+  保护用户文件，写操作串行，不强推/硬重置/绕过保护/自动删分支。只暂存本任务内容，子仓切换产生的伞仓指针偏移单独识别，不靠清理消除。只有实现节点可在伞仓任务分支更新候选 gitlink；合并先子仓后伞仓，固定候选 SHA，不追逐最新 tip 或 merge SHA。统一用 merge commit 保留候选提交，策略不支持则交 Manager。
+  开发阶段完成项目要求的单元测试和自检，review 批准后 merge，再由 verify 独立集成测试。tester 按初始化授权和项目既定方法，在测试环境构建/部署本轮已合并伞仓提交及其 gitlink 对应版本；缺环境或权限先 BLOCK，不用旧服务冒充。共享客户端核实例归属，不结束他人进程。只有本轮集成测试通过才关闭唯一 Issue。
   普通证据集中写 Issue，绑定 runId、阶段、仓库/修订和前序链接；PR 留摘要及 Implements 完整 Issue 引用，禁止提前自动关票。只有长篇复杂报告写 ignored、未跟踪 run 目录，Issue 留摘要/版本/路径；多行正文用 --body-file，不泄露凭据。重试仅查询本节点操作，成功复用、遗漏补齐。
-  handoff 传 runId、Issue/初始化/本节点评论链接、仓库分支表、manifest；验证时附 verificationStage=premerge 或 postmerge，发布后附 publication 与验证入口。只传链接和必要对象，不复制全历史。
+  handoff 传 runId、Issue/初始化/本节点评论链接、仓库分支表和本轮 manifest；合并后附本轮合并记录、精确伞仓提交、gitlink 版本组合与测试环境入口；返工附失败报告及已合并/待合并事实。只传链接和必要对象，不复制全历史。
+  环境故障首次出现时在主 Issue（无主票则当前唯一 Issue）登记环境标识、仓库/基线 SHA、失败用例与错误特征、对照证据、影响范围及已有补跑结果/明确例外依据；尚未处理则注明待补证或补跑缺口，后续 handoff 只传该评论链接。同环境且无相关变更时复用归因；环境、相关实现/测试/依赖或失败特征变化则补查。基线也失败不等于验证通过，不把失败写成不适用或自动豁免；仍须满足项目质量要求及冻结 criteria；因环境故障无法完成必需检查则 node_block 交 Manager，已确认产品缺陷按当前节点结果返工。
+  跨仓环境证据须区分仓库、源码/制品版本及适用 manifest/验证阶段，不能把一个仓或阶段的结论套用于另一个。
 roles:
   coordinator:
     persona: |
-      负责本 Issue 多仓发布及关闭；消费代码批准和所需阶段验证，不重复审查。先子仓后伞仓，发布不改候选指针；每仓成功留痕，已发布只补遗漏。若计划需要合并后验收，全部仓发布后交 tester，再回来关票；未通过不得关闭。任何仓已发布后禁止 stale-review 回实现。
+      负责本轮多仓 PR 合并，消费 review 批准，不重复审查或执行集成测试。先子仓后伞仓，不改候选指针；每仓成功留痕，已合并不重复操作。全部合并后交 tester，保持 Issue open，不提前关票。冲突或候选失效需改代码时回 implement，保留已合并事实。
     model:
       provider: zai-coding-cn
       modelId: glm-5.3-flash
   developer:
     persona: |
-      实现唯一 Issue 的授权跨仓小改，在各仓任务分支提交；在伞仓任务分支组装候选 gitlink 和 manifest。自测后开 PR，不合并或关票。返工复用尚未合并的任务 PR；已发布问题交 Manager，不修改已合并 PR 假装返工。
+      每轮完成唯一 Issue 的完整跨仓功能或修复，在各仓任务分支提交，并在伞仓任务分支组装完整 gitlink 和 manifest。自测后开 PR，不合并或关票。返工复用尚未合并的任务 PR；已合并部分需要修改则从当前目标基线新建修复分支和新 PR，关联同一 Issue，不复用旧已合并 PR。只改必要仓，仍交接完整版本组合。
+      开发阶段完成自检和必要回归，默认不额外执行完整双轴 code-review；正式独立审查交 review 节点，用户或项目明确要求的额外审查保留。
     reuse: continuable
     model:
       provider: commandcode
       modelId: deepseek/deepseek-v4.1-flash
   code-reviewer:
     persona: |
-      独立审查本 Issue 的全部候选 PR、gitlink 和跨仓交互，结论绑定完整 manifest；实现只读，不合并、不代独立测试。只审当前改动及本轮发现，不重复初始化。根据计划的合并前验证要求选择出口。
+      独立审查本轮完整候选集合中的 PR、gitlink 和跨仓交互，结论绑定完整 manifest；实现只读，不合并、不代独立测试。只审当前改动及本轮发现，不重复初始化。批准后交 merge，不能宣告集成测试通过。
     model:
       provider: kimi-coding
       modelId: k3
@@ -32,10 +36,15 @@ roles:
       provider: kimi-coding
       modelId: k3
     persona: |
-      按 handoff 的 verificationStage 和对应验收范围独立测试，不读取开发自测结论充当独立验证。premerge 测固定候选，postmerge 测实际交付/部署版本；报告绑定阶段、manifest、必要的 publication 与实际制品。已发布后的失败/版本变化只能 BLOCK，不能返回旧 PR 开发。不改产品代码、部署或关票。
+      负责合并后的独立集成测试与验收收尾。按本轮合并记录中的精确伞仓提交及其 gitlink 检出完整版本组合，在获准测试环境构建/部署并验证，不拉各子仓最新 tip 替代。产品缺陷 changes-required 回 implement 开修复 PR；环境/权限故障 BLOCK。不改产品代码，不操作生产环境；全部必需集成验收通过后记录结果、关闭 Issue 并提交 passed。
+      可读取已登记环境故障的原始特征和基线对照，避免重复归因；不以开发自测结论、既有豁免或其他仓/阶段结果代替本轮独立验收，报告保留实际失败和未测边界。
 judgeRole:
   persona: |
-    只读核验当前结果 criteria 与本节点实际证据，信任已验收的上游结果，不重新验收全流程。事实支持 ACCEPT，明确不符 REJECT，必要信息不足 NEED_CONTEXT。区分代码批准、premerge/postmerge 验证、部分发布与最终 delivered；只有尚未发布时能返回实现，已发布阶段失败不得伪装普通返工。不因 gitlink 不等于基线最新 tip 否定精确版本交付。
+    只读核验当前结果 criteria 与本节点实际证据，信任已验收的上游结果，不重新验收全流程。事实支持 ACCEPT，明确不符 REJECT，必要信息不足 NEED_CONTEXT。顺序为完整实现、自检、review、merge、verify；merge 成功不代表集成验收通过。verify 产品缺陷可以 changes-required 回实现，即使 PR 已合并；修复须新 PR。仅开发测试环境，禁止生产操作；不因 gitlink 不等于基线最新 tip 否定精确版本组合。
+    只读约束针对操作，不限于名称带 inspect 的工具。按实际可见工具选择查询能力：inspection 不支持 PR/评论/提交关系，不代表全部工具都不支持；可通过可见命令工具只读查询 git/gh（API 使用 GET），不可写仓库或远端、修改环境，也不为核验执行会修改状态的测试。工具确实不可见、查询失败或事实不足时才 NEED_CONTEXT，一次列明缺失事实、对应对象/修订、已尝试查询及错误；未尝试须说明能力缺失原因，不虚构调用或反复尝试同一失败查询。
+    核验本节点报告的对象/版本、覆盖范围、发现处置与可追溯证据是否一致，不默认再执行完整 code-review 或全量测试；评论存在、Actor 自述或 Manager 宣告均不能单独证明结论。前序已验收事实按适用版本复用，当前 PR 状态/head/目标/checks 等易变事实按本节点需要实时查询。明显矛盾按 criteria REJECT；补证只补缺口，不重查已满足且未变化的事实，合并/收尾不重新裁决上游审查。
+    环境记录只支持适用范围内的归因，不自动免除验证；核对其环境/版本/用例与当前任务关系，不能把“基线也失败”判成通过。明确例外不得改写冻结 criteria，必需检查仍未满足则请求补证或处理。
+    跨仓查询显式指定 repo/path，当前 workspace 的 inspection 事实不能证明其他仓。证据须匹配目标仓与候选 manifest；独立验证还须匹配阶段和实际源码/制品版本，不能以开发自测或另一阶段报告替代。
   model:
     provider: zai-coding-cn
     modelId: glm-5.3-flash
@@ -51,17 +60,18 @@ workflow:
         type: actor-task
         role: manager
         instruction: |
-          1. 核对伞仓唯一开放 Issue 的范围/验收和未解决依赖；简单关联改动可涉及多个指定仓，但不调度子票、不管理 Milestone。读取仓库拓扑、GitHub 身份和项目质量要求，确认工作区/索引干净。需要拆票或分批发布则先协调，不能硬塞进快速链路。
+          1. 核对伞仓唯一开放 Issue 的范围/验收和未解决依赖；一次实现完整多仓功能，不调度子票、不管理 Milestone。读取仓库拓扑、GitHub 身份和项目质量要求，确认工作区/索引干净。需拆票或超范围先协调。
           2. 明确本次修改仓、各仓已有目标基线和任务分支及操作授权；沿用已明确的用户决定，不重复询问。子仓基线与伞仓记录的版本不同则明确本次采用版本，不静默升级。仅给实际修改仓及需要更新指针的伞仓创建/复用任务分支，记录原始 baseCommit；未改依赖保留原 gitlink SHA，不建分支/PR。缺基线或分支归属不明交 Manager 处理，不重置已有分支。
-          3. 按项目要求记录开发自检、premergeRequired/postmergeRequired 及各阶段独立验证范围/环境与部署授权入口。不需要独立验证须有适用依据；既要求合并前客户端验证又要求合并后部署 E2E 时两项都登记。开发期开 PR 前自检若依赖本票尚未发布的后端，必须具备获准的候选环境；否则先协调或改分阶段完整流程，后置验证不能替代该前提。
-          4. 在 Issue 发布初始化评论：真实 runId、仓库/分支/起点表、验收及不做范围、版本依赖、合并方式 merge commit、阶段门槛和授权。GitHub Issue 跟踪，长报告才落 ignored run 目录；rapid-multi 版本 2026-09-19.1。交接上述入口，保存成功后 ready。
+          3. 按项目要求记录开发自检和合并后的完整集成验收范围；明确测试环境标识、构建/部署方法及 tester 的操作授权。测试按已合并伞仓的 gitlink 版本组合进行，不安排合并前独立 verify。项目明确要求的开发自检仍须满足；有冲突先协调，不擅自跳过。确认目标分支及关联自动化不会触发生产操作；不满足则 BLOCK。
+          4. 在 Issue 发布初始化评论：真实 runId、仓库/分支/起点表、验收及不做范围、版本依赖、合并方式 merge commit、测试环境和授权。GitHub Issue 跟踪，长报告才落 ignored run 目录；rapid-multi 版本 2026-09-23.1。交接上述入口，保存成功后 ready。
+          环境记录：沿用已知环境/凭据故障的证据与获准处理方式；首次发现时在本次 Issue 记录环境、仓库/基线、失败特征、对照和处理入口，handoff 传链接，无已知故障不预建清单。不得记录凭据或把环境失败视为自动通过；项目质量要求和冻结 criteria 不变，未满足必需验证先协调。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         ready:
           criteria: |
-            唯一 Issue 范围及仓库授权明确，任务分支/原始起点可追溯，未覆盖用户内容；初始化评论包含仓库分支表、固定依赖、开发检查和两个独立验证时点的要求，所需开发期前提可满足。无需 Milestone/子票，handoff 完整。
+            唯一 Issue 完整范围及仓库授权明确，任务分支/原始起点可追溯，未覆盖用户内容；初始化评论包含仓库分支表、固定依赖、开发自检和合并后集成验收要求、可用测试环境及部署授权。目标分支和自动化不触发生产操作；无需 Milestone/子票，handoff 完整。
           target:
             node: implement
     implement:
@@ -69,8 +79,8 @@ workflow:
         type: actor-task
         role: developer
         instruction: |
-          1. 按当前 Issue 验收和本轮必修项完成授权仓的最小改动；每仓在自己的任务分支提交，必要时安全同步本仓基线。只处理当前任务，不重查上游规划。
-          2. 先准备子仓候选并推送，再在伞仓任务分支提交对应精确 head 的 gitlink 及本票伞仓代码。未改依赖保留原指针；有授权但无内容变化的目标仓固定基线 SHA/tree，记 no-change，不造空 PR。候选 head 包含固定 base；冲突或已发布事实交 Manager，不自行重置或回滚。
+          1. 按当前 Issue 验收和本轮必修项完成全部相关仓的完整功能或修复，不按单仓拆成多轮实现。先核对本轮待合并与历史已合并事实；未合并 PR 可更新，已合并部分需修改时从当前获准目标基线创建新修复分支和 PR，关联同一 Issue。安全同步并解决冲突，不强推或重置用户内容；超范围交 Manager。
+          2. 先准备子仓候选并推送，再在伞仓任务分支提交对应精确 head 的 gitlink 及本票伞仓代码。未改依赖保留本轮明确的固定版本（修复轮沿用上轮已合并组合），记 no-change，不追逐 tip、不造空 PR。候选 head 包含本轮 base；部分合并返工保留成功记录，不回滚或假装尚未合并。
           3. 运行项目要求的开发自检/回归；要求真实客户端开 PR 前自检时必须先通过。为每个实际有变化的仓创建/更新任务分支→基线 PR，伞仓指针变化也须 PR。各 PR 使用 Implements 同一个伞仓 Issue。
           4. Issue 发布实现与 manifest：各 PR repo/path/base/head/tree、no-change 或未改依赖 SHA、伞仓 gitlink、验收覆盖和自测结果；返工记录修复/反证。基线/head变化须重组 manifest 并失效旧批准/验证，交完整集合审查。
       checker:
@@ -79,7 +89,7 @@ workflow:
       results:
         implemented:
           criteria: |
-            本 Issue 的授权改动已推送并形成完整候选集合：各变更仓 PR 源/目标正确，head 包含固定 base，伞仓 gitlink 精确引用子仓候选，未改依赖无越权升级。开发必需检查完成，Issue 实现评论及 manifest 已发布；没有提前合并关票。
+            本轮完整 Issue 功能或必修项已实现并形成完整候选集合：各变更仓待合并 PR 源/目标正确，head 包含本轮 base，伞仓 gitlink 精确引用对应版本，未改依赖无越权升级。历史已合并部分需要修复时已有新 PR，不复用旧已合并 PR。开发必需检查完成，Issue 实现评论及 manifest 已记录；未自行合并本轮 PR 或关闭 Issue。
           target:
             node: review
     review:
@@ -87,55 +97,24 @@ workflow:
         type: actor-task
         role: code-reviewer
         instruction: |
-          审查本次 manifest 的全部 PR、Issue 验收及跨仓交互，核验本轮自测/发现处置，结论绑定确切 base/head/tree/gitlink。有必修 changes-required 回实现；候选修订变化 stale-review 回实现重组；技术/环境缺口 BLOCK。代码通过后，premergeRequired=true 则 verification-required，交 tester 阶段 premerge 的验收/版本/环境入口，不传开发自测结论；否则 approved 交发布，合并后门槛仍保留。
+          审查本轮完整 manifest 的 PR、Issue 验收及跨仓交互，核验本轮自测/发现处置，结论绑定确切 base/head/tree/gitlink。有必修 changes-required 回实现；候选修订变化 stale-review 回实现重组；技术/环境缺口 BLOCK。全部代码通过后 approved 交 merge；不代替后续集成测试，不重复审查未变化的历史已合并内容。修复轮确认必修项已处理、需要修改的已合并 PR 已被新修复 PR 接续。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
         approved:
           criteria: |
-            当前 manifest 全部代码审查通过、无未解决必修；计划 premergeRequired=false 且有符合项目要求的依据，结论已发布。即使 postmergeRequired=true 也只批准代码发布，不提前宣布交付。
-          target:
-            node: merge
-        verification-required:
-          criteria: |
-            当前 manifest 代码审查通过，premergeRequired=true 尚需独立合并前验证；handoff 指定 verificationStage=premerge，含验收/候选/环境入口，不含开发自测结论。
-          target:
-            node: verify
-        changes-required:
-          criteria: |
-            尚未发布的候选存在具体必修清单、修复依据与验收，已记录到唯一 Issue。
-          target:
-            node: implement
-        stale-review:
-          criteria: |
-            候选 PR/base/head/gitlink 改变，已记录新旧对象；所有仓尚未发布，需重组 manifest 后重新审查。
-          target:
-            node: implement
-    verify:
-      execution:
-        type: actor-task
-        role: tester
-        instruction: |
-          只执行 handoff 指定阶段的独立验收。premerge 使用已批准候选及合并前检查范围；postmerge 使用 publication 中的实际交付版本，按项目要求确认部署就绪并执行 E2E。源码→制品→服务版本须有对应关系，候选 head 与实际 merge SHA 不同要按 publication 的 tree/包含映射解释，不能拿旧服务代替。
-          Issue 报告标阶段、manifest/交付入口、用例和实际结果；完成 passed 回 merge。premerge 且所有仓未发布时，产品缺陷 changes-required，修订变化 stale-review；postmerge 或已有发布时的失败/漂移 BLOCK 交 Manager 保留事实处理，不返回旧 PR 实现。缺必需环境/部署权限同样 BLOCK，不擅自跳过或自行部署。
-      checker:
-        checkerId: judge.claim-correct
-        config: {}
-      results:
-        passed:
-          criteria: |
-            指定阶段的独立验证已实际完成并通过，报告绑定 verificationStage、当前 manifest 和实际运行版本；postmerge 还绑定 publication/实际部署就绪证据。所需检查无缺口，未用另一阶段或开发自测结论替代。
+            本轮完整 manifest 代码审查通过、无未解决必修，开发自检证据符合项目要求，结论已记录并绑定确切候选；修复轮已回应上轮失败项。只批准合并，不宣告集成测试通过或关闭 Issue。
           target:
             node: merge
         changes-required:
           criteria: |
-            当前阶段为 premerge 且本次所有仓尚未发布，实际验证发现具体产品缺陷，Issue 有复现和修复验收。
+            本轮候选存在具体必修清单、修复依据与验收，已记录到唯一 Issue，需修改实现；不是仅候选身份变化。
           target:
             node: implement
         stale-review:
           criteria: |
-            当前阶段为 premerge 且所有仓尚未发布，候选修订变化使当前验证失效，差异已记录。
+            本轮候选 PR/base/head/gitlink 改变使审查对象失效，新旧对象及已合并/待合并事实已记录，需重组 manifest 后重新审查；不是对固定候选的产品缺陷判定。
           target:
             node: implement
     merge:
@@ -143,27 +122,45 @@ workflow:
         type: actor-task
         role: coordinator
         instruction: |
-          1. 消费当前代码批准和计划需要的 premerge 通过结果，先区分已发布与待发布仓。已合并按原批准及实际合并结果补记录，不因正常基线前进重新发布；紧邻每个待发布 PR 的合并核对当前 base/head、检查与保护，no-change 目标仓核对固定基线 SHA/tree。尚无任何仓发布时修订/新实质反证使批准失效则 stale-review 回实现；已有部分发布则 BLOCK，不将批次退回旧 PR。
-          2. 每个待发布 PR 先记录本次合并前核验，再条件合并；按依赖先子仓后伞仓，使用 merge commit。核对源 head/合并起点匹配批准、实际 merge tree=候选 tree、基线包含候选 head，并逐仓记录结果。根 gitlink 保持候选 SHA，不换成 merge SHA；未改依赖只确认固定提交可获取，不要求它等于最新基线。结果未知先查，重试只补遗漏。
-          3. 所有仓发布完成后按同一 manifest 和实际发布映射在 Issue 创建/复用唯一 publication：每仓候选→实际 merge SHA/tree、PR/no-change、伞仓指针、批准及验证链接。postmergeRequired=true 且该 publication 尚无对应独立验收通过时，保持 Issue open，verification-required 交 tester，标 verificationStage=postmerge；不可沿用 premerge 报告代替。postmerge 返回后直接消费原 publication URL 和通过报告进入收尾，不新建 publication、不重查已发布 no-change 仓的最新基线、不重复发布。
-          4. 全部发布和计划所需阶段验证完成后，记录最终交付摘要并关闭唯一 Issue，安全恢复约定工作状态、保留分支与用户内容。关票/网络失败只补收尾；已发布后新缺陷或验收失败 BLOCK，不能返工旧 PR 或提前关闭。
+          1. 消费本轮 review 批准及完整 manifest，区分已合并与待合并仓；不重做代码审查或功能测试。紧邻每个待合并 PR 核对源 head、目标基线、检查与保护及不触发生产操作。冲突或候选/基线变化使批准失效、需要修改代码或重组候选时，stale-review 回 implement；部分已合并也如实记录，未合并 PR 可更新，已合并部分需改则新 PR，不整批重复合并。
+          2. 按依赖先子仓后伞仓，使用 merge commit，条件合并固定 head。核对实际 merge tree=批准候选 tree、目标基线包含候选 SHA，并逐仓留痕。伞仓 gitlink 保持批准的候选 SHA，不换成 merge SHA；未改依赖只确认固定提交可获取，不要求等于最新 tip。网络、权限或结果未知先查询实际状态，无法继续则 BLOCK；重试复用成功，只补未完成操作，不自动回滚。
+          3. 全部仓完成后，在 Issue 创建/复用本轮 manifest 对应的合并记录：每仓 PR/no-change、候选→实际 merge SHA/tree、精确伞仓合并提交及 gitlink、review 批准链接和测试环境入口。修复轮创建新记录并关联上轮失败报告；同轮重试复用记录。完整组合必须与批准一致，异常不得提交 merged。
+          4. merged 交 tester 执行集成测试，handoff 提供合并记录和完整版本组合。保持 Issue open，不提前关票、不执行生产部署、不把合并成功当成验收通过。
       checker:
         checkerId: judge.claim-correct
         config: {}
       results:
-        delivered:
+        merged:
           criteria: |
-            全部仓已按批准候选完成发布，publication 记录实际 merge tree/包含关系且伞仓指针未变；项目要求的 premerge/postmerge 验证各有本阶段通过证据，未遗漏部署或独立验收。唯一 Issue 已关闭，最终摘要及工作区收尾完成，无重复发布或越权改动。
-          target:
-            return: delivered
-        verification-required:
-          criteria: |
-            所有仓发布完成并记录 publication，postmergeRequired=true 但对应合并后独立验收尚未完成；Issue 仍开放，handoff 标 verificationStage=postmerge 并提供验收、manifest、publication 和环境入口。
+            本轮全部相关 PR 已按批准候选完成合并，实际 merge tree/包含关系正确且伞仓指针未变；合并记录固定精确伞仓提交和完整 gitlink 组合，未改依赖版本明确。Issue 仍开放，handoff 含 manifest、合并记录、验收及测试环境入口；无重复合并或生产操作。
           target:
             node: verify
         stale-review:
           criteria: |
-            本次所有仓均未发布，待发布 PR/base/head 或 no-change 目标基线已变化，或出现批准未覆盖的新实质反证；失效原因已记录，未合并关票，需重组候选。
+            待合并 PR 存在需代码解决的冲突，或候选/基线变化使当前批准失效，需修改实现或重组 manifest 后重新审查。已记录原因、新旧对象及每仓已合并/待合并事实，Issue 保持开放；不是单纯网络、权限或合并结果未知故障，不回滚已合并内容。
+          target:
+            node: implement
+    verify:
+      execution:
+        type: actor-task
+        role: tester
+        instruction: |
+          1. 消费本轮合并记录中的精确伞仓提交及其 gitlink，检出一致的完整版本组合；确认各变更子仓候选已合入获准基线。测试源版本以该组合为准，不能拉各仓最新 tip 代替。按初始化授权和项目既定方法构建/部署到测试环境，记录源码→制品→运行服务的对应关系；禁止生产操作。
+          2. 独立执行完整 Issue 的集成验收及必要回归，不以开发自测结论替代。Issue 报告绑定本轮 manifest、合并记录、精确伞仓/gitlink、实际运行版本、用例与结果；修复轮复验失败项及必要回归，明确未测边界。
+          3. 在正确版本组合上发现产品缺陷，记录复现、证据、影响仓与修复验收，changes-required 回 implement，保持 Issue open；已合并不是拒绝返工的理由，新修改走新修复 PR。部署版本不符先恢复正确测试环境再测；无法恢复、环境/权限故障则 BLOCK，不伪装成产品缺陷，不因子仓 tip 前进要求改产品。
+          4. 必需集成验收全部通过后记录最终摘要并关闭唯一 Issue，按约定收尾测试环境和工作区、保留分支与用户内容，然后 passed 返回 delivered。关票/网络/收尾失败只补遗漏；同版本且环境未变时复用已完成验收，不重复合并或重跑整轮；本轮失败时不得关票。
+      checker:
+        checkerId: judge.claim-correct
+        config: {}
+      results:
+        passed:
+          criteria: |
+            本轮已合并伞仓提交及其 gitlink 对应的完整组合已在获准测试环境独立集成验收通过，报告绑定合并记录与实际运行版本，必需检查无缺口、无未解决产品缺陷。唯一 Issue 已关闭，最终摘要和约定收尾完成；没有生产操作，未用开发自测或旧版本报告替代。
+          target:
+            return: delivered
+        changes-required:
+          criteria: |
+            本轮已合并版本组合在正确测试环境中实际复现产品缺陷，Issue 已记录失败版本、复现/证据、影响范围、未测边界及修复验收，并保持开放。需要产品代码修复而非单纯环境或部署版本纠正；下一轮按已合并事实创建新修复 PR。
           target:
             node: implement
   returns:
