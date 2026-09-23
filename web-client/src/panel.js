@@ -16,7 +16,7 @@
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { callEditor, rpcErrorMessage } from './rpc.js'
 import {
-  applyPersonaEdit, isDirty, layoutFilenameFor, moveNodeEdit, redoEdit, savePlanOf, undoEdit,
+  applyPersonaEdit, ID_PATTERN, isDirty, layoutFilenameFor, moveNodeEdit, redoEdit, savePlanOf, undoEdit,
 } from './edits.js'
 
 function workflowIdOf(yamlName) {
