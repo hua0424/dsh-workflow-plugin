@@ -363,6 +363,14 @@ export function parseNewFilenameEdit(yamlName) {
   return { ok: true, workflowId: stem }
 }
 
+/** 新建文件名冲突检查（已存在文件拒绝新建覆盖，防最小模板吞掉既有工作流）。 */
+export function checkNewFilename(files, yamlName) {
+  if (files.includes(yamlName)) {
+    return { ok: false, reason: `文件 "${yamlName}" 已存在：新建将覆盖已有工作流，已拒绝；如需编辑请直接打开该文件` }
+  }
+  return { ok: true }
+}
+
 /** 最小合法 v3 起点（Manager 入口单节点 + 单返回，不依赖任何 roles）。 */
 export function minimalConfigOf() {
   return {

@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import {
   addActorNodeEdit, addFlowReturnEdit, addNodeResultEdit, deleteFlowReturnEdit,
   deleteNodeEdit, deleteNodeResultEdit, findNodeRefsEdit, minimalConfigOf,
-  parseNewFilenameEdit, redoEdit, renameFlowReturnEdit, renameNodeEdit,
+  checkNewFilename, parseNewFilenameEdit, redoEdit, renameFlowReturnEdit, renameNodeEdit,
   renameNodeResultEdit, setActorFieldsEdit, setFlowStartNodeEdit, setNodeResultEdit,
   SUPPORTED_CHECKER_IDS as clientCheckers, undoEdit,
 } from '../web-client/src/edits.js'
@@ -90,6 +90,12 @@ test('T3-panel: 新建文件名与最小起点（checker 名单对等）', () =>
   const config = minimalConfigOf()
   const fresh = newDraftSession('fresh')
   assert.deepEqual(config, fresh.draft.config)
+
+  // F-001：已存在文件名拒绝新建覆盖（防最小模板吞掉既有工作流 YAML）。
+  assert.deepEqual(checkNewFilename(['mini.yaml'], 'fresh.yaml'), { ok: true })
+  const conflict = checkNewFilename(['mini.yaml', 'fresh.yaml'], 'fresh.yaml')
+  assert.equal(conflict.ok, false)
+  assert.match(conflict.ok ? '' : conflict.reason, /已存在/)
 })
 
 test('T3-panel: Actor 节点增改删改名与布局', () => {

@@ -19,7 +19,7 @@ import { createElement as h, useCallback, useEffect, useRef, useState } from 're
 import { callEditor, rpcErrorMessage } from './rpc.js'
 import {
   addActorNodeEdit, addFlowReturnEdit, addNodeResultEdit, addRoleEdit, applyPersonaEdit,
-  deleteFlowReturnEdit, deleteNodeEdit, deleteNodeResultEdit, deleteRoleEdit, findNodeRefsEdit,
+  checkNewFilename, deleteFlowReturnEdit, deleteNodeEdit, deleteNodeResultEdit, deleteRoleEdit, findNodeRefsEdit,
   findRoleRefs, ID_PATTERN, isDirty, layoutFilenameFor, minimalConfigOf, moveNodeEdit,
   parseNewFilenameEdit, redoEdit, renameFlowReturnEdit, renameNodeEdit, renameNodeResultEdit,
   renameRoleEdit, savePlanOf, setActorFieldsEdit, setFlowStartNodeEdit, setJudgeDenyEdit,
@@ -462,6 +462,12 @@ export function WorkflowConfigEditorPanel(props) {
     const parsed = parseNewFilenameEdit(name)
     if (!parsed.ok) {
       setState((prev) => ({ ...prev, problems: [parsed.reason] }))
+      return
+    }
+    // F-001：已存在文件拒绝新建覆盖（最小模板 save 会直接覆盖 YAML）。
+    const conflict = checkNewFilename(state.files, name)
+    if (!conflict.ok) {
+      setState((prev) => ({ ...prev, problems: [conflict.reason] }))
       return
     }
     if (isDirty(state) && !window.confirm('有未保存的修改，新建文件将放弃它们。继续吗？')) return
