@@ -11,12 +11,12 @@
  *   不检查外部修改；布局与业务分别报告写入结果。
  */
 import { stringify } from 'yaml'
-import type { RoleDefinition, RoleModel, RoleReuseMode, WorkflowConfig } from '../types.ts'
-import { ID_PATTERN, nodeOnReturn, nodeResults, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, roleReuseMode } from '../types.ts'
+import type { RoleDefinition, RoleModel, RoleReuseMode, Target, WorkflowConfig, WorkflowDef } from '../types.ts'
+import { ID_PATTERN, LIMITS, nodeOnReturn, nodeResults, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, roleReuseMode, WorkflowError } from '../types.ts'
 import { parseCatalogConfig } from '../catalog/parse.ts'
 import { parseWorkflowConfig } from '../catalog/schema.ts'
-import { validateAndNormalize } from '../catalog/validate.ts'
-import { emptyLayout, fillMissingPositions, getPosition, parseLayoutFile, serializeLayout, setPosition, type EditorLayout, type LayoutLoad, type NodePosition } from './layout.ts'
+import { BUILTIN_CHECKER_IDS, validateAndNormalize } from '../catalog/validate.ts'
+import { emptyLayout, fillMissingPositions, getPosition, gridPosition, parseLayoutFile, serializeLayout, setPosition, type EditorLayout, type LayoutLoad, type NodePosition } from './layout.ts'
 
 /** 撤销/重做历史上限（页面内，超出丢弃最旧）。 */
 export const HISTORY_LIMIT = 50
@@ -470,6 +470,547 @@ export function setJudgeDeny(session: DraftSession, deny: string[] | undefined):
   pushHistory(session)
   if (normalized.value === undefined) delete session.draft.config.judgeRole.tools
   else session.draft.config.judgeRole.tools = { deny: normalized.value }
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/* ------------------------------------------------------------------ *
+ * T3（#162）新建流程与 Actor 结果路由编辑。
+ *
+ * 全部作用于同一草稿、经 pushHistory 接入撤销/重做并置 dirtyBusiness
+ * （新增节点同时补布局坐标，一并置 dirtyLayout；布局键按主/子流程隔离，
+ * 同名节点互不覆盖）。setter 只做本地守卫（ID 形状、存在性、同流程引用、
+ * Manager 入口、直接自环拦截）；完整语义（可达性、返回覆盖、Child 映射等）
+ * 由保存前的 validateDraft 统一裁决。删除/改名不静默修补：悬空引用保留，
+ * 由 validator 明确诊断并阻止保存。Program/Child 节点不在本票编辑范围：
+ * 相关 op 遇到非 Actor 节点明确拒绝，不触碰其字段（不丢失）。
+ * ------------------------------------------------------------------ */
+
+/** 新建文件名 → workflowId（工作流 ID 来自文件名，不写非法 YAML 字段）。 */
+export function parseNewFilename(yamlName: string): { ok: true; workflowId: string } | { ok: false; reason: string } {
+  if (!yamlName.endsWith('.yaml')) return { ok: false, reason: `新建文件名 "${yamlName}" 必须以小写 .yaml 结尾` }
+  const stem = yamlName.slice(0, -'.yaml'.length)
+  if (!ID_PATTERN.test(stem)) return { ok: false, reason: `新建文件名 "${yamlName}" 主体不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  return { ok: true, workflowId: stem }
+}
+
+/**
+ * 最小合法 v3 起点：Manager 入口单节点 + 单返回。
+ * 不依赖任何 roles（新建闭环无需等待 T2），Judge 取最小 persona。
+ */
+export function newDraftSession(workflowId: string): DraftSession {
+  if (!ID_PATTERN.test(workflowId)) throw new WorkflowError(`workflow id "${workflowId}" 不是合法小写 [a-z][a-z0-9-]* 标识符`)
+  const config: WorkflowConfig = {
+    schemaVersion: 'agent-workflow/v3',
+    roles: {},
+    judgeRole: { persona: '确认 Actor 结果是否可信；只做 ACCEPT/REJECT/NEED_CONTEXT 判定，不选择业务结果。' },
+    workflow: {
+      startNode: 'main',
+      returns: ['done'],
+      nodes: {
+        main: {
+          execution: { type: 'actor-task', role: 'manager', instruction: '统筹本工作流：拆解任务并组织后续节点。' },
+          checker: { checkerId: 'judge.claim-correct', config: {} },
+          results: {
+            done: { criteria: '工作流目标已达成。', target: { return: 'done' } },
+          },
+        },
+      },
+    },
+  }
+  // 构造期即走真实校验链：最小起点自身必须合法（有问题是实现 bug，早爆）。
+  validateAndNormalize(parseWorkflowConfig(structuredClone(config)), { workflowId, warnings: [] })
+  const layout = emptyLayout()
+  fillMissingPositions(config, layout)
+  return {
+    draft: { workflowId, config, layout, dirtyBusiness: false, dirtyLayout: false },
+    past: [],
+    future: [],
+  }
+}
+
+/** 取某流程定义（undefined = 主流程）；子流程定义的新增/删除留给 T5。 */
+function flowOf(session: DraftSession, flowId: string | undefined): WorkflowDef | undefined {
+  if (flowId === undefined) return session.draft.config.workflow
+  return session.draft.config.childWorkflows?.[flowId]
+}
+
+/** 流程引用键（返回改名时定位 Child 调用方用；主流程即 workflowId）。 */
+function flowKeyOf(session: DraftSession, flowId: string | undefined): string {
+  return flowId ?? session.draft.workflowId
+}
+
+/** Actor 角色引用守卫：manager 或已配置角色；judge 保留不可作 worker。 */
+function checkActorRole(session: DraftSession, role: string): string | undefined {
+  if (role === 'manager') return undefined
+  if (role === 'judge') return '角色 "judge" 为保留 Judge 身份，不可作为 Actor worker'
+  if (!ID_PATTERN.test(role)) return `角色 "${role}" 不是合法小写 [a-z][a-z0-9-]* 标识符`
+  if (!hasRole(session.draft.config, role)) return `角色 "${role}" 不存在（已有角色可供选择，新建角色请用角色编辑）`
+  return undefined
+}
+
+function checkInstruction(instruction: string): string | undefined {
+  if (instruction.trim() === '') return 'Actor instruction 为空：请填非空文本'
+  return undefined
+}
+
+function checkCheckerId(checkerId: string): string | undefined {
+  if (!BUILTIN_CHECKER_IDS.has(checkerId)) {
+    return `checker "${checkerId}" 不受支持（当前支持：${[...BUILTIN_CHECKER_IDS].join(', ')}）`
+  }
+  return undefined
+}
+
+/** 共同 criteria：undefined = 保持；null = 清除；string = 设置（trim 后存）。 */
+function checkCommonCriteria(criteria: string | null): { ok: true; value?: string } | { ok: false; reason: string } {
+  if (criteria === null) return { ok: true, value: undefined }
+  const trimmed = criteria.trim()
+  if (trimmed.length < LIMITS.criteriaMin || trimmed.length > LIMITS.criteriaMax) {
+    return { ok: false, reason: `共同 criteria 须为 ${LIMITS.criteriaMin}..${LIMITS.criteriaMax} 字符（trim 后 ${trimmed.length}），清除请使用清除操作` }
+  }
+  return { ok: true, value: trimmed }
+}
+
+/** 结果 criteria 本地守卫（trim 后存；长度沿用领域上限）。 */
+function checkResultCriteria(criteria: string): { ok: true; value: string } | { ok: false; reason: string } {
+  const trimmed = criteria.trim()
+  if (trimmed.length < LIMITS.criteriaMin || trimmed.length > LIMITS.criteriaMax) {
+    return { ok: false, reason: `结果 criteria 须为 ${LIMITS.criteriaMin}..${LIMITS.criteriaMax} 字符（trim 后 ${trimmed.length}）` }
+  }
+  return { ok: true, value: trimmed }
+}
+
+/**
+ * 同流程目标守卫：形状恰好 { node } 或 { return } 之一，引用本流程已声明项；
+ * 直接自环（target.node === selfId）按编辑器限制拒绝（多节点回路不受影响）。
+ */
+function checkFlowTarget(flow: WorkflowDef, target: unknown, selfId?: string): { ok: true; value: Target } | { ok: false; reason: string } {
+  if (typeof target !== 'object' || target === null || Array.isArray(target)) {
+    return { ok: false, reason: '结果目标须为 { node: <本流程节点> } 或 { return: <本流程返回> }（恰好其一，不支持自由条件表达式）' }
+  }
+  const record = target as Record<string, unknown>
+  const hasNode = Object.prototype.hasOwnProperty.call(record, 'node')
+  const hasReturn = Object.prototype.hasOwnProperty.call(record, 'return')
+  if (hasNode === hasReturn) {
+    return { ok: false, reason: '结果目标须恰好为 { node } 或 { return } 之一（一个结果只有一个目标）' }
+  }
+  if (hasNode) {
+    if (typeof record['node'] !== 'string' || !ID_PATTERN.test(record['node'])) {
+      return { ok: false, reason: `目标节点 "${String(record['node'])}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+    }
+    const nodeId = record['node'] as string
+    if (selfId !== undefined && nodeId === selfId) {
+      return { ok: false, reason: `结果目标 "${nodeId}" 直接指向自身：编辑器禁止新建直接自环（多节点回路不受影响，不改变 Runtime 合同）` }
+    }
+    if (!Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
+      return { ok: false, reason: `目标节点 "${nodeId}" 在本流程中不存在（节点目标只引用同一流程）` }
+    }
+    return { ok: true, value: { node: nodeId } }
+  }
+  if (typeof record['return'] !== 'string' || !ID_PATTERN.test(record['return'])) {
+    return { ok: false, reason: `目标返回 "${String(record['return'])}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  }
+  const returnName = record['return'] as string
+  if (!flow.returns.includes(returnName)) {
+    return { ok: false, reason: `目标返回 "${returnName}" 未在本流程 returns 中声明（返回目标是视觉表示，不新增执行节点）` }
+  }
+  return { ok: true, value: { return: returnName } }
+}
+
+/** 本流程内指向某节点的引用位置（删除前提示用；含入口/结果目标/返回映射值）。 */
+export interface NodeRef {
+  node: string
+  kind: 'start' | 'target' | 'onReturn'
+  detail: string
+}
+
+export function findNodeRefs(session: DraftSession, flowId: string | undefined, nodeId: string): NodeRef[] {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return []
+  const refs: NodeRef[] = []
+  if (flow.startNode === nodeId) refs.push({ node: nodeId, kind: 'start', detail: '流程入口 startNode' })
+  for (const [fromId, node] of Object.entries(flow.nodes)) {
+    for (const [resultName, result] of Object.entries(nodeResults(node) ?? {})) {
+      if ('node' in result.target && result.target.node === nodeId) {
+        refs.push({ node: fromId, kind: 'target', detail: `结果 "${resultName}"` })
+      }
+    }
+    for (const [returnName, target] of Object.entries(nodeOnReturn(node) ?? {})) {
+      if ('node' in target && target.node === nodeId) {
+        refs.push({ node: fromId, kind: 'onReturn', detail: `返回映射 "${returnName}"` })
+      }
+    }
+  }
+  return refs
+}
+
+/** 仅 Actor 节点可编辑（Program/Child 留给 T4/T5，字段不得丢失）。 */
+function actorNodeOf(flow: WorkflowDef, nodeId: string): { ok: true; node: import('../types.ts').ActorTaskNode } | { ok: false; reason: string } {
+  const node = flow.nodes[nodeId]
+  if (node === undefined) return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
+  if (node.execution.type !== 'actor-task') {
+    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不在本票编辑范围（T4/T5；其字段保持不丢失）` }
+  }
+  return { ok: true, node: node as import('../types.ts').ActorTaskNode }
+}
+
+export interface NewActorNodeFields {
+  role: string
+  instruction: string
+  checkerId?: string
+  /** 共同 criteria：缺席 = 无共同条件；空串拒绝（用清除语义无意义，新建即无）。 */
+  commonCriteria?: string
+  resultName: string
+  resultCriteria: string
+  target: unknown
+}
+
+/** 新增 Actor 节点（简单网格摆放；可暂时不可达，保存前校验裁决）。 */
+export function addActorNode(session: DraftSession, flowId: string | undefined, nodeId: string, fields: NewActorNodeFields): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（子流程定义的新增留给 T5）` }
+  if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
+    return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
+  }
+  const badRole = checkActorRole(session, fields.role)
+  if (badRole !== undefined) return { ok: false, reason: badRole }
+  const badInstruction = checkInstruction(fields.instruction)
+  if (badInstruction !== undefined) return { ok: false, reason: badInstruction }
+  const checkerId = fields.checkerId ?? 'judge.claim-correct'
+  const badChecker = checkCheckerId(checkerId)
+  if (badChecker !== undefined) return { ok: false, reason: badChecker }
+  let common: string | undefined
+  if (fields.commonCriteria !== undefined) {
+    const checked = checkCommonCriteria(fields.commonCriteria)
+    if (!checked.ok) return checked
+    common = checked.value
+  }
+  if (!ID_PATTERN.test(fields.resultName)) {
+    return { ok: false, reason: `结果名 "${fields.resultName}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  }
+  const criteria = checkResultCriteria(fields.resultCriteria)
+  if (!criteria.ok) return criteria
+  const target = checkFlowTarget(flow, fields.target, nodeId)
+  if (!target.ok) return target
+  pushHistory(session)
+  flow.nodes[nodeId] = {
+    execution: { type: 'actor-task', role: fields.role, instruction: fields.instruction.trim() },
+    checker: { checkerId, config: common === undefined ? {} : { criteria: common } },
+    results: { [fields.resultName]: { criteria: criteria.value, target: target.value } },
+  }
+  // ponytail：固定步长网格补位，不引入自动布局引擎。
+  setPosition(session.draft.layout, flowId, nodeId, gridPosition(Object.keys(flow.nodes).length - 1))
+  session.draft.dirtyBusiness = true
+  session.draft.dirtyLayout = true
+  return { ok: true }
+}
+
+export interface ActorFieldPatch {
+  role?: string
+  instruction?: string
+  checkerId?: string
+  /** 共同 criteria：缺席 = 保持；null = 清除；string = 设置。 */
+  commonCriteria?: string | null
+}
+
+/** 修改 Actor 节点属性（主流程入口节点角色须保持 manager）。 */
+export function setActorFields(session: DraftSession, flowId: string | undefined, nodeId: string, patch: ActorFieldPatch): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = actorNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  const node = found.node
+  if (patch.role !== undefined) {
+    const badRole = checkActorRole(session, patch.role)
+    if (badRole !== undefined) return { ok: false, reason: badRole }
+    if (flowId === undefined && nodeId === flow.startNode && patch.role !== 'manager') {
+      return { ok: false, reason: `主流程入口节点 "${nodeId}" 角色须为 manager（Manager Actor 限制）` }
+    }
+  }
+  if (patch.instruction !== undefined) {
+    const bad = checkInstruction(patch.instruction)
+    if (bad !== undefined) return { ok: false, reason: bad }
+  }
+  if (patch.checkerId !== undefined) {
+    const bad = checkCheckerId(patch.checkerId)
+    if (bad !== undefined) return { ok: false, reason: bad }
+  }
+  let common: string | undefined | null
+  if (patch.commonCriteria !== undefined) {
+    if (patch.commonCriteria === null) {
+      common = null
+    } else {
+      const checked = checkCommonCriteria(patch.commonCriteria)
+      if (!checked.ok) return checked
+      common = checked.value
+    }
+  }
+  const nextRole = patch.role ?? node.execution.role
+  const nextInstruction = patch.instruction === undefined ? node.execution.instruction : patch.instruction.trim()
+  const nextChecker = patch.checkerId ?? node.checker.checkerId
+  const currentCommon = (node.checker.config?.['criteria'] as string | undefined) ?? null
+  const nextCommon = common === undefined ? currentCommon : common
+  if (nextRole === node.execution.role
+    && nextInstruction === node.execution.instruction
+    && nextChecker === node.checker.checkerId
+    && (nextCommon ?? null) === (currentCommon ?? null)) return { ok: true }
+  pushHistory(session)
+  node.execution.role = nextRole
+  node.execution.instruction = nextInstruction
+  node.checker.checkerId = nextChecker
+  node.checker.config = nextCommon == null ? {} : { criteria: nextCommon }
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+export type NodeRenameResult = { ok: true; updated: number } | { ok: false; reason: string }
+
+/**
+ * 节点改名：同步入口、同流程全部结果目标/返回映射值与布局坐标。
+ * 目标只引用同一流程，跨流程同名节点不受影响。
+ */
+export function renameNode(session: DraftSession, flowId: string | undefined, oldId: string, newId: string): NodeRenameResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  if (!Object.prototype.hasOwnProperty.call(flow.nodes, oldId)) {
+    return { ok: false, reason: `节点 "${oldId}" 在${flowId === undefined ? '主流程' : `子流程 "${flowId}"`}中不存在` }
+  }
+  if (oldId === newId) return { ok: true, updated: 0 }
+  if (!ID_PATTERN.test(newId)) return { ok: false, reason: `节点 id "${newId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(flow.nodes, newId)) {
+    return { ok: false, reason: `节点 "${newId}" 已存在` }
+  }
+  pushHistory(session)
+  flow.nodes[newId] = flow.nodes[oldId]!
+  delete flow.nodes[oldId]
+  if (flow.startNode === oldId) flow.startNode = newId
+  let updated = 0
+  for (const node of Object.values(flow.nodes)) {
+    for (const result of Object.values(nodeResults(node) ?? {})) {
+      if ('node' in result.target && result.target.node === oldId) {
+        result.target = { node: newId }
+        updated++
+      }
+    }
+    const onReturn = nodeOnReturn(node)
+    if (onReturn !== undefined) {
+      for (const [returnName, target] of Object.entries(onReturn)) {
+        if ('node' in target && target.node === oldId) {
+          onReturn[returnName] = { node: newId }
+          updated++
+        }
+      }
+    }
+  }
+  const pos = getPosition(session.draft.layout, flowId, oldId)
+  if (pos !== undefined) {
+    setPosition(session.draft.layout, flowId, newId, pos)
+    const table = flowId === undefined ? session.draft.layout.main : session.draft.layout.children[flowId]
+    if (table !== undefined) delete table[oldId]
+    session.draft.dirtyLayout = true
+  }
+  session.draft.dirtyBusiness = true
+  return { ok: true, updated }
+}
+
+/**
+ * 删除节点：引用刻意保留悬空（不静默选替代目标），未修正时 validateDraft
+ * 明确诊断并阻止保存；布局坐标随节点移除（撤销可恢复）。
+ */
+export function deleteNode(session: DraftSession, flowId: string | undefined, nodeId: string): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  if (!Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
+    return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
+  }
+  pushHistory(session)
+  delete flow.nodes[nodeId]
+  const table = flowId === undefined ? session.draft.layout.main : session.draft.layout.children[flowId]
+  if (table !== undefined) delete table[nodeId]
+  session.draft.dirtyBusiness = true
+  session.draft.dirtyLayout = true
+  return { ok: true }
+}
+
+/** 新增命名结果（Judge verdict 不是 Node Result：本 op 只作用于 Actor 节点结果表）。 */
+export function addNodeResult(session: DraftSession, flowId: string | undefined, nodeId: string, name: string, criteria: string, target: unknown): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = actorNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  if (!ID_PATTERN.test(name)) return { ok: false, reason: `结果名 "${name}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(found.node.results, name)) {
+    return { ok: false, reason: `结果 "${name}" 已存在（重命名请使用改名操作）` }
+  }
+  const checkedCriteria = checkResultCriteria(criteria)
+  if (!checkedCriteria.ok) return checkedCriteria
+  const checkedTarget = checkFlowTarget(flow, target, nodeId)
+  if (!checkedTarget.ok) return checkedTarget
+  pushHistory(session)
+  found.node.results[name] = { criteria: checkedCriteria.value, target: checkedTarget.value }
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+export interface ResultPatch {
+  criteria?: string
+  target?: unknown
+}
+
+/** 修改命名结果的 criteria 和/或 target（拖线即只带 target 的 patch）。 */
+export function setNodeResult(session: DraftSession, flowId: string | undefined, nodeId: string, name: string, patch: ResultPatch): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = actorNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  const result = found.node.results[name]
+  if (result === undefined) return { ok: false, reason: `节点 "${nodeId}" 结果 "${name}" 不存在` }
+  let nextCriteria = result.criteria
+  if (patch.criteria !== undefined) {
+    const checked = checkResultCriteria(patch.criteria)
+    if (!checked.ok) return checked
+    nextCriteria = checked.value
+  }
+  let nextTarget = result.target
+  if (patch.target !== undefined) {
+    const checked = checkFlowTarget(flow, patch.target, nodeId)
+    if (!checked.ok) return checked
+    nextTarget = checked.value
+  }
+  if (nextCriteria === result.criteria && JSON.stringify(nextTarget) === JSON.stringify(result.target)) return { ok: true }
+  pushHistory(session)
+  result.criteria = nextCriteria
+  result.target = nextTarget
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/** 结果改名（结果名只在所属节点内解释，边身份随之同步，无跨节点引用）。 */
+export function renameNodeResult(session: DraftSession, flowId: string | undefined, nodeId: string, oldName: string, newName: string): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = actorNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  if (!Object.prototype.hasOwnProperty.call(found.node.results, oldName)) {
+    return { ok: false, reason: `节点 "${nodeId}" 结果 "${oldName}" 不存在` }
+  }
+  if (oldName === newName) return { ok: true }
+  if (!ID_PATTERN.test(newName)) return { ok: false, reason: `结果名 "${newName}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(found.node.results, newName)) {
+    return { ok: false, reason: `节点 "${nodeId}" 结果 "${newName}" 已存在` }
+  }
+  pushHistory(session)
+  found.node.results[newName] = found.node.results[oldName]!
+  delete found.node.results[oldName]
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/** 删除命名结果（无跨节点引用；空结果表由保存前校验阻止）。 */
+export function deleteNodeResult(session: DraftSession, flowId: string | undefined, nodeId: string, name: string): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = actorNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  if (!Object.prototype.hasOwnProperty.call(found.node.results, name)) {
+    return { ok: false, reason: `节点 "${nodeId}" 结果 "${name}" 不存在` }
+  }
+  pushHistory(session)
+  delete found.node.results[name]
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/** 设置流程入口（主流程入口须为 manager Actor；可暂时不可达由校验裁决）。 */
+export function setFlowStartNode(session: DraftSession, flowId: string | undefined, nodeId: string): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const node = flow.nodes[nodeId]
+  if (node === undefined) return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
+  if (flowId === undefined && !(node.execution.type === 'actor-task' && node.execution.role === 'manager')) {
+    return { ok: false, reason: `主流程入口须为 role "manager" 的 Actor 节点（"${nodeId}" 为 ${node.execution.type === 'actor-task' ? `role "${node.execution.role}"` : node.execution.type}）` }
+  }
+  if (flow.startNode === nodeId) return { ok: true }
+  pushHistory(session)
+  flow.startNode = nodeId
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/** 新增流程返回（声明即可；尚无路径指向时保存前校验提示补线）。 */
+export function addFlowReturn(session: DraftSession, flowId: string | undefined, name: string): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  if (!ID_PATTERN.test(name)) return { ok: false, reason: `返回名 "${name}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (flow.returns.includes(name)) return { ok: false, reason: `返回 "${name}" 已声明（重命名请使用改名操作）` }
+  pushHistory(session)
+  flow.returns.push(name)
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+export type FlowReturnRenameResult = { ok: true; updated: number } | { ok: false; reason: string }
+
+/**
+ * 流程返回改名：同步本流程内全部 { return } 目标、返回端口，
+ * 以及已有 Child 调用方对该返回名的 onReturn 引用键（不留隐蔽失配）。
+ */
+export function renameFlowReturn(session: DraftSession, flowId: string | undefined, oldName: string, newName: string): FlowReturnRenameResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  if (!flow.returns.includes(oldName)) return { ok: false, reason: `返回 "${oldName}" 未在本流程声明` }
+  if (oldName === newName) return { ok: true, updated: 0 }
+  if (!ID_PATTERN.test(newName)) return { ok: false, reason: `返回名 "${newName}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (flow.returns.includes(newName)) return { ok: false, reason: `返回 "${newName}" 已声明` }
+  pushHistory(session)
+  flow.returns = flow.returns.map(name => name === oldName ? newName : name)
+  let updated = 0
+  for (const node of Object.values(flow.nodes)) {
+    for (const result of Object.values(nodeResults(node) ?? {})) {
+      if ('return' in result.target && result.target.return === oldName) {
+        result.target = { return: newName }
+        updated++
+      }
+    }
+    const onReturn = nodeOnReturn(node)
+    if (onReturn !== undefined) {
+      for (const [key, target] of Object.entries(onReturn)) {
+        if ('return' in target && target.return === oldName) {
+          onReturn[key] = { return: newName }
+          updated++
+        }
+      }
+    }
+  }
+  // 已有 Child 调用方对该子流程返回名的 onReturn 引用键同步改名。
+  const calleeKey = flowKeyOf(session, flowId)
+  const allFlows = [session.draft.config.workflow, ...Object.values(session.draft.config.childWorkflows ?? {})]
+  for (const callerFlow of allFlows) {
+    for (const node of Object.values(callerFlow.nodes)) {
+      if (node.execution.type !== 'child-workflow' || node.execution.workflowId !== calleeKey) continue
+      const onReturn = nodeOnReturn(node)
+      if (onReturn !== undefined && Object.prototype.hasOwnProperty.call(onReturn, oldName)) {
+        onReturn[newName] = onReturn[oldName]!
+        delete onReturn[oldName]
+        updated++
+      }
+    }
+  }
+  session.draft.dirtyBusiness = true
+  return { ok: true, updated }
+}
+
+/**
+ * 删除流程返回：相关目标/映射键刻意保留悬空（不静默选替代），
+ * 未修正时 validateDraft 明确诊断并阻止保存。
+ */
+export function deleteFlowReturn(session: DraftSession, flowId: string | undefined, name: string): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  if (!flow.returns.includes(name)) return { ok: false, reason: `返回 "${name}" 未在本流程声明` }
+  pushHistory(session)
+  flow.returns = flow.returns.filter(entry => entry !== name)
   session.draft.dirtyBusiness = true
   return { ok: true }
 }

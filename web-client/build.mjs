@@ -72,7 +72,7 @@ return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage };
 })();
 var __edits = (function () {
 ${edits}
-return { HISTORY_LIMIT, ID_PATTERN, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, layoutFilenameFor, clone, isDirty, savePlanOf, snapshotOf, pushHistory, applyPersonaEdit, moveNodeEdit, undoEdit, redoEdit, addRoleEdit, setRolePersonaEdit, setRoleModelEdit, setRoleReuseEdit, setRoleDenyEdit, renameRoleEdit, deleteRoleEdit, findRoleRefs, setJudgePersonaEdit, setJudgeModelEdit, setJudgeDenyEdit };
+return { HISTORY_LIMIT, ID_PATTERN, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, SUPPORTED_CHECKER_IDS, layoutFilenameFor, clone, isDirty, savePlanOf, snapshotOf, pushHistory, applyPersonaEdit, moveNodeEdit, undoEdit, redoEdit, addRoleEdit, setRolePersonaEdit, setRoleModelEdit, setRoleReuseEdit, setRoleDenyEdit, renameRoleEdit, deleteRoleEdit, findRoleRefs, setJudgePersonaEdit, setJudgeModelEdit, setJudgeDenyEdit, parseNewFilenameEdit, checkNewFilename, minimalConfigOf, addActorNodeEdit, setActorFieldsEdit, renameNodeEdit, deleteNodeEdit, findNodeRefsEdit, addNodeResultEdit, setNodeResultEdit, renameNodeResultEdit, deleteNodeResultEdit, setFlowStartNodeEdit, addFlowReturnEdit, renameFlowReturnEdit, deleteFlowReturnEdit };
 })();
 var __panel = (function () {
 ${panel}
