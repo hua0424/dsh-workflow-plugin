@@ -1,12 +1,11 @@
 /**
  * 配置编辑面板（React plain-JS，无 JSX 工具链依赖；画布为最小占位实现）。
  *
- * 范围（T3 #162 在 T2 上追加）：新建合法 v3 配置（合法小写 .yaml 文件名、
- * 最小 Manager 入口起点）→ 切换主/子流程 → 编辑入口 startNode 与 returns →
- * Actor 节点新增/属性/改名/删除 → 命名结果 criteria/target 编辑 → 结果端口
- * 点选连线改目标 → 只读预览 → 校验后显式保存 → 分别报告 YAML/布局写入结果。
+ * 范围（T4 #163 在 T3 上追加）：内置 Program 节点新增/程序与 instruction/
+ * 参数/ PASS-FAIL 结果编辑（程序与参数合同只读服务端 metadata RPC 单源，
+ * 不硬编码注册表）→ 其余沿用 T3 能力（新建/流程/Actor/结果/连线/预览/保存）。
  *
- * 不做：Program（T4）、Child 映射与子流程定义增删（T5）。
+ * 不做：Child 映射与子流程定义增删（T5）。
  * 画布节点拖动用指针事件最小实现，结果连线用“端口点选 + 目标点选”最小实现；
  * （本票不引入 reactflow 打包，保持 bundle 零第三方）。
  * 不提供运行控制；保存成功只报告文件写入，不描述模型可用或可启动。
@@ -18,12 +17,13 @@
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { callEditor, rpcErrorMessage } from './rpc.js'
 import {
-  addActorNodeEdit, addFlowReturnEdit, addNodeResultEdit, addRoleEdit, applyPersonaEdit,
+  addActorNodeEdit, addFlowReturnEdit, addNodeResultEdit, addProgramNodeEdit, addRoleEdit, applyPersonaEdit,
   checkNewFilename, deleteFlowReturnEdit, deleteNodeEdit, deleteNodeResultEdit, deleteRoleEdit, findNodeRefsEdit,
   findRoleRefs, ID_PATTERN, isDirty, layoutFilenameFor, minimalConfigOf, moveNodeEdit,
   parseNewFilenameEdit, redoEdit, renameFlowReturnEdit, renameNodeEdit, renameNodeResultEdit,
   renameRoleEdit, savePlanOf, setActorFieldsEdit, setFlowStartNodeEdit, setJudgeDenyEdit,
-  setJudgeModelEdit, setJudgePersonaEdit, setNodeResultEdit, setRoleDenyEdit, setRoleModelEdit,
+  setJudgeModelEdit, setJudgePersonaEdit, setNodeResultEdit, setProgramFieldsEdit, setProgramParamEdit,
+  setProgramResultEdit, setRoleDenyEdit, setRoleModelEdit,
   setRolePersonaEdit, setRoleReuseEdit, SUPPORTED_CHECKER_IDS, undoEdit,
 } from './edits.js'
 
@@ -104,6 +104,26 @@ function emptyAddNodeForm(role) {
 function emptyAddResultForm(flowDef) {
   const firstNode = Object.keys(flowDef.nodes ?? {})[0] ?? ''
   return { name: '', criteria: '', targetKind: 'node', targetValue: firstNode }
+}
+
+/** Program 节点编辑表单（选定节点+草稿 → 输入态；业务唯一来源仍是 state.draft）。 */
+function programEditFormOf(flowDef, nodeId, programIds) {
+  const node = (flowDef.nodes ?? {})[nodeId]
+  const execution = node?.execution ?? {}
+  return {
+    sel: nodeId,
+    rename: nodeId,
+    programId: execution.programId ?? programIds[0] ?? '',
+    instruction: execution.instruction ?? '',
+  }
+}
+
+function emptyAddProgramForm(programIds) {
+  return {
+    id: '', programId: programIds[0] ?? '', instruction: '',
+    passCriteria: '', passTargetKind: 'return', passTargetValue: '',
+    failCriteria: '', failTargetKind: 'return', failTargetValue: '',
+  }
 }
 
 function targetLabel(target) {
@@ -207,6 +227,11 @@ export function WorkflowConfigEditorPanel(props) {
   const [addResult, setAddResult] = useState({ name: '', criteria: '', targetKind: 'node', targetValue: '' })
   const [newReturn, setNewReturn] = useState('')
   const [wire, setWire] = useState(null)
+  // T4 Program 表单缓冲与元数据（程序/参数合同只读服务端 metadata RPC，不硬编码）。
+  const [addProgram, setAddProgram] = useState(emptyAddProgramForm([]))
+  const [programEdit, setProgramEdit] = useState({ sel: '', rename: '', programId: '', instruction: '' })
+  const [programCatalog, setProgramCatalog] = useState(null)
+  const [programCatalogError, setProgramCatalogError] = useState(null)
   const lastSyncedFile = useRef(null)
 
   const dirty = isDirty(state)
@@ -292,6 +317,8 @@ export function WorkflowConfigEditorPanel(props) {
         problems: [], flow: null, positions, personaInput,
       })
       await refreshPreview(draft)
+      const programs = await refreshProgramCatalog()
+      setAddProgram(emptyAddProgramForm(Object.keys(programs ?? {})))
     } catch (error) {
       setState((prev) => ({ ...prev, busy: false, problems: [`读取文件失败（权限/IO 错误如实上报，未伪装为文件缺失）：${String(error?.message ?? error)}`] }))
     }
@@ -308,6 +335,25 @@ export function WorkflowConfigEditorPanel(props) {
     setState((prev) => ({ ...prev, preview: previewed.value }))
   }, [call])
 
+  /** T4 程序元数据单源直读（失败则禁用 Program 编辑，不用硬编码兜底）。 */
+  const refreshProgramCatalog = useCallback(async () => {
+    const meta = await call('metadata', {})
+    if (!meta.ok) {
+      setProgramCatalog(null)
+      setProgramCatalogError(rpcErrorMessage(meta))
+      return null
+    }
+    const programs = meta.value?.programs
+    if (programs === null || typeof programs !== 'object' || Array.isArray(programs)) {
+      setProgramCatalog(null)
+      setProgramCatalogError('程序元数据形状异常（非对象），Program 编辑已禁用')
+      return null
+    }
+    setProgramCatalog(programs)
+    setProgramCatalogError(null)
+    return programs
+  }, [call])
+
   // 切换文件时用草稿重建表单缓冲（文件内编辑不回写缓冲，输入态不受覆盖）。
   useEffect(() => {
     if (state.selected === null || state.draft === null || lastSyncedFile.current === state.selected) return
@@ -321,6 +367,8 @@ export function WorkflowConfigEditorPanel(props) {
     setAddResult({ name: '', criteria: '', targetKind: 'node', targetValue: '' })
     setNewReturn('')
     setWire(null)
+    setProgramEdit({ sel: '', rename: '', programId: '', instruction: '' })
+    setAddProgram(emptyAddProgramForm([]))
   }, [state.selected, state.draft])
 
   /** edits 结果统一处理：失败入 problems；成功换草稿并刷新只读预览（同一草稿源）。 */
@@ -485,14 +533,17 @@ export function WorkflowConfigEditorPanel(props) {
       dirtyBusiness: true, dirtyLayout: true,
     })
     await refreshPreview(draft)
-  }, [newFileName, state, refreshPreview])
+    const programs = await refreshProgramCatalog()
+    setAddProgram(emptyAddProgramForm(Object.keys(programs ?? {})))
+  }, [newFileName, state, refreshPreview, refreshProgramCatalog])
 
   const syncNodeEdit = useCallback((draft, flowDef, id) => {
     setNodeSel(id)
     setNodeEdit(nodeEditFormOf(flowDef, id))
+    setProgramEdit(programEditFormOf(flowDef, id, Object.keys(programCatalog ?? {})))
     setAddResult(emptyAddResultForm(flowDef))
     setWire(null)
-  }, [])
+  }, [programCatalog])
 
   const addActor = useCallback(async (flowId) => {
     const id = addNode.id.trim()
@@ -588,10 +639,74 @@ export function WorkflowConfigEditorPanel(props) {
     })
   }, [state, nodeEdit.sel, wire, runEdit])
 
-  /** 结果连线提交（拖线即只带 target 的 patch；一个结果只有一个目标）。 */
+  /* T4 Program 节点/参数/PASS-FAIL 表单回调（同一草稿 + 同一撤销/预览通道）。 */
+  const addProgramNode = useCallback(async (flowId) => {
+    const id = addProgram.id.trim()
+    await runEdit(addProgramNodeEdit(state, flowId, id, {
+      programId: addProgram.programId,
+      instruction: addProgram.instruction.trim() === '' ? undefined : addProgram.instruction,
+      passCriteria: addProgram.passCriteria,
+      passTarget: targetOf(addProgram.passTargetKind, addProgram.passTargetValue),
+      failCriteria: addProgram.failCriteria,
+      failTarget: targetOf(addProgram.failTargetKind, addProgram.failTargetValue),
+    }, programCatalog), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      syncNodeEdit(result.state.draft, flowDef, id)
+      setAddProgram((prev) => emptyAddProgramForm(Object.keys(programCatalog ?? {})))
+    })
+  }, [state, addProgram, programCatalog, runEdit, syncNodeEdit])
+
+  const applyProgramFields = useCallback(async (flowId) => {
+    const sel = programEdit.sel
+    await runEdit(setProgramFieldsEdit(state, flowId, sel, {
+      programId: programEdit.programId,
+      instruction: programEdit.instruction,
+    }, programCatalog), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      syncNodeEdit(result.state.draft, flowDef, sel)
+    })
+  }, [state, programEdit, programCatalog, runEdit, syncNodeEdit])
+
+  const clearProgramInstruction = useCallback(async (flowId) => {
+    const sel = programEdit.sel
+    await runEdit(setProgramFieldsEdit(state, flowId, sel, { instruction: null }, programCatalog), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      syncNodeEdit(result.state.draft, flowDef, sel)
+    })
+  }, [state, programEdit.sel, programCatalog, runEdit, syncNodeEdit])
+
+  const applyProgramParam = useCallback(async (flowId, nodeId, key, text, specType) => {
+    // number 参数的文本输入转数值（空串/非数值由 edits 类型守卫明确拒绝，不静默成 0）。
+    const value = specType === 'number' && text.trim() !== '' ? Number(text) : text
+    await runEdit(setProgramParamEdit(state, flowId, nodeId, key, value, programCatalog), undefined)
+  }, [state, programCatalog, runEdit])
+
+  const deleteProgramParam = useCallback(async (flowId, nodeId, key) => {
+    await runEdit(setProgramParamEdit(state, flowId, nodeId, key, undefined, programCatalog), undefined)
+  }, [state, programCatalog, runEdit])
+
+  const applyProgramResult = useCallback(async (flowId, nodeId, name, patch) => {
+    await runEdit(setProgramResultEdit(state, flowId, nodeId, name, patch), undefined)
+  }, [state, runEdit])
+
+  /** Program 改名（改名框在 Program 卡上，读 programEdit；引用同步复用通用改名）。 */
+  const renameProgramNode = useCallback(async (flowId) => {
+    const next = programEdit.rename.trim()
+    await runEdit(renameNodeEdit(state, flowId, programEdit.sel, next), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      syncNodeEdit(result.state.draft, flowDef, next)
+    })
+  }, [state, programEdit, runEdit, syncNodeEdit])
+
+  /** 结果连线提交（Program 端口走 PASS/FAIL patch，Actor 走命名结果 patch）。 */
   const commitWire = useCallback(async (flowId, target) => {
     if (wire === null) return
-    await runEdit(setNodeResultEdit(state, flowId, wire.node, wire.result, { target }), () => {
+    const flowDef = flowId === null ? state.draft?.workflow : state.draft?.childWorkflows?.[flowId]
+    const wired = flowDef?.nodes?.[wire.node]
+    const edit = wired?.execution?.type === 'builtin-program'
+      ? setProgramResultEdit(state, flowId, wire.node, wire.result, { target })
+      : setNodeResultEdit(state, flowId, wire.node, wire.result, { target })
+    await runEdit(edit, () => {
       setWire(null)
     })
   }, [state, wire, runEdit])
@@ -749,6 +864,11 @@ export function WorkflowConfigEditorPanel(props) {
         onRename: renameSelectedNode, onDelete: deleteSelectedNode,
         onAddResult: addResultRow, onApplyResult: applyResult,
         onRenameResult: renameResult, onDeleteResult: deleteResult,
+        programCatalog, programCatalogError, addProgram, setAddProgram,
+        programEdit, setProgramEdit, onAddProgram: addProgramNode,
+        onProgramFields: applyProgramFields, onClearProgramInstruction: clearProgramInstruction,
+        onProgramParam: applyProgramParam, onDeleteProgramParam: deleteProgramParam,
+        onApplyProgramResult: applyProgramResult, onRenameProgram: renameProgramNode,
         busy: state.busy,
       }) : null,
       activeFlow !== null ? h(NodeCanvas, {
@@ -935,14 +1055,18 @@ function ReturnRow(props) {
  */
 function NodeSection(props) {
   const { draft, flowId, def, nodeSel, nodeEdit, setNodeEdit, addNode, setAddNode, addResult, setAddResult } = props
+  const { programCatalog, programCatalogError, addProgram, setAddProgram, programEdit } = props
   const setEdit = (field) => (event) => setNodeEdit((prev) => ({ ...prev, [field]: event.target.value }))
+  const setAddProg = (field) => (event) => setAddProgram((prev) => ({ ...prev, [field]: event.target.value }))
   const roleOptions = ['manager', ...Object.keys(draft.roles ?? {}).filter((r) => r !== 'manager')]
+  const programIds = Object.keys(programCatalog ?? {})
   const nodeIds = Object.keys(def.nodes ?? {})
   const selected = (def.nodes ?? {})[nodeSel]
   const isActor = selected?.execution?.type === 'actor-task'
+  const isProgram = selected?.execution?.type === 'builtin-program'
   const results = isActor ? Object.entries(selected.results ?? {}) : []
   return h('div', { className: 'wf-nodes' },
-    h('h3', null, 'Actor 节点与结果路由'),
+    h('h3', null, '节点与结果路由（Actor/Program）'),
     h('div', { className: 'wf-node-new' },
       h('label', null, '新增节点 id'),
       h('input', { value: addNode.id, onChange: (event) => setAddNode((prev) => ({ ...prev, id: event.target.value })) }),
@@ -966,6 +1090,33 @@ function NodeSection(props) {
       h('input', { value: addNode.targetValue, onChange: (event) => setAddNode((prev) => ({ ...prev, targetValue: event.target.value })) }),
       h('button', { onClick: () => props.onAdd(flowId), disabled: props.busy }, '新增节点'),
     ),
+    h('div', { className: 'wf-program-new' },
+      h('h4', null, '新增 Program 节点（PASS/FAIL 成对声明；参数建后逐项填写，必填缺席不阻止保存）'),
+      programCatalog === null
+        ? h('div', null, programCatalogError ?? '程序元数据加载中…')
+        : h('div', null,
+          h('label', null, '新增节点 id'),
+          h('input', { value: addProgram.id, onChange: setAddProg('id') }),
+          h('label', null, '程序（固定名单，不可配任意脚本）'),
+          h('select', { value: addProgram.programId, onChange: setAddProg('programId') },
+            ...programIds.map((p) => h('option', { key: p, value: p }, p))),
+          h('label', null, 'instruction（可选，留空=无）'),
+          h('input', { value: addProgram.instruction, onChange: setAddProg('instruction') }),
+          h('label', null, 'PASS criteria'),
+          h('input', { value: addProgram.passCriteria, onChange: setAddProg('passCriteria') }),
+          h('label', null, 'PASS 目标'),
+          h('select', { value: addProgram.passTargetKind, onChange: setAddProg('passTargetKind') },
+            h('option', { value: 'node' }, '节点'), h('option', { value: 'return' }, '返回')),
+          h('input', { value: addProgram.passTargetValue, onChange: setAddProg('passTargetValue') }),
+          h('label', null, 'FAIL criteria'),
+          h('input', { value: addProgram.failCriteria, onChange: setAddProg('failCriteria') }),
+          h('label', null, 'FAIL 目标'),
+          h('select', { value: addProgram.failTargetKind, onChange: setAddProg('failTargetKind') },
+            h('option', { value: 'node' }, '节点'), h('option', { value: 'return' }, '返回')),
+          h('input', { value: addProgram.failTargetValue, onChange: setAddProg('failTargetValue') }),
+          h('button', { onClick: () => props.onAddProgram(flowId), disabled: props.busy }, '新增 Program 节点'),
+        ),
+    ),
     nodeIds.length > 0 ? h('div', { className: 'wf-node-list' },
       h('span', null, '节点：'),
       ...nodeIds.map((id) => h('button', {
@@ -976,7 +1127,17 @@ function NodeSection(props) {
     ) : h('div', null, '（暂无节点）'),
     selected === undefined ? null : h('div', { className: 'wf-node-card' },
       h('div', null, `当前：${nodeSel}（${selected.execution?.type ?? '未知类型'}；边身份 = 源节点 + 结果名）`),
-      !isActor ? h('div', null, '（Program/Child 节点不在本票编辑范围，只读；其字段保持不丢失）') : h('div', null,
+      !isActor && !isProgram ? h('div', null, '（Child 节点不在本票编辑范围，只读；其字段保持不丢失）') : isProgram ? h(ProgramCard, {
+        key: `${flowId ?? '__main__'}:${nodeSel}:${selected.execution?.programId ?? ''}`,
+        flowId, nodeId: nodeSel, node: selected,
+        catalog: programCatalog, catalogError: programCatalogError,
+        programEdit, setProgramEdit: props.setProgramEdit,
+        returns: def.returns ?? [], nodeIds,
+        onRenameProgram: props.onRenameProgram, onDelete: props.onDelete,
+        onFields: props.onProgramFields, onClearInstruction: props.onClearProgramInstruction,
+        onParam: props.onProgramParam, onDeleteParam: props.onDeleteProgramParam,
+        onApplyResult: props.onApplyProgramResult, busy: props.busy,
+      }) : h('div', null,
         h('div', null,
           h('label', null, '改名'),
           h('input', { value: nodeEdit.rename, onChange: setEdit('rename') }),
@@ -1024,7 +1185,79 @@ function NodeSection(props) {
   )
 }
 
-/** 单个命名结果行：本地缓冲 criteria/目标/改名，应用时一次性 patch。 */
+/** Program 节点卡：改名/程序与 instruction/参数/PASS-FAIL（结果行固定，不可改名删除）。 */
+function ProgramCard(props) {
+  const { flowId, nodeId, node, catalog, catalogError, programEdit, setProgramEdit } = props
+  const execution = node.execution ?? {}
+  const spec = catalog?.[execution.programId]
+  const params = spec?.parameters ?? {}
+  const config = execution.config ?? {}
+  const knownKeys = Object.keys(params)
+  const extraKeys = Object.keys(config).filter((key) => !Object.prototype.hasOwnProperty.call(params, key))
+  const [inputs, setInputs] = useState(() => Object.fromEntries(
+    knownKeys.map((key) => [key, config[key] === undefined ? '' : String(config[key])]),
+  ))
+  const setEdit = (field) => (event) => setProgramEdit((prev) => ({ ...prev, [field]: event.target.value }))
+  const setInput = (key) => (event) => setInputs((prev) => ({ ...prev, [key]: event.target.value }))
+  return h('div', null,
+    h('div', null,
+      h('label', null, '改名'),
+      h('input', { value: programEdit.rename, onChange: setEdit('rename') }),
+      h('button', { onClick: () => props.onRenameProgram(flowId), disabled: props.busy }, '改名'),
+    ),
+    catalog === null
+      ? h('div', null, catalogError ?? '程序元数据加载中…')
+      : h('div', null,
+        h('label', null, '程序（固定名单，不可配任意脚本）'),
+        h('select', { value: programEdit.programId, onChange: setEdit('programId'), disabled: props.busy },
+          ...Object.keys(catalog).map((p) => h('option', { key: p, value: p }, p))),
+        h('div', null, spec?.description ?? '（未知程序：元数据无描述，字段保持不删除）'),
+      ),
+    h('div', null,
+      h('label', null, 'instruction（可选；应用空值被拒绝，清除请用清除按钮）'),
+      h('textarea', { value: programEdit.instruction, rows: 2, onChange: setEdit('instruction') }),
+      h('button', { onClick: () => props.onFields(flowId), disabled: props.busy || catalog === null }, '应用属性'),
+      h('button', { onClick: () => props.onClearInstruction(flowId), disabled: props.busy || catalog === null }, '清除 instruction'),
+    ),
+    spec === undefined ? null : h('div', { className: 'wf-program-params' },
+      h('span', null, '参数（类型按元数据表达；必填 * 缺席不阻止保存，运行时可补参）：'),
+      ...knownKeys.map((key) => h('div', { key },
+        h('code', { title: params[key].description }, `${key}${params[key].required ? ' *' : ''}（${params[key].type}）`),
+        h('span', null, params[key].description),
+        h('input', {
+          value: inputs[key] ?? '',
+          onChange: setInput(key),
+          disabled: props.busy,
+          title: `当前值：${JSON.stringify(config[key] ?? null)}`,
+        }),
+        h('button', { onClick: () => props.onParam(flowId, nodeId, key, inputs[key] ?? '', params[key].type), disabled: props.busy }, '应用'),
+        h('button', { onClick: () => props.onDeleteParam(flowId, nodeId, key), disabled: props.busy }, '删除'),
+      )),
+    ),
+    extraKeys.length === 0 ? null : h('div', null,
+      h('span', null, '导入保留字段（只读，编辑器不删除）：'),
+      ...extraKeys.map((key) => h('div', { key }, h('code', null, `${key} = ${JSON.stringify(config[key])}`))),
+    ),
+    h('div', { className: 'wf-results' },
+      h('span', null, 'PASS/FAIL（协议固定结果，点选连线改目标；不可改名/删除）：'),
+      ...['PASS', 'FAIL'].map((name) => {
+        const result = (node.results ?? {})[name]
+        return result === undefined
+          ? h('div', { key: name }, `结果 "${name}" 缺失：PASS/FAIL 须成对声明，未修正时保存将被阻止`)
+          : h(ResultRow, {
+            key: `${flowId ?? '__main__'}:${nodeId}:${name}`,
+            flowId, nodeId, name, result, fixed: true,
+            returns: props.returns ?? [], nodeIds: props.nodeIds ?? [],
+            onApply: (fid, n, patch) => props.onApplyResult(fid, nodeId, n, patch),
+            busy: props.busy,
+          })
+      }),
+    ),
+    h('button', { onClick: () => props.onDelete(flowId), disabled: props.busy }, '删除节点'),
+  )
+}
+
+/** 单个命名结果行：本地缓冲 criteria/目标/改名，应用时一次性 patch（fixed 隐藏改名删除）。 */
 function ResultRow(props) {
   const { flowId, nodeId, name, result } = props
   const initialKind = result?.target?.node !== undefined ? 'node' : 'return'
@@ -1048,9 +1281,11 @@ function ResultRow(props) {
       }),
       disabled: props.busy,
     }, '应用'),
-    h('input', { value: rename, onChange: (event) => setRename(event.target.value), disabled: props.busy }),
-    h('button', { onClick: () => props.onRename(flowId, name, rename), disabled: props.busy }, '改名'),
-    h('button', { onClick: () => props.onDelete(flowId, name), disabled: props.busy }, '删除'),
+    props.fixed === true ? null : h('div', { className: 'wf-result-rename' },
+      h('input', { value: rename, onChange: (event) => setRename(event.target.value), disabled: props.busy }),
+      h('button', { onClick: () => props.onRename(flowId, name, rename), disabled: props.busy }, '改名'),
+      h('button', { onClick: () => props.onDelete(flowId, name), disabled: props.busy }, '删除'),
+    ),
   )
 }
 

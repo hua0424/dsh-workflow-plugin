@@ -11,6 +11,7 @@ import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import { parseCatalogConfig } from '../catalog/parse.ts'
 import { parseWorkflowConfig } from '../catalog/schema.ts'
 import { validateAndNormalize } from '../catalog/validate.ts'
+import { BUILTIN_PROGRAM_METADATA } from '../programs/metadata.ts'
 import { ID_PATTERN } from '../types.ts'
 import { findDirectSelfLoops, serializeConfig } from './draft.ts'
 import { emptyLayout, fillMissingPositions, parseLayoutFile, type EditorLayout } from './layout.ts'
@@ -147,6 +148,15 @@ export function rpcResolveLayout(configJson: unknown, layoutText?: string): Edit
   return { ok: true, value: { layout, warnings, filled } }
 }
 
+/**
+ * T4（#163）程序元数据：固定 Program 的 id/描述/参数合同单源直出
+ * （与静态校验、Runtime 参数校验同源；纯 JSON，无密钥/路径）。
+ * 面板程序下拉与参数提示只读本端点，不硬编码第二份注册表。
+ */
+export function rpcProgramMetadata(): EditorRpcResult {
+  return { ok: true, value: { programs: structuredClone(BUILTIN_PROGRAM_METADATA) } }
+}
+
 /** 按 endpoint 分派（payload 只读文本/JSON；未知 endpoint 明确拒绝）。 */
 export function createEditorRpcHandler(): EditorRpcHandler {
   return async (endpoint, payload) => {
@@ -178,7 +188,10 @@ export function createEditorRpcHandler(): EditorRpcHandler {
       }
       return rpcResolveLayout(body['config'], layoutText as string | undefined)
     }
-    return fail('editor/unknown-endpoint', `未知 endpoint "${endpoint}"（仅支持 parse/validate/preview/layout）`)
+    if (endpoint === 'metadata') {
+      return rpcProgramMetadata()
+    }
+    return fail('editor/unknown-endpoint', `未知 endpoint "${endpoint}"（仅支持 parse/validate/preview/layout/metadata）`)
   }
 }
 
