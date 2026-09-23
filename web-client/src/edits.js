@@ -345,7 +345,7 @@ export function setJudgeDenyEdit(state, deny) {
  * T3（#162）新建流程与 Actor 结果路由编辑镜像：与服务端 `src/editor/draft.ts`
  * 同语义（本地守卫一致，完整语义走服务端 validate RPC）。节点新增同时补
  * positions 坐标并置 dirtyLayout；布局键按主/子流程隔离。删除/改名不静默
- * 修补，悬空引用由保存前校验诊断。Program/Child 节点拒绝编辑，字段不丢失。
+ * 修补，悬空引用由保存前校验诊断。Program/Child 节点拒绝 Actor 结果编辑，字段不丢失。
  * ------------------------------------------------------------------ */
 
 /** 当前支持的 checker（与服务端 BUILTIN_CHECKER_IDS 同源；对等测试钉住）。 */
@@ -460,7 +460,7 @@ function actorNodeOfEdit(flowDef, nodeId) {
   const node = (flowDef.nodes ?? {})[nodeId]
   if (node === undefined) return { error: `节点 "${nodeId}" 在本流程中不存在` }
   if (node.execution?.type !== 'actor-task') {
-    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不是 Actor 节点（Program 请用 Program 配置编辑，Child 留给 T5）` }
+    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不是 Actor 节点（Program 请用 Program 配置编辑，Child 请用子流程与返回映射编辑）` }
   }
   return { node }
 }
@@ -478,7 +478,7 @@ function withDraftHistory(state) {
 export function addActorNodeEdit(state, flowId, nodeId, fields) {
   if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
   const flowDef = flowDefOf(state.draft, flowId)
-  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（子流程定义的新增留给 T5）` }
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（新建子流程请用子流程管理）` }
   if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
   if (Object.prototype.hasOwnProperty.call(flowDef.nodes ?? {}, nodeId)) {
     return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
@@ -834,7 +834,7 @@ function programNodeOfEdit(flowDef, nodeId) {
   const node = (flowDef.nodes ?? {})[nodeId]
   if (node === undefined) return { error: `节点 "${nodeId}" 在本流程中不存在` }
   if (node.execution?.type !== 'builtin-program') {
-    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不是 Program 节点（Actor 请用结果路由编辑，Child 留给 T5）` }
+    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不是 Program 节点（Actor 请用结果路由编辑，Child 请用子流程与返回映射编辑）` }
   }
   return { node }
 }
@@ -882,7 +882,7 @@ function programConfigSizeError(config) {
 export function addProgramNodeEdit(state, flowId, nodeId, fields, programCatalog) {
   if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
   const flowDef = flowDefOf(state.draft, flowId)
-  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（子流程定义的新增留给 T5）` }
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（新建子流程请用子流程管理）` }
   if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
   if (Object.prototype.hasOwnProperty.call(flowDef.nodes ?? {}, nodeId)) {
     return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
@@ -1034,5 +1034,253 @@ export function setProgramResultEdit(state, flowId, nodeId, name, patch) {
   }
   const { withHistory, draft } = withDraftHistory(state)
   ;(flowId === null ? draft.workflow : draft.childWorkflows[flowId]).nodes[nodeId].results[name] = { criteria: nextCriteria, target: nextTarget }
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/* ------------------------------------------------------------------ *
+ * T5（#164）子流程与返回映射编辑镜像：与服务端 `src/editor/draft.ts`
+ * 同语义（本地守卫一致，完整语义走服务端 validate RPC）。子流程增删改名
+ * 同步调用方与 positions 坐标表；Child 只引用本文件子流程；onReturn 键
+ * 创建时一次配齐，换被调用方保留原映射，单键设置兼做增键、undefined 删键。
+ * ------------------------------------------------------------------ */
+
+/** 最小合法子流程起点（与服务端 minimalFlowDef 同形状；对等测试钉住）。 */
+export function minimalFlowDefOf() {
+  return {
+    startNode: 'main',
+    returns: ['done'],
+    nodes: {
+      main: {
+        execution: { type: 'actor-task', role: 'manager', instruction: '统筹本工作流：拆解任务并组织后续节点。' },
+        checker: { checkerId: 'judge.claim-correct', config: {} },
+        results: {
+          done: { criteria: '工作流目标已达成。', target: { return: 'done' } },
+        },
+      },
+    },
+  }
+}
+
+function childNodeOfEdit(flowDef, nodeId) {
+  const node = (flowDef.nodes ?? {})[nodeId]
+  if (node === undefined) return { error: `节点 "${nodeId}" 在本流程中不存在` }
+  if (node.execution?.type !== 'child-workflow') {
+    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不是 Child 节点（Actor 请用结果路由编辑，Program 请用 Program 配置编辑；其字段保持不丢失）` }
+  }
+  return { node }
+}
+
+function childCallGraphOf(draft, workflowId) {
+  const graph = {}
+  const put = (key, def) => {
+    graph[key] = []
+    for (const node of Object.values(def.nodes ?? {})) {
+      if (node.execution?.type === 'child-workflow') graph[key].push(node.execution.workflowId)
+    }
+  }
+  put(workflowId, draft.workflow)
+  for (const [id, def] of Object.entries(draft.childWorkflows ?? {})) put(id, def)
+  return graph
+}
+
+function childReachesEdit(draft, workflowId, from, target) {
+  const graph = childCallGraphOf(draft, workflowId)
+  const seen = new Set()
+  const stack = [from]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    if (current === target) return true
+    if (seen.has(current)) continue
+    seen.add(current)
+    for (const next of graph[current] ?? []) stack.push(next)
+  }
+  return false
+}
+
+function childCalleeError(draft, workflowId, callerKey, callee) {
+  if (typeof callee !== 'string' || !ID_PATTERN.test(callee)) {
+    return `子流程 "${String(callee)}" 不是合法小写 [a-z][a-z0-9-]* 标识符`
+  }
+  if ((draft.childWorkflows ?? {})[callee] === undefined) {
+    return `子流程 "${callee}" 不存在（Child 只引用本文件允许的子流程，不支持外部文件调用，也不允许调用 root；新建子流程请用子流程管理）`
+  }
+  if (callee === callerKey) {
+    return `子流程 "${callee}" 不能调用自身（直接递归拒绝，不改变 Runtime 递归合同）`
+  }
+  if (childReachesEdit(draft, workflowId, callee, callerKey)) {
+    return `调用子流程 "${callee}" 将形成调用环（间接递归拒绝，不改变 Runtime 递归合同）`
+  }
+  return undefined
+}
+
+/** 新增子流程（最小合法起点；入口节点同步补 positions 坐标）。 */
+export function addSubflowEdit(state, flowId) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  if (!ID_PATTERN.test(flowId)) return { ok: false, reason: `子流程 id "${flowId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (flowId === state.workflowId) {
+    return { ok: false, reason: `子流程 "${flowId}" 与主流程 id 相同（Child 不能调用 root，同名将致校验歧义）` }
+  }
+  if ((state.draft.childWorkflows ?? {})[flowId] !== undefined) {
+    return { ok: false, reason: `子流程 "${flowId}" 已存在（重命名请使用改名操作）` }
+  }
+  const { withHistory, draft, positions } = withDraftHistory(state)
+  draft.childWorkflows ??= {}
+  draft.childWorkflows[flowId] = minimalFlowDefOf()
+  ;(positions.children[flowId] ??= {}).main = gridPositionOf(0)
+  return { ok: true, state: { ...withHistory, draft, positions, dirtyBusiness: true, dirtyLayout: true, saveResult: null } }
+}
+
+/** 子流程改名：同步全部调用方与 positions 坐标表。 */
+export function renameSubflowEdit(state, oldId, newId) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const table = state.draft.childWorkflows ?? {}
+  if (table[oldId] === undefined) return { ok: false, reason: `子流程 "${oldId}" 不存在` }
+  if (oldId === newId) return { ok: true, noop: true, updated: 0, state }
+  if (!ID_PATTERN.test(newId)) return { ok: false, reason: `子流程 id "${newId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (newId === state.workflowId) {
+    return { ok: false, reason: `子流程 "${newId}" 与主流程 id 相同（Child 不能调用 root）` }
+  }
+  if (table[newId] !== undefined) return { ok: false, reason: `子流程 "${newId}" 已存在` }
+  const { withHistory, draft, positions } = withDraftHistory(state)
+  draft.childWorkflows[newId] = draft.childWorkflows[oldId]
+  delete draft.childWorkflows[oldId]
+  let updated = 0
+  for (const flow of [draft.workflow, ...Object.values(draft.childWorkflows ?? {})]) {
+    for (const node of Object.values(flow.nodes ?? {})) {
+      if (node.execution?.type === 'child-workflow' && node.execution?.workflowId === oldId) {
+        node.execution.workflowId = newId
+        updated++
+      }
+    }
+  }
+  let movedLayout = false
+  if (positions.children[oldId] !== undefined) {
+    positions.children[newId] = positions.children[oldId]
+    delete positions.children[oldId]
+    movedLayout = true
+  }
+  return { ok: true, updated, state: { ...withHistory, draft, positions, dirtyBusiness: true, dirtyLayout: movedLayout ? true : withHistory.dirtyLayout, saveResult: null } }
+}
+
+/** 子流程调用方位置（删除前提示用）。 */
+export function findSubflowCallersEdit(draft, flowId) {
+  const callers = []
+  const flows = [{ id: null, def: draft.workflow }]
+  for (const [id, def] of Object.entries(draft.childWorkflows ?? {})) flows.push({ id, def })
+  for (const flow of flows) {
+    for (const [nodeId, node] of Object.entries(flow.def.nodes ?? {})) {
+      if (node.execution?.type === 'child-workflow' && node.execution?.workflowId === flowId) {
+        callers.push({ flowId: flow.id, node: nodeId })
+      }
+    }
+  }
+  return callers
+}
+
+/** 删除子流程（调用方引用保留悬空，由保存前校验诊断；坐标表随定义移除）。 */
+export function deleteSubflowEdit(state, flowId) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  if ((state.draft.childWorkflows ?? {})[flowId] === undefined) {
+    return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  }
+  const { withHistory, draft, positions } = withDraftHistory(state)
+  delete draft.childWorkflows[flowId]
+  let removedLayout = false
+  if (positions.children[flowId] !== undefined) {
+    delete positions.children[flowId]
+    removedLayout = true
+  }
+  return { ok: true, state: { ...withHistory, draft, positions, dirtyBusiness: true, dirtyLayout: removedLayout ? true : withHistory.dirtyLayout, saveResult: null } }
+}
+
+/** 新增 Child 节点（返回映射一次配齐；简单网格摆放）。 */
+export function addChildNodeEdit(state, flowId, nodeId, fields) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const flowDef = flowDefOf(state.draft, flowId)
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（新建子流程请用子流程管理）` }
+  if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(flowDef.nodes ?? {}, nodeId)) {
+    return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
+  }
+  const callerKey = flowId === null ? state.workflowId : flowId
+  const badCallee = childCalleeError(state.draft, state.workflowId, callerKey, fields.workflowId)
+  if (badCallee !== undefined) return { ok: false, reason: badCallee }
+  const calleeDef = state.draft.childWorkflows[fields.workflowId]
+  if (fields.targets === null || typeof fields.targets !== 'object' || Array.isArray(fields.targets)) {
+    return { ok: false, reason: 'Child 返回映射须为对象（键为被调用流程的返回名，值为本流程目标）' }
+  }
+  const expected = [...(calleeDef.returns ?? [])].sort()
+  const given = Object.keys(fields.targets).sort()
+  const missing = expected.filter((name) => !given.includes(name))
+  if (missing.length > 0) {
+    return { ok: false, reason: `返回映射缺少返回 ${missing.join('、')} 的目标（创建时须一次配齐，不静默猜测目标）` }
+  }
+  const extra = given.filter((name) => !expected.includes(name))
+  if (extra.length > 0) {
+    return { ok: false, reason: `返回映射多了未知返回 ${extra.join('、')}（须与子流程 "${fields.workflowId}" 的 returns 精确匹配）` }
+  }
+  const onReturn = {}
+  for (const name of expected) {
+    const checked = flowTargetError(flowDef, fields.targets[name], nodeId)
+    if (checked.error !== undefined) return { ok: false, reason: checked.error }
+    onReturn[name] = checked.value
+  }
+  const { withHistory, draft, positions } = withDraftHistory(state)
+  const flow = flowId === null ? draft.workflow : draft.childWorkflows[flowId]
+  flow.nodes[nodeId] = { execution: { type: 'child-workflow', workflowId: fields.workflowId }, onReturn }
+  const table = flowId === null ? positions.main : (positions.children[flowId] ??= {})
+  table[nodeId] = gridPositionOf(Object.keys(flow.nodes).length - 1)
+  return { ok: true, state: { ...withHistory, draft, positions, dirtyBusiness: true, dirtyLayout: true, saveResult: null } }
+}
+
+/** 修改 Child 调用的子流程（onReturn 原样保留，错配由保存前校验诊断）。 */
+export function setChildWorkflowIdEdit(state, flowId, nodeId, callee) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const flowDef = flowDefOf(state.draft, flowId)
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = childNodeOfEdit(flowDef, nodeId)
+  if (found.error !== undefined) return { ok: false, reason: found.error }
+  const callerKey = flowId === null ? state.workflowId : flowId
+  const badCallee = childCalleeError(state.draft, state.workflowId, callerKey, callee)
+  if (badCallee !== undefined) return { ok: false, reason: badCallee }
+  if (found.node.execution.workflowId === callee) return { ok: true, noop: true, state }
+  const { withHistory, draft } = withDraftHistory(state)
+  ;(flowId === null ? draft.workflow : draft.childWorkflows[flowId]).nodes[nodeId].execution.workflowId = callee
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/** 设置/删除单个返回映射（target === undefined = 删除该键）。 */
+export function setChildReturnTargetEdit(state, flowId, nodeId, returnName, target) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const flowDef = flowDefOf(state.draft, flowId)
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = childNodeOfEdit(flowDef, nodeId)
+  if (found.error !== undefined) return { ok: false, reason: found.error }
+  const calleeDef = (state.draft.childWorkflows ?? {})[found.node.execution?.workflowId]
+  if (calleeDef === undefined) {
+    return { ok: false, reason: `节点 "${nodeId}" 调用的子流程 "${found.node.execution?.workflowId}" 不存在：先修正调用目标，再编辑返回映射` }
+  }
+  if (!ID_PATTERN.test(returnName)) {
+    return { ok: false, reason: `返回名 "${returnName}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  }
+  if (target === undefined) {
+    if (!Object.prototype.hasOwnProperty.call(found.node.onReturn ?? {}, returnName)) {
+      return { ok: false, reason: `节点 "${nodeId}" 返回映射 "${returnName}" 不存在（无可删除内容）` }
+    }
+    const { withHistory, draft } = withDraftHistory(state)
+    delete (flowId === null ? draft.workflow : draft.childWorkflows[flowId]).nodes[nodeId].onReturn[returnName]
+    return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+  }
+  if (!(calleeDef.returns ?? []).includes(returnName)) {
+    return { ok: false, reason: `返回 "${returnName}" 未在子流程 "${found.node.execution?.workflowId}" 声明（映射键须与被调用流程 returns 精确匹配）` }
+  }
+  const checked = flowTargetError(flowDef, target, nodeId)
+  if (checked.error !== undefined) return { ok: false, reason: checked.error }
+  const current = (found.node.onReturn ?? {})[returnName]
+  if (current !== undefined && JSON.stringify(current) === JSON.stringify(checked.value)) {
+    return { ok: true, noop: true, state }
+  }
+  const { withHistory, draft } = withDraftHistory(state)
+  ;(flowId === null ? draft.workflow : draft.childWorkflows[flowId]).nodes[nodeId].onReturn[returnName] = checked.value
   return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
 }
