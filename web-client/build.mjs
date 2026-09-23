@@ -72,7 +72,7 @@ return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage };
 })();
 var __edits = (function () {
 ${edits}
-return { HISTORY_LIMIT, ID_PATTERN, layoutFilenameFor, clone, isDirty, savePlanOf, snapshotOf, pushHistory, applyPersonaEdit, moveNodeEdit, undoEdit, redoEdit };
+return { HISTORY_LIMIT, ID_PATTERN, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, layoutFilenameFor, clone, isDirty, savePlanOf, snapshotOf, pushHistory, applyPersonaEdit, moveNodeEdit, undoEdit, redoEdit, addRoleEdit, setRolePersonaEdit, setRoleModelEdit, setRoleReuseEdit, setRoleDenyEdit, renameRoleEdit, deleteRoleEdit, findRoleRefs, setJudgePersonaEdit, setJudgeModelEdit, setJudgeDenyEdit };
 })();
 var __panel = (function () {
 ${panel}

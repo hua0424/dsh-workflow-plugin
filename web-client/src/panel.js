@@ -1,13 +1,15 @@
 /**
- * T1 配置编辑面板（React plain-JS，无 JSX 工具链依赖；画布为最小占位实现）。
+ * 配置编辑面板（React plain-JS，无 JSX 工具链依赖；画布为最小占位实现）。
  *
- * 范围（#160 T1）：打开授权目录 → 选 YAML → 自动关联布局 → 编辑公共
- * actorCommonPersona → 切换主/子流程查看并移动节点位置 → 只读预览 →
- * 校验后显式保存 → 分别报告 YAML/布局写入结果。
+ * 范围（T2 #161 在 T1 闭环上追加）：打开授权目录 → 选 YAML → 自动关联布局 →
+ * 编辑公共 actorCommonPersona、角色表（增删改名）、judgeRole（无复用）与模型
+ * （provider/modelId/可选 reasoningEffort 三态）→ 切换主/子流程查看并移动节点
+ * 位置 → 只读预览 → 校验后显式保存 → 分别报告 YAML/布局写入结果。
  *
- * 不做：新建配置（T3）、角色/Judge/模型表单（T2）、Program（T4）、Child 映射（T5）、
- * 拓扑增删（均后票）。画布节点拖动用指针事件最小实现；React Flow 画布替换见 README
- * pending（本票不引入 reactflow 打包，保持 bundle 零第三方）。
+ * 不做：新建配置（T3）、Program（T4）、Child 映射（T5）、拓扑增删（均后票）。
+ * 画布节点拖动用指针事件最小实现；React Flow 画布替换见 README pending
+ * （本票不引入 reactflow 打包，保持 bundle 零第三方）。
+ * 不提供运行控制；保存成功只报告文件写入，不描述模型可用或可启动。
  *
  * 业务校验与布局规则全部走服务端 RPC（src/editor/* 单源），浏览器不复制规则。
  * 面板编辑变迁（历史/脏标记/保存计划）唯一来源为同目录 `edits.js`
@@ -16,11 +18,58 @@
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { callEditor, rpcErrorMessage } from './rpc.js'
 import {
-  applyPersonaEdit, ID_PATTERN, isDirty, layoutFilenameFor, moveNodeEdit, redoEdit, savePlanOf, undoEdit,
+  addRoleEdit, applyPersonaEdit, deleteRoleEdit, findRoleRefs, ID_PATTERN, isDirty,
+  layoutFilenameFor, moveNodeEdit, redoEdit, renameRoleEdit, savePlanOf,
+  setJudgeDenyEdit, setJudgeModelEdit, setJudgePersonaEdit, setRoleDenyEdit,
+  setRoleModelEdit, setRolePersonaEdit, setRoleReuseEdit, undoEdit,
 } from './edits.js'
+
+/** deny 文本框解析：逗号/顿号/换行分隔，逐项 trim（空白项保留，由 edits 守卫明确拒绝）。 */
+function parseDenyText(text) {
+  return text.split(/[,，、\n]/).map((entry) => entry.trim())
+}
+
+/** 模型表单 → edits 输入：档位空白即省略该键（显式模型但未设档位）。 */
+function modelInputOf(form) {
+  return {
+    provider: form.provider,
+    modelId: form.modelId,
+    reasoningEffort: form.effort.trim() === '' ? undefined : form.effort,
+  }
+}
 
 function workflowIdOf(yamlName) {
   return yamlName.endsWith('.yaml') ? yamlName.slice(0, -'.yaml'.length) : yamlName
+}
+
+/** deny 列表 → 文本框（逗号分隔；缺席即空框，应用空框由守卫拒绝，清除请用清除按钮）。 */
+function denyTextOf(deny) {
+  return (deny ?? []).join(', ')
+}
+
+function roleFormOf(draft, sel) {
+  const role = (draft.roles ?? {})[sel]
+  return {
+    sel,
+    rename: sel,
+    persona: role?.persona ?? '',
+    provider: role?.model?.provider ?? '',
+    modelId: role?.model?.modelId ?? '',
+    effort: role?.model?.reasoningEffort ?? '',
+    reuse: role?.reuse ?? 'node',
+    deny: denyTextOf(role?.tools?.deny),
+  }
+}
+
+function judgeFormOf(draft) {
+  const judge = draft.judgeRole
+  return {
+    persona: judge.persona ?? '',
+    provider: judge.model?.provider ?? '',
+    modelId: judge.model?.modelId ?? '',
+    effort: judge.model?.reasoningEffort ?? '',
+    deny: denyTextOf(judge.tools?.deny),
+  }
 }
 
 function targetLabel(target) {
@@ -109,6 +158,11 @@ export function WorkflowConfigEditorPanel(props) {
   const [state, setState] = useState(initialState)
   const [flow, setFlow] = useState(null)
   const dragRef = useRef(null)
+  // T2 表单缓冲（纯输入态，非业务模型；业务唯一来源仍是 state.draft，经 edits.js 变更）。
+  const [newRole, setNewRole] = useState({ id: '', persona: '' })
+  const [roleForm, setRoleForm] = useState({ sel: '', rename: '', persona: '', provider: '', modelId: '', effort: '', reuse: 'node', deny: '' })
+  const [judgeForm, setJudgeForm] = useState({ persona: '', provider: '', modelId: '', effort: '', deny: '' })
+  const lastSyncedFile = useRef(null)
 
   const dirty = isDirty(state)
   useEffect(() => {
@@ -209,6 +263,32 @@ export function WorkflowConfigEditorPanel(props) {
     setState((prev) => ({ ...prev, preview: previewed.value }))
   }, [call])
 
+  // 切换文件时用草稿重建表单缓冲（文件内编辑不回写缓冲，输入态不受覆盖）。
+  useEffect(() => {
+    if (state.selected === null || state.draft === null || lastSyncedFile.current === state.selected) return
+    lastSyncedFile.current = state.selected
+    const ids = Object.keys(state.draft.roles ?? {})
+    setRoleForm(roleFormOf(state.draft, ids[0] ?? ''))
+    setJudgeForm(judgeFormOf(state.draft))
+    setNewRole({ id: '', persona: '' })
+  }, [state.selected, state.draft])
+
+  /** edits 结果统一处理：失败入 problems；成功换草稿并刷新只读预览（同一草稿源）。 */
+  const runEdit = useCallback(async (result, after) => {
+    if (!result.ok) {
+      setState((prev) => ({ ...prev, problems: [result.reason] }))
+      return
+    }
+    if (result.noop === true) return
+    setState(result.state)
+    if (after !== undefined) after(result)
+    await refreshPreview(result.state.draft)
+  }, [refreshPreview])
+
+  const syncRoleForm = useCallback((draft, sel) => {
+    setRoleForm(roleFormOf(draft, sel))
+  }, [])
+
   const applyPersona = useCallback(async (clear) => {
     if (state.draft === null) return
     const edited = applyPersonaEdit(state, clear)
@@ -222,8 +302,111 @@ export function WorkflowConfigEditorPanel(props) {
     await refreshPreview(edited.state.draft)
   }, [state, refreshPreview])
 
-  const moveNode = useCallback((flowId, nodeId, pos) => {
-    setState((prev) => {
+  /* T2 角色/Judge/模型表单回调（同一草稿 + 同一撤销/预览通道）。 */
+  const addNewRole = useCallback(async () => {
+    const id = newRole.id.trim()
+    await runEdit(addRoleEdit(state, id, { persona: newRole.persona }), (result) => {
+      syncRoleForm(result.state.draft, id)
+      setNewRole({ id: '', persona: '' })
+    })
+  }, [state, newRole, runEdit, syncRoleForm])
+
+  const selectRole = useCallback((id) => {
+    setRoleForm((prev) => (state.draft === null ? prev : roleFormOf(state.draft, id)))
+  }, [state.draft])
+
+  const renameSelectedRole = useCallback(async () => {
+    const next = roleForm.rename.trim()
+    await runEdit(renameRoleEdit(state, roleForm.sel, next), (result) => {
+      syncRoleForm(result.state.draft, next)
+    })
+  }, [state, roleForm, runEdit, syncRoleForm])
+
+  const applyRolePersona = useCallback(async () => {
+    const sel = roleForm.sel
+    await runEdit(setRolePersonaEdit(state, sel, roleForm.persona), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm, runEdit, syncRoleForm])
+
+  const applyRoleReuse = useCallback(async (reuse) => {
+    const sel = roleForm.sel
+    await runEdit(setRoleReuseEdit(state, sel, reuse), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm.sel, runEdit, syncRoleForm])
+
+  const applyRoleModel = useCallback(async () => {
+    const sel = roleForm.sel
+    await runEdit(setRoleModelEdit(state, sel, modelInputOf(roleForm)), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm, runEdit, syncRoleForm])
+
+  const clearRoleModel = useCallback(async () => {
+    const sel = roleForm.sel
+    await runEdit(setRoleModelEdit(state, sel, undefined), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm.sel, runEdit, syncRoleForm])
+
+  const applyRoleDeny = useCallback(async () => {
+    const sel = roleForm.sel
+    await runEdit(setRoleDenyEdit(state, sel, parseDenyText(roleForm.deny)), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm, runEdit, syncRoleForm])
+
+  const clearRoleDeny = useCallback(async () => {
+    const sel = roleForm.sel
+    await runEdit(setRoleDenyEdit(state, sel, undefined), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm.sel, runEdit, syncRoleForm])
+
+  const deleteSelectedRole = useCallback(async () => {
+    const key = roleForm.sel
+    const refs = state.draft === null ? [] : findRoleRefs(state.draft, key)
+    if (!window.confirm(refs.length > 0
+      ? `角色 "${key}" 仍有 ${refs.length} 处 Actor 引用，删除后保存将被阻止（须先修正引用）。继续删除吗？`
+      : `删除角色 "${key}" 吗？`)) return
+    await runEdit(deleteRoleEdit(state, key), (result) => {
+      const ids = Object.keys(result.state.draft.roles ?? {})
+      syncRoleForm(result.state.draft, ids[0] ?? '')
+    })
+  }, [state, roleForm.sel, runEdit, syncRoleForm])
+
+  const applyJudgePersona = useCallback(async () => {
+    await runEdit(setJudgePersonaEdit(state, judgeForm.persona), (result) => {
+      setJudgeForm(judgeFormOf(result.state.draft))
+    })
+  }, [state, judgeForm, runEdit])
+
+  const applyJudgeModel = useCallback(async () => {
+    await runEdit(setJudgeModelEdit(state, modelInputOf(judgeForm)), (result) => {
+      setJudgeForm(judgeFormOf(result.state.draft))
+    })
+  }, [state, judgeForm, runEdit])
+
+  const clearJudgeModel = useCallback(async () => {
+    await runEdit(setJudgeModelEdit(state, undefined), (result) => {
+      setJudgeForm(judgeFormOf(result.state.draft))
+    })
+  }, [state, runEdit])
+
+  const applyJudgeDeny = useCallback(async () => {
+    await runEdit(setJudgeDenyEdit(state, parseDenyText(judgeForm.deny)), (result) => {
+      setJudgeForm(judgeFormOf(result.state.draft))
+    })
+  }, [state, judgeForm, runEdit])
+
+  const clearJudgeDeny = useCallback(async () => {
+    await runEdit(setJudgeDenyEdit(state, undefined), (result) => {
+      setJudgeForm(judgeFormOf(result.state.draft))
+    })
+  }, [state, runEdit])
+
+  const moveNode = useCallback((flowId, nodeId, pos) => {    setState((prev) => {
       const edited = moveNodeEdit(prev, flowId, nodeId, pos)
       if (!edited.ok || edited.noop === true) return prev
       return edited.state
@@ -304,7 +487,7 @@ export function WorkflowConfigEditorPanel(props) {
     : (activeFlow.id === null ? state.positions.main : (state.positions.children[activeFlow.id] ?? {}))
 
   return h('div', { className: 'wf-editor' },
-    h('h2', null, '工作流配置编辑器（T1 最小闭环）'),
+    h('h2', null, '工作流配置编辑器'),
     capError !== null ? h('div', { className: 'wf-error', role: 'alert' }, capError) : null,
     h('div', { className: 'wf-toolbar' },
       h('button', { onClick: openDirectory, disabled: state.busy }, '打开目录'),
@@ -339,6 +522,18 @@ export function WorkflowConfigEditorPanel(props) {
         h('button', { onClick: () => applyPersona(false), disabled: state.busy }, '应用'),
         h('button', { onClick: () => applyPersona(true), disabled: state.busy }, '清除'),
       ),
+      h(RoleSection, {
+        draft, roleForm, setRoleForm, newRole, setNewRole,
+        onAdd: addNewRole, onSelect: selectRole, onRename: renameSelectedRole,
+        onPersona: applyRolePersona, onReuse: applyRoleReuse, onModel: applyRoleModel,
+        onClearModel: clearRoleModel, onDeny: applyRoleDeny, onClearDeny: clearRoleDeny,
+        onDelete: deleteSelectedRole, busy: state.busy,
+      }),
+      h(JudgeSection, {
+        draft, judgeForm, setJudgeForm,
+        onPersona: applyJudgePersona, onModel: applyJudgeModel, onClearModel: clearJudgeModel,
+        onDeny: applyJudgeDeny, onClearDeny: clearJudgeDeny, busy: state.busy,
+      }),
       flows.length > 0 ? h('div', { className: 'wf-flows' },
         ...flows.map((f) => h('button', {
           key: f.id ?? '__main__',
@@ -365,6 +560,108 @@ export function WorkflowConfigEditorPanel(props) {
         h('div', null, '（两文件不承诺原子性；失败部分保留未保存状态，可重试）'),
       ) : null,
     ) : null,
+  )
+}
+
+/**
+ * T2 角色区：角色不是画布执行节点，只在此表单维护。
+ * 全部经 edits.js 作用于同一草稿；改名同步更新 Actor 引用，删除保留悬空引用
+ * （保存前校验诊断并阻止，未修正时 problems 明确报错）。
+ */
+function RoleSection(props) {
+  const { draft, roleForm, setRoleForm, newRole, setNewRole } = props
+  const setField = (field) => (event) => setRoleForm((prev) => ({ ...prev, [field]: event.target.value }))
+  const roleIds = Object.keys(draft.roles ?? {})
+  const selected = (draft.roles ?? {})[roleForm.sel]
+  const refs = roleForm.sel === '' ? [] : findRoleRefs(draft, roleForm.sel)
+  return h('div', { className: 'wf-roles' },
+    h('h3', null, '角色（非画布节点）'),
+    h('div', { className: 'wf-role-new' },
+      h('label', null, '新增角色 id'),
+      h('input', { value: newRole.id, onChange: (event) => setNewRole((prev) => ({ ...prev, id: event.target.value })) }),
+      h('label', null, 'persona'),
+      h('input', { value: newRole.persona, onChange: (event) => setNewRole((prev) => ({ ...prev, persona: event.target.value })) }),
+      h('button', { onClick: props.onAdd, disabled: props.busy }, '新增角色'),
+    ),
+    roleIds.length > 0 ? h('div', { className: 'wf-role-list' },
+      h('span', null, '角色：'),
+      ...roleIds.map((id) => h('button', {
+        key: id,
+        onClick: () => props.onSelect(id),
+        disabled: props.busy || id === roleForm.sel,
+      }, id)),
+    ) : h('div', null, '（暂无角色，请新增）'),
+    selected === undefined ? null : h('div', { className: 'wf-role-card' },
+      h('div', null, `当前：${roleForm.sel}（被 ${refs.length} 处 Actor 引用；改名同步更新，删除后保存将被阻止）`),
+      h('div', null,
+        h('label', null, '改名'),
+        h('input', { value: roleForm.rename, onChange: setField('rename') }),
+        h('button', { onClick: props.onRename, disabled: props.busy }, '改名'),
+      ),
+      h('div', null,
+        h('label', null, 'persona'),
+        h('textarea', { value: roleForm.persona, rows: 2, onChange: setField('persona') }),
+        h('button', { onClick: props.onPersona, disabled: props.busy }, '应用'),
+      ),
+      h('div', null,
+        h('label', null, '复用粒度 reuse（省略 = node）'),
+        h('select', {
+          value: roleForm.reuse,
+          onChange: (event) => props.onReuse(event.target.value),
+          disabled: props.busy,
+        },
+          h('option', { value: 'node' }, 'node'),
+          h('option', { value: 'continuable' }, 'continuable'),
+        ),
+      ),
+      h('div', null,
+        h('label', null, '模型 provider（省略整模型请用清除按钮）'),
+        h('input', { value: roleForm.provider, onChange: setField('provider') }),
+        h('label', null, 'modelId'),
+        h('input', { value: roleForm.modelId, onChange: setField('modelId') }),
+        h('label', null, 'reasoningEffort（留空=显式模型但未设档位，不硬编码枚举）'),
+        h('input', { value: roleForm.effort, onChange: setField('effort') }),
+        h('button', { onClick: props.onModel, disabled: props.busy }, '应用模型'),
+        h('button', { onClick: props.onClearModel, disabled: props.busy }, '清除模型'),
+      ),
+      h('div', null,
+        h('label', null, 'tools.deny（逗号分隔；省略请用清除按钮）'),
+        h('input', { value: roleForm.deny, onChange: setField('deny') }),
+        h('button', { onClick: props.onDeny, disabled: props.busy }, '应用'),
+        h('button', { onClick: props.onClearDeny, disabled: props.busy }, '清除'),
+      ),
+      h('button', { onClick: props.onDelete, disabled: props.busy }, '删除角色'),
+    ),
+  )
+}
+
+/** T2 Judge 区：persona/可选模型/tools.deny，不提供 reuse。 */
+function JudgeSection(props) {
+  const { judgeForm, setJudgeForm } = props
+  const setField = (field) => (event) => setJudgeForm((prev) => ({ ...prev, [field]: event.target.value }))
+  return h('div', { className: 'wf-judge' },
+    h('h3', null, 'Judge（无复用配置；必需工具保护由服务端校验）'),
+    h('div', null,
+      h('label', null, 'persona'),
+      h('textarea', { value: judgeForm.persona, rows: 2, onChange: setField('persona') }),
+      h('button', { onClick: props.onPersona, disabled: props.busy }, '应用'),
+    ),
+    h('div', null,
+      h('label', null, '模型 provider（省略整模型请用清除按钮）'),
+      h('input', { value: judgeForm.provider, onChange: setField('provider') }),
+      h('label', null, 'modelId'),
+      h('input', { value: judgeForm.modelId, onChange: setField('modelId') }),
+      h('label', null, 'reasoningEffort（留空=显式模型但未设档位）'),
+      h('input', { value: judgeForm.effort, onChange: setField('effort') }),
+      h('button', { onClick: props.onModel, disabled: props.busy }, '应用模型'),
+      h('button', { onClick: props.onClearModel, disabled: props.busy }, '清除模型'),
+    ),
+    h('div', null,
+      h('label', null, 'tools.deny（逗号分隔；省略请用清除按钮）'),
+      h('input', { value: judgeForm.deny, onChange: setField('deny') }),
+      h('button', { onClick: props.onDeny, disabled: props.busy }, '应用'),
+      h('button', { onClick: props.onClearDeny, disabled: props.busy }, '清除'),
+    ),
   )
 }
 
