@@ -1,13 +1,13 @@
 /**
  * 配置编辑面板（React plain-JS，无 JSX 工具链依赖；画布为最小占位实现）。
  *
- * 范围（T2 #161 在 T1 闭环上追加）：打开授权目录 → 选 YAML → 自动关联布局 →
- * 编辑公共 actorCommonPersona、角色表（增删改名）、judgeRole（无复用）与模型
- * （provider/modelId/可选 reasoningEffort 三态）→ 切换主/子流程查看并移动节点
- * 位置 → 只读预览 → 校验后显式保存 → 分别报告 YAML/布局写入结果。
+ * 范围（T3 #162 在 T2 上追加）：新建合法 v3 配置（合法小写 .yaml 文件名、
+ * 最小 Manager 入口起点）→ 切换主/子流程 → 编辑入口 startNode 与 returns →
+ * Actor 节点新增/属性/改名/删除 → 命名结果 criteria/target 编辑 → 结果端口
+ * 点选连线改目标 → 只读预览 → 校验后显式保存 → 分别报告 YAML/布局写入结果。
  *
- * 不做：新建配置（T3）、Program（T4）、Child 映射（T5）、拓扑增删（均后票）。
- * 画布节点拖动用指针事件最小实现；React Flow 画布替换见 README pending
+ * 不做：Program（T4）、Child 映射与子流程定义增删（T5）。
+ * 画布节点拖动用指针事件最小实现，结果连线用“端口点选 + 目标点选”最小实现；
  * （本票不引入 reactflow 打包，保持 bundle 零第三方）。
  * 不提供运行控制；保存成功只报告文件写入，不描述模型可用或可启动。
  *
@@ -18,10 +18,13 @@
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { callEditor, rpcErrorMessage } from './rpc.js'
 import {
-  addRoleEdit, applyPersonaEdit, deleteRoleEdit, findRoleRefs, ID_PATTERN, isDirty,
-  layoutFilenameFor, moveNodeEdit, redoEdit, renameRoleEdit, savePlanOf,
-  setJudgeDenyEdit, setJudgeModelEdit, setJudgePersonaEdit, setRoleDenyEdit,
-  setRoleModelEdit, setRolePersonaEdit, setRoleReuseEdit, undoEdit,
+  addActorNodeEdit, addFlowReturnEdit, addNodeResultEdit, addRoleEdit, applyPersonaEdit,
+  deleteFlowReturnEdit, deleteNodeEdit, deleteNodeResultEdit, deleteRoleEdit, findNodeRefsEdit,
+  findRoleRefs, ID_PATTERN, isDirty, layoutFilenameFor, minimalConfigOf, moveNodeEdit,
+  parseNewFilenameEdit, redoEdit, renameFlowReturnEdit, renameNodeEdit, renameNodeResultEdit,
+  renameRoleEdit, savePlanOf, setActorFieldsEdit, setFlowStartNodeEdit, setJudgeDenyEdit,
+  setJudgeModelEdit, setJudgePersonaEdit, setNodeResultEdit, setRoleDenyEdit, setRoleModelEdit,
+  setRolePersonaEdit, setRoleReuseEdit, SUPPORTED_CHECKER_IDS, undoEdit,
 } from './edits.js'
 
 /** deny 文本框解析：逗号/顿号/换行分隔，逐项 trim（空白项保留，由 edits 守卫明确拒绝）。 */
@@ -70,6 +73,37 @@ function judgeFormOf(draft) {
     effort: judge.model?.reasoningEffort ?? '',
     deny: denyTextOf(judge.tools?.deny),
   }
+}
+
+/** 结果目标表单 → edits/server 输入（kind node/return 二选一，无自由表达式）。 */
+function targetOf(kind, value) {
+  return kind === 'node' ? { node: value.trim() } : { return: value.trim() }
+}
+
+/** Actor 节点编辑表单（选定节点+草稿 → 输入态；业务唯一来源仍是 state.draft）。 */
+function nodeEditFormOf(flowDef, nodeId) {
+  const node = (flowDef.nodes ?? {})[nodeId]
+  const execution = node?.execution ?? {}
+  return {
+    sel: nodeId,
+    rename: nodeId,
+    role: execution.role ?? 'manager',
+    instruction: execution.instruction ?? '',
+    checkerId: node?.checker?.checkerId ?? SUPPORTED_CHECKER_IDS[0],
+    common: node?.checker?.config?.criteria ?? '',
+  }
+}
+
+function emptyAddNodeForm(role) {
+  return {
+    id: '', role, instruction: '', checkerId: SUPPORTED_CHECKER_IDS[0], common: '',
+    resultName: 'ok', resultCriteria: '', targetKind: 'return', targetValue: '',
+  }
+}
+
+function emptyAddResultForm(flowDef) {
+  const firstNode = Object.keys(flowDef.nodes ?? {})[0] ?? ''
+  return { name: '', criteria: '', targetKind: 'node', targetValue: firstNode }
 }
 
 function targetLabel(target) {
@@ -162,6 +196,17 @@ export function WorkflowConfigEditorPanel(props) {
   const [newRole, setNewRole] = useState({ id: '', persona: '' })
   const [roleForm, setRoleForm] = useState({ sel: '', rename: '', persona: '', provider: '', modelId: '', effort: '', reuse: 'node', deny: '' })
   const [judgeForm, setJudgeForm] = useState({ persona: '', provider: '', modelId: '', effort: '', deny: '' })
+  // T3 表单缓冲与选择态（同上：纯输入态；边身份 = 源节点 + 结果名）。
+  const [newFileName, setNewFileName] = useState('')
+  const [nodeSel, setNodeSel] = useState(null)
+  const [addNode, setAddNode] = useState(emptyAddNodeForm('manager'))
+  const [nodeEdit, setNodeEdit] = useState({
+    sel: '', rename: '', role: 'manager', instruction: '',
+    checkerId: SUPPORTED_CHECKER_IDS[0], common: '',
+  })
+  const [addResult, setAddResult] = useState({ name: '', criteria: '', targetKind: 'node', targetValue: '' })
+  const [newReturn, setNewReturn] = useState('')
+  const [wire, setWire] = useState(null)
   const lastSyncedFile = useRef(null)
 
   const dirty = isDirty(state)
@@ -271,6 +316,11 @@ export function WorkflowConfigEditorPanel(props) {
     setRoleForm(roleFormOf(state.draft, ids[0] ?? ''))
     setJudgeForm(judgeFormOf(state.draft))
     setNewRole({ id: '', persona: '' })
+    setNodeSel(null)
+    setAddNode(emptyAddNodeForm(ids[0] === undefined ? 'manager' : ids[0]))
+    setAddResult({ name: '', criteria: '', targetKind: 'node', targetValue: '' })
+    setNewReturn('')
+    setWire(null)
   }, [state.selected, state.draft])
 
   /** edits 结果统一处理：失败入 problems；成功换草稿并刷新只读预览（同一草稿源）。 */
@@ -406,6 +456,141 @@ export function WorkflowConfigEditorPanel(props) {
     })
   }, [state, runEdit])
 
+  /* T3 新建/流程/Actor/结果表单回调（同一草稿 + 同一撤销/预览通道）。 */
+  const createNewFile = useCallback(async () => {
+    const name = newFileName.trim()
+    const parsed = parseNewFilenameEdit(name)
+    if (!parsed.ok) {
+      setState((prev) => ({ ...prev, problems: [parsed.reason] }))
+      return
+    }
+    if (isDirty(state) && !window.confirm('有未保存的修改，新建文件将放弃它们。继续吗？')) return
+    const workflowId = parsed.workflowId
+    const draft = minimalConfigOf()
+    const positions = { main: { main: { x: 40, y: 40 } }, children: {} }
+    const files = state.files.includes(name) ? state.files : [...state.files, name].sort()
+    setFlow(null)
+    setNodeSel(null)
+    setWire(null)
+    setState({
+      ...initialState, dirName: state.dirName, files,
+      selected: name, workflowId, draft, warnings: [], problems: [],
+      flow: null, positions, personaInput: '',
+      dirtyBusiness: true, dirtyLayout: true,
+    })
+    await refreshPreview(draft)
+  }, [newFileName, state, refreshPreview])
+
+  const syncNodeEdit = useCallback((draft, flowDef, id) => {
+    setNodeSel(id)
+    setNodeEdit(nodeEditFormOf(flowDef, id))
+    setAddResult(emptyAddResultForm(flowDef))
+    setWire(null)
+  }, [])
+
+  const addActor = useCallback(async (flowId) => {
+    const id = addNode.id.trim()
+    await runEdit(addActorNodeEdit(state, flowId, id, {
+      role: addNode.role,
+      instruction: addNode.instruction,
+      checkerId: addNode.checkerId,
+      commonCriteria: addNode.common.trim() === '' ? undefined : addNode.common,
+      resultName: addNode.resultName.trim(),
+      resultCriteria: addNode.resultCriteria,
+      target: targetOf(addNode.targetKind, addNode.targetValue),
+    }), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      syncNodeEdit(result.state.draft, flowDef, id)
+      setAddNode((prev) => emptyAddNodeForm(prev.role))
+    })
+  }, [state, addNode, runEdit, syncNodeEdit])
+
+  const applyNodeFields = useCallback(async (flowId) => {
+    const sel = nodeEdit.sel
+    await runEdit(setActorFieldsEdit(state, flowId, sel, {
+      role: nodeEdit.role,
+      instruction: nodeEdit.instruction,
+      checkerId: nodeEdit.checkerId,
+      commonCriteria: nodeEdit.common.trim() === ''
+        ? ((flowId === null ? state.draft?.workflow : state.draft?.childWorkflows?.[flowId])?.nodes?.[sel]?.checker?.config?.criteria === undefined ? undefined : null)
+        : nodeEdit.common,
+    }), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      syncNodeEdit(result.state.draft, flowDef, sel)
+    })
+  }, [state, nodeEdit, runEdit, syncNodeEdit])
+
+  const renameSelectedNode = useCallback(async (flowId) => {
+    const next = nodeEdit.rename.trim()
+    await runEdit(renameNodeEdit(state, flowId, nodeEdit.sel, next), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      syncNodeEdit(result.state.draft, flowDef, next)
+    })
+  }, [state, nodeEdit, runEdit, syncNodeEdit])
+
+  const deleteSelectedNode = useCallback(async (flowId) => {
+    const key = nodeEdit.sel
+    const refs = state.draft === null ? [] : findNodeRefsEdit(state.draft, flowId, key)
+    const hint = refs.length > 0
+      ? `节点 "${key}" 仍有 ${refs.length} 处引用（${refs.map((r) => `${r.node}${r.detail}`).join('、')}），删除后保存将被阻止。继续删除吗？`
+      : `删除节点 "${key}" 吗？`
+    if (!window.confirm(hint)) return
+    await runEdit(deleteNodeEdit(state, flowId, key), () => {
+      setNodeSel(null)
+      setWire(null)
+    })
+  }, [state, nodeEdit.sel, runEdit])
+
+  const applyStartNode = useCallback(async (flowId, nodeId) => {
+    await runEdit(setFlowStartNodeEdit(state, flowId, nodeId), undefined)
+  }, [state, runEdit])
+
+  const addReturn = useCallback(async (flowId) => {
+    const name = newReturn.trim()
+    await runEdit(addFlowReturnEdit(state, flowId, name), () => {
+      setNewReturn('')
+    })
+  }, [state, newReturn, runEdit])
+
+  const renameReturn = useCallback(async (flowId, oldName, nextName) => {
+    await runEdit(renameFlowReturnEdit(state, flowId, oldName, nextName.trim()), undefined)
+  }, [state, runEdit])
+
+  const deleteReturn = useCallback(async (flowId, name) => {
+    if (!window.confirm(`删除返回 "${name}" 吗？相关目标保留悬空，保存将被阻止（须先修正引用）。`)) return
+    await runEdit(deleteFlowReturnEdit(state, flowId, name), undefined)
+  }, [state, runEdit])
+
+  const addResultRow = useCallback(async (flowId) => {
+    await runEdit(addNodeResultEdit(state, flowId, nodeEdit.sel, addResult.name.trim(), addResult.criteria, targetOf(addResult.targetKind, addResult.targetValue)), (result) => {
+      const flowDef = flowId === null ? result.state.draft.workflow : result.state.draft.childWorkflows[flowId]
+      setAddResult(emptyAddResultForm(flowDef))
+    })
+  }, [state, nodeEdit.sel, addResult, runEdit])
+
+  const applyResult = useCallback(async (flowId, name, patch) => {
+    await runEdit(setNodeResultEdit(state, flowId, nodeEdit.sel, name, patch), undefined)
+  }, [state, nodeEdit.sel, runEdit])
+
+  const renameResult = useCallback(async (flowId, name, nextName) => {
+    await runEdit(renameNodeResultEdit(state, flowId, nodeEdit.sel, name, nextName.trim()), undefined)
+  }, [state, nodeEdit.sel, runEdit])
+
+  const deleteResult = useCallback(async (flowId, name) => {
+    await runEdit(deleteNodeResultEdit(state, flowId, nodeEdit.sel, name), (result) => {
+      if (wire !== null && wire.node === nodeEdit.sel && wire.result === name) setWire(null)
+    })
+  }, [state, nodeEdit.sel, wire, runEdit])
+
+  /** 结果连线提交（拖线即只带 target 的 patch；一个结果只有一个目标）。 */
+  const commitWire = useCallback(async (flowId, target) => {
+    if (wire === null) return
+    await runEdit(setNodeResultEdit(state, flowId, wire.node, wire.result, { target }), () => {
+      setWire(null)
+    })
+  }, [state, wire, runEdit])
+
+
   const moveNode = useCallback((flowId, nodeId, pos) => {    setState((prev) => {
       const edited = moveNodeEdit(prev, flowId, nodeId, pos)
       if (!edited.ok || edited.noop === true) return prev
@@ -537,18 +722,48 @@ export function WorkflowConfigEditorPanel(props) {
       flows.length > 0 ? h('div', { className: 'wf-flows' },
         ...flows.map((f) => h('button', {
           key: f.id ?? '__main__',
-          onClick: () => setFlow(f.id),
+          onClick: () => { setFlow(f.id); setNodeSel(null); setWire(null) },
           disabled: activeFlow !== null && f.id === activeFlow.id,
         }, f.label)),
       ) : null,
+      h('div', { className: 'wf-newfile' },
+        h('label', null, '新建合法小写 .yaml 文件名（工作流 ID 来自文件名，不写多余字段）'),
+        h('input', { value: newFileName, onChange: (event) => setNewFileName(event.target.value), placeholder: 'review.yaml' }),
+        h('button', { onClick: createNewFile, disabled: state.busy }, '新建配置'),
+      ),
+      activeFlow !== null ? h(FlowSection, {
+        flowId: activeFlow.id, def: activeFlow.def, newReturn, setNewReturn,
+        onStart: applyStartNode, onAddReturn: addReturn, onRenameReturn: renameReturn,
+        onDeleteReturn: deleteReturn, busy: state.busy,
+      }) : null,
+      activeFlow !== null ? h(NodeSection, {
+        draft, flowId: activeFlow.id, def: activeFlow.def,
+        nodeSel, nodeEdit, setNodeEdit, addNode, setAddNode, addResult, setAddResult,
+        onSelect: syncNodeEdit, onAdd: addActor, onFields: applyNodeFields,
+        onRename: renameSelectedNode, onDelete: deleteSelectedNode,
+        onAddResult: addResultRow, onApplyResult: applyResult,
+        onRenameResult: renameResult, onDeleteResult: deleteResult,
+        busy: state.busy,
+      }) : null,
       activeFlow !== null ? h(NodeCanvas, {
         flowId: activeFlow.id,
         def: activeFlow.def,
         positions: activePositions,
         startNode: activeFlow.def.startNode,
         returns: activeFlow.def.returns,
+        selectedNode: nodeSel,
+        wire,
         onMove: moveNode,
         dragRef,
+        onSelectNode: (id) => {
+          const flowDef = activeFlow.def
+          if ((flowDef.nodes ?? {})[id] === undefined) return
+          syncNodeEdit(draft, flowDef, id)
+        },
+        onPortStart: (nodeId, result) => setWire({ node: nodeId, result }),
+        onWireNode: (nodeId) => commitWire(activeFlow.id, { node: nodeId }),
+        onWireReturn: (ret) => commitWire(activeFlow.id, { return: ret }),
+        onCancelWire: () => setWire(null),
       }) : null,
       h('div', { className: 'wf-preview' },
         h('h3', null, state.preview !== null && state.preview.problems.length > 0 ? '只读 YAML 预览（草稿：未通过校验）' : '只读 YAML 预览'),
@@ -665,7 +880,177 @@ function JudgeSection(props) {
   )
 }
 
-function NodeCanvas({ flowId, def, positions, startNode, returns, onMove, dragRef }) {
+/**
+ * T3 流程区：入口 startNode 与 returns 增删改名。
+ * 子流程定义的新增/删除留给 T5；返回改名同步 Child 调用方 onReturn 键。
+ */
+function FlowSection(props) {
+  const { flowId, def, newReturn, setNewReturn } = props
+  const nodeIds = Object.keys(def.nodes ?? {})
+  return h('div', { className: 'wf-flowconf' },
+    h('h3', null, flowId === null ? '主流程入口与返回' : `子流程 ${flowId} 入口与返回`),
+    h('div', null,
+      h('label', null, '入口 startNode（主流程须为 manager Actor）'),
+      h('select', {
+        value: def.startNode,
+        onChange: (event) => props.onStart(flowId, event.target.value),
+        disabled: props.busy,
+      }, ...nodeIds.map((id) => h('option', { key: id, value: id }, id))),
+    ),
+    h('div', null,
+      h('span', null, '返回 returns（改名同步目标与调用方映射，删除保留悬空）：'),
+      ...(def.returns ?? []).map((name) => h(ReturnRow, {
+        key: name, name, flowId,
+        onRename: props.onRenameReturn, onDelete: props.onDeleteReturn, busy: props.busy,
+      })),
+    ),
+    h('div', null,
+      h('label', null, '新增返回'),
+      h('input', { value: newReturn, onChange: (event) => setNewReturn(event.target.value) }),
+      h('button', { onClick: () => props.onAddReturn(flowId), disabled: props.busy }, '新增返回'),
+    ),
+  )
+}
+
+function ReturnRow(props) {
+  const [rename, setRename] = useState(props.name)
+  return h('span', { className: 'wf-return' },
+    h('code', null, props.name),
+    h('input', { value: rename, onChange: (event) => setRename(event.target.value), disabled: props.busy }),
+    h('button', { onClick: () => props.onRename(props.flowId, props.name, rename), disabled: props.busy }, '改名'),
+    h('button', { onClick: () => props.onDelete(props.flowId, props.name), disabled: props.busy }, '删除'),
+  )
+}
+
+/**
+ * T3 Actor 节点区：节点不是角色——画布执行节点在此增删改名并编辑属性，
+ * 命名结果的 criteria/target 在结果行内编辑。Program/Child 节点只读展示，
+ * 不提供编辑入口（T4/T5；字段保持不丢失）。
+ */
+function NodeSection(props) {
+  const { draft, flowId, def, nodeSel, nodeEdit, setNodeEdit, addNode, setAddNode, addResult, setAddResult } = props
+  const setEdit = (field) => (event) => setNodeEdit((prev) => ({ ...prev, [field]: event.target.value }))
+  const roleOptions = ['manager', ...Object.keys(draft.roles ?? {}).filter((r) => r !== 'manager')]
+  const nodeIds = Object.keys(def.nodes ?? {})
+  const selected = (def.nodes ?? {})[nodeSel]
+  const isActor = selected?.execution?.type === 'actor-task'
+  const results = isActor ? Object.entries(selected.results ?? {}) : []
+  return h('div', { className: 'wf-nodes' },
+    h('h3', null, 'Actor 节点与结果路由'),
+    h('div', { className: 'wf-node-new' },
+      h('label', null, '新增节点 id'),
+      h('input', { value: addNode.id, onChange: (event) => setAddNode((prev) => ({ ...prev, id: event.target.value })) }),
+      h('label', null, '角色（已有角色可选）'),
+      h('select', { value: addNode.role, onChange: (event) => setAddNode((prev) => ({ ...prev, role: event.target.value })) },
+        ...roleOptions.map((r) => h('option', { key: r, value: r }, r))),
+      h('label', null, '指令'),
+      h('input', { value: addNode.instruction, onChange: (event) => setAddNode((prev) => ({ ...prev, instruction: event.target.value })) }),
+      h('label', null, 'checker'),
+      h('select', { value: addNode.checkerId, onChange: (event) => setAddNode((prev) => ({ ...prev, checkerId: event.target.value })) },
+        ...SUPPORTED_CHECKER_IDS.map((c) => h('option', { key: c, value: c }, c))),
+      h('label', null, '共同 criteria（留空=无）'),
+      h('input', { value: addNode.common, onChange: (event) => setAddNode((prev) => ({ ...prev, common: event.target.value })) }),
+      h('label', null, '初始结果名'),
+      h('input', { value: addNode.resultName, onChange: (event) => setAddNode((prev) => ({ ...prev, resultName: event.target.value })) }),
+      h('label', null, '初始结果 criteria'),
+      h('input', { value: addNode.resultCriteria, onChange: (event) => setAddNode((prev) => ({ ...prev, resultCriteria: event.target.value })) }),
+      h('label', null, '初始目标'),
+      h('select', { value: addNode.targetKind, onChange: (event) => setAddNode((prev) => ({ ...prev, targetKind: event.target.value })) },
+        h('option', { value: 'node' }, '节点'), h('option', { value: 'return' }, '返回')),
+      h('input', { value: addNode.targetValue, onChange: (event) => setAddNode((prev) => ({ ...prev, targetValue: event.target.value })) }),
+      h('button', { onClick: () => props.onAdd(flowId), disabled: props.busy }, '新增节点'),
+    ),
+    nodeIds.length > 0 ? h('div', { className: 'wf-node-list' },
+      h('span', null, '节点：'),
+      ...nodeIds.map((id) => h('button', {
+        key: id,
+        onClick: () => props.onSelect(draft, def, id),
+        disabled: props.busy || id === nodeSel,
+      }, `${id}${id === def.startNode ? ' ★' : ''}`)),
+    ) : h('div', null, '（暂无节点）'),
+    selected === undefined ? null : h('div', { className: 'wf-node-card' },
+      h('div', null, `当前：${nodeSel}（${selected.execution?.type ?? '未知类型'}；边身份 = 源节点 + 结果名）`),
+      !isActor ? h('div', null, '（Program/Child 节点不在本票编辑范围，只读；其字段保持不丢失）') : h('div', null,
+        h('div', null,
+          h('label', null, '改名'),
+          h('input', { value: nodeEdit.rename, onChange: setEdit('rename') }),
+          h('button', { onClick: () => props.onRename(flowId), disabled: props.busy }, '改名'),
+        ),
+        h('div', null,
+          h('label', null, '角色'),
+          h('select', { value: nodeEdit.role, onChange: setEdit('role'), disabled: props.busy },
+            ...roleOptions.map((r) => h('option', { key: r, value: r }, r))),
+          h('label', null, '指令'),
+          h('textarea', { value: nodeEdit.instruction, rows: 2, onChange: setEdit('instruction') }),
+        ),
+        h('div', null,
+          h('label', null, 'checker'),
+          h('select', { value: nodeEdit.checkerId, onChange: setEdit('checkerId'), disabled: props.busy },
+            ...SUPPORTED_CHECKER_IDS.map((c) => h('option', { key: c, value: c }, c))),
+          h('label', null, '共同 criteria（留空=清除/保持无）'),
+          h('input', { value: nodeEdit.common, onChange: setEdit('common') }),
+          h('button', { onClick: () => props.onFields(flowId), disabled: props.busy }, '应用属性'),
+        ),
+        h('div', { className: 'wf-results' },
+          h('span', null, '命名结果（每结果一端口，点选连线改目标；Judge verdict 不是结果）：'),
+          ...results.map(([name, result]) => h(ResultRow, {
+            key: `${flowId ?? '__main__'}:${nodeSel}:${name}`,
+            flowId, nodeId: nodeSel, name, result,
+            returns: def.returns ?? [], nodeIds,
+            onApply: props.onApplyResult, onRename: props.onRenameResult,
+            onDelete: props.onDeleteResult, busy: props.busy,
+          })),
+        ),
+        h('div', { className: 'wf-result-new' },
+          h('label', null, '新增结果名'),
+          h('input', { value: addResult.name, onChange: (event) => setAddResult((prev) => ({ ...prev, name: event.target.value })) }),
+          h('label', null, 'criteria'),
+          h('input', { value: addResult.criteria, onChange: (event) => setAddResult((prev) => ({ ...prev, criteria: event.target.value })) }),
+          h('label', null, '目标'),
+          h('select', { value: addResult.targetKind, onChange: (event) => setAddResult((prev) => ({ ...prev, targetKind: event.target.value })) },
+            h('option', { value: 'node' }, '节点'), h('option', { value: 'return' }, '返回')),
+          h('input', { value: addResult.targetValue, onChange: (event) => setAddResult((prev) => ({ ...prev, targetValue: event.target.value })) }),
+          h('button', { onClick: () => props.onAddResult(flowId), disabled: props.busy }, '新增结果'),
+        ),
+        h('button', { onClick: () => props.onDelete(flowId), disabled: props.busy }, '删除节点'),
+      ),
+    ),
+  )
+}
+
+/** 单个命名结果行：本地缓冲 criteria/目标/改名，应用时一次性 patch。 */
+function ResultRow(props) {
+  const { flowId, nodeId, name, result } = props
+  const initialKind = result?.target?.node !== undefined ? 'node' : 'return'
+  const initialValue = result?.target?.node ?? result?.target?.return ?? ''
+  const [criteria, setCriteria] = useState(result?.criteria ?? '')
+  const [kind, setKind] = useState(initialKind)
+  const [value, setValue] = useState(initialValue)
+  const [rename, setRename] = useState(name)
+  const targetText = result?.target?.node !== undefined ? `→ 节点 ${result.target.node}` : `→ 返回 ${result.target.return}`
+  return h('div', { className: 'wf-result-row' },
+    h('code', null, `${name} · ${targetText}`),
+    h('label', null, 'criteria'),
+    h('input', { value: criteria, onChange: (event) => setCriteria(event.target.value), disabled: props.busy }),
+    h('label', null, '目标'),
+    h('select', { value: kind, onChange: (event) => setKind(event.target.value), disabled: props.busy },
+      h('option', { value: 'node' }, '节点'), h('option', { value: 'return' }, '返回')),
+    h('input', { value, onChange: (event) => setValue(event.target.value), disabled: props.busy }),
+    h('button', {
+      onClick: () => props.onApply(flowId, name, {
+        criteria, target: kind === 'node' ? { node: value.trim() } : { return: value.trim() },
+      }),
+      disabled: props.busy,
+    }, '应用'),
+    h('input', { value: rename, onChange: (event) => setRename(event.target.value), disabled: props.busy }),
+    h('button', { onClick: () => props.onRename(flowId, name, rename), disabled: props.busy }, '改名'),
+    h('button', { onClick: () => props.onDelete(flowId, name), disabled: props.busy }, '删除'),
+  )
+}
+
+function NodeCanvas(props) {
+  const { flowId, def, positions, startNode, returns, onMove, dragRef } = props
+  const { selectedNode, wire, onSelectNode, onPortStart, onWireNode, onWireReturn, onCancelWire } = props
   const nodes = Object.entries(def.nodes ?? {})
   const onPointerDown = (event, nodeId) => {
     const start = positions[nodeId] ?? { x: 0, y: 0 }
@@ -685,25 +1070,58 @@ function NodeCanvas({ flowId, def, positions, startNode, returns, onMove, dragRe
   }
   return h('div', { className: 'wf-flow' },
     h('div', null, `入口：${startNode}　返回：${(returns ?? []).join(', ')}（返回为视觉标记，非执行节点）`),
+    wire !== null ? h('div', { className: 'wf-wire' },
+      h('span', null, `连线中：${wire.node} · ${wire.result} → 点击目标节点或返回（一个结果只有一个目标）`),
+      h('button', { onClick: onCancelWire }, '取消连线'),
+    ) : null,
+    h('div', null,
+      h('span', null, '返回目标：'),
+      ...(returns ?? []).map((ret) => h('button', {
+        key: ret,
+        onClick: () => (wire !== null ? onWireReturn(ret) : null),
+        disabled: wire === null,
+        title: wire === null ? '先点击结果端口再选择返回目标' : `将 ${wire.node} · ${wire.result} 指向返回 ${ret}`,
+      }, `⇥ ${ret}`)),
+    ),
     h('div', { className: 'wf-canvas' },
       ...nodes.map(([nodeId, node], index) => {
         const pos = positions[nodeId] ?? { x: 40 + (index % 4) * 220, y: 40 + Math.floor(index / 4) * 140 }
         return h('div', {
           key: nodeId,
-          className: 'wf-node',
+          className: `wf-node${nodeId === selectedNode ? ' wf-selected' : ''}`,
           style: { left: `${pos.x}px`, top: `${pos.y}px` },
           onPointerDown: (event) => onPointerDown(event, nodeId),
           onPointerMove: (event) => onPointerMove(event, nodeId),
           onPointerUp,
+          onClick: (event) => {
+            // 连线中点击节点 = 选择连线目标；否则选中节点进属性表单。
+            if (wire !== null) onWireNode(nodeId)
+            else if (event.target === event.currentTarget) onSelectNode(nodeId)
+          },
         },
-          h('div', { className: 'wf-node-title' }, `${nodeId}${nodeId === startNode ? ' ★' : ''}`),
+          h('div', {
+            className: 'wf-node-title',
+            onClick: () => {
+              if (wire !== null) onWireNode(nodeId)
+              else onSelectNode(nodeId)
+            },
+          }, `${nodeId}${nodeId === startNode ? ' ★' : ''}`),
           h('div', { className: 'wf-node-type' }, nodeSummary(node)),
-          ...portsOf(node).map((port) => h('div', { key: port.key, className: 'wf-port' }, port.label)),
+          ...portsOf(node).map((port) => h('div', {
+            key: port.key,
+            className: `wf-port${wire !== null && wire.node === nodeId && wire.result === port.key ? ' wf-wiring' : ''}`,
+            onPointerDown: (event) => event.stopPropagation(),
+            onClick: (event) => {
+              event.stopPropagation()
+              onPortStart(nodeId, port.key)
+            },
+            title: '点击开始连线，再点击目标节点或返回',
+          }, `○ ${port.label}`)),
           h('div', { className: 'wf-pos' }, `(${pos.x}, ${pos.y})`),
         )
       }),
     ),
-    h('div', null, '（T1 画布为最小占位实现：拖动改位置，不改拓扑；React Flow 替换见 README pending）'),
+    h('div', null, '（T3 画布：拖动改位置，点击节点进属性表单；结果端口点选后再点目标完成连线，不支持自由条件表达式）'),
   )
 }
 
