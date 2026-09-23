@@ -33,6 +33,8 @@ export interface EditorDraft {
 interface DraftSnapshot {
   config: WorkflowConfig
   layout: EditorLayout
+  dirtyBusiness: boolean
+  dirtyLayout: boolean
 }
 
 export interface DraftSession {
@@ -119,7 +121,12 @@ export function loadDraft(workflowId: string, yamlText: string, layoutText?: str
 }
 
 function snapshot(session: DraftSession): DraftSnapshot {
-  return { config: structuredClone(session.draft.config), layout: structuredClone(session.draft.layout) }
+  return {
+    config: structuredClone(session.draft.config),
+    layout: structuredClone(session.draft.layout),
+    dirtyBusiness: session.draft.dirtyBusiness,
+    dirtyLayout: session.draft.dirtyLayout,
+  }
 }
 
 /** 记录一次可撤销变更（调用方在修改前调用；清空 redo 栈）。 */
@@ -129,27 +136,27 @@ function pushHistory(session: DraftSession): void {
   session.future = []
 }
 
-/** 撤销：返回 false 表示无可撤销内容。 */
+/** 撤销：恢复快照的业务/布局与脏标记（纯布局撤销后保存只写布局）。 */
 export function undo(session: DraftSession): boolean {
   const prev = session.past.pop()
   if (prev === undefined) return false
   session.future.push(snapshot(session))
   session.draft.config = prev.config
   session.draft.layout = prev.layout
-  session.draft.dirtyBusiness = true
-  session.draft.dirtyLayout = true
+  session.draft.dirtyBusiness = prev.dirtyBusiness
+  session.draft.dirtyLayout = prev.dirtyLayout
   return true
 }
 
-/** 重做：返回 false 表示无可重做内容。 */
+/** 重做：恢复快照的业务/布局与脏标记。 */
 export function redo(session: DraftSession): boolean {
   const next = session.future.pop()
   if (next === undefined) return false
   session.past.push(snapshot(session))
   session.draft.config = next.config
   session.draft.layout = next.layout
-  session.draft.dirtyBusiness = true
-  session.draft.dirtyLayout = true
+  session.draft.dirtyBusiness = next.dirtyBusiness
+  session.draft.dirtyLayout = next.dirtyLayout
   return true
 }
 

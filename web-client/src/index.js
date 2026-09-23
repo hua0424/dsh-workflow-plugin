@@ -2,7 +2,9 @@
  * T1 客户端入口：宿主模块加载器 factory 格式（见 web-client/build.mjs）。
  *
  * 正式接入：root `main` keyed slot 注册全局面板 + `sidebar.panellist` 入口；
- * 无 DOM 注入，不另起服务器，不修改宿主。React 由宿主共享实例提供
+ * 无 DOM 注入，不另起服务器，不修改宿主。`layout.selectPanel` 无需客户端注册：
+ * 宿主在切换前检查实时 `main` 注册表（packages/client/ui-layout README 与
+ * service.ts），侧栏点击/调用 selectPanel 由壳完成。React 由宿主共享实例提供
  * （module-table baseline：react / react-dom / @deepseek-ai/cordis），
  * 本 bundle 不打包第二份 React；React Flow 等非宿主依赖随客户端提供（pending，见 README）。
  *

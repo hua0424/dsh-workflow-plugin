@@ -208,6 +208,27 @@ test('T1: 撤销/重做覆盖 persona 与位置，有上限', () => {
   assert.ok(session.past.length <= 50, `历史超过上限：${session.past.length}`)
 })
 
+test('T1: 撤销/重做恢复脏标记——纯布局撤销后保存只写布局', () => {
+  const { session } = mustLoad()
+  assert.deepEqual(setNodePosition(session, undefined, 'plan', { x: 11, y: 22 }), { ok: true })
+  assert.deepEqual(savePlan(session), { writeYaml: false, writeLayout: true })
+  assert.equal(undo(session), true)
+  assert.deepEqual(savePlan(session), { writeYaml: false, writeLayout: false })
+  assert.equal(redo(session), true)
+  assert.deepEqual(savePlan(session), { writeYaml: false, writeLayout: true })
+
+  // 业务改动撤销后回到撤销前的脏状态（此处仍有布局改动，只写布局）。
+  assert.deepEqual(setActorCommonPersona(session, 'v2'), { ok: true })
+  assert.deepEqual(savePlan(session), { writeYaml: true, writeLayout: true })
+  assert.equal(undo(session), true)
+  assert.deepEqual(savePlan(session), { writeYaml: false, writeLayout: true })
+  assert.equal(undo(session), true)
+  assert.deepEqual(savePlan(session), { writeYaml: false, writeLayout: false })
+  assert.equal(redo(session), true)
+  assert.equal(redo(session), true)
+  assert.deepEqual(savePlan(session), { writeYaml: true, writeLayout: true })
+})
+
 test('T1: 保存前验证作用于副本，不原地改写页面草稿', () => {
   const { session } = mustLoad()
   const plan = session.draft.config.workflow.nodes['plan']

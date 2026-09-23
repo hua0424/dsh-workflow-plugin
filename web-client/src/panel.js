@@ -10,25 +10,17 @@
  * pending（本票不引入 reactflow 打包，保持 bundle 零第三方）。
  *
  * 业务校验与布局规则全部走服务端 RPC（src/editor/* 单源），浏览器不复制规则。
+ * 面板编辑变迁（历史/脏标记/保存计划）唯一来源为同目录 `edits.js`
+ * （纯函数，可单测；脏语义钉住服务端 `draft.ts savePlan`）。
  */
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
 import { callEditor, rpcErrorMessage } from './rpc.js'
-
-const HISTORY_LIMIT = 50
-const ID_PATTERN = /^[a-z][a-z0-9-]*$/
-
-function layoutFilenameFor(yamlName) {
-  if (typeof yamlName !== 'string' || !yamlName.endsWith('.yaml')) return undefined
-  const stem = yamlName.slice(0, -'.yaml'.length)
-  return stem === '' ? undefined : `${stem}.layout.json`
-}
+import {
+  applyPersonaEdit, isDirty, layoutFilenameFor, moveNodeEdit, redoEdit, savePlanOf, undoEdit,
+} from './edits.js'
 
 function workflowIdOf(yamlName) {
   return yamlName.endsWith('.yaml') ? yamlName.slice(0, -'.yaml'.length) : yamlName
-}
-
-function clone(value) {
-  return JSON.parse(JSON.stringify(value))
 }
 
 function targetLabel(target) {
@@ -63,10 +55,6 @@ function portsOf(node) {
   return []
 }
 
-function isDirty(state) {
-  return state.dirtyBusiness || state.dirtyLayout
-}
-
 const initialState = {
   dirName: '',
   files: [],
@@ -85,16 +73,6 @@ const initialState = {
   future: [],
   saveResult: null,
   busy: false,
-}
-
-function snapshotOf(state) {
-  return { draft: clone(state.draft), positions: clone(state.positions), personaInput: state.personaInput }
-}
-
-function pushHistory(state) {
-  const past = [...state.past, snapshotOf(state)]
-  while (past.length > HISTORY_LIMIT) past.shift()
-  return { ...state, past, future: [] }
 }
 
 async function readTextFile(dir, name) {
@@ -151,6 +129,8 @@ export function WorkflowConfigEditorPanel(props) {
 
   const openDirectory = useCallback(async () => {
     setCapError(null)
+    // 打开新目录会丢弃当前文件列表与草稿：脏状态下需确认（切换文件已有同类确认）。
+    if (isDirty(state) && !window.confirm('有未保存的修改，打开目录将放弃它们。继续吗？')) return
     if (typeof window.showDirectoryPicker !== 'function') {
       setCapError('当前浏览器不支持 File System Access 目录 API（需要 Chrome/Edge 等支持该能力的浏览器），未加载任何文件，也未使用服务端路径替代。')
       return
@@ -176,7 +156,7 @@ export function WorkflowConfigEditorPanel(props) {
       if (error instanceof DOMException && error.name === 'AbortError') return
       setCapError(`打开目录失败：${String(error?.message ?? error)}（未使用服务端路径替代）`)
     }
-  }, [])
+  }, [state])
 
   const selectFile = useCallback(async (name) => {
     if (dir === null) return
@@ -231,63 +211,31 @@ export function WorkflowConfigEditorPanel(props) {
 
   const applyPersona = useCallback(async (clear) => {
     if (state.draft === null) return
-    const raw = clear ? undefined : state.personaInput
-    if (raw !== undefined && raw.trim() === '') {
-      setState((prev) => ({ ...prev, problems: ['actorCommonPersona 为空：保留请填非空文本，删除请使用清除操作（省略与非空值区别保留）'] }))
+    const edited = applyPersonaEdit(state, clear)
+    if (!edited.ok) {
+      setState((prev) => ({ ...prev, problems: [edited.reason] }))
       return
     }
-    const next = clear ? undefined : raw.trim()
-    setState((prev) => {
-      if (prev.draft === null) return prev
-      const withHistory = pushHistory(prev)
-      const draft = clone(withHistory.draft)
-      if (next === undefined) delete draft.actorCommonPersona
-      else draft.actorCommonPersona = next
-      return { ...withHistory, draft, personaInput: next ?? '', dirtyBusiness: true, saveResult: null, problems: [] }
-    })
-  }, [state.draft, state.personaInput])
+    if (edited.noop === true) return
+    setState(edited.state)
+    // 只读预览必须立即反映刚应用的草稿（此前仅加载/保存后刷新，预览滞后）。
+    await refreshPreview(edited.state.draft)
+  }, [state, refreshPreview])
 
   const moveNode = useCallback((flowId, nodeId, pos) => {
-    if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return
     setState((prev) => {
-      if (prev.draft === null) return prev
-      const table = flowId === null ? prev.positions.main : (prev.positions.children[flowId] ?? {})
-      const current = table[nodeId]
-      if (current !== undefined && current.x === pos.x && current.y === pos.y) return prev
-      const withHistory = pushHistory(prev)
-      const positions = clone(withHistory.positions)
-      if (flowId === null) positions.main[nodeId] = { x: pos.x, y: pos.y }
-      else positions.children[flowId] = { ...(positions.children[flowId] ?? {}), [nodeId]: { x: pos.x, y: pos.y } }
-      return { ...withHistory, positions, dirtyLayout: true, saveResult: null }
+      const edited = moveNodeEdit(prev, flowId, nodeId, pos)
+      if (!edited.ok || edited.noop === true) return prev
+      return edited.state
     })
   }, [])
 
   const doUndo = useCallback(() => {
-    setState((prev) => {
-      if (prev.past.length === 0 || prev.draft === null) return prev
-      const last = prev.past[prev.past.length - 1]
-      return {
-        ...prev,
-        past: prev.past.slice(0, -1),
-        future: [...prev.future, snapshotOf(prev)],
-        draft: last.draft, positions: last.positions, personaInput: last.personaInput,
-        dirtyBusiness: true, dirtyLayout: true, saveResult: null,
-      }
-    })
+    setState((prev) => undoEdit(prev) ?? prev)
   }, [])
 
   const doRedo = useCallback(() => {
-    setState((prev) => {
-      if (prev.future.length === 0 || prev.draft === null) return prev
-      const next = prev.future[prev.future.length - 1]
-      return {
-        ...prev,
-        future: prev.future.slice(0, -1),
-        past: [...prev.past, snapshotOf(prev)],
-        draft: next.draft, positions: next.positions, personaInput: next.personaInput,
-        dirtyBusiness: true, dirtyLayout: true, saveResult: null,
-      }
-    })
+    setState((prev) => redoEdit(prev) ?? prev)
   }, [])
 
   const save = useCallback(async () => {
@@ -300,8 +248,10 @@ export function WorkflowConfigEditorPanel(props) {
       return
     }
     const normalized = validated.value.normalized
-    const writeYaml = state.dirtyBusiness
-    const writeLayout = state.dirtyBusiness || state.dirtyLayout
+    // 保存计划唯一口径：与服务端 draft.ts savePlan 同语义（edits.savePlanOf）。
+    const plan = savePlanOf(state)
+    const writeYaml = plan.writeYaml
+    const writeLayout = plan.writeLayout
     const result = { yaml: null, layout: null }
     try {
       if (writeYaml) {

@@ -8,8 +8,8 @@
  *   factory 末尾 return { PANEL_KEY, inject, apply }。
  *
  * 用法：node web-client/build.mjs [--out <目录>]
- * 约束：三源文件经正则做最小拼合（顺序 rpc → panel → index，无重名顶层绑定，
- * react 经 require('react') 取宿主共享实例）。React Flow 引入后必须切换到正式
+ * 约束：四源文件经正则做最小拼合（顺序 rpc → edits → panel → index，
+ * 无重名顶层绑定，react 经 require('react') 取宿主共享实例）。React Flow 引入后必须切换到正式
  * bundler，本脚本即退役（见 README）。
  */
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
@@ -46,8 +46,9 @@ function rewriteImports(source, from, toExpression) {
 /** 剥 ESM import/export，改写为拼合作用域内的直接引用。 */
 export function bundleSources() {
   const rpc = read('rpc.js').replace(/^export\s+/gm, '')
+  const edits = read('edits.js').replace(/^export\s+/gm, '')
   const panel = rewriteImports(read('panel.js'), 'react', "require('react')")
-  const panelLinked = rewriteImports(panel, './rpc.js', '__rpc')
+  const panelLinked = rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits')
   const index = rewriteImports(
     rewriteImports(read('index.js'), './panel.js', '__panel'),
     './rpc.js',
@@ -55,18 +56,23 @@ export function bundleSources() {
   )
   return {
     rpc,
+    edits,
     panel: panelLinked.replace(/^export\s+/gm, ''),
     index: index.replace(/^export\s+/gm, ''),
   }
 }
 
 export function buildClientBundle({ outDir } = {}) {
-  const { rpc, panel, index } = bundleSources()
+  const { rpc, edits, panel, index } = bundleSources()
   const bundle = `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {
 var module = { exports: {} }; var exports = module.exports;
 var __rpc = (function () {
 ${rpc}
 return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage };
+})();
+var __edits = (function () {
+${edits}
+return { HISTORY_LIMIT, ID_PATTERN, layoutFilenameFor, clone, isDirty, savePlanOf, snapshotOf, pushHistory, applyPersonaEdit, moveNodeEdit, undoEdit, redoEdit };
 })();
 var __panel = (function () {
 ${panel}
