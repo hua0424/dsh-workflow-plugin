@@ -460,7 +460,7 @@ function actorNodeOfEdit(flowDef, nodeId) {
   const node = (flowDef.nodes ?? {})[nodeId]
   if (node === undefined) return { error: `节点 "${nodeId}" 在本流程中不存在` }
   if (node.execution?.type !== 'actor-task') {
-    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不在本票编辑范围（T4/T5；其字段保持不丢失）` }
+    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不是 Actor 节点（Program 请用 Program 配置编辑，Child 留给 T5）` }
   }
   return { node }
 }
@@ -813,5 +813,226 @@ export function deleteFlowReturnEdit(state, flowId, name) {
   const { withHistory, draft } = withDraftHistory(state)
   const flow = flowId === null ? draft.workflow : draft.childWorkflows[flowId]
   flow.returns = flow.returns.filter((entry) => entry !== name)
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/* ------------------------------------------------------------------ *
+ * T4（#163）内置 Program 配置编辑镜像：与服务端 `src/editor/draft.ts`
+ * 同语义（本地守卫一致，完整语义走服务端 validate RPC）。
+ *
+ * 程序单源：调用方经 RPC `metadata` 端点取服务端元数据，以
+ * `programCatalog` 显形参数传入（本模块不硬编码程序注册表；对等测试用
+ * 真实 `BUILTIN_PROGRAM_METADATA` 钉住一致）。PASS/FAIL 固定，不提供
+ * 结果增删改名。config 全量保留：未知/多余字段永不剥离，换程序不碰
+ * config；required 只做表单提示，不做保存必填（运行时可补参）。
+ * ------------------------------------------------------------------ */
+
+/** 程序参数整体上限（与服务端 LIMITS.programParametersMax 同源；对等测试钉住）。 */
+export const PROGRAM_PARAMETERS_MAX = 8000
+
+function programNodeOfEdit(flowDef, nodeId) {
+  const node = (flowDef.nodes ?? {})[nodeId]
+  if (node === undefined) return { error: `节点 "${nodeId}" 在本流程中不存在` }
+  if (node.execution?.type !== 'builtin-program') {
+    return { error: `节点 "${nodeId}" 为 ${node.execution?.type} 类型，不是 Program 节点（Actor 请用结果路由编辑，Child 留给 T5）` }
+  }
+  return { node }
+}
+
+function programIdError(programCatalog, programId) {
+  const ids = Object.keys(programCatalog ?? {})
+  if (typeof programId !== 'string' || !Object.prototype.hasOwnProperty.call(programCatalog ?? {}, programId)) {
+    return `程序 "${String(programId)}" 不受支持（当前支持：${ids.join(', ')}；不允许配置任意脚本或新增程序类型）`
+  }
+  return undefined
+}
+
+function programInstructionError(instruction) {
+  if (typeof instruction !== 'string' || instruction.trim() === '') {
+    return 'Program instruction 为空：保留请填非空文本，删除请使用清除操作（省略与非空值区别保留）'
+  }
+  return undefined
+}
+
+function programParamError(programCatalog, programId, key, value) {
+  if (typeof key !== 'string' || key === '') {
+    return { error: '程序参数名须为非空字符串（与元数据键精确匹配，不做 trim）' }
+  }
+  const spec = (programCatalog?.[programId]?.parameters ?? {})[key]
+  if (spec === undefined) {
+    const known = Object.keys(programCatalog?.[programId]?.parameters ?? {})
+    return { error: `程序 "${programId}" 没有参数 "${key}"（已知参数：${known.join(', ') || '无'}；导入的既有字段保持不删除）` }
+  }
+  if (spec.type === 'string') {
+    if (typeof value !== 'string' || value.trim() === '') return { error: `程序参数 "${key}" 须为非空 string` }
+  } else if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return { error: `程序参数 "${key}" 须为有限 number` }
+  }
+  return { value }
+}
+
+function programConfigSizeError(config) {
+  if (JSON.stringify(config).length > PROGRAM_PARAMETERS_MAX) {
+    return `程序参数整体超过 ${PROGRAM_PARAMETERS_MAX} 字符上限（JSON 计）`
+  }
+  return undefined
+}
+
+/** 新增 Program 节点（PASS/FAIL 成对声明；简单网格摆放）。 */
+export function addProgramNodeEdit(state, flowId, nodeId, fields, programCatalog) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const flowDef = flowDefOf(state.draft, flowId)
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（子流程定义的新增留给 T5）` }
+  if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(flowDef.nodes ?? {}, nodeId)) {
+    return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
+  }
+  const badProgram = programIdError(programCatalog, fields.programId)
+  if (badProgram !== undefined) return { ok: false, reason: badProgram }
+  let instruction
+  if (fields.instruction !== undefined) {
+    const bad = programInstructionError(fields.instruction)
+    if (bad !== undefined) return { ok: false, reason: bad }
+    instruction = fields.instruction.trim()
+  }
+  let config
+  if (fields.config !== undefined) {
+    if (fields.config === null || typeof fields.config !== 'object' || Array.isArray(fields.config)) {
+      return { ok: false, reason: 'Program config 须为对象（键值表）' }
+    }
+    config = {}
+    for (const [key, value] of Object.entries(fields.config)) {
+      const checked = programParamError(programCatalog, fields.programId, key, value)
+      if (checked.error !== undefined) return { ok: false, reason: checked.error }
+      config[key] = checked.value
+    }
+    const tooLarge = programConfigSizeError(config)
+    if (tooLarge !== undefined) return { ok: false, reason: tooLarge }
+  }
+  const badPassCriteria = criteriaError(fields.passCriteria)
+  if (badPassCriteria !== undefined) return { ok: false, reason: badPassCriteria }
+  const passTarget = flowTargetError(flowDef, fields.passTarget, nodeId)
+  if (passTarget.error !== undefined) return { ok: false, reason: passTarget.error }
+  const badFailCriteria = criteriaError(fields.failCriteria)
+  if (badFailCriteria !== undefined) return { ok: false, reason: badFailCriteria }
+  const failTarget = flowTargetError(flowDef, fields.failTarget, nodeId)
+  if (failTarget.error !== undefined) return { ok: false, reason: failTarget.error }
+  const { withHistory, draft, positions } = withDraftHistory(state)
+  const flow = flowId === null ? draft.workflow : draft.childWorkflows[flowId]
+  flow.nodes[nodeId] = {
+    execution: {
+      type: 'builtin-program',
+      programId: fields.programId,
+      ...(instruction === undefined ? {} : { instruction }),
+      ...(config === undefined ? {} : { config }),
+    },
+    results: {
+      PASS: { criteria: fields.passCriteria.trim(), target: passTarget.value },
+      FAIL: { criteria: fields.failCriteria.trim(), target: failTarget.value },
+    },
+  }
+  const table = flowId === null ? positions.main : (positions.children[flowId] ??= {})
+  table[nodeId] = gridPositionOf(Object.keys(flow.nodes).length - 1)
+  return { ok: true, state: { ...withHistory, draft, positions, dirtyBusiness: true, dirtyLayout: true, saveResult: null } }
+}
+
+/** 修改 Program 程序与 instruction（instruction：缺席=保持；null=清除；string=设置）。 */
+export function setProgramFieldsEdit(state, flowId, nodeId, patch, programCatalog) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const flowDef = flowDefOf(state.draft, flowId)
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = programNodeOfEdit(flowDef, nodeId)
+  if (found.error !== undefined) return { ok: false, reason: found.error }
+  const node = found.node
+  let nextProgramId = node.execution.programId
+  if (patch.programId !== undefined) {
+    const bad = programIdError(programCatalog, patch.programId)
+    if (bad !== undefined) return { ok: false, reason: bad }
+    nextProgramId = patch.programId
+  }
+  const currentInstruction = node.execution.instruction ?? null
+  let nextInstruction = currentInstruction
+  if (patch.instruction !== undefined) {
+    if (patch.instruction === null) {
+      nextInstruction = null
+    } else {
+      const bad = programInstructionError(patch.instruction)
+      if (bad !== undefined) return { ok: false, reason: bad }
+      nextInstruction = patch.instruction.trim()
+    }
+  }
+  if (nextProgramId === node.execution.programId && nextInstruction === currentInstruction) {
+    return { ok: true, noop: true, state }
+  }
+  const { withHistory, draft } = withDraftHistory(state)
+  const flow = flowId === null ? draft.workflow : draft.childWorkflows[flowId]
+  const target = flow.nodes[nodeId]
+  target.execution.programId = nextProgramId
+  if (nextInstruction === null) delete target.execution.instruction
+  else target.execution.instruction = nextInstruction
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/** 设置/删除单个参数（value === undefined = 删除该键；删空后 config 键省略）。 */
+export function setProgramParamEdit(state, flowId, nodeId, key, value, programCatalog) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const flowDef = flowDefOf(state.draft, flowId)
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = programNodeOfEdit(flowDef, nodeId)
+  if (found.error !== undefined) return { ok: false, reason: found.error }
+  if (typeof key !== 'string' || key === '') {
+    return { ok: false, reason: '程序参数名须为非空字符串（与元数据键精确匹配，不做 trim）' }
+  }
+  const current = (found.node.execution.config ?? {})[key]
+  if (value === undefined) {
+    if (current === undefined) return { ok: false, reason: `程序参数 "${key}" 不存在（无可删除内容）` }
+    const { withHistory, draft } = withDraftHistory(state)
+    const target = (flowId === null ? draft.workflow : draft.childWorkflows[flowId]).nodes[nodeId]
+    delete target.execution.config[key]
+    if (Object.keys(target.execution.config).length === 0) delete target.execution.config
+    return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+  }
+  const checked = programParamError(programCatalog, found.node.execution.programId, key, value)
+  if (checked.error !== undefined) return { ok: false, reason: checked.error }
+  if (current === checked.value) return { ok: true, noop: true, state }
+  const next = { ...(found.node.execution.config ?? {}), [key]: checked.value }
+  const tooLarge = programConfigSizeError(next)
+  if (tooLarge !== undefined) return { ok: false, reason: tooLarge }
+  const { withHistory, draft } = withDraftHistory(state)
+  ;(flowId === null ? draft.workflow : draft.childWorkflows[flowId]).nodes[nodeId].execution.config = next
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/** 修改 PASS/FAIL 的 criteria 和/或 target（拖线即只带 target 的 patch）。 */
+export function setProgramResultEdit(state, flowId, nodeId, name, patch) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const flowDef = flowDefOf(state.draft, flowId)
+  if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = programNodeOfEdit(flowDef, nodeId)
+  if (found.error !== undefined) return { ok: false, reason: found.error }
+  if (name !== 'PASS' && name !== 'FAIL') {
+    return { ok: false, reason: `Program 结果固定为 PASS/FAIL（"${name}" 不是 Program 协议结果；不套用 Actor 命名结果限制）` }
+  }
+  const result = (found.node.results ?? {})[name]
+  if (result === undefined) {
+    return { ok: false, reason: `节点 "${nodeId}" 结果 "${name}" 不存在（PASS/FAIL 须成对声明，未修正时保存将被阻止）` }
+  }
+  let nextCriteria = result.criteria
+  if (patch.criteria !== undefined) {
+    const bad = criteriaError(patch.criteria)
+    if (bad !== undefined) return { ok: false, reason: bad }
+    nextCriteria = patch.criteria.trim()
+  }
+  let nextTarget = result.target
+  if (patch.target !== undefined) {
+    const checked = flowTargetError(flowDef, patch.target, nodeId)
+    if (checked.error !== undefined) return { ok: false, reason: checked.error }
+    nextTarget = checked.value
+  }
+  if (nextCriteria === result.criteria && JSON.stringify(nextTarget) === JSON.stringify(result.target)) {
+    return { ok: true, noop: true, state }
+  }
+  const { withHistory, draft } = withDraftHistory(state)
+  ;(flowId === null ? draft.workflow : draft.childWorkflows[flowId]).nodes[nodeId].results[name] = { criteria: nextCriteria, target: nextTarget }
   return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
 }

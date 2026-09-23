@@ -11,11 +11,12 @@
  *   不检查外部修改；布局与业务分别报告写入结果。
  */
 import { stringify } from 'yaml'
-import type { RoleDefinition, RoleModel, RoleReuseMode, Target, WorkflowConfig, WorkflowDef } from '../types.ts'
+import type { BuiltinProgramNode, RoleDefinition, RoleModel, RoleReuseMode, Target, WorkflowConfig, WorkflowDef } from '../types.ts'
 import { ID_PATTERN, LIMITS, nodeOnReturn, nodeResults, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, roleReuseMode, WorkflowError } from '../types.ts'
 import { parseCatalogConfig } from '../catalog/parse.ts'
 import { parseWorkflowConfig } from '../catalog/schema.ts'
 import { BUILTIN_CHECKER_IDS, validateAndNormalize } from '../catalog/validate.ts'
+import { BUILTIN_PROGRAM_IDS, BUILTIN_PROGRAM_METADATA } from '../programs/metadata.ts'
 import { emptyLayout, fillMissingPositions, getPosition, gridPosition, parseLayoutFile, serializeLayout, setPosition, type EditorLayout, type LayoutLoad, type NodePosition } from './layout.ts'
 
 /** 撤销/重做历史上限（页面内，超出丢弃最旧）。 */
@@ -649,7 +650,7 @@ function actorNodeOf(flow: WorkflowDef, nodeId: string): { ok: true; node: impor
   const node = flow.nodes[nodeId]
   if (node === undefined) return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
   if (node.execution.type !== 'actor-task') {
-    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不在本票编辑范围（T4/T5；其字段保持不丢失）` }
+    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不是 Actor 节点（Program 请用 Program 配置编辑，Child 留给 T5；其字段保持不丢失）` }
   }
   return { ok: true, node: node as import('../types.ts').ActorTaskNode }
 }
@@ -1011,6 +1012,256 @@ export function deleteFlowReturn(session: DraftSession, flowId: string | undefin
   if (!flow.returns.includes(name)) return { ok: false, reason: `返回 "${name}" 未在本流程声明` }
   pushHistory(session)
   flow.returns = flow.returns.filter(entry => entry !== name)
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/* ------------------------------------------------------------------ *
+ * T4（#163）内置 Program 配置编辑。
+ *
+ * 全部作用于同一草稿、经 pushHistory 接入撤销/重做并置 dirtyBusiness
+ * （新增节点同时补布局坐标，一并置 dirtyLayout）。改名/删除/引用查找/
+ * 目标守卫复用 T3 通用能力（类型无关）；PASS/FAIL 是 Program 执行协议
+ * 的固定结果，不套用 Actor 命名结果限制，故不提供结果增删改名 op。
+ *
+ * - 程序单源：programId 与参数合同只读 `programs/metadata.ts`
+ *  （与静态校验、Runtime 参数校验同源），不维护第二份注册表，不允许
+ *   配置任意脚本或新增程序类型；Program 不配 Checker，不引入 Judge。
+ * - config 全量保留：导入的未知/多余字段永不剥离；换程序不碰 config；
+ *   显式参数 op 只动目标键。元数据 required 只做表单提示，不做保存必填
+ *   （运行时 node_run_program 允许补充参数，编辑器不擅自加码）。
+ * - 完整语义（可达性、返回覆盖等）由保存前的 validateDraft 统一裁决。
+ * ------------------------------------------------------------------ */
+
+/** 仅 Program 节点可编辑（Actor 用 T3 结果路由编辑，Child 留给 T5）。 */
+function programNodeOf(flow: WorkflowDef, nodeId: string): { ok: true; node: BuiltinProgramNode } | { ok: false; reason: string } {
+  const node = flow.nodes[nodeId]
+  if (node === undefined) return { ok: false, reason: `节点 "${nodeId}" 在本流程中不存在` }
+  if (node.execution.type !== 'builtin-program') {
+    return { ok: false, reason: `节点 "${nodeId}" 为 ${node.execution.type} 类型，不是 Program 节点（Actor 请用结果路由编辑，Child 留给 T5）` }
+  }
+  return { ok: true, node: node as BuiltinProgramNode }
+}
+
+/** 程序守卫：固定名单（与静态校验、Runtime 同源），任意脚本/新类型拒绝。 */
+function checkProgramId(programId: unknown): { ok: true; value: string } | { ok: false; reason: string } {
+  if (typeof programId !== 'string' || !BUILTIN_PROGRAM_IDS.has(programId)) {
+    return { ok: false, reason: `程序 "${String(programId)}" 不受支持（当前支持：${[...BUILTIN_PROGRAM_IDS].join(', ')}；不允许配置任意脚本或新增程序类型）` }
+  }
+  return { ok: true, value: programId }
+}
+
+/** 可选 instruction：缺席 = 无；空串拒绝（用清除语义无意义，新建请缺席）。 */
+function checkProgramInstruction(instruction: string): { ok: true; value: string } | { ok: false; reason: string } {
+  const trimmed = instruction.trim()
+  if (trimmed === '') return { ok: false, reason: 'Program instruction 为空：保留请填非空文本，删除请使用清除操作（省略与非空值区别保留）' }
+  return { ok: true, value: trimmed }
+}
+
+/**
+ * 单个参数守卫（按元数据现有类型表达；未知键拒绝——导入的既有未知字段
+ * 走保留通道，从不经过本函数，故不受影响；运行时补参同样须满足类型）。
+ */
+function checkProgramParam(programId: string, key: string, value: unknown): { ok: true; value: unknown } | { ok: false; reason: string } {
+  if (typeof key !== 'string' || key === '') return { ok: false, reason: '程序参数名须为非空字符串（与元数据键精确匹配，不做 trim）' }
+  const spec = BUILTIN_PROGRAM_METADATA[programId]?.parameters[key]
+  if (spec === undefined) {
+    const known = Object.keys(BUILTIN_PROGRAM_METADATA[programId]?.parameters ?? {})
+    return { ok: false, reason: `程序 "${programId}" 没有参数 "${key}"（已知参数：${known.join(', ') || '无'}；导入的既有字段保持不删除）` }
+  }
+  if (spec.type === 'string') {
+    if (typeof value !== 'string' || value.trim() === '') return { ok: false, reason: `程序参数 "${key}" 须为非空 string` }
+  } else if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return { ok: false, reason: `程序参数 "${key}" 须为有限 number` }
+  }
+  return { ok: true, value }
+}
+
+/** 参数整体上限（与 Runtime programParameters 的 JSON 边界同源）。 */
+function checkProgramConfigSize(config: Record<string, unknown>): string | undefined {
+  if (JSON.stringify(config).length > LIMITS.programParametersMax) {
+    return `程序参数整体超过 ${LIMITS.programParametersMax} 字符上限（JSON 计）`
+  }
+  return undefined
+}
+
+export interface NewProgramNodeFields {
+  programId: string
+  instruction?: string
+  config?: Record<string, unknown>
+  passCriteria: string
+  passTarget: unknown
+  failCriteria: string
+  failTarget: unknown
+}
+
+/** 新增 Program 节点（PASS/FAIL 成对声明；简单网格摆放；可暂时不可达）。 */
+export function addProgramNode(session: DraftSession, flowId: string | undefined, nodeId: string, fields: NewProgramNodeFields): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在（子流程定义的新增留给 T5）` }
+  if (!ID_PATTERN.test(nodeId)) return { ok: false, reason: `节点 id "${nodeId}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
+  if (Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
+    return { ok: false, reason: `节点 "${nodeId}" 已存在（重命名请使用改名操作）` }
+  }
+  const program = checkProgramId(fields.programId)
+  if (!program.ok) return program
+  let instruction: string | undefined
+  if (fields.instruction !== undefined) {
+    const checked = checkProgramInstruction(fields.instruction)
+    if (!checked.ok) return checked
+    instruction = checked.value
+  }
+  let config: Record<string, unknown> | undefined
+  if (fields.config !== undefined) {
+    if (typeof fields.config !== 'object' || fields.config === null || Array.isArray(fields.config)) {
+      return { ok: false, reason: 'Program config 须为对象（键值表）' }
+    }
+    config = {}
+    for (const [key, value] of Object.entries(fields.config)) {
+      const checked = checkProgramParam(program.value, key, value)
+      if (!checked.ok) return checked
+      config[key] = checked.value
+    }
+    const tooLarge = checkProgramConfigSize(config)
+    if (tooLarge !== undefined) return { ok: false, reason: tooLarge }
+  }
+  const passCriteria = checkResultCriteria(fields.passCriteria)
+  if (!passCriteria.ok) return passCriteria
+  const passTarget = checkFlowTarget(flow, fields.passTarget, nodeId)
+  if (!passTarget.ok) return passTarget
+  const failCriteria = checkResultCriteria(fields.failCriteria)
+  if (!failCriteria.ok) return failCriteria
+  const failTarget = checkFlowTarget(flow, fields.failTarget, nodeId)
+  if (!failTarget.ok) return failTarget
+  pushHistory(session)
+  flow.nodes[nodeId] = {
+    execution: {
+      type: 'builtin-program',
+      programId: program.value,
+      ...(instruction === undefined ? {} : { instruction }),
+      ...(config === undefined ? {} : { config }),
+    },
+    results: {
+      PASS: { criteria: passCriteria.value, target: passTarget.value },
+      FAIL: { criteria: failCriteria.value, target: failTarget.value },
+    },
+  }
+  // ponytail：固定步长网格补位，不引入自动布局引擎（与 addActorNode 同规则）。
+  setPosition(session.draft.layout, flowId, nodeId, gridPosition(Object.keys(flow.nodes).length - 1))
+  session.draft.dirtyBusiness = true
+  session.draft.dirtyLayout = true
+  return { ok: true }
+}
+
+export interface ProgramFieldPatch {
+  programId?: string
+  /** 可选 instruction：缺席 = 保持；null = 清除；string = 设置。 */
+  instruction?: string | null
+}
+
+/**
+ * 修改 Program 程序与 instruction（换程序不碰 config，全量保留；
+ * 类型错配由运行时诊断，编辑器不擅自删除）。
+ */
+export function setProgramFields(session: DraftSession, flowId: string | undefined, nodeId: string, patch: ProgramFieldPatch): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = programNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  const node = found.node
+  let nextProgramId = node.execution.programId
+  if (patch.programId !== undefined) {
+    const checked = checkProgramId(patch.programId)
+    if (!checked.ok) return checked
+    nextProgramId = checked.value
+  }
+  const currentInstruction = node.execution.instruction ?? null
+  let nextInstruction = currentInstruction
+  if (patch.instruction !== undefined) {
+    if (patch.instruction === null) {
+      nextInstruction = null
+    } else {
+      const checked = checkProgramInstruction(patch.instruction)
+      if (!checked.ok) return checked
+      nextInstruction = checked.value
+    }
+  }
+  if (nextProgramId === node.execution.programId && nextInstruction === currentInstruction) return { ok: true }
+  pushHistory(session)
+  node.execution.programId = nextProgramId
+  if (nextInstruction === null) delete node.execution.instruction
+  else node.execution.instruction = nextInstruction
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/**
+ * 设置/删除单个参数（value === undefined = 删除该键；删空后 config 键省略，
+ * 与“无参数”语义等价。required 缺席不阻止（运行时可补参），类型必须满足）。
+ */
+export function setProgramParam(session: DraftSession, flowId: string | undefined, nodeId: string, key: string, value: unknown): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = programNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  const node = found.node
+  if (typeof key !== 'string' || key === '') return { ok: false, reason: '程序参数名须为非空字符串（与元数据键精确匹配，不做 trim）' }
+  const current = node.execution.config?.[key]
+  if (value === undefined) {
+    if (current === undefined) return { ok: false, reason: `程序参数 "${key}" 不存在（无可删除内容）` }
+    pushHistory(session)
+    delete node.execution.config![key]
+    if (Object.keys(node.execution.config!).length === 0) delete node.execution.config
+    session.draft.dirtyBusiness = true
+    return { ok: true }
+  }
+  const checked = checkProgramParam(node.execution.programId, key, value)
+  if (!checked.ok) return checked
+  if (current === checked.value) return { ok: true }
+  const next = { ...(node.execution.config ?? {}), [key]: checked.value }
+  const tooLarge = checkProgramConfigSize(next)
+  if (tooLarge !== undefined) return { ok: false, reason: tooLarge }
+  pushHistory(session)
+  node.execution.config = next
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+export interface ProgramResultPatch {
+  criteria?: string
+  target?: unknown
+}
+
+/**
+ * 修改 PASS/FAIL 的 criteria 和/或 target（拖线即只带 target 的 patch；
+ * 结果名固定，不提供增删改名——缺/多结果由保存前校验裁决）。
+ */
+export function setProgramResult(session: DraftSession, flowId: string | undefined, nodeId: string, name: string, patch: ProgramResultPatch): RoleEditResult {
+  const flow = flowOf(session, flowId)
+  if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
+  const found = programNodeOf(flow, nodeId)
+  if (!found.ok) return found
+  if (name !== 'PASS' && name !== 'FAIL') {
+    return { ok: false, reason: `Program 结果固定为 PASS/FAIL（"${name}" 不是 Program 协议结果；不套用 Actor 命名结果限制）` }
+  }
+  const result = found.node.results[name]
+  if (result === undefined) return { ok: false, reason: `节点 "${nodeId}" 结果 "${name}" 不存在（PASS/FAIL 须成对声明，未修正时保存将被阻止）` }
+  let nextCriteria = result.criteria
+  if (patch.criteria !== undefined) {
+    const checked = checkResultCriteria(patch.criteria)
+    if (!checked.ok) return checked
+    nextCriteria = checked.value
+  }
+  let nextTarget = result.target
+  if (patch.target !== undefined) {
+    const checked = checkFlowTarget(flow, patch.target, nodeId)
+    if (!checked.ok) return checked
+    nextTarget = checked.value
+  }
+  if (nextCriteria === result.criteria && JSON.stringify(nextTarget) === JSON.stringify(result.target)) return { ok: true }
+  pushHistory(session)
+  result.criteria = nextCriteria
+  result.target = nextTarget
   session.draft.dirtyBusiness = true
   return { ok: true }
 }
