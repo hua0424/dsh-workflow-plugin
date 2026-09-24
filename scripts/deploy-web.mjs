@@ -34,6 +34,7 @@ export function bundlePackageJson(pkg) {
     main: pkg.main,
     license: pkg.license,
     dependencies,
+    exports: pkg.exports,
     dsh: pkg.dsh,
   }
 }
@@ -44,10 +45,19 @@ export function deployBundle({ repoRoot, target }) {
     throw new Error('lib/index.js missing — run the build first (`pnpm run build`)')
   }
   const manifest = bundlePackageJson(JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')))
+  // dsh.client declared → the ./client bundle must exist and ship, mirroring the host's fail-loud scan.
+  const clientDist = join(repoRoot, 'web-client', 'dist', 'client.js')
+  if (manifest.dsh?.client?.platform === 'web' && !existsSync(clientDist)) {
+    throw new Error('web-client/dist/client.js missing — run the client build first (`node web-client/build.mjs`)')
+  }
   mkdirSync(target, { recursive: true })
   // Replace lib wholesale (removes old junction/copy trees).
   rmSync(join(target, 'lib'), { recursive: true, force: true })
   cpSync(join(repoRoot, 'lib'), join(target, 'lib'), { recursive: true })
+  if (existsSync(clientDist)) {
+    mkdirSync(dirname(join(target, 'web-client', 'dist', 'client.js')), { recursive: true })
+    cpSync(clientDist, join(target, 'web-client', 'dist', 'client.js'))
+  }
   writeFileSync(join(target, 'cordis.patch.yml'), readFileSync(join(repoRoot, 'cordis.patch.yml'), 'utf8'), 'utf8')
   writeFileSync(join(target, 'package.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8')
   return { target, manifest }
