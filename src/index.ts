@@ -377,9 +377,23 @@ export function apply(ctx: Context) {
   const workflowTools = makeWorkflowTools(toolHost)
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
   // #160 T1：配置编辑器同源 RPC（parse/validate/preview/layout，只收受限文本/JSON，
-  // 不接受路径、不访问 catalog/Run/状态库）。无 `connection` 服务（非 Web 加载）
-  // 时跳过注册，插件其余功能不受影响。
-  const editorRpc = registerEditorRpc(ctx as unknown as { get(name: string): unknown })
+  // 不接受路径、不访问 catalog/Run/状态库）。connection 服务在 web profile 下可能晚于
+  // 本插件 apply 才激活，一次性 ctx.get 会拿到 undefined 静默跳过（浏览器 405）——
+  // 正式宿主用 inject 反应式等待（对齐 dsh-api-gateway 的同款模式）；无 connection
+  // 服务的环境（非 Web 加载 / 测试桩无 inject）保持一次性读取语义，回调不触发，
+  // 插件其余功能不受影响。
+  const disposeEditorRpcFns: Array<() => void> = []
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['connection'], (connCtx: unknown) => {
+      const registered = registerEditorRpc(connCtx as unknown as { get(name: string): unknown })
+      if (registered.status === 'registered') {
+        disposeEditorRpcFns.push(() => { void registered.dispose() })
+      }
+    })
+  } else {
+    const registered = registerEditorRpc(ctx as unknown as { get(name: string): unknown })
+    if (registered.status === 'registered') disposeEditorRpcFns.push(() => { void registered.dispose() })
+  }
 
   // ---- Turn settlement ----
   // 同步回调只捕获事实（#99 AC6）：路由已确定的参与者在这里立即定格该 Turn 的消息
@@ -417,7 +431,7 @@ export function apply(ctx: Context) {
   ctx.effect(() => () => {
     disposeCommand()
     for (const dispose of disposeTools) dispose()
-    if (editorRpc.status === 'registered') void editorRpc.dispose()
+    for (const dispose of disposeEditorRpcFns.splice(0)) dispose()
   })
 
   // ---- Host restart reconciliation (design §4.2 H1) ----

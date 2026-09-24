@@ -31,6 +31,44 @@ function parseDenyText(text) {
   return text.split(/[,，、\n]/).map((entry) => entry.trim())
 }
 
+/* 上次授权目录句柄的持久化（IndexedDB 单键 kv）。ponytail: 浏览器安全模型不允许
+   无授权预选路径；仅记住用户已授权的句柄，权限仍为 granted 才恢复，任何失败静默
+   回落手动「打开目录」。升级路径：多目录列表 + 每目录最近文件。 */
+function idbOpenDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('wf-editor-prefs', 1)
+    request.onupgradeneeded = () => request.result.createObjectStore('kv')
+    request.onsuccess = () => resolve(request.result)
+    request.onerror = () => reject(request.error)
+  })
+}
+
+async function rememberDirHandle(handle) {
+  try {
+    const db = await idbOpenDb()
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('kv', 'readwrite')
+      tx.objectStore('kv').put(handle, 'lastDir')
+      tx.oncomplete = () => resolve(undefined)
+      tx.onerror = () => reject(tx.error)
+    })
+    db.close()
+  } catch { /* 持久化失败不影响本次会话 */ }
+}
+
+async function readRememberedDirHandle() {
+  try {
+    const db = await idbOpenDb()
+    const handle = await new Promise((resolve, reject) => {
+      const request = db.transaction('kv').objectStore('kv').get('lastDir')
+      request.onsuccess = () => resolve(request.result)
+      request.onerror = () => reject(request.error)
+    })
+    db.close()
+    return handle ?? null
+  } catch { return null }
+}
+
 /** 模型表单 → edits 输入：档位空白即省略该键（显式模型但未设档位）。 */
 function modelInputOf(form) {
   return {
@@ -289,6 +327,20 @@ export function WorkflowConfigEditorPanel(props) {
     [editorRpc],
   )
 
+  /* 列出目录内合法命名 YAML 并整体重置编辑状态（打开与恢复共用）。 */
+  const adoptDirectory = useCallback(async (picked) => {
+    const names = []
+    for await (const entry of picked.values()) {
+      if (entry.kind === 'file' && ID_PATTERN.test(entry.name.slice(0, -'.yaml'.length)) && entry.name.endsWith('.yaml')) {
+        names.push(entry.name)
+      }
+    }
+    names.sort()
+    setDir(picked)
+    setState({ ...initialState, dirName: picked.name ?? '', files: names })
+    setFlow(null)
+  }, [])
+
   const openDirectory = useCallback(async () => {
     setCapError(null)
     // 打开新目录会丢弃当前文件列表与草稿：脏状态下需确认（切换文件已有同类确认）。
@@ -304,21 +356,30 @@ export function WorkflowConfigEditorPanel(props) {
         setCapError('目录读写授权被拒绝或撤销：未加载任何文件。请重新授权后重试。')
         return
       }
-      const names = []
-      for await (const entry of picked.values()) {
-        if (entry.kind === 'file' && ID_PATTERN.test(entry.name.slice(0, -'.yaml'.length)) && entry.name.endsWith('.yaml')) {
-          names.push(entry.name)
-        }
-      }
-      names.sort()
-      setDir(picked)
-      setState({ ...initialState, dirName: picked.name ?? '', files: names })
-      setFlow(null)
+      await adoptDirectory(picked)
+      await rememberDirHandle(picked)
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return
       setCapError(`打开目录失败：${String(error?.message ?? error)}（未使用服务端路径替代）`)
     }
-  }, [state])
+    // state 仅用于脏检查；adoptDirectory 自带完整状态重置。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state, adoptDirectory])
+
+  /* 打开面板时自动恢复上次授权目录（权限仍为 granted 才恢复；浏览器安全模型
+     不允许无授权预选路径，未恢复时用户仍点「打开目录」）。 */
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      const saved = await readRememberedDirHandle()
+      if (saved === null || cancelled) return
+      let permission = 'denied'
+      try { permission = await saved.queryPermission({ mode: 'readwrite' }) } catch { /* 句柄失效按未授权处理 */ }
+      if (permission !== 'granted' || cancelled) return
+      await adoptDirectory(saved)
+    })()
+    return () => { cancelled = true }
+  }, [adoptDirectory])
 
   const selectFile = useCallback(async (name) => {
     if (dir === null) return
@@ -953,6 +1014,13 @@ export function WorkflowConfigEditorPanel(props) {
         disabled: state.busy || state.selected === name,
       }, name)),
     ) : null,
+    /* 新建配置不依赖已加载草稿：目录打开即可用（此前藏在 draft 门槛后，
+       RPC 故障导致 draft 恒空时新建入口完全不可见）。 */
+    dir !== null ? h('div', { className: 'wf-newfile' },
+      h('label', null, '新建合法小写 .yaml 文件名（工作流 ID 来自文件名，不写多余字段）'),
+      h('input', { value: newFileName, onChange: (event) => setNewFileName(event.target.value), placeholder: 'review.yaml' }),
+      h('button', { onClick: createNewFile, disabled: state.busy }, '新建配置'),
+    ) : null,
     state.problems.length > 0 ? h('div', { className: 'wf-error', role: 'alert' },
       ...state.problems.map((message, index) => h('div', { key: index }, message)),
     ) : null,
@@ -996,11 +1064,6 @@ export function WorkflowConfigEditorPanel(props) {
         onAdd: addNewSubflow, onRename: renameActiveSubflow, onDelete: deleteActiveSubflow,
         busy: state.busy,
       }) : null,
-      h('div', { className: 'wf-newfile' },
-        h('label', null, '新建合法小写 .yaml 文件名（工作流 ID 来自文件名，不写多余字段）'),
-        h('input', { value: newFileName, onChange: (event) => setNewFileName(event.target.value), placeholder: 'review.yaml' }),
-        h('button', { onClick: createNewFile, disabled: state.busy }, '新建配置'),
-      ),
       activeFlow !== null ? h(FlowSection, {
         flowId: activeFlow.id, def: activeFlow.def, newReturn, setNewReturn,
         onStart: applyStartNode, onAddReturn: addReturn, onRenameReturn: renameReturn,

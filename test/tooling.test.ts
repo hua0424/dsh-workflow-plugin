@@ -119,6 +119,9 @@ test('#101 隔离 bundle：deployBundle 只写隔离目标，产物版本/依赖
     writeFileSync(join(fakeRepo, 'lib', 'nested', 'x.js'), 'export {}\n')
     writeFileSync(join(fakeRepo, 'cordis.patch.yml'), '- insert: { id: dsh-agent-team-workflow }\n')
     writeFileSync(join(fakeRepo, 'package.json'), JSON.stringify(repoPackage, null, 2))
+    // dsh.client 声明要求随部署携带 ./client bundle（宿主扫描 fail-loud，此处同语义）。
+    mkdirSync(join(fakeRepo, 'web-client', 'dist'), { recursive: true })
+    writeFileSync(join(fakeRepo, 'web-client', 'dist', 'client.js'), '/* stub client */\n')
     const target = join(dir, 'isolated-bundle')
     const { manifest } = deployBundle({ repoRoot: fakeRepo, target })
     const written = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'))
@@ -127,8 +130,12 @@ test('#101 隔离 bundle：deployBundle 只写隔离目标，产物版本/依赖
     assert.deepEqual(written.dependencies, repoPackage.dependencies)
     assert.equal(existsSync(join(target, 'lib', 'index.js')), true)
     assert.equal(existsSync(join(target, 'lib', 'nested', 'x.js')), true)
+    assert.equal(existsSync(join(target, 'web-client', 'dist', 'client.js')), true, 'dsh.client 声明时客户端 bundle 必须随部署写出')
     assert.match(readFileSync(join(target, 'cordis.patch.yml'), 'utf8'), /dsh-agent-team-workflow/)
     assert.throws(() => deployBundle({ repoRoot: join(dir, 'empty'), target }), /lib\/index\.js missing/)
+    // 声明了 dsh.client 但 bundle 缺失：fail-closed，与宿主激活扫描同语义。
+    rmSync(join(fakeRepo, 'web-client'), { recursive: true, force: true })
+    assert.throws(() => deployBundle({ repoRoot: fakeRepo, target: join(dir, 'no-client') }), /client\.js missing/)
   } finally { cleanup() }
 })
 
