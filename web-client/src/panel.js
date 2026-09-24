@@ -279,6 +279,7 @@ export function WorkflowConfigEditorPanel(props) {
   const editorRpc = props.editorRpc
   const [dir, setDir] = useState(null)
   const [capError, setCapError] = useState(null)
+  const [restoreCandidate, setRestoreCandidate] = useState(null)
   const [state, setState] = useState(initialState)
   const [flow, setFlow] = useState(null)
   const dragRef = useRef(null)
@@ -366,20 +367,38 @@ export function WorkflowConfigEditorPanel(props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state, adoptDirectory])
 
-  /* 打开面板时自动恢复上次授权目录（权限仍为 granted 才恢复；浏览器安全模型
-     不允许无授权预选路径，未恢复时用户仍点「打开目录」）。 */
+  /* 打开面板时自动恢复上次授权目录：权限仍为 granted 直接恢复；退回 prompt 时
+     记下候选句柄，渲染「恢复上次目录」按钮——requestPermission 需要用户手势，
+     浏览器安全模型不允许无授权静默恢复。 */
   useEffect(() => {
     let cancelled = false
     void (async () => {
       const saved = await readRememberedDirHandle()
       if (saved === null || cancelled) return
       let permission = 'denied'
-      try { permission = await saved.queryPermission({ mode: 'readwrite' }) } catch { /* 句柄失效按未授权处理 */ }
-      if (permission !== 'granted' || cancelled) return
-      await adoptDirectory(saved)
+      try { permission = await saved.queryPermission({ mode: 'readwrite' }) } catch { /* 句柄失效按未授权处理 */ return }
+      if (cancelled) return
+      if (permission === 'granted') await adoptDirectory(saved)
+      else setRestoreCandidate(saved)
     })()
     return () => { cancelled = true }
   }, [adoptDirectory])
+
+  const restoreDirectory = useCallback(async () => {
+    const saved = restoreCandidate
+    if (saved === null) return
+    setRestoreCandidate(null)
+    try {
+      const permission = await saved.requestPermission({ mode: 'readwrite' }).catch(() => 'denied')
+      if (permission !== 'granted') {
+        setCapError('恢复目录授权被拒绝：请点「打开目录」重新选择。')
+        return
+      }
+      await adoptDirectory(saved)
+    } catch (error) {
+      setCapError(`恢复上次目录失败：${String(error?.message ?? error)}`)
+    }
+  }, [restoreCandidate, adoptDirectory])
 
   const selectFile = useCallback(async (name) => {
     if (dir === null) return
@@ -1000,6 +1019,8 @@ export function WorkflowConfigEditorPanel(props) {
     capError !== null ? h('div', { className: 'wf-error', role: 'alert' }, capError) : null,
     h('div', { className: 'wf-toolbar' },
       h('button', { onClick: openDirectory, disabled: state.busy }, '打开目录'),
+      restoreCandidate !== null && dir === null ? h('button', { onClick: restoreDirectory, disabled: state.busy },
+        `恢复上次目录（${restoreCandidate.name ?? '未知'}）`) : null,
       state.dirName !== '' ? h('span', null, `目录：${state.dirName}`) : null,
       draft !== null ? h('span', null, dirty ? '● 未保存' : '○ 已保存') : null,
       h('button', { onClick: doUndo, disabled: state.past.length === 0 || state.busy }, '撤销'),

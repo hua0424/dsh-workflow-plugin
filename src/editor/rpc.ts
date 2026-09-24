@@ -206,12 +206,14 @@ interface ConnectionService {
 
 /**
  * 在 host ctx 上注册编辑器 RPC（Web 同源鉴权通道），返回释放函数以便接入 effect 寿命。
+ * 服务读取用属性访问（`ctx.connection`）：真实 Cordis Context 经 proxy 解析服务名，
+ * 没有 `ctx.get(name)` 方法——经 inject 回调拿到的 connCtx 同样如此。
  * @returns 已注册（含 dispose）或因无 connection 服务而跳过（非 Web 加载不被破坏）。
  */
-export function registerEditorRpc(ctx: { get(name: string): unknown }):
+export function registerEditorRpc(ctx: { connection?: ConnectionService }):
   | { status: 'registered'; dispose: () => Promise<void> }
   | { status: 'skipped-no-connection' } {
-  const connection = ctx.get('connection') as ConnectionService | undefined
+  const connection = ctx.connection
   if (connection === undefined || typeof connection.rpc?.handle !== 'function') return { status: 'skipped-no-connection' }
   const dispose = connection.rpc.handle(EDITOR_RPC_CHANNEL, createEditorRpcHandler())
   return { status: 'registered', dispose }

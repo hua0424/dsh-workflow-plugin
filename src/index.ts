@@ -19,7 +19,7 @@ import { WorkflowError } from './types.ts'
 import type { RunState, NodeExecution } from './types.ts'
 import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
-import { registerEditorRpc } from './editor/rpc.ts'
+import { registerEditorRpc, type EditorRpcHandler } from './editor/rpc.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, managerRouteOf, programHost, type HostAdapters } from './plugin/host.ts'
 import {
@@ -383,15 +383,18 @@ export function apply(ctx: Context) {
   // 服务的环境（非 Web 加载 / 测试桩无 inject）保持一次性读取语义，回调不触发，
   // 插件其余功能不受影响。
   const disposeEditorRpcFns: Array<() => void> = []
+  type EditorConnection = { rpc: { handle(channel: string, handler: EditorRpcHandler): () => Promise<void> } }
+  const registerOn = (source: unknown): ReturnType<typeof registerEditorRpc> =>
+    registerEditorRpc(source as { connection?: EditorConnection })
   if (typeof ctx.inject === 'function') {
     ctx.inject(['connection'], (connCtx: unknown) => {
-      const registered = registerEditorRpc(connCtx as unknown as { get(name: string): unknown })
+      const registered = registerOn(connCtx)
       if (registered.status === 'registered') {
         disposeEditorRpcFns.push(() => { void registered.dispose() })
       }
     })
   } else {
-    const registered = registerEditorRpc(ctx as unknown as { get(name: string): unknown })
+    const registered = registerOn(ctx)
     if (registered.status === 'registered') disposeEditorRpcFns.push(() => { void registered.dispose() })
   }
 

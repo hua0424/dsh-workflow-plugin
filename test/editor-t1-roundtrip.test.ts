@@ -390,21 +390,19 @@ test('T1: RPC layout 端点单源解析布局（缺文件补位/损坏回退）'
 })
 
 test('T1: RPC 注册在无 connection 时跳过，有 connection 时挂载指定 channel', async () => {
-  assert.deepEqual(registerEditorRpc({ get: () => undefined }), { status: 'skipped-no-connection' })
+  assert.deepEqual(registerEditorRpc({}), { status: 'skipped-no-connection' })
   let seenChannel = ''
   let seenHandler: ((e: string, p: unknown, s: AbortSignal) => Promise<unknown>) | undefined
   const registration = registerEditorRpc({
-    get: (name: string) => name === 'connection'
-      ? {
-        rpc: {
-          handle: (channel: string, handler: (e: string, p: unknown, s: AbortSignal) => Promise<unknown>) => {
-            seenChannel = channel
-            seenHandler = handler
-            return async () => {}
-          },
+    connection: {
+      rpc: {
+        handle: (channel: string, handler: (e: string, p: unknown, s: AbortSignal) => Promise<unknown>) => {
+          seenChannel = channel
+          seenHandler = handler
+          return async () => {}
         },
-      }
-      : undefined,
+      },
+    },
   })
   assert.equal(registration.status, 'registered')
   assert.equal(seenChannel, EDITOR_RPC_CHANNEL)
