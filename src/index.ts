@@ -19,7 +19,7 @@ import { WorkflowError } from './types.ts'
 import type { RunState, NodeExecution } from './types.ts'
 import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
-import { registerEditorRpc, type EditorRpcHandler } from './editor/rpc.ts'
+import { installEditorRpc } from './editor/rpc.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, managerRouteOf, programHost, type HostAdapters } from './plugin/host.ts'
 import {
@@ -377,25 +377,20 @@ export function apply(ctx: Context) {
   const workflowTools = makeWorkflowTools(toolHost)
   const disposeTools = workflowTools.map(def => ctx.tools.register(def))
   // #160 T1：配置编辑器同源 RPC（parse/validate/preview/layout，只收受限文本/JSON，
-  // 不接受路径、不访问 catalog/Run/状态库）。connection 服务在 web profile 下可能晚于
-  // 本插件 apply 才激活，一次性 ctx.get 会拿到 undefined 静默跳过（浏览器 405）——
-  // 正式宿主用 inject 反应式等待（对齐 dsh-api-gateway 的同款模式）；无 connection
-  // 服务的环境（非 Web 加载 / 测试桩无 inject）保持一次性读取语义，回调不触发，
-  // 插件其余功能不受影响。
+  // 不接受路径、不访问 catalog/Run/状态库）。connection/webServer 在 web profile 下晚于
+  // 本插件 apply 才激活，用 inject 反应式等待；installEditorRpc 优先把路由挂到本插件
+  // 自己 inject 的 webServer（dsh v0.1.5-alpha.1+ 的 rpc.handle 会因 owner.webServer
+  // 未声明而抛错），旧宿主回退 rpc.handle。无这两项服务的环境（非 Web 加载 / 测试桩
+  // 无 inject）回调不触发，插件其余功能不受影响。
   const disposeEditorRpcFns: Array<() => void> = []
-  type EditorConnection = { rpc: { handle(channel: string, handler: EditorRpcHandler): () => Promise<void> } }
-  const registerOn = (source: unknown): ReturnType<typeof registerEditorRpc> =>
-    registerEditorRpc(source as { connection?: EditorConnection })
   if (typeof ctx.inject === 'function') {
-    ctx.inject(['connection'], (connCtx: unknown) => {
-      const registered = registerOn(connCtx)
-      if (registered.status === 'registered') {
-        disposeEditorRpcFns.push(() => { void registered.dispose() })
-      }
+    ctx.inject(['connection', 'webServer'], (webCtx: unknown) => {
+      const installed = installEditorRpc(webCtx as Parameters<typeof installEditorRpc>[0])
+      if (installed.status !== 'skipped') disposeEditorRpcFns.push(installed.dispose)
     })
   } else {
-    const registered = registerOn(ctx)
-    if (registered.status === 'registered') disposeEditorRpcFns.push(() => { void registered.dispose() })
+    const installed = installEditorRpc(ctx as Parameters<typeof installEditorRpc>[0])
+    if (installed.status !== 'skipped') disposeEditorRpcFns.push(installed.dispose)
   }
 
   // ---- Turn settlement ----

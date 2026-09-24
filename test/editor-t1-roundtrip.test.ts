@@ -16,7 +16,7 @@ import {
   parseLayoutFile, serializeLayout,
 } from '../src/editor/layout.ts'
 import {
-  createEditorRpcHandler, EDITOR_RPC_CHANNEL, registerEditorRpc,
+  createEditorRpcHandler, EDITOR_RPC_CHANNEL, editorFetchHandler, installEditorRpc, registerEditorRpc,
   rpcParseText, rpcPreview, rpcResolveLayout, rpcValidateConfig,
 } from '../src/editor/rpc.ts'
 import { parseCatalogConfig } from '../src/catalog/parse.ts'
@@ -409,4 +409,58 @@ test('T1: RPC 注册在无 connection 时跳过，有 connection 时挂载指定
   assert.ok(typeof (registration as { dispose?: unknown }).dispose === 'function')
   const result = await seenHandler!('parse', { workflowId: 'review', text: RICH_CONFIG }, AbortSignal.timeout(5000))
   assert.equal((result as { ok: boolean }).ok, true)
+})
+
+test('installEditorRpc：有 webServer 时直接挂路由；鉴权 fail-closed；fetch 层 wire 协议对齐', async () => {
+  // 无任何服务 → skipped；仅 connection（旧宿主）→ fallback 走 rpc.handle。
+  assert.equal(installEditorRpc({}).status, 'skipped')
+  assert.equal(installEditorRpc({
+    connection: { rpc: { handle: () => async () => {} } },
+  }).status, 'fallback')
+
+  // webServer + connection：挂 prefix 路由，鉴权用 requestRejection（方法调用）。
+  let mounted: { kind: string, path: string, handler: (req: unknown, res: unknown) => Promise<void> } | undefined
+  const installed = installEditorRpc({
+    connection: {
+      rpc: { handle: () => async () => {} },
+      requestRejection: (req: { headers: Record<string, string> }) =>
+        req.headers['x-test-deny'] === '1' ? 401 : undefined,
+    },
+    webServer: { register: (route: typeof mounted) => { mounted = route; return () => {} } },
+  })
+  assert.equal(installed.status, 'mounted')
+  assert.equal(mounted?.kind, 'prefix')
+  assert.equal(mounted?.path, EDITOR_RPC_CHANNEL)
+
+  // 鉴权拒绝：401 直接回文本，不进 bridge。
+  const denied: { status?: number, body?: string, ended?: boolean } & Record<string, unknown> = {
+    writeHead(status: number) { this.status = status },
+    end(body?: string) { this.body = body; this.ended = true },
+    on() {}, off() {}, once() {},
+  }
+  await mounted!.handler({ headers: { 'x-test-deny': '1' } }, denied)
+  assert.equal(denied.status, 401)
+  assert.equal(denied.body, 'unauthorized')
+
+  // fetch 层 wire 协议：合法 envelope → 200 server-response；method 不匹配 → bad-request。
+  const handler = createEditorRpcHandler()
+  const fetcher = editorFetchHandler(EDITOR_RPC_CHANNEL, handler)
+  const envelope = JSON.stringify({ type: 'client-request', rpcId: 'r1', method: 'parse', payload: { workflowId: 'review', text: RICH_CONFIG } })
+  const okRes = await fetcher.fetch(new Request(`http://x${EDITOR_RPC_CHANNEL}/parse`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: envelope,
+  }))
+  assert.equal(okRes.status, 200)
+  const okBody = JSON.parse(await okRes.text()) as { type: string, rpcId: string, result: { ok: boolean } }
+  assert.equal(okBody.type, 'server-response')
+  assert.equal(okBody.rpcId, 'r1')
+  assert.equal(okBody.result.ok, true)
+  const badRes = await fetcher.fetch(new Request(`http://x${EDITOR_RPC_CHANNEL}/parse`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'client-request', rpcId: 'r2', method: 'validate', payload: {} }),
+  }))
+  const badBody = JSON.parse(await badRes.text()) as { result: { ok: boolean, error: { code: string } } }
+  assert.equal(badBody.result.ok, false)
+  assert.equal(badBody.result.error.code, 'bad-request')
+  const getRes = await fetcher.fetch(new Request(`http://x${EDITOR_RPC_CHANNEL}/parse`, { method: 'GET' }))
+  assert.equal(getRes.status, 404)
 })

@@ -218,3 +218,218 @@ export function registerEditorRpc(ctx: { connection?: ConnectionService }):
   const dispose = connection.rpc.handle(EDITOR_RPC_CHANNEL, createEditorRpcHandler())
   return { status: 'registered', dispose }
 }
+
+/**
+ * dsh v0.1.5-alpha.1+ 的正式安装路径：client-connection 的 inject 收缩为 ['credentials']，
+ * `connection.rpc.handle()` 内部访问 owner.webServer 必抛 "cannot get property without
+ * inject"（实测 2026-09-24，dsh-pocket lib/web-rpc.js 记录了同一坑）。因此优先把通道
+ * 路由直接挂到**本插件自己 inject 的 webServer** 上，鉴权以方法形式调用
+ * `connection.requestRejection(req)`（401/403 均由它判定，丢失 this 会 TypeError →
+ * fail-closed 403）；wire 协议（client-request → handler → server-response）与
+ * Connection /api 通道逐字段一致，浏览器客户端无需改动。
+ * 旧版宿主（无 webServer 服务，如 headless）回退 `connection.rpc.handle`。
+ */
+export function installEditorRpc(ctx: EditorWebCtx):
+  | { status: 'mounted'; dispose: () => void }
+  | { status: 'fallback'; dispose: () => Promise<void> }
+  | { status: 'skipped' } {
+  const connection = ctx.connection
+  const webServer = ctx.webServer
+  if (connection !== undefined && webServer !== undefined && typeof webServer.register === 'function') {
+    const fetchHandler = editorFetchHandler(EDITOR_RPC_CHANNEL, createEditorRpcHandler())
+    const route: WebRoute = {
+      kind: 'prefix',
+      path: EDITOR_RPC_CHANNEL,
+      handler: async (req, res) => {
+        let rejection: number | undefined = 403
+        if (typeof connection.requestRejection === 'function') {
+          try { rejection = connection.requestRejection(req) } catch { rejection = 403 }
+        }
+        if (rejection !== undefined) {
+          res.writeHead(rejection, { 'content-type': 'text/plain; charset=utf-8' })
+          res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+          return
+        }
+        await httpBridge(req, res, fetchHandler, EDITOR_RPC_BODY_MAX)
+      },
+    }
+    const registered: unknown = webServer.register(route)
+    // register 可能返回 disposer、Promise<disposer> 或 undefined；统一成幂等清理函数。
+    const cleanup = typeof registered === 'function'
+      ? () => { try { (registered as () => void)() } catch { /* 已清理 */ } }
+      : registered !== null && typeof registered === 'object' && typeof (registered as { then?: unknown }).then === 'function'
+        ? (() => {
+          let done = false
+          return () => { void (async () => {
+            if (done) return
+            done = true
+            try {
+              const dispose = await registered as unknown
+              if (typeof dispose === 'function') (dispose as () => void)()
+            } catch { /* 已清理 */ }
+          })() }
+        })()
+        : () => {}
+    return { status: 'mounted', dispose: cleanup }
+  }
+  const fallback = registerEditorRpc(ctx)
+  if (fallback.status === 'registered') return { status: 'fallback', dispose: fallback.dispose }
+  return { status: 'skipped' }
+}
+
+/** 单请求体上限：业务文本上限 512KB，信封开销留余量。 */
+export const EDITOR_RPC_BODY_MAX = 2 * 1024 * 1024
+
+/** endpoint 段字符（与 dsh-client-connection 的 ENDPOINT_SEGMENT_PATTERN 对齐）。 */
+const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
+
+/** client-request 信封校验失败时使用的兜底 rpcId（与 dsh 内部 INVALID_REQUEST_RPC_ID 对齐）。 */
+const INVALID_REQUEST_RPC_ID = 'invalid-request'
+
+interface NodeLikeRequest {
+  method?: string
+  url?: string
+  headers: Record<string, unknown>
+  destroy(): void
+  [Symbol.asyncIterator](): AsyncIterableIterator<Buffer>
+}
+
+interface NodeLikeResponse {
+  writableEnded: boolean
+  write(chunk: unknown): boolean
+  end(chunk?: unknown): void
+  writeHead(status: number, headers?: Record<string, unknown>): void
+  on(event: string, listener: () => void): void
+  off(event: string, listener: () => void): void
+  once(event: string, listener: () => void): void
+}
+
+export interface WebRoute {
+  kind: 'prefix'
+  path: string
+  handler: (req: NodeLikeRequest, res: NodeLikeResponse) => Promise<void>
+}
+
+export interface EditorWebCtx {
+  connection?: ConnectionService & { requestRejection?: (req: NodeLikeRequest) => number | undefined }
+  webServer?: { register(route: WebRoute): unknown }
+}
+
+/** 从 `${channel}/<endpoint>` 路径取 endpoint；段非法返回 undefined（与宿主对齐）。 */
+function endpointFromPath(channel: string, pathname: string): string | undefined {
+  if (!pathname.startsWith(`${channel}/`)) return undefined
+  const endpoint = pathname.slice(channel.length + 1)
+  const segments = endpoint.split('/')
+  if (segments.some(segment =>
+    segment === '' || segment === '.' || segment === '..' || !ENDPOINT_SEGMENT_PATTERN.test(segment))) {
+    return undefined
+  }
+  return endpoint
+}
+
+function serverResponseJson(rpcId: string, result: EditorRpcResult): string {
+  return JSON.stringify({ type: 'server-response', rpcId, result })
+}
+
+/**
+ * 把编辑器 handler 包装成 fetch-shaped handler：404（非 POST / 无 endpoint）、
+ * 415（content-type）、400（非 JSON）、bad-request（信封非法 / method 不匹配）、
+ * 500（handler 抛错），成功 200 返回 server-response JSON。
+ */
+export function editorFetchHandler(channel: string, handler: EditorRpcHandler): { fetch(request: Request): Promise<Response> } {
+  return {
+    async fetch(request: Request): Promise<Response> {
+      const endpoint = endpointFromPath(channel, new URL(request.url).pathname)
+      if (request.method !== 'POST' || endpoint === undefined) {
+        return new Response('not found', { status: 404 })
+      }
+      const mediaType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase()
+      if (mediaType !== 'application/json') {
+        return new Response('content type must be application/json', { status: 415 })
+      }
+      let body: unknown
+      try { body = await request.json() } catch {
+        return new Response('body is not JSON', { status: 400 })
+      }
+      const envelope = body as { rpcId?: unknown; method?: unknown } | null
+      const rpcId = envelope !== null && typeof envelope.rpcId === 'string' ? envelope.rpcId : INVALID_REQUEST_RPC_ID
+      const method = envelope !== null && typeof envelope.method === 'string' ? envelope.method : null
+      if (rpcId === INVALID_REQUEST_RPC_ID || method === null) {
+        return new Response(serverResponseJson(INVALID_REQUEST_RPC_ID, {
+          ok: false,
+          error: { code: 'bad-request', message: 'invalid client-request message', details: { issues: [] } },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (method !== endpoint) {
+        return new Response(serverResponseJson(rpcId, {
+          ok: false,
+          error: {
+            code: 'bad-request',
+            message: `method ${JSON.stringify(method)} does not match endpoint ${JSON.stringify(endpoint)}`,
+            details: { issues: [] },
+          },
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      try {
+        const result = await handler(endpoint, (envelope as { payload?: unknown }).payload, request.signal)
+        return new Response(serverResponseJson(rpcId, result), { status: 200, headers: { 'content-type': 'application/json' } })
+      } catch (error) {
+        return new Response(`handler failure: ${String(error)}`, { status: 500 })
+      }
+    },
+  }
+}
+
+/**
+ * node:http 请求 → fetch-shaped handler → node:http 响应的桥接（对齐宿主 bridge）：
+ * res 关闭即 abort、超限 413 + 销毁 socket、数组请求头丢弃、背压等 drain/close。
+ */
+async function httpBridge(req: NodeLikeRequest, res: NodeLikeResponse, fetchHandler: { fetch(request: Request): Promise<Response> }, maxBodyBytes: number): Promise<void> {
+  const abort = new AbortController()
+  res.on('close', () => { if (!res.writableEnded) abort.abort() })
+  const declaredLen = req.headers['content-length']
+  if (declaredLen !== undefined && Number(declaredLen) > maxBodyBytes) {
+    res.writeHead(413, { connection: 'close' })
+    res.end()
+    req.destroy()
+    return
+  }
+  const chunks: Buffer[] = []
+  let received = 0
+  let tooLarge = false
+  for await (const chunk of req) {
+    received += chunk.length
+    if (received > maxBodyBytes) { tooLarge = true; break }
+    chunks.push(chunk)
+  }
+  if (tooLarge) {
+    res.writeHead(413, { connection: 'close' })
+    res.end()
+    req.destroy()
+    return
+  }
+  const host = typeof req.headers['host'] === 'string' ? req.headers['host'] : '127.0.0.1'
+  const url = `http://${host}${req.url ?? '/'}`
+  const headerEntries = Object.entries(req.headers).filter((entry) => typeof entry[1] === 'string') as Array<[string, string]>
+  const init: RequestInit = {
+    method: req.method ?? 'GET',
+    headers: Object.fromEntries(headerEntries),
+    signal: abort.signal,
+  }
+  if (chunks.length > 0) init.body = Buffer.concat(chunks)
+  const response = await fetchHandler.fetch(new Request(url, init))
+  const headers = Object.fromEntries(response.headers.entries())
+  res.writeHead(response.status, headers)
+  if (response.body === null) { res.end(); return }
+  for await (const chunk of response.body) {
+    if (!res.write(chunk)) {
+      await new Promise<void>((resolve) => {
+        const done = () => { res.off('drain', done); res.off('close', done); resolve() }
+        res.once('drain', done)
+        res.once('close', done)
+      })
+    }
+    if (res.writableEnded) break
+  }
+  res.end()
+}
