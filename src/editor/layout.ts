@@ -4,8 +4,10 @@
  * 只记录坐标，不复制业务数据：
  * `{ version: 1, main: { <nodeId>: {x,y} }, children: { <childId>: { <nodeId>: {x,y} } } }`
  * 主流程与子流程按身份隔离，同名节点互不覆盖。
+ * 结束节点使用保留键 `return:<返回名>`，与合法节点 id 不冲突。
+ * 连线路由使用 `edge:<节点 id>:<结果名>`，x/y 分别记录折线竖段/绕行横段坐标。
  */
-import type { WorkflowConfig } from '../types.ts'
+import { declaredResults, type WorkflowConfig } from '../types.ts'
 
 /** 画布坐标（像素）。 */
 export interface NodePosition {
@@ -156,23 +158,25 @@ export function fillMissingPositions(config: WorkflowConfig, layout: EditorLayou
 }
 
 /**
- * 按当前配置序列化布局（只写现存节点的坐标，陈旧记录自然丢弃；
+ * 按当前配置序列化布局（只写现存节点/结束标记/连线的坐标，陈旧记录自然丢弃；
  * 子流程空表保留键，便于切换显示）。
  */
 export function serializeLayout(config: WorkflowConfig, layout: EditorLayout): string {
   const out: EditorLayout = { version: LAYOUT_VERSION, main: {}, children: {} }
-  for (const nodeId of Object.keys(config.workflow.nodes)) {
-    const pos = layout.main[nodeId]
-    if (pos !== undefined) out.main[nodeId] = { x: pos.x, y: pos.y }
-  }
-  for (const [childId, def] of Object.entries(config.childWorkflows ?? {})) {
-    const table = layout.children[childId] ?? {}
+  // 冒号不属于合法节点 id，return:/edge: 为布局保留；兼容已有 v1 文件。
+  for (const [childId, def] of [[undefined, config.workflow] as const, ...Object.entries(config.childWorkflows ?? {})]) {
+    const table = childId === undefined ? layout.main : layout.children[childId] ?? {}
     const flow: Record<string, NodePosition> = {}
-    for (const nodeId of Object.keys(def.nodes)) {
+    const keys = [
+      ...Object.keys(def.nodes), ...def.returns.map(name => `return:${name}`),
+      ...Object.entries(def.nodes).flatMap(([id, node]) => declaredResults(node).map(result => `edge:${id}:${result}`)),
+    ]
+    for (const nodeId of keys) {
       const pos = table[nodeId]
       if (pos !== undefined) flow[nodeId] = { x: pos.x, y: pos.y }
     }
-    out.children[childId] = flow
+    if (childId === undefined) out.main = flow
+    else out.children[childId] = flow
   }
   return `${JSON.stringify(out, undefined, 2)}\n`
 }

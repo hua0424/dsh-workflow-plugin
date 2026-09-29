@@ -199,7 +199,7 @@ export function setNodePosition(session: DraftSession, flowId: string | undefine
   }
   const flow = flowId === undefined ? session.draft.config.workflow : session.draft.config.childWorkflows?.[flowId]
   if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
-  if (!Object.prototype.hasOwnProperty.call(flow.nodes, nodeId)) {
+  if (!Object.prototype.hasOwnProperty.call(flow.nodes, nodeId) && !(nodeId.startsWith('return:') && flow.returns.includes(nodeId.slice(7)))) {
     return { ok: false, reason: `节点 "${nodeId}" 在${flowId === undefined ? '主流程' : `子流程 "${flowId}"`}中不存在（本票不开放新增节点）` }
   }
   const current = getPosition(session.draft.layout, flowId, nodeId)
@@ -819,6 +819,13 @@ export function renameNode(session: DraftSession, flowId: string | undefined, ol
     if (table !== undefined) delete table[oldId]
     session.draft.dirtyLayout = true
   }
+  const table = flowId === undefined ? session.draft.layout.main : session.draft.layout.children[flowId]
+  for (const key of Object.keys(table ?? {})) {
+    if (!key.startsWith(`edge:${oldId}:`)) continue
+    table![`edge:${newId}:${key.slice(`edge:${oldId}:`.length)}`] = table![key]!
+    delete table![key]
+    session.draft.dirtyLayout = true
+  }
   session.draft.dirtyBusiness = true
   return { ok: true, updated }
 }
@@ -912,6 +919,12 @@ export function renameNodeResult(session: DraftSession, flowId: string | undefin
   pushHistory(session)
   found.node.results[newName] = found.node.results[oldName]!
   delete found.node.results[oldName]
+  const table = flowId === undefined ? session.draft.layout.main : session.draft.layout.children[flowId]
+  if (table?.[`edge:${nodeId}:${oldName}`] !== undefined) {
+    table[`edge:${nodeId}:${newName}`] = table[`edge:${nodeId}:${oldName}`]!
+    delete table[`edge:${nodeId}:${oldName}`]
+    session.draft.dirtyLayout = true
+  }
   session.draft.dirtyBusiness = true
   return { ok: true }
 }
@@ -973,6 +986,11 @@ export function renameFlowReturn(session: DraftSession, flowId: string | undefin
   if (!ID_PATTERN.test(newName)) return { ok: false, reason: `返回名 "${newName}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
   if (flow.returns.includes(newName)) return { ok: false, reason: `返回 "${newName}" 已声明` }
   pushHistory(session)
+  const table = flowId === undefined ? session.draft.layout.main : session.draft.layout.children[flowId]
+  if (table?.[`return:${oldName}`] !== undefined) {
+    table[`return:${newName}`] = table[`return:${oldName}`]!
+    delete table[`return:${oldName}`]
+  }
   flow.returns = flow.returns.map(name => name === oldName ? newName : name)
   let updated = 0
   for (const node of Object.values(flow.nodes)) {
@@ -994,14 +1012,20 @@ export function renameFlowReturn(session: DraftSession, flowId: string | undefin
   }
   // 已有 Child 调用方对该子流程返回名的 onReturn 引用键同步改名。
   const calleeKey = flowKeyOf(session, flowId)
-  const allFlows = [session.draft.config.workflow, ...Object.values(session.draft.config.childWorkflows ?? {})]
-  for (const callerFlow of allFlows) {
-    for (const node of Object.values(callerFlow.nodes)) {
+  const allFlows = [[undefined, session.draft.config.workflow] as const, ...Object.entries(session.draft.config.childWorkflows ?? {})]
+  for (const [callerId, callerFlow] of allFlows) {
+    for (const [nodeId, node] of Object.entries(callerFlow.nodes)) {
       if (node.execution.type !== 'child-workflow' || node.execution.workflowId !== calleeKey) continue
       const onReturn = nodeOnReturn(node)
       if (onReturn !== undefined && Object.prototype.hasOwnProperty.call(onReturn, oldName)) {
         onReturn[newName] = onReturn[oldName]!
         delete onReturn[oldName]
+        const callerTable = callerId === undefined ? session.draft.layout.main : session.draft.layout.children[callerId]
+        if (callerTable?.[`edge:${nodeId}:${oldName}`] !== undefined) {
+          callerTable[`edge:${nodeId}:${newName}`] = callerTable[`edge:${nodeId}:${oldName}`]!
+          delete callerTable[`edge:${nodeId}:${oldName}`]
+          session.draft.dirtyLayout = true
+        }
         updated++
       }
     }
@@ -1019,6 +1043,8 @@ export function deleteFlowReturn(session: DraftSession, flowId: string | undefin
   if (flow === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
   if (!flow.returns.includes(name)) return { ok: false, reason: `返回 "${name}" 未在本流程声明` }
   pushHistory(session)
+  const table = flowId === undefined ? session.draft.layout.main : session.draft.layout.children[flowId]
+  if (table !== undefined) delete table[`return:${name}`]
   flow.returns = flow.returns.filter(entry => entry !== name)
   session.draft.dirtyBusiness = true
   return { ok: true }

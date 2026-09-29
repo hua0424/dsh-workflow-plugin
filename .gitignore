@@ -26,3 +26,4 @@ review-*.txt
 /web-client/dist/
 
 .scratch
+.playwright-cli

@@ -604,7 +604,13 @@ export function renameNodeEdit(state, flowId, oldId, newId) {
     table[newId] = table[oldId]
     delete table[oldId]
   }
-  const dirtyLayout = table !== undefined && table[newId] !== undefined
+  let dirtyLayout = table !== undefined && table[newId] !== undefined
+  for (const key of Object.keys(table ?? {})) {
+    if (!key.startsWith(`edge:${oldId}:`)) continue
+    table[`edge:${newId}:${key.slice(`edge:${oldId}:`.length)}`] = table[key]
+    delete table[key]
+    dirtyLayout = true
+  }
   return {
     ok: true, updated,
     state: { ...withHistory, draft, positions, dirtyBusiness: true, dirtyLayout: dirtyLayout || withHistory.dirtyLayout, saveResult: null },
@@ -710,11 +716,18 @@ export function renameNodeResultEdit(state, flowId, nodeId, oldName, newName) {
   if (Object.prototype.hasOwnProperty.call(found.node.results ?? {}, newName)) {
     return { ok: false, reason: `节点 "${nodeId}" 结果 "${newName}" 已存在` }
   }
-  const { withHistory, draft } = withDraftHistory(state)
+  const { withHistory, draft, positions } = withDraftHistory(state)
   const flow = flowId === null ? draft.workflow : draft.childWorkflows[flowId]
   flow.nodes[nodeId].results[newName] = flow.nodes[nodeId].results[oldName]
   delete flow.nodes[nodeId].results[oldName]
-  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+  const table = flowId === null ? positions.main : positions.children[flowId]
+  let dirtyLayout = withHistory.dirtyLayout
+  if (table?.[`edge:${nodeId}:${oldName}`] !== undefined) {
+    table[`edge:${nodeId}:${newName}`] = table[`edge:${nodeId}:${oldName}`]
+    delete table[`edge:${nodeId}:${oldName}`]
+    dirtyLayout = true
+  }
+  return { ok: true, state: { ...withHistory, draft, positions, dirtyLayout, dirtyBusiness: true, saveResult: null } }
 }
 
 /** 删除命名结果。 */
@@ -772,7 +785,12 @@ export function renameFlowReturnEdit(state, flowId, oldName, newName) {
   if (oldName === newName) return { ok: true, noop: true, updated: 0, state }
   if (!ID_PATTERN.test(newName)) return { ok: false, reason: `返回名 "${newName}" 不是合法小写 [a-z][a-z0-9-]* 标识符` }
   if ((flowDef.returns ?? []).includes(newName)) return { ok: false, reason: `返回 "${newName}" 已声明` }
-  const { withHistory, draft } = withDraftHistory(state)
+  const { withHistory, draft, positions } = withDraftHistory(state)
+  const table = flowId === null ? positions.main : positions.children[flowId]
+  if (table?.[`return:${oldName}`] !== undefined) {
+    table[`return:${newName}`] = table[`return:${oldName}`]
+    delete table[`return:${oldName}`]
+  }
   const flow = flowId === null ? draft.workflow : draft.childWorkflows[flowId]
   flow.returns = flow.returns.map((name) => (name === oldName ? newName : name))
   let updated = 0
@@ -791,17 +809,24 @@ export function renameFlowReturnEdit(state, flowId, oldName, newName) {
     }
   }
   const calleeKey = flowId === null ? state.workflowId : flowId
-  for (const callerFlow of [draft.workflow, ...Object.values(draft.childWorkflows ?? {})]) {
-    for (const node of Object.values(callerFlow.nodes ?? {})) {
+  let dirtyLayout = withHistory.dirtyLayout
+  for (const [callerId, callerFlow] of [[null, draft.workflow], ...Object.entries(draft.childWorkflows ?? {})]) {
+    for (const [nodeId, node] of Object.entries(callerFlow.nodes ?? {})) {
       if (node.execution?.type !== 'child-workflow' || node.execution?.workflowId !== calleeKey) continue
       if (Object.prototype.hasOwnProperty.call(node.onReturn ?? {}, oldName)) {
         node.onReturn[newName] = node.onReturn[oldName]
         delete node.onReturn[oldName]
+        const callerTable = callerId === null ? positions.main : positions.children[callerId]
+        if (callerTable?.[`edge:${nodeId}:${oldName}`] !== undefined) {
+          callerTable[`edge:${nodeId}:${newName}`] = callerTable[`edge:${nodeId}:${oldName}`]
+          delete callerTable[`edge:${nodeId}:${oldName}`]
+          dirtyLayout = true
+        }
         updated++
       }
     }
   }
-  return { ok: true, updated, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+  return { ok: true, updated, state: { ...withHistory, draft, positions, dirtyLayout, dirtyBusiness: true, saveResult: null } }
 }
 
 /** 删除流程返回（相关目标/映射键保留悬空，由保存前校验诊断）。 */
@@ -810,10 +835,12 @@ export function deleteFlowReturnEdit(state, flowId, name) {
   const flowDef = flowDefOf(state.draft, flowId)
   if (flowDef === undefined) return { ok: false, reason: `子流程 "${flowId}" 不存在` }
   if (!(flowDef.returns ?? []).includes(name)) return { ok: false, reason: `返回 "${name}" 未在本流程声明` }
-  const { withHistory, draft } = withDraftHistory(state)
+  const { withHistory, draft, positions } = withDraftHistory(state)
+  const table = flowId === null ? positions.main : positions.children[flowId]
+  if (table !== undefined) delete table[`return:${name}`]
   const flow = flowId === null ? draft.workflow : draft.childWorkflows[flowId]
   flow.returns = flow.returns.filter((entry) => entry !== name)
-  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+  return { ok: true, state: { ...withHistory, draft, positions, dirtyBusiness: true, saveResult: null } }
 }
 
 /* ------------------------------------------------------------------ *

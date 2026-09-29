@@ -8,7 +8,7 @@
  *   factory 末尾 return { PANEL_KEY, inject, apply }。
  *
  * 用法：node web-client/build.mjs [--out <目录>]
- * 约束：四源文件经正则做最小拼合（顺序 rpc → edits → panel → index，
+ * 约束：源文件经正则做最小拼合（顺序 rpc → edits → styles → panel → index，
  * 无重名顶层绑定，react 经 require('react') 取宿主共享实例）。React Flow 引入后必须切换到正式
  * bundler，本脚本即退役（见 README）。
  */
@@ -47,23 +47,27 @@ function rewriteImports(source, from, toExpression) {
 export function bundleSources() {
   const rpc = read('rpc.js').replace(/^export\s+/gm, '')
   const edits = read('edits.js').replace(/^export\s+/gm, '')
+  const styles = read('styles.js').replace(/^export\s+/gm, '')
+  const modelSelector = rewriteImports(read('model-selector.js'), 'react', "require('react')").replace(/^export\s+/gm, '')
   const panel = rewriteImports(read('panel.js'), 'react', "require('react')")
-  const panelLinked = rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits')
-  const index = rewriteImports(
+  const panelLinked = rewriteImports(rewriteImports(rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits'), './styles.js', '__styles'), './model-selector.js', '__modelSelector')
+  const index = rewriteImports(rewriteImports(
     rewriteImports(read('index.js'), './panel.js', '__panel'),
     './rpc.js',
     '__rpc',
-  )
+  ), './model-selector.js', '__modelSelector')
   return {
     rpc,
     edits,
+    styles,
+    modelSelector,
     panel: panelLinked.replace(/^export\s+/gm, ''),
     index: index.replace(/^export\s+/gm, ''),
   }
 }
 
 export function buildClientBundle({ outDir } = {}) {
-  const { rpc, edits, panel, index } = bundleSources()
+  const { rpc, edits, styles, modelSelector, panel, index } = bundleSources()
   const bundle = `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {
 var module = { exports: {} }; var exports = module.exports;
 var __rpc = (function () {
@@ -73,6 +77,14 @@ return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage };
 var __edits = (function () {
 ${edits}
 return { HISTORY_LIMIT, ID_PATTERN, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, SUPPORTED_CHECKER_IDS, PROGRAM_PARAMETERS_MAX, layoutFilenameFor, clone, isDirty, savePlanOf, snapshotOf, pushHistory, applyPersonaEdit, moveNodeEdit, undoEdit, redoEdit, addRoleEdit, setRolePersonaEdit, setRoleModelEdit, setRoleReuseEdit, setRoleDenyEdit, renameRoleEdit, deleteRoleEdit, findRoleRefs, setJudgePersonaEdit, setJudgeModelEdit, setJudgeDenyEdit, parseNewFilenameEdit, checkNewFilename, minimalConfigOf, minimalFlowDefOf, addActorNodeEdit, setActorFieldsEdit, renameNodeEdit, deleteNodeEdit, findNodeRefsEdit, addNodeResultEdit, setNodeResultEdit, renameNodeResultEdit, deleteNodeResultEdit, setFlowStartNodeEdit, addFlowReturnEdit, renameFlowReturnEdit, deleteFlowReturnEdit, addProgramNodeEdit, setProgramFieldsEdit, setProgramParamEdit, setProgramResultEdit, addSubflowEdit, renameSubflowEdit, findSubflowCallersEdit, deleteSubflowEdit, addChildNodeEdit, setChildWorkflowIdEdit, setChildReturnTargetEdit };
+})();
+var __styles = (function () {
+${styles}
+return { EDITOR_STYLES };
+})();
+var __modelSelector = (function () {
+${modelSelector}
+return { ModelFields, modelChoices, readModelCatalog };
 })();
 var __panel = (function () {
 ${panel}

@@ -11,10 +11,10 @@ import assert from 'node:assert/strict'
 import {
   applyPersonaEdit, HISTORY_LIMIT, ID_PATTERN as clientIdPattern,
   isDirty, layoutFilenameFor as clientLayoutFilenameFor,
-  moveNodeEdit, redoEdit, savePlanOf, undoEdit,
+  moveNodeEdit, redoEdit, savePlanOf, undoEdit, renameFlowReturnEdit, deleteFlowReturnEdit, renameNodeEdit, renameNodeResultEdit,
 } from '../web-client/src/edits.js'
-import { loadDraft, savePlan, setActorCommonPersona, setNodePosition, undo } from '../src/editor/draft.ts'
-import { layoutFilenameFor as serverLayoutFilenameFor } from '../src/editor/layout.ts'
+import { loadDraft, savePlan, setActorCommonPersona, setNodePosition, undo, renameFlowReturn, deleteFlowReturn, renameNode, renameNodeResult } from '../src/editor/draft.ts'
+import { layoutFilenameFor as serverLayoutFilenameFor, serializeLayout, parseLayoutFile } from '../src/editor/layout.ts'
 import { ID_PATTERN as serverIdPattern } from '../src/types.ts'
 
 const MINI_CONFIG = `
@@ -49,6 +49,109 @@ function freshPanel(config: unknown) {
     problems: [],
   }
 }
+
+test('结束节点位置：布局独立保存、重载、撤销重做及返回改名/删除', () => {
+  const loaded = loadDraft('mini', MINI_CONFIG)
+  if (!loaded.ok) throw new Error('fixture failed')
+  const { session } = loaded
+  assert.deepEqual(setNodePosition(session, undefined, 'return:done', { x: 310, y: 240 }), { ok: true })
+  const moved = moveNodeEdit(freshPanel(session.draft.config), null, 'return:done', { x: 310, y: 240 })
+  assert.ok(moved.ok && moved.state)
+  const panel = moved.state!
+  assert.deepEqual(savePlanOf(panel), { writeYaml: false, writeLayout: true })
+  assert.deepEqual(redoEdit(undoEdit(panel)!)!.positions, panel.positions)
+  const reloaded = parseLayoutFile(serializeLayout(session.draft.config, session.draft.layout))
+  assert.deepEqual(reloaded.layout.main['return:done'], { x: 310, y: 240 })
+  session.draft.config.childWorkflows = { child: structuredClone(session.draft.config.workflow) }
+  assert.deepEqual(setNodePosition(session, 'child', 'return:done', { x: 120, y: 420 }), { ok: true })
+  session.draft.layout.main['return:stale'] = { x: 1, y: 1 }
+  const withChild = parseLayoutFile(serializeLayout(session.draft.config, session.draft.layout)).layout
+  assert.deepEqual(withChild.main['return:done'], { x: 310, y: 240 })
+  assert.deepEqual(withChild.children['child']?.['return:done'], { x: 120, y: 420 })
+  assert.equal(withChild.main['return:stale'], undefined)
+  assert.equal(clientIdPattern.test('return:done'), false)
+  assert.equal(serverIdPattern.test('return:done'), false)
+  assert.equal(setNodePosition(session, 'child', 'return:missing', { x: 1, y: 1 }).ok, false)
+  assert.equal(renameFlowReturn(session, 'child', 'done', 'finished').ok, true)
+  assert.deepEqual(session.draft.layout.children['child']?.['return:finished'], { x: 120, y: 420 })
+  assert.equal(session.draft.layout.children['child']?.['return:done'], undefined)
+  assert.deepEqual(session.draft.layout.main['return:done'], { x: 310, y: 240 })
+  assert.equal(deleteFlowReturn(session, 'child', 'finished').ok, true)
+  assert.equal(session.draft.layout.children['child']?.['return:finished'], undefined)
+  assert.equal(undo(session), true)
+  assert.deepEqual(session.draft.layout.children['child']?.['return:finished'], { x: 120, y: 420 })
+  const renamed = renameFlowReturnEdit(panel, null, 'done', 'finished')
+  assert.ok(renamed.ok && renamed.state)
+  assert.deepEqual(renamed.state!.positions.main['return:finished'], { x: 310, y: 240 })
+  assert.equal(renamed.state!.positions.main['return:done'], undefined)
+  const deleted = deleteFlowReturnEdit(renamed.state!, null, 'finished')
+  assert.ok(deleted.ok && deleted.state)
+  assert.equal(deleted.state!.positions.main['return:finished'], undefined)
+  assert.deepEqual(undoEdit(deleted.state!)!.positions.main['return:finished'], { x: 310, y: 240 })
+})
+
+test('连线路由位置：主/子流程与 onReturn 保存重载、剪枝、撤销重做', () => {
+  const loaded = loadDraft('mini', MINI_CONFIG)
+  if (!loaded.ok) throw new Error('fixture failed')
+  const config = loaded.session.draft.config
+  config.childWorkflows = { child: structuredClone(config.workflow) }
+  config.workflow.nodes['call'] = {
+    execution: { type: 'child-workflow', workflowId: 'child' },
+    onReturn: { done: { return: 'done' } },
+  }
+  const original = JSON.stringify(config)
+  const first = moveNodeEdit(freshPanel(config), null, 'edge:a:ok', { x: -110, y: 340 })
+  assert.ok(first.ok && first.state)
+  const child = moveNodeEdit(first.state!, 'child', 'edge:a:ok', { x: 440, y: -70 })
+  assert.ok(child.ok && child.state)
+  const call = moveNodeEdit(child.state!, null, 'edge:call:done', { x: 500, y: 620 })
+  assert.ok(call.ok && call.state)
+  const panel = call.state!
+  assert.deepEqual(savePlanOf(panel), { writeYaml: false, writeLayout: true })
+  assert.deepEqual(redoEdit(undoEdit(panel)!)!.positions, panel.positions)
+  assert.equal(JSON.stringify(panel.draft), original)
+  const layout = { version: 1 as const, ...panel.positions }
+  layout.main['edge:missing:ok'] = { x: 1, y: 1 }
+  layout.main['edge:a:missing'] = { x: 1, y: 1 }
+  layout.children['child']!['edge:a:missing'] = { x: 1, y: 1 }
+  layout.children['missing'] = { 'edge:a:ok': { x: 1, y: 1 } }
+  const reloaded = parseLayoutFile(serializeLayout(config, layout)).layout
+  assert.deepEqual(reloaded.main, { 'edge:a:ok': { x: -110, y: 340 }, 'edge:call:done': { x: 500, y: 620 } })
+  assert.deepEqual(reloaded.children, { child: { 'edge:a:ok': { x: 440, y: -70 } } })
+})
+
+test('节点/结果/子流程返回改名保留连线路由，前后端一致且可撤销', () => {
+  const loaded = loadDraft('mini', MINI_CONFIG)
+  if (!loaded.ok) throw new Error('fixture failed')
+  const { session } = loaded
+  session.draft.config.childWorkflows = { child: structuredClone(session.draft.config.workflow) }
+  session.draft.config.workflow.nodes['call'] = {
+    execution: { type: 'child-workflow', workflowId: 'child' }, onReturn: { done: { return: 'done' } },
+  }
+  session.draft.layout = {
+    version: 1, main: { 'edge:call:done': { x: 400, y: 100 } },
+    children: { child: { 'edge:a:ok': { x: -50, y: 90 } } },
+  }
+  const initial = structuredClone(session.draft.layout)
+  let panel = { ...freshPanel(session.draft.config), positions: structuredClone(session.draft.layout) }
+  assert.equal(renameNode(session, 'child', 'a', 'b').ok, true)
+  panel = renameNodeEdit(panel, 'child', 'a', 'b').state!
+  assert.equal(renameNodeResult(session, 'child', 'b', 'ok', 'yes').ok, true)
+  panel = renameNodeResultEdit(panel, 'child', 'b', 'ok', 'yes').state!
+  assert.equal(renameFlowReturn(session, 'child', 'done', 'finished').ok, true)
+  panel = renameFlowReturnEdit(panel, 'child', 'done', 'finished').state!
+  assert.deepEqual(panel.positions, session.draft.layout)
+  assert.deepEqual(session.draft.layout, {
+    version: 1, main: { 'edge:call:finished': { x: 400, y: 100 } },
+    children: { child: { 'edge:b:yes': { x: -50, y: 90 } } },
+  })
+  assert.equal(panel.dirtyLayout, true)
+  assert.equal(session.draft.dirtyLayout, true)
+  assert.deepEqual(parseLayoutFile(serializeLayout(session.draft.config, session.draft.layout)).layout, panel.positions)
+  for (let i = 0; i < 3; i++) { assert.equal(undo(session), true); panel = undoEdit(panel)! }
+  assert.deepEqual(panel.positions, initial)
+  assert.deepEqual(session.draft.layout, initial)
+})
 
 test('T1-panel: persona 设置/清除/noop/空白拒绝', () => {
   let panel = freshPanel({ workflow: {} })

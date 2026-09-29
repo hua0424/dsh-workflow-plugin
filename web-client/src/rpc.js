@@ -22,10 +22,35 @@ export async function callEditor(connection, endpoint, payload, signal) {
   if (typeof call !== 'function') {
     return { ok: false, error: { code: 'editor/no-channel', message: '当前页面没有可用的编辑器 RPC 通道', details: {} } }
   }
+  const controller = new AbortController()
+  let timedOut = false
+  const cancel = () => controller.abort(signal?.reason)
+  const cancelledResult = () => ({ ok: false, error: {
+    code: timedOut ? 'editor/timeout' : 'editor/cancelled',
+    message: timedOut ? '编辑器请求超过 15 秒未响应，请检查连接后重试。' : '编辑器请求已取消。',
+    details: {},
+  } })
+  if (signal?.aborted) return cancelledResult()
+  signal?.addEventListener('abort', cancel, { once: true })
+  const timer = setTimeout(() => { timedOut = true; controller.abort() }, 15_000)
+  let onAbort
+  const cancelled = new Promise((resolve) => {
+    onAbort = () => resolve(cancelledResult())
+    controller.signal.addEventListener('abort', onAbort, { once: true })
+  })
   try {
-    return normalizeResult(await call.call(connection.rpc, EDITOR_RPC_CHANNEL, endpoint, payload, signal))
+    // 同时终止传输与等待：宿主通道即使没有响应 abort，也不能一直锁住编辑器。
+    return normalizeResult(await Promise.race([
+      call.call(connection.rpc, EDITOR_RPC_CHANNEL, endpoint, payload, controller.signal),
+      cancelled,
+    ]))
   } catch (error) {
+    if (controller.signal.aborted) return cancelledResult()
     return { ok: false, error: { code: 'editor/transport', message: String(error), details: {} } }
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener('abort', cancel)
+    controller.signal.removeEventListener('abort', onAbort)
   }
 }
 

@@ -14,15 +14,18 @@
  */
 import { WorkflowConfigEditorIcon, WorkflowConfigEditorPanel } from './panel.js'
 import { callEditor } from './rpc.js'
+import { readModelCatalog } from './model-selector.js'
 
 export const PANEL_KEY = 'workflow-config-editor'
 
 /** 浏览器侧 Cordis 依赖：slot 注册表、主面板控制器、Connection RPC 通道。 */
-export const inject = ['slots', 'layout', 'connection']
+export const inject = ['slots', 'layout', 'connection', 'remote', 'remote.session']
 
 export function apply(ctx) {
   const editorRpc = (endpoint, payload, signal) => callEditor(ctx.connection, endpoint, payload, signal)
-  const injected = () => ({ editorRpc })
+  let modelRequest
+  const loadModels = () => modelRequest ??= readModelCatalog(ctx.remote).finally(() => { modelRequest = undefined })
+  const injected = () => ({ editorRpc, loadModels })
 
   // 全局主面板（keyed：key 即 sidebar 入口 id）。
   ctx.slots.inject('main', () =>

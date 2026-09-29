@@ -1,62 +1,31 @@
-# Web 配置编辑器客户端（T1 最小闭环）
+# Web 配置编辑器
 
-位置：`web-client/src/`（纯 JS + `React.createElement`，无 JSX、无第三方依赖）。
-本目录在顶层 `tsconfig.json` 的 `src/**` 之外，服务端 `tsc` 不编译它；
-`node --check` / `web-client/build.mjs` + 桩冒烟覆盖语法与模块形状。
+编辑器通过宿主 `main` 面板和 `sidebar.panellist` 注册，React 使用宿主共享实例。浏览器通过 File System Access API 打开用户授权目录；解析、校验、预览、布局补齐和程序元数据经宿主 RPC 调用，保存仍由用户点击触发。
 
-## 组成
+## 界面与操作
 
-- `src/rpc.js` — 经 `ctx.connection.rpc.call('/workflow-config-editor', …)`
-  调用 host 端 `parse/validate/preview/layout`。只发 `{workflowId, text/config}`
-  受限文本/JSON，不发任何服务端路径。
-- `src/panel.js` — T1 面板：打开授权目录 → 列合法命名 YAML → 自动关联
-  `<stem>.layout.json` → 编辑公共 `actorCommonPersona`（设置/清除，应用后立即刷新
-  只读预览）→ 主/子流程切换查看并拖动节点（仅位置）→ 只读预览 → 校验后显式
-  保存 → 分别报告 YAML/布局写入结果。撤销/重做上限 50，页面内，不持久化，
-  恢复快照脏标记（纯布局撤销后保存只写布局）；脏状态下打开目录/切换文件
-  `confirm`，关闭/刷新 `beforeunload`（尽力提供）。
-- `src/edits.js` — 面板纯状态变迁（无 React/DOM/RPC，node:test 直接覆盖）：
-  面板侧唯一的编辑/历史/保存计划来源，脏语义钉住服务端 `savePlan`。
-- `src/index.js` — 正式接入：`main` keyed 注册全局面板 +
-  `sidebar.panellist` 入口（id 与 key 一致），无 DOM 注入，不另起服务器。
-- `build.mjs` — 最小拼合：输出宿主模块加载器 factory 格式
-  `window.__ModuleLoader__.load({ id, factory })`（banner/footer/intro 对齐
-  宿主 `tsdown.client.ts` 约定）。产物 `dist/` gitignored，不提交：
-  `node web-client/build.mjs [--out <目录>]`。
+- 左侧画布显示节点、结果连线和流程返回；点击节点在右侧编辑，拖动标题调整位置。
+- 点击结果端口后，再点目标节点或返回完成连线。主流程与子流程独立切换。
+- 右侧分为节点、角色、流程和 YAML 四个页签；新增 Actor / Program / Child 表单默认折叠。
+- 支持缩放、适应画布、撤销与重做。一次拖动对应一次撤销，保存布局后重新打开保留坐标。
+- 空白处按住鼠标右键或中键，可向任意方向持续平移；「适应画布」回到节点范围。
+- 连线使用直角折线，点击单条线高亮，再拖动控制柄调整走线；路径随布局保存，支持撤销与重做。
+- 属性面板宽度为 320px，可用「收起属性」扩大画布；展开后保留尚未应用的表单输入。
+- 窄面板自动改为上下布局；样式限定在 `.wf-editor` 内，并支持系统深色模式。
+- 程序元数据在面板打开时独立请求，预览跟随草稿异步刷新；RPC 超过 15 秒返回错误提示，避免无限等待。
 
-## 有意不做的（本票边界）
+## 源码与构建
 
-- 未声明 `package.json` 的 `dsh.client`、未加 `exports["./client"]`、
-  `deploy-web.mjs` 未改：仓库内尚无可提交的已验证客户端产物；
-  声明即进入宿主 boot 图，缺 bundle 会在激活期 fail-loud 拖累整个插件
-  （含非 Web 加载）。管线 + 浏览器验证落地后再声明，二者是后票（图/表单票）的前置。
-- 未引入 React Flow：画布为指针拖动最小占位实现（只改位置，不改拓扑）；
-  React Flow + CSS + 正式 bundler 随 T3 图编辑票引入，本脚本届时退役。
-- React/React DOM 取宿主共享实例（module-table baseline），本 bundle 只
-  `require('react')`，不打包第二份（桩冒烟已断言除 react 外零 require）。
+- `src/index.js`：宿主注册入口。
+- `src/panel.js`：画布、属性面板与文件操作。
+- `src/styles.js`：随 bundle 分发的作用域样式，无外部 CSS 加载步骤。
+- `src/edits.js`：草稿、历史和保存计划的纯状态变迁。
+- `src/rpc.js`：同源 RPC、超时与取消。
 
-## 已验证（模拟）vs 待验证（真实浏览器）
+使用 `node web-client/build.mjs [--out <目录>]` 生成宿主模块加载器 factory 格式产物。构建脚本只拼合本目录固定模块，浏览器只 require 宿主 React，不打包第二份 React，不引入画图库依赖。源码属于纯 JS，不在根 tsconfig 编译范围内。
 
-已验证（本机真实执行，非浏览器）：
-- `test/editor-t1-roundtrip.test.ts` 16 用例：真实 parser/schema/validator
-  的加载→修改→保存→重载业务等价、全字段保留、布局恢复、无效输入、
-  自环拒绝、部分写入失败、撤销/重做、RPC 受限输入与副本语义。
-- `node web-client/build.mjs` 产物 `node --check` 通过；桩冒烟
-  （`.scratch/web-client-smoke.mjs`，可复现）：factory 仅 require react，
-  `apply` 注册 `main{key}` + `sidebar.panellist{id}`。
-- `pnpm run verify` 通过（见 #160 实现评论）。
+`node scripts/deploy-web.mjs --out <临时目录>` 可验证完整插件产物；部署真实 profile 仍需显式授权。服务端变更前先运行 `pnpm run build`。
 
-待真实浏览器验证（未做，不宣称）：
-实际宿主面板挂载、`main`/`sidebar.panellist` 注册选项形状与生成 client
-目录的一致性（`cordis_inspect what:"client"`）、React 单例与样式、
-目录授权/拒绝/撤销、不支持 API 提示、拖动、离开提醒。静态相容与桩冒烟
-不代替上述实测；部署仍需独立授权（父票 #159 边界）。
+## 验证边界
 
-已确认无需验证的子项（宿主源码证据，不写代码）：
-- `layout.selectPanel` 无需客户端注册：宿主切换前检查实时 `main` 注册表，
-  缺 key 抛错并保留当前面板（`packages/client/ui-layout/README.md` +
-  `service.ts selectPanel`）；客户端只需注册 `main` keyed 位。
-- 面板取消选择（关闭面板）无客户端可拦截的钩子：`ui-slots` 无
-  beforeClose/canClose/guard API，`selectPanel` 直接切换并卸载旧面板；
-  在面板内拦截关闭需改宿主，而 #159 明确排除修改宿主。AC10 的关闭提醒
-  子句需 spec 方缩窄或立宿主需求（r001 F4，已交 Manager 裁决）。
+`pnpm run verify` 覆盖服务端及编辑器状态/RPC 回归；真实浏览器的布局、拖动、连线和保存往返另见 `scripts/editor-ui-smoke/README.md`。隔离浏览器使用真实 React、当前 bundle 与真实编辑器 RPC handler，文件句柄是内存实现，不会修改真实配置。该检查不等同于已安装 DSH 实例的网络性能验收。
