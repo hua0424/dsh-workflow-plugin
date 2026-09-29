@@ -78,6 +78,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
     boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
     previousFeedback: { result: 'NEED_CONTEXT', reason: 'need facts', claim: { result: 'succeeded', handoff: 'candidate' } },
     managerContext: 'more evidence', cwd: '.', judgeSessionId: 'sess-judge', recovery: true,
+    workspace: 'ws',
   }), { messageId: 'dispatch-3' })
   assert.deepEqual(deliveries.slice(0, 2), [
     { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
@@ -130,7 +131,7 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
     await assert.rejects(host.startJudge(run, {
       nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
       boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
-      cwd: '.', judgeSessionId: 'judge-new',
+      cwd: '.', judgeSessionId: 'judge-new', workspace: 'ws',
     }), /timeout after 20ms at stage "spawn judge"/)
     assert.deepEqual(signals.map(signal => signal.aborted), [true, true],
       'the timeout is a real interrupt source, not a decorative signal')
@@ -569,7 +570,7 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
     await assert.rejects(makeSubagentHost(adapters, testParticipants(adapters.ctx)).followupJudge(run, 'sess-judge', {
       nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
       boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
-      cwd: '.', judgeSessionId: 'sess-judge',
+      cwd: '.', judgeSessionId: 'sess-judge', workspace: 'ws',
     }), /timeout after 20ms at stage "send"/)
     assert.deepEqual(signals.map(signal => signal.aborted), [true, true])
   })

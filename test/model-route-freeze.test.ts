@@ -254,7 +254,7 @@ function judgeInput(run: RunState, judgeSessionId: string): JudgeSpawnInput {
   return {
     nodeToken: run.callStack[0]!.nodeToken, criteria: 'PASS.',
     boundary: { dispatchedAt: 0, managerFromSeq: 0 }, claim: { result: 'succeeded', handoff: 'candidate' },
-    cwd: '.', judgeSessionId,
+    cwd: '.', judgeSessionId, workspace: 'ws',
   }
 }
 

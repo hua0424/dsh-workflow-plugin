@@ -26,6 +26,7 @@ import { topFrame } from '../state/invariants.ts'
 import { DISPATCH_TIMEOUTS, withTimeout } from '../engine/timeouts.ts'
 import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
+import { runMaterialsSection } from '../engine/texts.ts'
 import type { ParticipantIndex } from './participants.ts'
 
 /** Optional Host service used by the continuation manager for cold Session reads. */
@@ -323,6 +324,7 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
       recovery: input.recovery,
       workerHandoff: input.claim.handoff,
       workspaceCwd: input.cwd,
+      runMaterials: runMaterialsSection(input.workspace, run.runId).trim(),
       transcript: projectNodeLocal(manager.session, input.boundary, actorSession),
       previousFeedback: input.previousFeedback,
       managerContext: input.managerContext,
