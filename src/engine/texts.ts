@@ -10,3 +10,21 @@ export const SUBMISSION_CONSTRAINT = `\n\n[提交要求]\n结果只通过 node_c
 
 export const ACTOR_RECOVERY_INSTRUCTION = `\n\n[中断恢复]\n之前中断，请先检查实际完成情况；已完成勿重复副作用，未完继续；不确定/缺权限BLOCK。完成后重新提交 result 与完整 handoff。`
 export const JUDGE_RECOVERY_INSTRUCTION = `\n\n[中断恢复]\n之前中断；只读核验当前 claim 与实际现场，不补做 Actor 工作。信息不足请 NEED_CONTEXT。`
+
+/**
+ * Issue #173：Run 本地材料目录（单源）。用该 Run 已绑定的 workspace + runId
+ * 计算，不猜测 cwd、不推断 Git 根、不改用户目录。
+ */
+export function runArtifactsDir(workspace: string, runId: string): string {
+  return `${workspace.replace(/[/\\]+$/, '')}/.dsh-workflow/runs/${runId}/`
+}
+
+/**
+ * Issue #173：每次派发给 Manager、Actor、Judge 时统一附带的简短规则。
+ * 调用方把它放在 `[instruction]` 之后、`SUBMISSION_CONSTRAINT` 之前——投影按
+ * `[instruction]` 截断（compressDispatchToHandoff），末尾固定后缀剥离
+ * （stripSubmissionConstraint）都不受影响。
+ */
+export function runMaterialsSection(workspace: string, runId: string): string {
+  return `\n\n[run-materials]\nrunId: ${runId}\ndir: ${runArtifactsDir(workspace, runId)}\n本地临时材料放该目录，按需创建；不预建空报告，不强制生成 run.md。应写 Issue/PR 或提交 Git 的项目文档保持原归属不变。`
+}

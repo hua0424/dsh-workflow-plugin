@@ -4,7 +4,7 @@ import { WorkflowError, LIMITS, declaredResults, nodeChecker, nodeOnReturn, node
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { resolveRoleModel } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
-import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT } from './texts.ts'
+import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT, runMaterialsSection } from './texts.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { withTurnEndFailure } from '../plugin/turn-end.ts'
@@ -29,6 +29,8 @@ export interface JudgeSpawnInput {
   cwd: string
   judgeSessionId: string
   recovery?: boolean
+  /** Issue #173：该 Run 已绑定的 workspace（状态行键），算材料目录用，不猜 cwd。 */
+  workspace: string
 }
 export type SessionAvailability = 'available' | 'missing' | 'unknown'
 /**
@@ -164,7 +166,7 @@ export class WorkflowEngine {
       input, phase: 'ready', roleBoundaryPrepared, restartPending: false, inputVersion: 1, blockReason: null, enteredAt: new Date().toISOString(),
       ...(predecessorId === undefined ? {} : { predecessorId }) }
   }
-  private judgePacket(run: RunState, e: NodeExecution, cwd: string): JudgeSpawnInput {
+  private judgePacket(run: RunState, e: NodeExecution, cwd: string, workspace: string): JudgeSpawnInput {
     const node = this.nodeAt(run, topFrame(run))!
     // 共同条件只存在于 actor-task Node 的 checker；Program / Child Node 不派 Judge。
     const criteria = nodeChecker(node)?.config.criteria ?? ''
@@ -179,6 +181,7 @@ export class WorkflowEngine {
       nodeToken: e.nodeToken, criteria: String(criteria),
       result: e.claim!.result, resultCriteria: selected?.criteria ?? '',
       boundary: e.boundary!, claim: { result: e.claim!.result, handoff: e.claim!.handoff }, cwd, judgeSessionId: e.judge!.sessionId!,
+      workspace,
       ...(feedback ? { previousFeedback: feedback } : {}),
       ...(e.resolution?.context ? { managerContext: e.resolution.context } : {}),
       ...(e.resolution?.target === 'judge' ? { recovery: true } : {}),
@@ -295,7 +298,7 @@ export class WorkflowEngine {
       const node = this.nodeAt(run, topFrame(run))!
       if (node.execution.type === 'builtin-program') {
         await this.state.put(ws, run, version, [change(e, 'program-ready')])
-        await this.targets.steerManager(run, `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[program]\n${node.execution.programId}\n请调用 node_run_program 提供当前参数；Program 结果由 Runtime 直接结算，不使用 Judge。`).catch(async error => {
+        await this.targets.steerManager(run, `[handoff]\n${e.input}\n\n[instruction]\n${node.execution.instruction ?? ''}\n\n[program]\n${node.execution.programId}\n请调用 node_run_program 提供当前参数；Program 结果由 Runtime 直接结算，不使用 Judge。${runMaterialsSection(ws, run.runId)}`).catch(async error => {
           const current = await this.state.get(ws)
           if (current?.version === version + 1 && current.execution.executionId === e.executionId) await this.blockRow(ws, current, `dispatch fault: ${error instanceof Error ? error.message : String(error)}`)
         })
@@ -358,7 +361,7 @@ export class WorkflowEngine {
         const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
         const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
         const predecessor = await this.predecessorResultContext(ws, e)
-        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${SUBMISSION_CONSTRAINT}`
+        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${runMaterialsSection(ws, run.runId)}${SUBMISSION_CONSTRAINT}`
         const sent = role === 'manager'
           ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
           : run.roleActors[role]
@@ -394,7 +397,7 @@ export class WorkflowEngine {
         committedVersion = version + 1
       } else if (e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion
         || (continuationSessionId !== undefined && e.judge.sessionId !== continuationSessionId)) return
-      const packet = this.judgePacket(run, e, cwd)
+      const packet = this.judgePacket(run, e, cwd, ws)
       const sent = continuationSessionId
         ? { ...await this.subagents.followupJudge(run, continuationSessionId, packet), judgeSessionId: continuationSessionId }
         : await this.subagents.startJudge(run, packet)

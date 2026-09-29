@@ -27,6 +27,8 @@ export interface JudgePromptInput {
   resultCriteria: string
   workerHandoff: string
   workspaceCwd: string
+  /** Issue #173：Run 材料目录段（引擎侧已按绑定 workspace 算好，缺席=旧调用）。 */
+  runMaterials?: string
   transcript: string
   /** Judge 中断恢复：只读核验，不补做 Actor 工作（固定协议段，随 packet 下发）。 */
   recovery?: boolean
@@ -68,7 +70,7 @@ Worker handoff:
 
 # Workspace
 cwd: {workspaceCwd}
-
+{runMaterials}
 # Node-local context (user/manager/actor-visible only, since this node dispatched)
 {transcript}
 
@@ -100,6 +102,7 @@ export function renderJudgePrompt(input: JudgePromptInput): string {
     // （与 `{workerHandoff}` 对称）。漏映射会让占位符原样下发，故集中在此。
     workerResult: input.result,
     criteria: input.criteria.trim() === '' ? '(none)' : input.criteria,
+    runMaterials: input.runMaterials ?? '',
     recovery: renderRecovery(input.recovery),
     previousFeedback: renderPreviousFeedback(input.previousFeedback),
     managerContext: renderManagerContext(input.managerContext),
