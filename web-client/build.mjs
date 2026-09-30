@@ -8,7 +8,8 @@
  *   factory 末尾 return { PANEL_KEY, inject, apply }。
  *
  * 用法：node web-client/build.mjs [--out <目录>]
- * 约束：源文件经正则做最小拼合（顺序 rpc → edits → styles → panel → index，
+ * 约束：源文件经正则做最小拼合（顺序 rpc → edits → styles → model-selector →
+ * start-submit/start-modal → panel → index，
  * 无重名顶层绑定，react 经 require('react') 取宿主共享实例）。React Flow 引入后必须切换到正式
  * bundler，本脚本即退役（见 README）。
  */
@@ -49,25 +50,33 @@ export function bundleSources() {
   const edits = read('edits.js').replace(/^export\s+/gm, '')
   const styles = read('styles.js').replace(/^export\s+/gm, '')
   const modelSelector = rewriteImports(read('model-selector.js'), 'react', "require('react')").replace(/^export\s+/gm, '')
+  const startSubmit = read('start-submit.js').replace(/^export\s+/gm, '')
+  // start-modal 的 './start-submit.js'  import 与 startSubmit 同一 IIFE 作用域拼合：
+  // 直接删 import 行（同名顶层绑定已在作用域内），避免第二套模块表。
+  const startModal = rewriteImports(read('start-modal.js'), 'react', "require('react')")
+    .replace(/^import\s*\{[^}]*\}\s*from\s*['"]\.\/start-submit\.js['"];?/gm, '')
+    .replace(/^export\s+/gm, '')
   const panel = rewriteImports(read('panel.js'), 'react', "require('react')")
   const panelLinked = rewriteImports(rewriteImports(rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits'), './styles.js', '__styles'), './model-selector.js', '__modelSelector')
-  const index = rewriteImports(rewriteImports(
+  const index = rewriteImports(rewriteImports(rewriteImports(
     rewriteImports(read('index.js'), './panel.js', '__panel'),
     './rpc.js',
     '__rpc',
-  ), './model-selector.js', '__modelSelector')
+  ), './model-selector.js', '__modelSelector'), './start-modal.js', '__startModal')
   return {
     rpc,
     edits,
     styles,
     modelSelector,
+    startSubmit,
+    startModal,
     panel: panelLinked.replace(/^export\s+/gm, ''),
     index: index.replace(/^export\s+/gm, ''),
   }
 }
 
 export function buildClientBundle({ outDir } = {}) {
-  const { rpc, edits, styles, modelSelector, panel, index } = bundleSources()
+  const { rpc, edits, styles, modelSelector, startSubmit, startModal, panel, index } = bundleSources()
   const bundle = `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {
 var module = { exports: {} }; var exports = module.exports;
 var __rpc = (function () {
@@ -89,6 +98,11 @@ return { ModelFields, modelChoices, readModelCatalog };
 var __panel = (function () {
 ${panel}
 return { WorkflowConfigEditorPanel, WorkflowConfigEditorIcon };
+})();
+var __startModal = (function () {
+${startSubmit}
+${startModal}
+return { START_PROMPT_MAX_CHARS, START_MODAL_STYLES, normalizeStartPrompt, startCommandLineOf, canStartWorkflow, executeStartWorkflow, StartWorkflowButton };
 })();
 ${index}
 return { PANEL_KEY, inject, apply }; } });\n`
