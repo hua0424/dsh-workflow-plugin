@@ -13,7 +13,7 @@
  * 及运行期 `cordis_inspect what:"client"` 为准，集成时以生成目录为准复核。
  */
 import { WorkflowConfigEditorIcon, WorkflowConfigEditorPanel } from './panel.js'
-import { callEditor } from './rpc.js'
+import { callEditor, readWorkflowCatalog } from './rpc.js'
 import { readModelCatalog } from './model-selector.js'
 
 export const PANEL_KEY = 'workflow-config-editor'
@@ -25,7 +25,9 @@ export function apply(ctx) {
   const editorRpc = (endpoint, payload, signal) => callEditor(ctx.connection, endpoint, payload, signal)
   let modelRequest
   const loadModels = () => modelRequest ??= readModelCatalog(ctx.remote).finally(() => { modelRequest = undefined })
-  const injected = () => ({ editorRpc, loadModels, layout: ctx.layout })
+  // #178 启动弹窗数据接缝：只读目录拉取（后继弹窗票消费；本票无弹窗 UI）。
+  const loadCatalog = (signal) => readWorkflowCatalog(editorRpc, { signal })
+  const injected = () => ({ editorRpc, loadModels, loadCatalog, layout: ctx.layout })
 
   // 全局主面板（keyed：key 即 sidebar 入口 id）。
   ctx.slots.inject('main', () =>

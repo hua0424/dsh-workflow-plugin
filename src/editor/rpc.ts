@@ -2,8 +2,12 @@
  * T1 同源鉴权 RPC（host 侧）：只接受受限文本/JSON，复用真实 parser/schema/validator
  * 的解析、诊断与规范化能力；校验副本，不原地改写调用方数据。
  *
- * - 不接受任意服务端文件路径（payload 只有 workflowId + 文本/JSON）。
- * - 不访问 catalog、Run 或引擎状态库（纯函数，无 Store/Engine 依赖）。
+ * - 不接受任意服务端文件路径（payload 只有 workflowId + 文本/JSON；catalog 端点
+ *   只接受空载荷，任何路径/目录/文件名输入都明确拒绝且不触发扫描）。
+ * - 除 catalog 端点外不访问 catalog、Run 或引擎状态库（纯函数，无 Store/Engine
+ *   依赖）；catalog 端点是唯一的只读例外：经注入的目录源做一次 fresh 扫描投影，
+ *   只返回 workflow-id 与诊断原因，不含配置全文、服务端路径或凭据，不执行命令、
+ *   不创建 Run、不激活空白会话。
  * - 宿主鉴权与同源通道由 Connection 拥有（channel 注册即纳入其鉴权）；
  *   非 Web 环境（无 `connection` 服务）下注册跳过，不破坏插件加载。
  */
@@ -157,13 +161,77 @@ export function rpcProgramMetadata(): EditorRpcResult {
   return { ok: true, value: { programs: structuredClone(BUILTIN_PROGRAM_METADATA) } }
 }
 
+/**
+ * #178 启动弹窗用工作流目录只读接缝：一次 fresh 扫描的投影。
+ * 调用方据 status 区分有效（valid，可选）、警告（warning，可选但需提示原因）、
+ * 无效（invalid，不可选）；空目录返回空 items。只出 workflow-id 与诊断原因，
+ * 不出配置全文、服务端路径、definitionHash 或凭据。
+ */
+export interface CatalogListItem {
+  workflowId: string | null
+  status: 'valid' | 'warning' | 'invalid'
+  reasons: string[]
+}
+
+export function rpcCatalogList(scan: {
+  entries: Array<{ workflowId: string }>
+  diagnostics: Array<{ workflowId: string | null; reason: string; severity: 'error' | 'warning' }>
+}): EditorRpcResult {
+  const warnings = new Map<string | null, string[]>()
+  for (const diagnostic of scan.diagnostics) {
+    if (diagnostic.severity !== 'warning') continue
+    const reasons = warnings.get(diagnostic.workflowId) ?? []
+    reasons.push(diagnostic.reason)
+    warnings.set(diagnostic.workflowId, reasons)
+  }
+  const items: CatalogListItem[] = scan.entries.map((entry) => {
+    const reasons = warnings.get(entry.workflowId) ?? []
+    return { workflowId: entry.workflowId, status: reasons.length > 0 ? 'warning' : 'valid', reasons }
+  })
+  for (const diagnostic of scan.diagnostics) {
+    if (diagnostic.severity !== 'error') continue
+    items.push({ workflowId: diagnostic.workflowId, status: 'invalid', reasons: [diagnostic.reason] })
+  }
+  items.sort((a, b) => (a.workflowId ?? '').localeCompare(b.workflowId ?? ''))
+  return { ok: true, value: { items } }
+}
+
+/**
+ * 只读目录源：复用命令层 list 业务能力（fresh 扫描 + 维护状态判定），
+ * 不复制 YAML 校验规则。维护状态下返回 `{ ok: false, reason }`（不上抛），
+ * 调用方如实报告不可用。
+ */
+export type CatalogListSource = () => Promise<{
+  entries: Array<{ workflowId: string }>
+  diagnostics: Array<{ workflowId: string | null; reason: string; severity: 'error' | 'warning' }>
+  ok?: boolean
+  reason?: string
+}>
+
 /** 按 endpoint 分派（payload 只读文本/JSON；未知 endpoint 明确拒绝）。 */
-export function createEditorRpcHandler(): EditorRpcHandler {
+export function createEditorRpcHandler(deps: { listCatalog?: CatalogListSource } = {}): EditorRpcHandler {
   return async (endpoint, payload) => {
     if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
       return fail('editor/invalid-payload', 'payload 必须是对象')
     }
     const body = payload as Record<string, unknown>
+    if (endpoint === 'catalog') {
+      // 空载荷之外的一切输入（路径/目录/文件名/workflowId 等）都明确拒绝，
+      // 且拒绝路径绝不调用目录源（不触发扫描）。
+      if (Object.keys(body).length > 0) {
+        return fail('editor/invalid-payload', 'catalog 只接受空载荷，不接受任何路径/目录/文件名输入')
+      }
+      const listCatalog = deps.listCatalog
+      if (listCatalog === undefined) return fail('editor/unavailable', '当前环境未提供工作流目录读取能力')
+      let listed: Awaited<ReturnType<CatalogListSource>>
+      try {
+        listed = await listCatalog()
+      } catch (error) {
+        return fail('editor/catalog-failed', `工作流目录读取失败：${String(error)}`)
+      }
+      if (listed.ok === false) return fail('editor/unavailable', listed.reason ?? '工作流目录不可用')
+      return rpcCatalogList(listed)
+    }
     if (endpoint === 'parse') {
       if (typeof body['workflowId'] !== 'string' || typeof body['text'] !== 'string') {
         return fail('editor/invalid-payload', 'parse 需要 { workflowId: string, text: string }')
@@ -191,7 +259,7 @@ export function createEditorRpcHandler(): EditorRpcHandler {
     if (endpoint === 'metadata') {
       return rpcProgramMetadata()
     }
-    return fail('editor/unknown-endpoint', `未知 endpoint "${endpoint}"（仅支持 parse/validate/preview/layout/metadata）`)
+    return fail('editor/unknown-endpoint', `未知 endpoint "${endpoint}"（仅支持 parse/validate/preview/layout/metadata/catalog）`)
   }
 }
 
@@ -210,12 +278,14 @@ interface ConnectionService {
  * 没有 `ctx.get(name)` 方法——经 inject 回调拿到的 connCtx 同样如此。
  * @returns 已注册（含 dispose）或因无 connection 服务而跳过（非 Web 加载不被破坏）。
  */
-export function registerEditorRpc(ctx: { connection?: ConnectionService }):
+export function registerEditorRpc(ctx: { connection?: ConnectionService },
+  deps: { listCatalog?: CatalogListSource } = {},
+):
   | { status: 'registered'; dispose: () => Promise<void> }
   | { status: 'skipped-no-connection' } {
   const connection = ctx.connection
   if (connection === undefined || typeof connection.rpc?.handle !== 'function') return { status: 'skipped-no-connection' }
-  const dispose = connection.rpc.handle(EDITOR_RPC_CHANNEL, createEditorRpcHandler())
+  const dispose = connection.rpc.handle(EDITOR_RPC_CHANNEL, createEditorRpcHandler(deps))
   return { status: 'registered', dispose }
 }
 
@@ -229,14 +299,14 @@ export function registerEditorRpc(ctx: { connection?: ConnectionService }):
  * Connection /api 通道逐字段一致，浏览器客户端无需改动。
  * 旧版宿主（无 webServer 服务，如 headless）回退 `connection.rpc.handle`。
  */
-export function installEditorRpc(ctx: EditorWebCtx):
+export function installEditorRpc(ctx: EditorWebCtx, deps: { listCatalog?: CatalogListSource } = {}):
   | { status: 'mounted'; dispose: () => void }
   | { status: 'fallback'; dispose: () => Promise<void> }
   | { status: 'skipped' } {
   const connection = ctx.connection
   const webServer = ctx.webServer
   if (connection !== undefined && webServer !== undefined && typeof webServer.register === 'function') {
-    const fetchHandler = editorFetchHandler(EDITOR_RPC_CHANNEL, createEditorRpcHandler())
+    const fetchHandler = editorFetchHandler(EDITOR_RPC_CHANNEL, createEditorRpcHandler(deps))
     const route: WebRoute = {
       kind: 'prefix',
       path: EDITOR_RPC_CHANNEL,
@@ -272,7 +342,7 @@ export function installEditorRpc(ctx: EditorWebCtx):
         : () => {}
     return { status: 'mounted', dispose: cleanup }
   }
-  const fallback = registerEditorRpc(ctx)
+  const fallback = registerEditorRpc(ctx, deps)
   if (fallback.status === 'registered') return { status: 'fallback', dispose: fallback.dispose }
   return { status: 'skipped' }
 }
