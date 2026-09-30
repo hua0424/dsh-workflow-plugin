@@ -22,8 +22,8 @@ review-*.txt
 /docs/dsh-workflow/runs/
 /docs/dsh-workflow/issues/
 
-# Run 本地材料目录 <workspace>/.dsh-workflow/runs/<runId>/（Issue #173）：忽略且未跟踪
-/.dsh-workflow/
+# DSH 统一管理目录 <workspace>/.dsh/（run 材料目录 .dsh/.dsh-workflow/runs/<runId>/ 在其下，Issue #173）：忽略且未跟踪
+/.dsh/
 
 # Web-client factory bundle output (built on demand, never committed)
 /web-client/dist/

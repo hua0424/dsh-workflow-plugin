@@ -1,5 +1,5 @@
 /**
- * Issue #173：派发上下文统一提供 Run 材料目录 `<workspace>/.dsh-workflow/runs/<runId>/`。
+ * Issue #173：派发上下文统一提供 Run 材料目录 `<workspace>/.dsh/.dsh-workflow/runs/<runId>/`。
  *
  * - 纯函数：用绑定 workspace + runId 计算目录，不猜 cwd、不推断 Git 根。
  * - 引擎：每次 actor-task 派发（Manager/Actor）文本统一附带 runId + 目录 + 简短规则。
@@ -21,15 +21,15 @@ import { makeStateHost } from '../src/plugin/host.ts'
 import type { ExecutionDispatch, WorkflowConfig } from '../src/types.ts'
 
 test('目录用绑定 workspace + runId 计算，不猜 cwd', () => {
-  assert.equal(runArtifactsDir('C:\\ws', 'run-1'), 'C:\\ws/.dsh-workflow/runs/run-1/')
-  assert.equal(runArtifactsDir('/repo/', 'abc'), '/repo/.dsh-workflow/runs/abc/')
-  assert.equal(runArtifactsDir('ws', 'x'), 'ws/.dsh-workflow/runs/x/')
+  assert.equal(runArtifactsDir('C:\\ws', 'run-1'), 'C:\\ws/.dsh/.dsh-workflow/runs/run-1/')
+  assert.equal(runArtifactsDir('/repo/', 'abc'), '/repo/.dsh/.dsh-workflow/runs/abc/')
+  assert.equal(runArtifactsDir('ws', 'x'), 'ws/.dsh/.dsh-workflow/runs/x/')
 })
 
 test('材料段含 runId/目录/简短规则，不强制 run.md', () => {
   const section = runMaterialsSection('ws', 'run-9')
   assert.match(section, /runId: run-9/)
-  assert.match(section, /dir: ws\/\.dsh-workflow\/runs\/run-9\//)
+  assert.match(section, /dir: ws\/\.dsh\/\.dsh-workflow\/runs\/run-9\//)
   assert.match(section, /按需创建/)
   assert.match(section, /不预建空报告/)
   assert.match(section, /不强制生成 run\.md/)
@@ -101,7 +101,7 @@ test('Manager 与 Actor 派发文本都附带绑定 workspace 算出的材料目
     assert.equal(h.actorTexts.length, 1)
     for (const text of [...h.managerTexts, ...h.actorTexts]) {
       assert.match(text, /\[run-materials\]/)
-      assert.ok(text.includes(`dir: ws/.dsh-workflow/runs/${runId}/`))
+      assert.ok(text.includes(`dir: ws/.dsh/.dsh-workflow/runs/${runId}/`))
       assert.ok(!text.includes(h.home), '不得用 cwd 猜测目录')
       // 固定后缀仍在末尾：投影剥离不受影响。
       assert.ok(text.endsWith(SUBMISSION_CONSTRAINT))
@@ -127,7 +127,7 @@ test('Judge packet 携带绑定 workspace；prompt 含同一目录', async () =>
       workerHandoff: 'done', workspaceCwd: 'cwd', transcript: '',
       runMaterials: runMaterialsSection(h.packets[1]!.workspace, runId).trim(),
     })
-    assert.ok(prompt.includes(`dir: ws/.dsh-workflow/runs/${runId}/`))
+    assert.ok(prompt.includes(`dir: ws/.dsh/.dsh-workflow/runs/${runId}/`))
   } finally { h.close() }
 })
 
@@ -137,7 +137,7 @@ test('Judge prompt 的材料段与派发侧同一单源', () => {
     workerHandoff: 'done', workspaceCwd: 'C:\\ws', transcript: '',
     runMaterials: hostSection('C:\\ws', 'run-1').trim(),
   })
-  assert.ok(prompt.includes('dir: C:\\ws/.dsh-workflow/runs/run-1/'))
+  assert.ok(prompt.includes('dir: C:\\ws/.dsh/.dsh-workflow/runs/run-1/'))
   assert.ok(prompt.includes('runId: run-1'))
 })
 

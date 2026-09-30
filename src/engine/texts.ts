@@ -16,7 +16,7 @@ export const JUDGE_RECOVERY_INSTRUCTION = `\n\n[中断恢复]\n之前中断；�
  * 计算，不猜测 cwd、不推断 Git 根、不改用户目录。
  */
 export function runArtifactsDir(workspace: string, runId: string): string {
-  return `${workspace.replace(/[/\\]+$/, '')}/.dsh-workflow/runs/${runId}/`
+  return `${workspace.replace(/[/\\]+$/, '')}/.dsh/.dsh-workflow/runs/${runId}/`
 }
 
 /**
