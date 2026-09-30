@@ -44,8 +44,8 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 
 ## DSH 运行基线（用户确认）
 
-- 当前运行版本：`0.1.5-rc.2`（2026-09-11 自 `0.1.2-rc.1` 升级，见 issue #37 / PR #38）；对应源码：`D:\project\github\deepseek-harness`（master 已含 tag `dsh-v0.1.5-rc.2`）。分析宿主兼容性、continuable Actor、compact 或 Session 行为时，查询此版本源码。
-- 0.1.2-rc.1 的宿主缺陷「冷 resume 已完成 turn 的 continuable 子会话永不 settle」（原事故 run 20260911-105817 的 B-001~B-007：复用任一 Role Actor 会话即 60s 超时降级 BLOCK）已在 0.1.5-rc.2 上实测不再复现：4 轮 `cold-resume-test` 的冷复用全部正常 settle，会话内 `compaction/start → compaction/end` 实测 10–16s，零 `coldMaterialize` 超时 BLOCK（详见 issue #37）。
+- 当前运行版本：`0.2.0-rc.2`（2026-09-30 自 `0.1.5-rc.2` 升级，见 milestone `dsh-020-migration` / 主票 #185 / 收尾 #191）；对应源码：`D:\project\github\deepseek-harness`（master 已含 tag `dsh-v0.2.0-rc.2`）。分析宿主兼容性、continuable Actor、compact 或 Session 行为时，查询此版本源码。
+- 0.1.2-rc.1 的宿主缺陷「冷 resume 已完成 turn 的 continuable 子会话永不 settle」（原事故 run 20260911-105817 的 B-001~B-007：复用任一 Role Actor 会话即 60s 超时降级 BLOCK）已在 0.1.5-rc.2 上实测不再复现：4 轮 `cold-resume-test` 的冷复用全部正常 settle，会话内 `compaction/start → compaction/end` 实测 10–16s，零 `coldMaterialize` 超时 BLOCK（详见 issue #37）。0.2.0-rc.2 迁移实测（#191）：`verify` 全链（typecheck + suite 649/649 + t3/e2e 双 smoke）与 `test:real-host`（A30：cold Role continuation + 节点边界 Basic compact + Judge 全周期 + Host interrupt 同 execution resume）全绿；FORMAT V3 存量日志经只读 open 冷读为 V4 事件且源字节不变（`test/session-format-cold-read.test.ts`，单向门）；orphan 判定按新 jobs 事件语义三重匹配（ADR-0003）。
 - 该仓库已用 codebase-memory 索引，project：`D-project-github-deepseek-harness`；优先图查询，引用前检查 coverage，必要时读取源文件核实。源码仓库与已安装运行产物是不同路径。
 - 本仓库的默认远端是github，相关操作可使用gh命令行工具。
 
@@ -55,7 +55,7 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 - Build / typecheck: `pnpm run build` / `pnpm run typecheck`（脚本显式调用 `node node_modules/typescript/bin/tsc`——`.bin` 链接未物化时 `tsc` 不在 PATH；无独立 lint script，tsc 即类型检查）.
 - Unit tests: `pnpm test` — node:test over `test/*.test.ts`，直接跑 `.ts` 源码，无需先 build；禁派生进程的受限环境（`spawn EPERM`）用 `pnpm run test:suite`（`--test-isolation=none`）等价取全量结果.
 - Controlled smoke: `pnpm run test:smoke` = `t3-smoke.mjs`（`reuse: continuable`：跨节点复用 + 边界 compact + END + 关库重开）+ `e2e-smoke.mjs`（缺省 `reuse: node`：REJECT 修正/failed onFail 自环/drain 换代/trace）；单跑用 `test:t3` / `test:e2e`. 真实 engine + SQLite + catalog loader，仅 stub 模型派发，隔离临时 DSH home，绝不触碰真实 `~/.dsh`.
-- Real Host: `pnpm run test:real-host` — exact 0.1.5-rc.2 真实 Host 组合（`node test/runtime-real-host.test.ts` 单文件直跑，不派生 runner 子进程）；与受控 smoke 分开报告，不得混称.
+- Real Host: `pnpm run test:real-host` — exact 0.2.0-rc.2 真实 Host 组合（`node test/runtime-real-host.test.ts` 单文件直跑，不派生 runner 子进程）；与受控 smoke 分开报告，不得混称.
 - State 诊断: `node scripts/check-state-rows.mjs <state.sqlite3 路径>` — 只读、显式路径、快照副本上诊断，不创建/改写目标库，也不默认真实 home.
 - Dev deploy: `pnpm run build && node scripts/deploy-web.mjs` → 部署到 `~/.dsh/profiles/web/wfdev`（需显式授权）；仅验证产物用 `node scripts/deploy-web.mjs --out <临时目录>`（bundle 元数据取自 `package.json`，宿主包保持 devDependencies；`--out` 缺值 = 用法错误 exit 2，绝不回落到 profile 目标）；bundle 成员变更后需重启 DSH（`dsh web`）.
 

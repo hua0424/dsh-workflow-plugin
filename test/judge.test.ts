@@ -254,6 +254,18 @@ test('target host Workflow queue provenance projects only for the Actor and only
   assert.deepEqual(projectSessionSurface(actor, 0, 'MANAGER'), [])
 })
 
+test('#189: new self-declared workflow-dispatch kind projects like the legacy plugin kind (content parity)', () => {
+  const dispatch = createUserMessage({ content: [{ type: 'text', text: 'current work' + SUBMISSION_CONSTRAINT }], source: { kind: 'workflow-dispatch', plugin: 'dsh-agent-team-workflow' } })
+  const actor = makeSession([
+    { type: 'user/message', data: dispatch, surfaceOp: 'append' },
+  ])
+  const text = projectNodeLocal(makeSession([]), {
+    dispatchedAt: 0, managerFromSeq: 0, executorSessionId: actor.id, executorDispatchMessageId: dispatch.id,
+  }, actor)
+  assert.equal(text, '[ACTOR]\ncurrent work')
+  assert.deepEqual(projectSessionSurface(actor, 0, 'MANAGER'), [])
+})
+
 test('the A3 submission constraint is stripped from the projected dispatch text (A3 R1/AC6)', () => {
   const relay = createUserMessage({
     content: [{ type: 'text', text: `[instruction]\nBuild it.${SUBMISSION_CONSTRAINT}` }],

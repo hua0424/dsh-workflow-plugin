@@ -64,7 +64,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
     },
   }
   const adapters: HostAdapters = {
-    ctx: { subagents: queue, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
+    ctx: { subagents: queue, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
@@ -81,8 +81,8 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
     workspace: 'ws',
   }), { messageId: 'dispatch-3' })
   assert.deepEqual(deliveries.slice(0, 2), [
-    { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
-    { parent: manager, childId: 'sess-dev', text: 'resume node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
+    { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'workflow-dispatch', plugin: 'dsh-agent-team-workflow' } },
+    { parent: manager, childId: 'sess-dev', text: 'resume node', source: { kind: 'workflow-dispatch', plugin: 'dsh-agent-team-workflow' } },
   ])
   assert.equal(deliveries[2]!.childId, 'sess-judge')
   assert.match(deliveries[2]!.text, /Worker handoff:\ncandidate/)
@@ -97,7 +97,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
 test('Judge drain propagates missing Manager and host drain failures', async () => {
   const manager = { session: { id: 'manager' } } as unknown as Agent
   const adapters: HostAdapters = {
-    ctx: { subagents: { drainContinuableChildren: async () => { throw new Error('drain failed') } }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
+    ctx: { subagents: { drainContinuableChildren: async () => { throw new Error('drain failed') } }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
   }
@@ -120,7 +120,7 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
       },
     }
     const adapters: HostAdapters = {
-      ctx: { subagents, tools: { schemas: () => [] }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
+      ctx: { subagents, tools: { schemas: () => [] }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
@@ -143,7 +143,7 @@ test('drain seam: a hanging drainContinuableChildren fails closed instead of pen
   await withShortTimeouts({ drain: 20 }, async () => {
     const manager = { session: { id: 'manager' } } as unknown as Agent
     const adapters: HostAdapters = {
-      ctx: { subagents: { drainContinuableChildren: async () => new Promise<never>(() => {}) }, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
+      ctx: { subagents: { drainContinuableChildren: async () => new Promise<never>(() => {}) }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
@@ -212,7 +212,7 @@ function makeHost(options: {
   const fakeCtx = {
     get,
     logger,
-    jobs: { list: () => [], onJobDone: () => () => {} },
+    jobs: { list: () => [], events: { subscribe: () => () => {} } },
     effect: () => {},
     agents: {
       get: (id: unknown) => (options.resident !== undefined && id === 'sess-dev' ? options.resident : undefined),
@@ -560,7 +560,7 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
       },
     }
     const adapters: HostAdapters = {
-      ctx: { subagents: queue, jobs: { onJobDone: () => () => {} }, effect: () => {} } as unknown as Context,
+      ctx: { subagents: queue, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
     }
@@ -645,7 +645,7 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
         return { header: { id }, read: async () => ({ events: [] }), close: async () => {} }
       },
     } : undefined,
-    jobs: { onJobDone: () => () => {} }, effect: () => {},
+    jobs: { events: { subscribe: () => () => {} } }, effect: () => {},
   } as unknown as Context
   const host = makeSubagentHost({
     ctx, managerAgentOf: () => undefined,

@@ -9,7 +9,7 @@ import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-c
 // Type-only：让 ctx.get('agentPresets') 解析到 preset 服务类型。运行期该服务
 // 经 DSH 安装解析；roster 缺席（base-only profile / 旧版 dsh）时 get 返回
 // undefined，走宿主平面回退——与 dsh-subagent/child-agent.ts 的用法一致。
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import type { ContinuableStartSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
@@ -17,6 +17,7 @@ import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError, type SessionHandle, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { StateStore } from '../state/store.ts'
+import { WORKFLOW_DISPATCH_SOURCE } from '../message-sources.ts'
 import type { DelegationRoute, RunState, SpawnAgentOptions } from '../types.ts'
 import { routeToAgentOptions, WorkflowError } from '../types.ts'
 import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
@@ -171,8 +172,8 @@ function compactRetryDelayMs(): number {
   return Number(process.env.DSH_WF_COMPACT_RETRY_MS ?? 2_000)
 }
 
-/** Durable host-authored provenance for every workflow dispatch. */
-const PLUGIN_SOURCE = { kind: 'plugin' as const, plugin: 'dsh-agent-team-workflow' }
+/** 本插件一切 workflow 派发的 durable provenance（自声明 kind，见 message-sources.ts）。 */
+const PLUGIN_SOURCE = WORKFLOW_DISPATCH_SOURCE
 
 /**
  * Queue one dispatcher turn to a continuable child, bounded by the `send` SLO.
@@ -247,7 +248,7 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
       // so the return is available even though steer() itself is fire-and-forget.
       const message = createUserMessage({
         content: textBlocks(text),
-        source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' },
+        source: { ...WORKFLOW_DISPATCH_SOURCE },
       })
       manager.steer(message)
       return { messageId: message.id }
