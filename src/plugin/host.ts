@@ -9,7 +9,7 @@ import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-c
 // Type-only：让 ctx.get('agentPresets') 解析到 preset 服务类型。运行期该服务
 // 经 DSH 安装解析；roster 缺席（base-only profile / 旧版 dsh）时 get 返回
 // undefined，走宿主平面回退——与 dsh-subagent/child-agent.ts 的用法一致。
-import type {} from '@deepseek-ai/dsh-agent-presets'
+import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import type { ContinuableStartSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
