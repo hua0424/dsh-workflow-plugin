@@ -25,7 +25,7 @@
  * 里进行（`resolveTurn`），Judge 从不在这里 drain 自己。
  */
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { JobDoneListener, JobSnapshot } from '@deepseek-ai/dsh-jobs'
+import type { JobEvents, JobRegistry, JobView } from '@deepseek-ai/dsh-jobs'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SubagentDescendantListEntry } from '@deepseek-ai/dsh-subagent'
 import type { SafeInspection } from '../engine/engine.ts'
@@ -108,7 +108,7 @@ export function workOrderMayAwaitTurn(facts: WorkOrderFacts, sessionId: string):
 export interface ParticipantServices {
   agents: { get(id: SessionId): Agent | undefined; list(): Agent[] }
   subagents: { listDescendants(sessionId: SessionId, signal?: AbortSignal): Promise<readonly SubagentDescendantListEntry[]> }
-  jobs: { list(caller?: Agent): readonly JobSnapshot[]; onJobDone(listener: JobDoneListener): () => void }
+  jobs: { list(caller?: SessionId): readonly JobView[]; events: JobEvents }
   effect(factory: () => () => void): void
 }
 
@@ -182,8 +182,17 @@ export interface ParticipantIndex {
 }
 
 /** 生产与测试同一条装配路径：宿主 Context（结构上就是服务切片）→ 本索引的服务面。 */
-export function participantServicesOf(host: ParticipantServices): ParticipantServices {
-  return { agents: host.agents, subagents: host.subagents, jobs: host.jobs, effect: factory => { host.effect(factory) } }
+export function participantServicesOf(host: {
+  agents: ParticipantServices['agents']
+  subagents: ParticipantServices['subagents']
+  jobs: Pick<JobRegistry, 'list' | 'events'>
+  effect: ParticipantServices['effect']
+}): ParticipantServices {
+  return {
+    agents: host.agents, subagents: host.subagents,
+    jobs: { list: caller => host.jobs.list(caller), events: host.jobs.events },
+    effect: factory => { host.effect(factory) },
+  }
 }
 
 export function makeParticipantIndex(services: ParticipantServices, workOrder: WorkOrderPort): ParticipantIndex {
@@ -211,12 +220,23 @@ export function makeParticipantIndex(services: ParticipantServices, workOrder: W
     if (parentId !== undefined) parents.set(agent.id, parentId)
   }
 
-  const stopObservingJobs = services.jobs.onJobDone((job, owner) => {
-    if (!owner || !job.detail?.includes('work may be orphaned')) return
-    recordParentSession(owner)
-    // 保留 exact owner 与当时已知祖先；descriptor 消失不能洗白父 Role。
+  const stopObservingJobs = services.jobs.events.subscribe({ owners: 'all' }, event => {
+    // orphan 三重匹配：只有「settled 事件」+「teardown 起因」+「保留的 teardown 抛错
+    // detail（`work may be orphaned` 子串，新注册表只在 cancel 抛错强行结算时写它）才算
+    // orphan。合规 teardown 结算（cancel 未抛错，无该子串）与 producer/kill 结算一律不
+    // 误判——起因或子串缺一即放行。
+    if (event.type !== 'settled' || event.cause !== 'teardown') return
+    if (!event.job.detail?.includes('work may be orphaned')) return
+    // owner 由会话 id 反查精确引用（当代观察优先，其次宿主 registry），只做 transient
+    // 使用、不新建保留；反查不到也不放行——tombstone 本就是 id 级事实，未知会话在收口
+    // 侧本就 fail-closed，按 id 钉住与寿命纪律一致（#54：middle 不可观测时仍要能追到父 Role）。
+    const ownerId = event.job.owner
+    if (ownerId === undefined) return
+    const owner = exact.get(ownerId) ?? services.agents.get(ownerId)
+    if (owner !== undefined) recordParentSession(owner)
+    // 保留 owner 与当时已知祖先；descriptor 消失不能洗白父 Role。
     const seen = new Set<string>()
-    for (let id: string | undefined = owner.id; id !== undefined && !seen.has(id); id = parents.get(id)) {
+    for (let id: string | undefined = ownerId; id !== undefined && !seen.has(id); id = parents.get(id)) {
       seen.add(id)
       unsafe.add(id)
       const agent = exact.get(id) ?? services.agents.get(SessionId(id))
@@ -402,7 +422,7 @@ export function makeParticipantIndex(services: ParticipantServices, workOrder: W
         const settled = agents.every(candidate => {
           const current = services.agents.get(candidate.id)
           return (current === undefined || current === candidate) && candidate.status === 'idle' && inboxEmpty(candidate) && !unsafe.has(candidate.id)
-            && services.jobs.list(candidate).filter(job => job.ownerSession === candidate.id)
+            && services.jobs.list(candidate.id).filter(job => job.owner === candidate.id)
               .every(job => TERMINAL_JOB_STATUSES.has(job.status) && !job.detail?.includes('work may be orphaned'))
         })
         return settled ? (waiting ? 'waiting' : 'safe') : 'unsafe'

@@ -85,7 +85,7 @@ function applyWithProviders(
     logger: { warn() {} },
     commands: { register(definition: CommandDefinition) { command = definition; return () => {} } },
     tools: { register() { return () => {} }, schemas() { return [] } },
-    jobs: { onJobDone() { return () => {} }, list() { return [] } },
+    jobs: { events: { subscribe() { return () => {} } }, list() { return [] } },
     agents: {
       get() { return undefined },
       list() { return [] },

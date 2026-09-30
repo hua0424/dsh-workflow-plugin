@@ -150,7 +150,7 @@ test('Role Actor system prompt 已组合：spawn 路径使用同一组合结果�
           return { childId: `sess-${seen.length}`, messageId: `message-${seen.length}` }
         },
       },
-      jobs: { onJobDone: () => () => {} },
+      jobs: { events: { subscribe: () => () => {} } },
       effect: () => {},
     } as unknown as Context,
     managerAgentOf: () => manager,
