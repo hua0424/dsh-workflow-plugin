@@ -133,6 +133,7 @@ test('#179 会话归属：切换会话关闭清理，陈旧响应双守卫丢弃
   assert.ok(modal.includes('submitGate'), '本地提交闸门防重复派发')
   assert.ok(modal.includes('showModal'), '优先原生 dialog，不新增 UI 框架')
   assert.ok(modal.includes('openSeq') && modal.includes('pendingCloseGen'), '陈旧 close 事件须按打开代际守卫')
+  assert.ok(modal.includes('shownSeq'), '打开 effect 不得随目录回调身份变化重开弹窗（F-004 会话切换回归）')
 })
 
 test('#179 隔离夹具提供启动弹窗受控页与检查脚本（浏览器证据链）', () => {

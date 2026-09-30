@@ -11,7 +11,8 @@
  * - 打开/刷新/取消只读目录，不执行命令、不创建 Run、不激活空白会话；
  * - 不碰对话输入框草稿（不读不写不清空未提交文字）；
  * - 切换会话或卸载关闭弹窗并清理，旧选择/prompt 不用于另一会话，陈旧
- *   目录响应按 generation + 会话双守卫丢弃，陈旧 close 按打开代际守卫丢弃；
+ *   目录响应按 generation + 会话双守卫丢弃，陈旧 close 按打开代际守卫丢弃，
+ *   打开展示按已展示代际守卫（会话切换不重开）；
  * - 本地提交闸门防重复派发；关闭 UI 不取消已发生的服务端启动（执行 promise
  *   不绑定弹窗 abort）；
  * - 只有传输成功且内层命令 result 为 success 才算成功；失败保留输入并显示
@@ -82,6 +83,9 @@ export function StartWorkflowButton(props) {
   /* F-001 打开代际：每次 openModal 递增；显式关闭/Escape 标记待处理 close 所属代际，陈旧 close 到达时丢弃。 */
   const openSeq = useRef(0)
   const pendingCloseGen = useRef(null)
+  /* F-004 已展示代际：打开 effect 不得随 refreshCatalog 身份变化（会话切换即变）
+     重跑 showModal，否则会把刚关闭的弹窗重开到新会话；每个打开代际只展示+拉取一次。 */
+  const shownSeq = useRef(0)
   const submitRef = useRef(submit)
   submitRef.current = submit
 
@@ -146,19 +150,25 @@ export function StartWorkflowButton(props) {
       const dlg = dialogRef.current
       if (dlg !== null && !dlg.open) {
         try { dlg.showModal() } catch { /* 已打开时忽略重复调用 */ }
+        shownSeq.current = openSeq.current
         void refreshCatalog()
       }
     }
   }, [gate.ok, channelReady, sessionId, refreshCatalog, open])
 
-  /* 打开落定：原生顶层弹窗 + 只读目录拉取（不执行命令）。 */
+  /* 打开落定：原生顶层弹窗 + 只读目录拉取（不执行命令）。
+     F-004 每个打开代际只展示+拉取一次：refreshCatalog 身份随 sessionId 变化，
+     会话切换的提交里 effect 会重跑，此时弹窗正被关闭，不得 showModal 重开。 */
   useEffect(() => {
     if (!open) return undefined
-    const dialog = dialogRef.current
-    if (dialog !== null && !dialog.open) {
-      try { dialog.showModal() } catch { /* 已打开时忽略重复调用 */ }
+    if (shownSeq.current !== openSeq.current) {
+      shownSeq.current = openSeq.current
+      const dialog = dialogRef.current
+      if (dialog !== null && !dialog.open) {
+        try { dialog.showModal() } catch { /* 已打开时忽略重复调用 */ }
+      }
+      void refreshCatalog()
     }
-    void refreshCatalog()
     return () => {
       catalogAbort.current?.abort()
       catalogAbort.current = null
