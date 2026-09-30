@@ -4,6 +4,8 @@ async page => {
   await page.evaluate(() => { window.__selectedPanel = 'unset'; });
   await page.getByRole('button', { name: '打开目录', exact: true }).click();
   await page.getByRole('button', { name: 'demo.yaml', exact: true }).click();
+  // 读取是异步 RPC：等 draft 渲染（=busy 已清）再断言空闲可返回，与脏检查段同一落定信号。
+  await page.getByRole('button', { name: '编辑节点 main', exact: true }).waitFor({ state: 'visible' });
   const back = page.getByRole('button', { name: '返回对话', exact: true });
   await back.waitFor({ state: 'visible' });
   if (!await back.isEnabled()) throw Error('Back entry must be enabled when idle');
