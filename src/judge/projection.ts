@@ -13,6 +13,7 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { isAppendSurfaceEvent, deriveEventMessage } from '@deepseek-ai/dsh-session'
 import type { NodeContextBoundary } from '../types.ts'
 import { SUBMISSION_CONSTRAINT } from '../engine/texts.ts'
+import { isWorkflowDispatchSource } from '../message-sources.ts'
 
 /** Max projected transcript length in characters (defensive bound, #45 P3 保留). */
 export const PROJECTION_MAX_CHARS = 120_000
@@ -67,7 +68,8 @@ export interface ProjectedMessage {
  * A1 R5 vs R6 source policy:
  * - MANAGER/USER sessions keep only `source.kind === 'user'` user messages
  *   (plugin/coordinator notices are excluded per R5);
- * - ACTOR 也保留本插件的 host Queue 派发来源；旧 coordinator 仅供历史读取。
+ * - ACTOR 也保留本插件的 host Queue 派发来源（新自声明 kind；旧 `plugin` kind
+ *   仅供存量历史读取）；旧 coordinator 仅供历史读取。
  *   dispatch/handoff/resolution 仍受 message-id 边界约束（R6）。
  *   首次 `startContinuable` prompt 的来源仍是 `{kind:'user'}`。
  */
@@ -78,7 +80,7 @@ function projectSurfaceEvent(event: SessionEvent, session: ProjectionSource, rol
   if (event.type === 'user/message') {
     const source = (event.data as { source?: { kind?: string; plugin?: string } }).source
     if (source?.kind !== 'user' && !(role === 'ACTOR' && (source?.kind === 'coordinator'
-      || (source?.kind === 'plugin' && source.plugin === 'dsh-agent-team-workflow')))) return undefined
+      || isWorkflowDispatchSource(source)))) return undefined
     // A1 R3: keep the three-way attribution — a real human user message in
     // the Manager session projects as USER, assistant output as MANAGER.
     if (role === 'MANAGER' && source?.kind === 'user') entryRole = 'USER'
