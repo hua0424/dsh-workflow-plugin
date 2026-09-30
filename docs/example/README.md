@@ -71,7 +71,7 @@ judgeRole:                   # Judge
 
 | 优先级 | 来源 | 说明 |
 | --- | --- | --- |
-| 1（最高） | 运行时 override | Manager 调用 `workflow_set_role_model({ roleKey, provider, modelId })`；`roleKey` 填 `"judge"` 即覆盖 Judge |
+| 1（最高） | 运行时 override | Manager 调用 `workflow_set_role_model({ roleKey, provider, modelId, reasoningEffort? })`；`roleKey` 填 `"judge"` 即覆盖 Judge，省略 `reasoningEffort` 即回落目标模型默认 |
 | 2 | YAML 定义 | `roles.<key>.model` / `judgeRole.model` |
 | 3（兜底） | 冻结的 Manager 路由 | Run 启动时解析一次并冻结；YAML 省略 `model` 即走这条 |
 

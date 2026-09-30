@@ -83,7 +83,7 @@ T5 已把 `jobs`、`compaction` 设为标准 Web composition 的 required servic
 
 Role（含 judgeRole）的模型路由由 provider、modelId 与可选思考强度（Reasoning Effort）组成，配置位置为 `roles.<role>.model.reasoningEffort` / `judgeRole.model.reasoningEffort`，与 provider/modelId 同级；不支持只填档位而不提供模型路由。档位 id 是 provider 适配器自有 opaque 字符串（如 off/minimal/low/medium/high/xhigh/max，不同模型档位集不同），schema 只做 trim/非空/长度约束，不 hardcode 档位枚举。
 
-默认与继承必须区分：显式 model + 显式档位用该值；显式 model + 省略档位**主动回落模型默认**（派发边界显式清除继承值——宿主对同路由子会话会保留父档位，“省略键”不等于“恢复默认”，不断言 options 缺键即默认生效）；完全未配置 model 保留既有 Manager 路由继承（含冻结档位）。运行期更换角色模型时思考强度不随行：清空并回落新模型默认档位（#153 T4）。
+默认与继承必须区分：显式 model + 显式档位用该值；显式 model + 省略档位**主动回落模型默认**（派发边界显式清除继承值——宿主对同路由子会话会保留父档位，“省略键”不等于“恢复默认”，不断言 options 缺键即默认生效）；完全未配置 model 保留既有 Manager 路由继承（含冻结档位）。运行期更换角色模型时思考强度不随行：省略档位即清空并回落新模型默认档位（#153 T4）；#172 起可显式传入 `reasoningEffort`，随 override 落库并经后续新建/重建会话完整传递，恢复后不丢失。
 
 旧快照兼容 = 可读取、可继续、无需迁移：不向旧定义补默认档位，不重写旧定义 hash，state 格式版本不变；显式路由缺档位的后续新建/重建派发采用上述默认语义，不为升级主动重建存量会话。
 
