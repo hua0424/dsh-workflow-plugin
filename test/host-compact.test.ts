@@ -81,8 +81,8 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
     workspace: 'ws',
   }), { messageId: 'dispatch-3' })
   assert.deepEqual(deliveries.slice(0, 2), [
-    { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
-    { parent: manager, childId: 'sess-dev', text: 'resume node', source: { kind: 'plugin', plugin: 'dsh-agent-team-workflow' } },
+    { parent: manager, childId: 'sess-dev', text: 'next node', source: { kind: 'workflow-dispatch', plugin: 'dsh-agent-team-workflow' } },
+    { parent: manager, childId: 'sess-dev', text: 'resume node', source: { kind: 'workflow-dispatch', plugin: 'dsh-agent-team-workflow' } },
   ])
   assert.equal(deliveries[2]!.childId, 'sess-judge')
   assert.match(deliveries[2]!.text, /Worker handoff:\ncandidate/)

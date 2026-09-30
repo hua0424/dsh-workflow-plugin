@@ -10,6 +10,7 @@ import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { workflowNoticeSource } from '../message-sources.ts'
 // Type-only：解析 ctx.get('sessionProjections')。#85 读宿主 UI 用的同一个 blank bit；
 // 服务缺席（未挂 session-controller 的宿主）时激活降级为 seq 启发式。
 import type {} from '@deepseek-ai/dsh-session-projection'
@@ -30,8 +31,6 @@ export function isRootCommandAgent(agent: Agent): boolean {
   const header = agent.session.header
   return header.parentSession === undefined && header.origin !== 'subagent' && (header.delegationDepth ?? 0) === 0
 }
-
-const PLUGIN_NAME = 'dsh-agent-team-workflow'
 
 /** 结果文本进 prompt 的上限：只给模型够转述的量（status 的 JSON 可达数十 KB）。 */
 const ACTIVATION_RESULT_MAX_CHARS = 4_000
@@ -58,7 +57,7 @@ export type SessionActivator = (agent: Agent, request: BlankActivationRequest) =
  *
  * 宿主 UI 在会话 `blank` 阶段整段不渲染对话区，`/dsh-flow` 的结果只落在会话日志里，
  * 用户看不到；命令生命周期事件又不含 `turn/start`，blank 位永不自行清除。这里投递一条
- * plugin/notice 消息唤醒一个 turn：`turn/start` 清除 blank，此前落日志的 command 节点
+ * 自声明 kind 的 notice 消息唤醒一个 turn：`turn/start` 清除 blank，此前落日志的 command 节点
  * 连同助手的一句转述立即可见。blank 位本身就是"每会话最多一次"的闸门（turn 一开即永久
  * 为 false），无需额外状态；任何失败都静默降级为 warn，不影响命令本身的结果与日志。
  */
@@ -74,12 +73,7 @@ export function makeBlankSessionActivator(ctx: Context): SessionActivator {
       if (!blank) return
       agent.followup(createUserMessage({
         content: [{ type: 'text', text: activationText(request) }],
-        source: {
-          kind: 'plugin',
-          plugin: PLUGIN_NAME,
-          form: 'notice',
-          summary: boundContextSummary(`/dsh-flow ${request.command.split(/\s+/)[0] || '(无参数)'} 结果`),
-        },
+        source: workflowNoticeSource(boundContextSummary(`/dsh-flow ${request.command.split(/\s+/)[0] || '(无参数)'} 结果`)),
       }))
     } catch (error) {
       ctx.logger.warn(`dsh-flow blank-session activation skipped: ${String(error)}`)

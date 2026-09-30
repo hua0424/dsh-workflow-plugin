@@ -451,7 +451,7 @@ function blankSession(id: string): Session {
   return session
 }
 
-test('#85: a blank root session gets one plugin/notice followup after the handler returns', async () => {
+test('#85: a blank root session gets one workflow-notice followup after the handler returns', async () => {
   const { agent, sent } = fakeRootAgent(blankSession('blank-root'))
   const { ctx } = ctxWith(projectionWith(true))
   const cmd = makeDshFlowCommand(makeCommandHost(), makeBlankSessionActivator(ctx as never))
@@ -460,7 +460,7 @@ test('#85: a blank root session gets one plugin/notice followup after the handle
   assert.equal(sent.length, 0) // 投递发生在 handler 返回之后
   await tick()
   assert.equal(sent.length, 1)
-  assert.equal(sent[0]!.source.kind, 'plugin')
+  assert.equal(sent[0]!.source.kind, 'workflow-notice')
   assert.equal((sent[0]!.source as { form?: string }).form, 'notice')
   assert.match(textOf(sent[0]!), /- a/) // 结果文本进了转述内容
   assert.match(textOf(sent[0]!), /不要调用任何工具/)
