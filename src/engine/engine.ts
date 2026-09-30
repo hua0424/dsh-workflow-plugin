@@ -1135,23 +1135,26 @@ export class WorkflowEngine {
     if (advanced.ok && advanced.run?.status === 'running') await this.drive(ws)
     return advanced
   }
-  async handleSetRoleModel(ws: string, role: string, provider: string, model: string, caller: string): Promise<EngineOutcome> {
+  async handleSetRoleModel(ws: string, role: string, provider: string, model: string, caller: string, reasoningEffort?: string): Promise<EngineOutcome> {
     const row = await this.state.get(ws)
     if (!row || row.run.status === 'completed' || row.run.status === 'terminated') return rejected('workflow_set_role_model requires the current active Run')
     if (caller !== row.run.managerSessionId) return rejected('workflow_set_role_model is Manager-only')
     if (role !== 'judge' && !(role in row.run.definitionSnapshot.roles)) return rejected(`unknown role "${role}"`)
+    // #172: reasoningEffort 非字符串（工具层透传的越界类型）同样 fail-closed；
+    // 校验全部发生在 mutation 之前，失败不留部分 override。
+    if (reasoningEffort !== undefined && typeof reasoningEffort !== 'string') return rejected('reasoningEffort must be a string when provided')
     let route
-    try { route = normalizeModelRoute(provider, model) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
+    try { route = normalizeModelRoute(provider, model, reasoningEffort) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
     const existing = row.run.modelOverrides[role]
     const mapped = role === 'judge' ? undefined : row.run.roleActors[role]
-    // #153 T4：仅比较 provider/modelId 不足以判定无变化——存活会话可能仍携带
+    // #153 T4 + #172：no-op 须比较三元件——存活会话可能仍携带
     // 旧档位（def/冻结的显式 effort，或升级前从 Manager 继承的档位），override
-    // 自身也可能带 effort（set 从不写入，但旧行不保证）。有存活映射或既有
-    // override 带 effort 时走正常替换生命周期（探针 + 删映射 + 重存干净 override，
-    // 后续派发经显式 undefined 回落模型默认）；Judge 恒无映射（Judge 会话复用由
-    // resume 的三元件比较决定，#22/T1），无映射且 override 干净时才可 no-op。
+    // 自身也可能带 effort（省略即无键 = 回落默认）。三元件全等、有存活映射或既有
+    // override 带 effort 时走正常替换生命周期（探针 + 删映射 + 重存 override，
+    // 后续派发经显式 undefined 回落模型默认，或携带显式档位）；Judge 恒无映射（Judge 会话复用由
+    // resume 的三元件比较决定，#22/T1），无映射且 override 三元件全等时才可 no-op。
     if (existing?.provider === route.provider && existing.modelId === route.modelId
-      && existing.reasoningEffort === undefined && mapped === undefined) return { ok: true, run: row.run, message: 'model override already applied' }
+      && existing.reasoningEffort === route.reasoningEffort && mapped === undefined) return { ok: true, run: row.run, message: 'model override already applied' }
     const currentNode = this.nodeAt(row.run, topFrame(row.run))
     const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
     if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')
@@ -1165,7 +1168,7 @@ export class WorkflowEngine {
     if (mapped) delete row.run.roleActors[role]
     if (replacesCurrentRole) row.execution.roleBoundaryPrepared = true
     await this.state.put(ws, row.run, row.version, [change(row.execution, 'model-changed')])
-    this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax) })
+    this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax), ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: jsonField(route.reasoningEffort, LIMITS.reasoningEffortMax) }) })
     return { ok: true, run: row.run, message: `model override saved for ${role}` }
   }
   /**

@@ -66,7 +66,7 @@ export interface ToolHost {
   resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string, target?: 'auto' | 'actor' | 'judge'): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
-  setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string, caller: string, reasoningEffort?: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   status(workspaceKey: string, caller: string, history?: { executionId: string; after?: number; limit?: number }): Promise<{ ok: boolean; reason?: string; status?: unknown }>
   judgeClaim(workspaceKey: string, nodeToken: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   respawnJudge(workspaceKey: string, nodeToken: string, reason: string | undefined, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -241,17 +241,18 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
 
     defineTool({
       name: 'workflow_set_role_model',
-      description: 'Manager 为某个 Role 或 Judge 切换模型（provider + modelId），成功后原思考强度即清空（含同模型再次设置），后续派发使用目标模型默认档位（换到与 Manager 相同路由也不重新继承 Manager 档位）。只影响之后新建的会话：Worker 覆盖即删旧映射（下次派发按新路由重建；同模型覆盖有存活会话时同样重建，不再静默复用），Judge 覆盖后 node_resume 自动对旧会话走 fresh（释放旧会话 + 新路由 spawn）；目标 Role 有 active Actor 时拒绝，正在判定的 live Judge 会话不受影响。',
+      description: 'Manager 为某个 Role 或 Judge 切换模型（provider + modelId，可选 reasoningEffort 显式档位；省略即清空旧档位，后续派发使用目标模型默认档位，换到与 Manager 相同路由也不重新继承 Manager 档位）。只影响之后新建的会话：Worker 覆盖即删旧映射（下次派发按新路由重建；同模型覆盖有存活会话时同样重建，不再静默复用），Judge 覆盖后 node_resume 自动对旧会话走 fresh（释放旧会话 + 新路由 spawn）；目标 Role 有 active Actor 时拒绝，正在判定的 live Judge 会话不受影响。',
       parameters: {
         roleKey: { type: 'string', required: true, description: 'roleKey 或 judge' },
         provider: { type: 'string', required: true, description: 'provider route' },
         modelId: { type: 'string', required: true, description: 'model id' },
+        reasoningEffort: { type: 'string', description: '可选思考强度（适配器自有档位 id；省略即回落目标模型默认）' },
       },
       output: stringOut,
       async execute(args, exec) {
         const auth = await controlWorkspace(host, exec.agent, 'workflow_set_role_model')
         if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
-        return fmtResult(await host.setRoleModel(auth.workspaceKey, args.roleKey, args.provider, args.modelId, auth.caller))
+        return fmtResult(await host.setRoleModel(auth.workspaceKey, args.roleKey, args.provider, args.modelId, auth.caller, args.reasoningEffort))
       },
     }),
 

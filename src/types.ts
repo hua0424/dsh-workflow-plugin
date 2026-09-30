@@ -138,15 +138,22 @@ export function readRoleDefModel(
  * catalog schema caps and `handleSetRoleModel`. Empty-after-trim or
  * over-limit components are rejected with the limit in the message; the
  * returned values are the trim results actually stored.
+ * #172: reasoningEffort 可选——显式档位走同一套“trim 后非空 + 长度上限”规则
+ * （与 catalog schema 同源，不 hardcode 跨 provider 枚举）；省略即无该键，
+ * 调用方（handleSetRoleModel）按“清空旧档位、回落模型默认”解释。
  */
-export function normalizeModelRoute(provider: string, modelId: string): RoleModel {
+export function normalizeModelRoute(provider: string, modelId: string, reasoningEffort?: string): RoleModel {
   const p = provider.trim()
   const m = modelId.trim()
   if (p === '') throw new WorkflowError(`provider must be 1..${LIMITS.providerMax} characters after trim`)
   if (p.length > LIMITS.providerMax) throw new WorkflowError(`provider must be at most ${LIMITS.providerMax} characters after trim (got ${p.length})`)
   if (m === '') throw new WorkflowError(`modelId must be 1..${LIMITS.modelIdMax} characters after trim`)
   if (m.length > LIMITS.modelIdMax) throw new WorkflowError(`modelId must be at most ${LIMITS.modelIdMax} characters after trim (got ${m.length})`)
-  return { provider: p, modelId: m }
+  if (reasoningEffort === undefined) return { provider: p, modelId: m }
+  const e = reasoningEffort.trim()
+  if (e === '') throw new WorkflowError(`reasoningEffort must be 1..${LIMITS.reasoningEffortMax} characters after trim`)
+  if (e.length > LIMITS.reasoningEffortMax) throw new WorkflowError(`reasoningEffort must be at most ${LIMITS.reasoningEffortMax} characters after trim (got ${e.length})`)
+  return { provider: p, modelId: m, reasoningEffort: e }
 }
 
 export interface RoleDefinition {
@@ -335,10 +342,9 @@ export interface ModelOverride {
   provider: string
   modelId: string
   /**
-   * #149 T1: 持久化兼容字段（可选）。T1 的 `workflow_set_role_model` 只写入
-   * provider/modelId（换模型清空旧档位的完整语义由 #153 T4 交付），此处预留
-   * effort 位使带档位的 Judge/previousJudge 快照与未来 override 可落库；
-   * 旧行无该键照常读取（state 格式版本不变）。
+   * #149 T1: 持久化兼容字段（可选）。#153 T4 前 `workflow_set_role_model` 只写入
+   * provider/modelId（换模型清空旧档位）；#172 起显式档位随 override 落库，
+   * 经 `resolveRoleModel` → 派发边界完整传递；旧行无该键照常读取（state 格式版本不变）。
    */
   reasoningEffort?: string
 }

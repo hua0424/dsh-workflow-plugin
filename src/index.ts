@@ -228,7 +228,7 @@ export function apply(ctx: Context) {
     resume: (ws, nodeToken, resolutionContext, caller, target) => engine.handleResume(ws, nodeToken, resolutionContext, caller, target).then(outcomeOf),
     runProgram: (ws, nodeToken, parameters, caller) => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf),
     resolveProgram: (ws, nodeToken, result, reason, caller) => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf),
-    setRoleModel: (ws, roleKey, provider, modelId, caller) => engine.handleSetRoleModel(ws, roleKey, provider, modelId, caller).then(outcomeOf),
+    setRoleModel: (ws, roleKey, provider, modelId, caller, reasoningEffort) => engine.handleSetRoleModel(ws, roleKey, provider, modelId, caller, reasoningEffort).then(outcomeOf),
     judgeClaim: (ws, nodeToken, result, reason, caller) => engine.handleJudgeClaim(ws, nodeToken, result, reason, caller).then(outcomeOf),
     respawnJudge: (ws, nodeToken, reason, caller) => engine.handleRespawnJudge(ws, nodeToken, reason, caller).then(outcomeOf),
     status: (ws, caller, history) => engine.status(ws, caller, history),
