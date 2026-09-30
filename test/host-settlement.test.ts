@@ -40,7 +40,7 @@ test('safe inspection rejects a different live Activation for the observed Sessi
   const replacement = { ...oldActor, whenIdle: async () => {} } as unknown as Agent
   let current: Agent | undefined = oldActor
   const ctx = {
-    jobs: { list: () => [], onJobDone: () => () => {} }, effect: () => {},
+    jobs: { list: () => [], events: { subscribe: () => () => {} } }, effect: () => {},
     agents: { get: () => current, list: () => current ? [current] : [] },
     subagents: { listDescendants: async () => [] },
   } as unknown as Context
@@ -58,7 +58,7 @@ test('safe inspection rejects a descendant that appears while idle checks await'
     whenIdle: async () => { if (++checks === 2) child = { id: 'child', status: 'running', session: { id: 'child', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent },
   } as unknown as Agent
   const ctx = {
-    jobs: { list: () => [], onJobDone: () => () => {} }, effect: () => {},
+    jobs: { list: () => [], events: { subscribe: () => () => {} } }, effect: () => {},
     agents: { get: (id: unknown) => id === 'actor' ? actor : child, list: () => child ? [actor, child] : [actor] },
     subagents: { listDescendants: async () => [] },
   } as unknown as Context
@@ -71,9 +71,9 @@ test('safe inspection requires observable idle descendants, empty inboxes, and t
   const child = { id: 'child', status: 'idle', session: { id: 'child', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
   let descendants: unknown[] = []
   let live: Agent[] = [actor]
-  let jobs: Array<{ status: string; ownerSession?: string; detail?: string }> = []
+  let jobs: Array<{ status: string; owner?: string; detail?: string }> = []
   const ctx = {
-    jobs: { list: () => jobs, onJobDone: () => () => {} }, effect: () => {},
+    jobs: { list: () => jobs, events: { subscribe: () => () => {} } }, effect: () => {},
     agents: { get: (id: unknown) => live.find(agent => agent.id === id), list: () => live },
     subagents: { listDescendants: async () => descendants },
   } as unknown as Context
@@ -92,11 +92,11 @@ test('safe inspection requires observable idle descendants, empty inboxes, and t
   live = [actor, child]
   jobs = [{ status: 'running' }]
   assert.equal(await host.safeToInspect('actor'), 'safe', 'unowned jobs do not belong to the Role tree')
-  jobs = [{ status: 'stopping', ownerSession: 'actor' }]
+  jobs = [{ status: 'stopping', owner: 'actor' }]
   assert.equal(await host.safeToInspect('actor'), 'unsafe')
-  jobs = [{ status: 'completed', ownerSession: 'actor' }]
+  jobs = [{ status: 'completed', owner: 'actor' }]
   assert.equal(await host.safeToInspect('actor'), 'safe')
-  jobs = [{ status: 'failed', ownerSession: 'actor', detail: 'work may be orphaned after teardown' }]
+  jobs = [{ status: 'failed', owner: 'actor', detail: 'work may be orphaned after teardown' }]
   assert.equal(await host.safeToInspect('actor'), 'unsafe')
 })
 
@@ -107,7 +107,7 @@ test('safe inspection keeps failing closed when a non-waitable member of the clo
   const neverInDescendants = { id: 'absent', status: 'running', session: { id: 'absent', header: { parentSession: 'actor' } }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: async () => {} } as unknown as Agent
   let live: Agent[] = [actor, neverInDescendants]
   const ctx = {
-    jobs: { list: () => [], onJobDone: () => () => {} }, effect: () => {},
+    jobs: { list: () => [], events: { subscribe: () => () => {} } }, effect: () => {},
     agents: { get: (id: unknown) => live.find(agent => agent.id === id), list: () => live },
     subagents: { listDescendants: async () => [] },
   } as unknown as Context
@@ -128,9 +128,10 @@ test('orphan evidence follows its exact nested Session across descriptor removal
     { kind: 'child', id: 'leaf-old', activity: 'inactive', hasChildren: false, mode: 'continuable', label: 'leaf', parentId: 'branch-old', depth: 2 },
   ]
   let branchLive = true
-  let done: ((job: { detail?: string }, owner?: Agent) => void) | undefined
+  type SettledEvent = { type: 'settled'; job: { owner?: string; detail?: string }; cause: string }
+  let done: ((event: SettledEvent) => void) | undefined
   const ctx = {
-    jobs: { list: () => [], onJobDone: (listener: typeof done) => { done = listener; return () => {} } }, effect: () => {},
+    jobs: { list: () => [], events: { subscribe: (_filter: unknown, listener: typeof done) => { done = listener; return () => {} } } }, effect: () => {},
     agents: {
       get: (id: unknown) => id === 'actor' ? actor : id === 'branch-old' && branchLive ? branch : id === 'fresh' ? fresh : undefined,
       list: () => branchLive ? [actor, branch, fresh] : [actor, fresh],
@@ -140,7 +141,7 @@ test('orphan evidence follows its exact nested Session across descriptor removal
   const host = makeSafetyHost(ctx, actor)
   assert.equal(await host.safeToInspect('actor'), 'safe')
   branchLive = false
-  done?.({ detail: 'work may be orphaned after forced cleanup' }, leaf)
+  done?.({ type: 'settled', job: { owner: String(leaf.id), detail: 'cancel threw during teardown; work may be orphaned: cleanup failed' }, cause: 'teardown' })
   descendants = []
   assert.equal(await host.safeToInspect('actor'), 'unsafe', 'known ancestry survives an unavailable middle Agent and descriptor removal')
   assert.equal(await host.safeToInspect('fresh'), 'safe')
@@ -149,14 +150,15 @@ test('orphan evidence follows its exact nested Session across descriptor removal
 test('safe inspection waits exact Agent, rejects job tail and retains cold/orphan evidence', async () => {
   const idle = Promise.withResolvers<void>()
   let live = true
-  let jobs: Array<{ status: string; ownerSession?: string; detail?: string }> = []
-  let done: ((job: { detail?: string }, owner?: Agent) => void) | undefined
+  let jobs: Array<{ status: string; owner?: string; detail?: string }> = []
+  type SettledEvent = { type: 'settled'; job: { owner?: string; detail?: string }; cause: string }
+  let done: ((event: SettledEvent) => void) | undefined
   let dispose: (() => void) | undefined
   let unsubscribed = false
   const actor = { id: 'actor', status: 'idle', session: { id: 'actor', header: {} }, inbox: { nextTurn: [], nextStep: [] }, whenIdle: () => idle.promise } as unknown as Agent
   const ctx = {
     get: () => { throw new Error('required services must use direct Context properties') },
-    jobs: { list: () => jobs, onJobDone: (listener: typeof done) => { done = listener; return () => { unsubscribed = true; done = undefined } } },
+    jobs: { list: () => jobs, events: { subscribe: (_filter: unknown, listener: typeof done) => { done = listener; return () => { unsubscribed = true; done = undefined } } } },
     effect: (factory: () => () => void) => { dispose = factory() },
     agents: { get: () => live ? actor : undefined, list: () => live ? [actor] : [] },
     subagents: { listDescendants: async () => [] },
@@ -167,13 +169,13 @@ test('safe inspection waits exact Agent, rejects job tail and retains cold/orpha
   const checking = host.safeToInspect('actor').then(result => { settled = true; return result })
   await Promise.resolve()
   assert.equal(settled, false, 'public idle does not prove maintenance/driver quiescence')
-  jobs = [{ status: 'stopping', ownerSession: 'actor' }]
+  jobs = [{ status: 'stopping', owner: 'actor' }]
   idle.resolve()
   assert.equal(await checking, 'unsafe')
   jobs = []
   live = false
   assert.equal(await host.safeToInspect('actor'), 'safe', 'recorded exact Agent survives cold release')
-  done?.({ detail: 'cancel threw during teardown; work may be orphaned: boom' }, actor)
+  done?.({ type: 'settled', job: { owner: String(actor.id), detail: 'cancel threw during teardown; work may be orphaned: boom' }, cause: 'teardown' })
   assert.equal(await host.safeToInspect('actor'), 'unsafe', 'removing job snapshots cannot erase orphan evidence')
   dispose?.()
   assert.equal(unsubscribed, true)

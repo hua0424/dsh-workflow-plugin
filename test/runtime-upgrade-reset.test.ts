@@ -566,7 +566,7 @@ test('plugin apply stays active on an incompatible store and only root plus expl
       logger: { warn() {} },
       commands: { register(definition: CommandDefinition) { command = definition; return () => {} } },
       tools: { register() { return () => {} }, schemas() { return [] } },
-      jobs: { onJobDone() { return () => {} }, list() { return [] } },
+      jobs: { events: { subscribe() { return () => {} } }, list() { return [] } },
       agents: { get() { return undefined }, list() { return [] }, currentInitiator() { return undefined } },
       subagents: {}, compaction: {}, sessions: {},
     }
@@ -621,7 +621,7 @@ test('plugin reset command is available to any top-level Session of the workspac
       logger: { warn() {} },
       commands: { register(definition: CommandDefinition) { command = definition; return () => {} } },
       tools: { register() { return () => {} }, schemas() { return [] } },
-      jobs: { onJobDone() { return () => {} }, list() { return [] } },
+      jobs: { events: { subscribe() { return () => {} } }, list() { return [] } },
       agents: { get() { return undefined }, list() { return [] }, currentInitiator() { return undefined } },
       subagents: {}, compaction: {}, sessions: {},
     }

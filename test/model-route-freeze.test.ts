@@ -298,7 +298,7 @@ function realHost(
     tools: { schemas: () => visible },
     get: () => undefined,
     logger: { warn: () => {} },
-    jobs: { onJobDone: () => () => {} },
+    jobs: { events: { subscribe: () => () => {} } },
     effect: () => {},
   } as unknown as Context
   const adapters: HostAdapters = {

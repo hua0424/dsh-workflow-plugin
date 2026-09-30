@@ -33,17 +33,18 @@ function harness(rows: Array<[string, WorkOrderFacts]> = []) {
   const rowMap = new Map(rows)
   const agents = new Map<string, Agent>()
   const descendants = new Map<string, unknown[]>()
-  const jobs: Array<{ status: string; ownerSession?: string; detail?: string }> = []
+  const jobs: Array<{ status: string; owner?: string; detail?: string }> = []
   const probes: string[] = []
   const scans: string[] = []
-  let jobDone: ((job: { detail?: string }, owner?: Agent) => void) | undefined
+  type SettledEvent = { type: 'settled'; job: { owner?: string; detail?: string }; cause: string }
+  let onSettled: ((event: SettledEvent) => void) | undefined
   let dispose: (() => void) | undefined
   const index = makeParticipantIndex({
     agents: { get: id => agents.get(String(id)), list: () => [...agents.values()] },
     subagents: { listDescendants: async id => (descendants.get(String(id)) ?? []) as never },
     jobs: {
       list: () => jobs as never,
-      onJobDone: listener => { jobDone = listener as never; return () => { jobDone = undefined } },
+      events: { subscribe: (_filter: unknown, listener: (event: SettledEvent) => void) => { onSettled = listener; return () => { onSettled = undefined } } },
     },
     effect: factory => { dispose = factory() },
   }, {
@@ -59,7 +60,8 @@ function harness(rows: Array<[string, WorkOrderFacts]> = []) {
   })
   return {
     index, agents, rowMap, jobs, probes, scans, descendants,
-    orphan: (owner: Agent) => jobDone?.({ detail: 'work may be orphaned after teardown' }, owner),
+    orphan: (owner: Agent) => onSettled?.({ type: 'settled', job: { owner: String(owner.id), detail: 'cancel threw during teardown; work may be orphaned: boom' }, cause: 'teardown' }),
+    settled: (cause: string, detail: string | undefined, ownerId: string | undefined) => onSettled?.({ type: 'settled', job: { owner: ownerId, detail }, cause }),
     dispose: () => dispose?.(),
   }
 }
@@ -253,6 +255,29 @@ test('#99 AC4：orphan 证据跨 descriptor/job 行消失存活，且只由插�
   assert.equal(await h.index.safeToInspect('actor'), 'unsafe', 'disposal releases retained references; nothing grants a pass afterwards')
 })
 
+test('#190 三重匹配：teardown 抛错结算进 tombstone，普通 teardown 与 producer/kill 不误判', async () => {
+  const h = harness()
+  const actor = mkAgent('actor')
+  h.agents.set('actor', actor)
+  h.index.observeTurnEnd('actor')
+
+  // 合规 teardown 结算（cancel 未抛错，无 orphan 子串）：不起因不算，只缺子串即放行。
+  h.settled('teardown', undefined, 'actor')
+  assert.equal(await h.index.safeToInspect('actor'), 'safe', 'plain teardown settlement without the orphan detail is not an orphan')
+
+  // producer/kill 结算即使带上可疑 detail：起因不对，一律不误判。
+  h.settled('producer', 'cancel threw during teardown; work may be orphaned: late flush', 'actor')
+  assert.equal(await h.index.safeToInspect('actor'), 'safe', 'producer settlement is never an orphan')
+  h.settled('kill', 'cancel threw during teardown; work may be orphaned: race', 'actor')
+  assert.equal(await h.index.safeToInspect('actor'), 'safe', 'kill settlement is never an orphan')
+  assert.equal(h.index.stats().tombstones, 0, '误判场景不得建 tombstone')
+
+  // teardown 抛错结算：三重全中，进 tombstone。
+  h.settled('teardown', 'cancel threw during teardown; work may be orphaned: boom', 'actor')
+  assert.equal(h.index.stats().tombstones, 1)
+  assert.equal(await h.index.safeToInspect('actor'), 'unsafe', 'teardown-throw settlement enters the tombstone')
+})
+
 test('#99 AC3：后代 pending inbox / 非终态 job 仍让收口 fail-closed（判据未被寿命改造削弱）', async () => {
   const h = harness()
   const actor = mkAgent('actor')
@@ -265,7 +290,7 @@ test('#99 AC3：后代 pending inbox / 非终态 job 仍让收口 fail-closed（
   h.agents.set('child', child)
   assert.equal(await h.index.safeToInspect('actor'), 'waiting', '唯一阻碍是仍在跑的已知后代 = 等待')
 
-  h.jobs.push({ status: 'stopping', ownerSession: 'actor' })
+  h.jobs.push({ status: 'stopping', owner: 'actor' })
   assert.equal(await h.index.safeToInspect('actor'), 'unsafe', '未终态 job 仍是收口未知')
   h.jobs.length = 0
   h.descendants.set('actor', [
@@ -279,7 +304,7 @@ test('#99 寿命边界：探针失败不是"可释放"的证据（fail-closed �
   const index = makeParticipantIndex({
     agents: { get: id => agents.get(String(id)), list: () => [...agents.values()] },
     subagents: { listDescendants: async () => [] },
-    jobs: { list: () => [], onJobDone: () => () => {} },
+    jobs: { list: () => [], events: { subscribe: () => () => {} } },
     effect: () => {},
   }, {
     workspaceKeyOf: async cwd => cwd,
