@@ -11,7 +11,7 @@
  * - 打开/刷新/取消只读目录，不执行命令、不创建 Run、不激活空白会话；
  * - 不碰对话输入框草稿（不读不写不清空未提交文字）；
  * - 切换会话或卸载关闭弹窗并清理，旧选择/prompt 不用于另一会话，陈旧
- *   目录响应按 generation + 会话双守卫丢弃；
+ *   目录响应按 generation + 会话双守卫丢弃，陈旧 close 按打开代际守卫丢弃；
  * - 本地提交闸门防重复派发；关闭 UI 不取消已发生的服务端启动（执行 promise
  *   不绑定弹窗 abort）；
  * - 只有传输成功且内层命令 result 为 success 才算成功；失败保留输入并显示
@@ -79,6 +79,9 @@ export function StartWorkflowButton(props) {
   const catalogAbort = useRef(null)
   const submitGate = useRef(false)
   const openSession = useRef(undefined)
+  /* F-001 打开代际：每次 openModal 递增；显式关闭/Escape 标记待处理 close 所属代际，陈旧 close 到达时丢弃。 */
+  const openSeq = useRef(0)
+  const pendingCloseGen = useRef(null)
   const submitRef = useRef(submit)
   submitRef.current = submit
 
@@ -86,8 +89,11 @@ export function StartWorkflowButton(props) {
     catalogAbort.current?.abort()
     catalogAbort.current = null
     catalogGen.current += 1
-    if (dialogRef.current?.open) dialogRef.current.close()
-    else setOpen(false)
+    const dialog = dialogRef.current
+    if (dialog?.open) {
+      pendingCloseGen.current = openSeq.current
+      dialog.close()
+    } else setOpen(false)
   }, [])
 
   /* 切换会话：关闭弹窗并清理，不把旧选择用于另一会话；进行中的提交不取消服务端启动。 */
@@ -124,6 +130,7 @@ export function StartWorkflowButton(props) {
 
   const openModal = useCallback(() => {
     if (!gate.ok || !channelReady) return
+    openSeq.current += 1
     openSession.current = sessionId
     setPrompt('')
     setSelection(null)
@@ -133,7 +140,16 @@ export function StartWorkflowButton(props) {
       setSubmit({ status: 'idle', message: '' })
     }
     setOpen(true)
-  }, [gate.ok, channelReady, sessionId])
+    /* F-001 快速取消→重开：旧 close 事件尚未派发时 open 仍为 true，
+       置位 effect 不会重跑；原生 dialog 已被同步 close，需在此同步重开并重拉目录。 */
+    if (open) {
+      const dlg = dialogRef.current
+      if (dlg !== null && !dlg.open) {
+        try { dlg.showModal() } catch { /* 已打开时忽略重复调用 */ }
+        void refreshCatalog()
+      }
+    }
+  }, [gate.ok, channelReady, sessionId, refreshCatalog, open])
 
   /* 打开落定：原生顶层弹窗 + 只读目录拉取（不执行命令）。 */
   useEffect(() => {
@@ -149,14 +165,24 @@ export function StartWorkflowButton(props) {
     }
   }, [open, refreshCatalog])
 
-  /* 原生 dialog 事件：提交中禁止 Escape 关闭；任何关闭同步 React 状态并回焦。 */
+  /* 原生 dialog 事件：提交中禁止 Escape 关闭；关闭按打开代际守卫同步 React 状态并回焦。 */
   useEffect(() => {
     const dialog = dialogRef.current
     if (dialog === null) return undefined
     const onCancel = (event) => {
-      if (submitRef.current.status === 'working' || submitGate.current) event.preventDefault()
+      if (submitRef.current.status === 'working' || submitGate.current) {
+        event.preventDefault()
+        return
+      }
+      /* Escape 将随后触发 close：标记所属代际，供 onClose 区分陈旧事件。 */
+      pendingCloseGen.current = openSeq.current
     }
     const onClose = () => {
+      const pending = pendingCloseGen.current
+      const current = openSeq.current
+      pendingCloseGen.current = null
+      /* F-001 陈旧 close（快速取消→重开后旧事件到达）不得回落新打开状态。 */
+      if (pending !== null && pending !== current) return
       setOpen(false)
       entryRef.current?.focus?.()
     }

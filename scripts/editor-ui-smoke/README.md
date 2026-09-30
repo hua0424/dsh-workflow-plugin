@@ -44,5 +44,5 @@ playwright-cli -s=start-smoke run-code --filename=scripts/editor-ui-smoke/check-
 playwright-cli -s=start-smoke close
 ```
 
-覆盖：只读列表有效/警告可选与无效禁用、上下文提示、`.yaml` 展示与 workflow-id 提交、空 prompt 语义、命令失败保留输入、未知结果指引查状态不重试、刷新/取消零副作用、运行中/提交中/无 workspace 禁用、切换会话清理、提交闸门（挂起时 Escape/取消不可绕过、单次派发）。断言失败退出非零。
+覆盖：只读列表有效/警告可选与无效禁用、上下文提示、`.yaml` 展示与 workflow-id 提交、空 prompt 语义、命令失败保留输入、未知结果指引查状态不重试、刷新/取消零副作用、运行中/提交中/无 workspace 禁用（自动等待断言）、快速取消重开（陈旧 close 代际守卫）、切换会话清理、提交闸门（挂起时 Escape/取消不可绕过、单次派发）。断言失败退出非零。
 

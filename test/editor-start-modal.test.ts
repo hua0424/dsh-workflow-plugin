@@ -125,13 +125,14 @@ test('#179 注册：session-scoped input.left 按钮，不替换 composer、无 
   assert.ok(modal.includes('role: \'alert\'') || modal.includes('role:"alert"') || modal.includes("role: 'alert'"), '错误区域可播报')
 })
 
-test('#179 会话归属：切换会话关闭清理，陈旧响应双守卫丢弃', () => {
+test('#179 会话归属：切换会话关闭清理，陈旧响应双守卫丢弃，陈旧 close 代际守卫', () => {
   const modal = readSrc('start-modal.js')
   assert.ok(modal.includes('openSession'), '应记录弹窗所属 Session')
   assert.ok(modal.includes('sessionId !== openSession.current'), '会话切换/陈旧响应须按所属会话守卫')
   assert.ok(modal.includes('catalogGen'), '只读请求须有 generation 守卫')
   assert.ok(modal.includes('submitGate'), '本地提交闸门防重复派发')
   assert.ok(modal.includes('showModal'), '优先原生 dialog，不新增 UI 框架')
+  assert.ok(modal.includes('openSeq') && modal.includes('pendingCloseGen'), '陈旧 close 事件须按打开代际守卫')
 })
 
 test('#179 隔离夹具提供启动弹窗受控页与检查脚本（浏览器证据链）', () => {
@@ -141,7 +142,7 @@ test('#179 隔离夹具提供启动弹窗受控页与检查脚本（浏览器证
   assert.ok(server.includes('/start-control'), '目录三态（ok/empty/error）应可经控制端点切换')
   assert.ok(server.includes('__runCommand'), '命令应经受控桩响应，不建真实 Run')
   const check = readFileSync(join(here, '..', 'scripts', 'editor-ui-smoke', 'check-start-modal.cjs'), 'utf8')
-  for (const key of ['已有活动 Run', '不要自动重试', '__resolveHang', '__renderStart']) {
+  for (const key of ['已有活动 Run', '不要自动重试', '__resolveHang', '__renderStart', '快速取消', 'wantEnabled']) {
     assert.ok(check.includes(key), `检查脚本应覆盖 ${key}`)
   }
 })

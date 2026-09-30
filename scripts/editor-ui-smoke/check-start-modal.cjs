@@ -5,6 +5,17 @@ async page => {
     (m) => fetch('/start-control', { method: 'POST', body: JSON.stringify({ mode: m }) }).then((r) => r.text()), mode);
   const entry = () => page.getByRole('button', { name: '启动工作流', exact: true });
   const dialog = () => page.getByRole('dialog', { name: '启动工作流', exact: true });
+  /* F-002 自动等待断言：React 18 提交异步落定，轮询至期望使能态（替代一次性 isEnabled 读取）。 */
+  const wantEnabled = async (want, msg) => {
+    const start = Date.now();
+    for (;;) {
+      let actual = null;
+      try { actual = await entry().isEnabled(); } catch { actual = null; }
+      if (actual === want) return;
+      if (Date.now() - start > 8000) throw Error(msg);
+      await page.waitForTimeout(60);
+    }
+  };
   const openFresh = async () => {
     await setCatalogMode('ok');
     await setExecMode('success');
@@ -16,7 +27,7 @@ async page => {
 
   await page.goto('http://127.0.0.1:43852/start');
   await entry().waitFor({ state: 'visible' });
-  if (!await entry().isEnabled()) throw Error('Start entry must be enabled for idle session with workspace');
+  await wantEnabled(true, 'Start entry must be enabled for idle session with workspace');
 
   // 打开只读目录：有效/警告可选、无效不可选；打开本身不执行命令。
   await openFresh();
@@ -85,15 +96,26 @@ async page => {
   await dialog().getByText('目录为空', { exact: false }).waitFor({ state: 'visible' });
   await page.keyboard.press('Escape');
   await dialog().waitFor({ state: 'hidden' });
-  // 禁用态：运行中/提交中/无 workspace。
+  // 快速取消→重开回归（F-001）：陈旧 close 不得关闭新弹窗，目录不永久 loading。
+  await setCatalogMode('ok');
+  await page.evaluate(() => { window.__execCalls = []; window.__renderStart('sess-1'); });
+  await entry().click();
+  await dialog().waitFor({ state: 'visible' });
+  await dialog().getByRole('button', { name: '取消', exact: true }).click();
+  await entry().click();
+  await dialog().waitFor({ state: 'visible' });
+  await dialog().getByRole('radio', { name: 'demo.yaml' }).waitFor({ state: 'visible' });
+  await dialog().getByRole('button', { name: '取消', exact: true }).click();
+  await dialog().waitFor({ state: 'hidden' });
+  // 禁用态：运行中/提交中/无 workspace（自动等待 React 提交落定）。
   await page.evaluate(() => { window.__renderStart('sess-1'); window.__setSessionState({ running: true }); });
-  if (await entry().isEnabled()) throw Error('Running session must disable entry');
+  await wantEnabled(false, 'Running session must disable entry');
   await page.evaluate(() => { window.__setSessionState({ running: false }); window.__setInputPhase('submitting'); });
-  if (await entry().isEnabled()) throw Error('Submitting session must disable entry');
+  await wantEnabled(false, 'Submitting session must disable entry');
   await page.evaluate(() => { window.__setInputPhase('plain'); window.__renderStart('sess-9'); });
-  if (await entry().isEnabled()) throw Error('Session without workspace must disable entry');
+  await wantEnabled(false, 'Session without workspace must disable entry');
   await page.evaluate(() => { window.__renderStart('sess-1'); });
-  if (!await entry().isEnabled()) throw Error('Entry must recover when session is idle again');
+  await wantEnabled(true, 'Entry must recover when session is idle again');
   // 切换会话关闭弹窗，不带走旧选择。
   await setCatalogMode('ok');
   await entry().click();
