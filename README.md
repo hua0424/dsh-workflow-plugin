@@ -3,10 +3,10 @@
 DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
 workflows (`agent-workflow/v2`).
 
-**当前状态：T1–T9 的 Node Execution Runtime 重构已实现、审查并合入 `main`，A01–A30 自动化验收账本见 [`docs/testing/node-execution-runtime-acceptance.md`](docs/testing/node-execution-runtime-acceptance.md)；本仓库不自动部署——部署是需用户显式授权的独立动作（见「Installation」）。验收基线宿主为 exact DSH `0.1.5-rc.2`（对齐记录见根目录 `AGENTS.md`）。现行验收入口是一条命令 `pnpm run verify`（typecheck + 全量 suite + 两套受控 smoke），逐项口径见 [`docs/testing/runtime-refact-test-migration.md`](docs/testing/runtime-refact-test-migration.md)。**
+**当前状态：T1–T9 的 Node Execution Runtime 重构已实现、审查并合入 `main`，A01–A30 自动化验收账本见 [`docs/testing/node-execution-runtime-acceptance.md`](docs/testing/node-execution-runtime-acceptance.md)；本仓库不自动部署——部署是需用户显式授权的独立动作（见「Installation」）。验收基线宿主为 exact DSH `0.2.0-rc.2`（对齐记录见根目录 `AGENTS.md`；0.2.0 迁移见 milestone `dsh-020-migration` / #185：devDeps 即宿主类型源，orphan 判定按新 jobs 事件语义三重匹配，FORMAT V3 存量冷读由 `test/session-format-cold-read.test.ts` 覆盖）。现行验收入口是一条命令 `pnpm run verify`（typecheck + 全量 suite + 两套受控 smoke），逐项口径见 [`docs/testing/runtime-refact-test-migration.md`](docs/testing/runtime-refact-test-migration.md)。**
 三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT、Manager 定向 resume/Judge respawn、争议协议、Manager-only 有界历史，以及关闭重开后的统一恢复。Role Actor 在新 visit（含自环）前安全收口并 compact 后续接同一 continuable Session；同 execution 返工/resume 不做 Node 边界 compact，持久 Session 确认不存在时由 fresh replacement 接手完整材料。
 
-受控 Runtime/SQLite smoke 与 exact DSH `0.1.5-rc.2` 真实 Host 组合分开报告：[`A01–A30 验收账本`](docs/testing/node-execution-runtime-acceptance.md)记录 Role Activation cold continuation、真实 Basic compaction、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume。脚本 LLM 不代表外部模型质量，Activation cold 也不冒充完整进程重启。
+受控 Runtime/SQLite smoke 与 exact DSH `0.2.0-rc.2` 真实 Host 组合分开报告：[`A01–A30 验收账本`](docs/testing/node-execution-runtime-acceptance.md)记录 Role Activation cold continuation、真实 Basic compaction、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume。脚本 LLM 不代表外部模型质量，Activation cold 也不冒充完整进程重启。
 
 T6 重启 reconciliation 不依赖崩溃前存在中断事件：未结束工作单保留 phase/input/claim 并进入可恢复
 BLOCK。Manager resume 重新进入普通 driver；working 或未可靠收口的 claim 默认交 Actor 检查现场并重新
@@ -68,10 +68,10 @@ cordis.patch.yml      profile-bundle patch (inserts the plugin row)
   - `pnpm test` — 全量 node:test（标准入口，按文件隔离子进程）。
   - `pnpm run test:suite` — 同样全量、`--test-isolation=none`：受限沙箱禁止派生进程（`spawn EPERM`）时的等价入口；Node 22.x 该 flag 名为 `--experimental-test-isolation=none`。
   - `pnpm run test:smoke` — 统一受控 smoke 入口 = `node scripts/t3-smoke.mjs`（`reuse: continuable`：Role 跨节点复用 + 节点边界 compact + 业务终局 + 关库重开）&& `node scripts/e2e-smoke.mjs`（缺省 `reuse: node`：REJECT 修正 + `retry` 结果自环 + 离开节点 drain + #131 Child 显式返回 + #132 Program 目标路由与人工恢复 + trace）。二者都只用独立临时 home，不读写真实 `~/.dsh`。
-  - `pnpm run test:real-host` — 单独运行 exact 0.1.5-rc.2 真实 Host 组合（单文件直跑，不派生 test runner 子进程）；与上面两类 controlled smoke 分开报告，三者不得混称。
+  - `pnpm run test:real-host` — 单独运行 exact 0.2.0-rc.2 真实 Host 组合（单文件直跑，不派生 test runner 子进程）；与上面两类 controlled smoke 分开报告，三者不得混称。
   - 计数口径：0 fail；仅允许**环境条件**跳过的用例（`test/programs.test.ts` 两条真实 spawn 用例在禁派生进程的环境按 EPERM 探测跳过，其逻辑由受控适配器用例覆盖）——不靠隐藏失败换取 0 skip，逐项替代见迁移账本。
 - 诊断工具：`node scripts/check-state-rows.mjs <state.sqlite3 路径>` 只读诊断指定库（显式路径、不默认真实 home、复制成临时快照后只读打开，不改写目标库）；当前 v10 / 旧三表（v9 及更早）/ 旧单表 / 未知布局 / 坏库分别给诊断，退出码 0/1/2。
-- Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.1.5-rc.2` types and are required Host services, not plugin runtime dependencies.
+- Runtime deps: `yaml`, `zod`. Host API packages (`@deepseek-ai/dsh-*`) are dev-dependencies only — at runtime they resolve from the DSH installation via the profile-module fallback (`~/.dsh/profiles/node_modules`), exactly like the shipped bundles. `jobs`/`compaction` use exact `0.2.0-rc.2` types and are required Host services, not plugin runtime dependencies.
 
 ## Installation (development)
 
