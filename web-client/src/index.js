@@ -25,7 +25,7 @@ export function apply(ctx) {
   const editorRpc = (endpoint, payload, signal) => callEditor(ctx.connection, endpoint, payload, signal)
   let modelRequest
   const loadModels = () => modelRequest ??= readModelCatalog(ctx.remote).finally(() => { modelRequest = undefined })
-  const injected = () => ({ editorRpc, loadModels })
+  const injected = () => ({ editorRpc, loadModels, layout: ctx.layout })
 
   // 全局主面板（keyed：key 即 sidebar 入口 id）。
   ctx.slots.inject('main', () =>
