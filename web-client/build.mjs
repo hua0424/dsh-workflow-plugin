@@ -72,7 +72,7 @@ export function buildClientBundle({ outDir } = {}) {
 var module = { exports: {} }; var exports = module.exports;
 var __rpc = (function () {
 ${rpc}
-return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage };
+return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage, readWorkflowCatalog };
 })();
 var __edits = (function () {
 ${edits}
