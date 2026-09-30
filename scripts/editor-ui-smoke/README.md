@@ -32,3 +32,17 @@ playwright-cli -s=editor-smoke close
 
 `check-routing.cjs` 验证属性面板收起后画布加宽、展开保留未应用表单；折线选中高亮、缩放下横/纵路由手柄拖动的坐标折算、整次拖动撤销/重做，以及布局保存和重新打开后路线一致。
 
+## 启动弹窗（#179）
+
+`/start` 受控页挂载真实 bundle 的 `conversation.input.left` 注册（捕获组件 + 真实 `loadCatalog`/`runCommand` 闭包）：目录经只读 catalog RPC（三态 `ok`/`empty`/`error` 由 `POST /start-control` 切换），命令经页面 `__runCommand` 受控桩（`__execMode`：`success`/`command-error`/`transport-fail`/`throw`/`hang`，`__resolveHang` 落定挂起请求），绝不建 Run、不碰真实 DSH home。
+
+```powershell
+node scripts/editor-ui-smoke/server.mjs <React文件目录>
+# 另起终端（独立无头浏览器）：
+playwright-cli -s=start-smoke open http://127.0.0.1:43852/start --browser=chrome
+playwright-cli -s=start-smoke run-code --filename=scripts/editor-ui-smoke/check-start-modal.cjs
+playwright-cli -s=start-smoke close
+```
+
+覆盖：只读列表有效/警告可选与无效禁用、上下文提示、`.yaml` 展示与 workflow-id 提交、空 prompt 语义、命令失败保留输入、未知结果指引查状态不重试、刷新/取消零副作用、运行中/提交中/无 workspace 禁用（自动等待断言）、快速取消重开（陈旧 close 代际守卫）、切换会话清理、提交闸门（挂起时 Escape/取消不可绕过、单次派发）。断言失败退出非零。
+
