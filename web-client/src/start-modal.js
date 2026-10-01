@@ -21,9 +21,16 @@
  *
  * 提交纯函数（命令组装/闸门/结果分类）见同目录 `start-submit.js`（无 React
  * 依赖，可单测）；本文件只含会话归属弹窗组件与自包含样式。
+ *
+ * #184 选择区从 radio group 换成原生 `<select>`（全部目录项进下拉，无效项
+ * 只带简短 error 后缀）；选中问题配置后 select 旁出现错误图标按钮
+ * （aria-haspopup/aria-expanded），点击展开该配置的 reasons，再点收起；
+ * 切换选择或刷新目录后收起并按新选择更新。prompt textarea min-height 提至
+ * 160px，保留 resize: vertical。原生 option 内不能内嵌可点击元素，错误图标
+ * 放在 select 同一行的行内位置——这是选原生 select 的固有限制，接受。
  */
 import { createElement as h, useCallback, useEffect, useRef, useState } from 'react'
-import { START_PROMPT_MAX_CHARS, normalizeStartPrompt, startCommandLineOf, canStartWorkflow, executeStartWorkflow } from './start-submit.js'
+import { START_PROMPT_MAX_CHARS, normalizeStartPrompt, startCommandLineOf, canStartWorkflow, executeStartWorkflow, startOptionLabelOf, canConfirmStart } from './start-submit.js'
 
 /** 自包含样式：随 bundle 下发，不依赖宿主全局 CSS；窄屏不溢出，明暗主题跟随系统。 */
 export const START_MODAL_STYLES = `
@@ -33,19 +40,22 @@ export const START_MODAL_STYLES = `
 .wf-start-dialog button, .wf-start-dialog textarea { font: inherit; }
 .wf-start-dialog button { min-height: 32px; padding: 5px 12px; border: 1px solid #dbe3ec; border-radius: 7px; background: #fff; cursor: pointer; }
 .wf-start-dialog button:disabled { cursor: default; opacity: .45; }
-.wf-start-dialog textarea { display: block; width: 100%; min-height: 64px; resize: vertical; }
+.wf-start-dialog textarea { display: block; width: 100%; min-height: 160px; resize: vertical; }
 .wf-start-dialog label { display: block; margin: 10px 0 5px; }
 .wf-start-dialog .wf-start-hint { margin: 0 0 4px; font-size: 12px; opacity: .75; }
-.wf-start-dialog .wf-start-list { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; max-height: 260px; overflow: auto; }
-.wf-start-dialog .wf-start-item { display: flex; gap: 8px; align-items: baseline; padding: 6px 8px; border: 1px solid #dbe3ec; border-radius: 8px; }
-.wf-start-dialog .wf-start-item code { overflow-wrap: anywhere; }
-.wf-start-dialog .wf-start-reasons { font-size: 12px; opacity: .8; }
+.wf-start-dialog .wf-start-select-row { margin: 8px 0; }
+.wf-start-dialog .wf-start-select-wrap { display: flex; gap: 8px; align-items: center; }
+.wf-start-dialog .wf-start-select-wrap select { flex: 1 1 auto; min-width: 0; max-width: 100%; min-height: 32px; font: inherit; }
+.wf-start-dialog .wf-start-reasons-toggle { flex: 0 0 auto; }
+.wf-start-dialog .wf-start-reasons-panel { margin: 8px 0 0; padding: 8px 10px; border: 1px solid #dbe3ec; border-radius: 8px; font-size: 12px; overflow-wrap: anywhere; }
+.wf-start-dialog .wf-start-reasons-panel ul { margin: 4px 0 0; padding-left: 18px; }
 .wf-start-dialog .wf-start-error { margin: 10px 0; padding: 8px 10px; border-radius: 8px; border: 1px solid #f4c7ce; background: #fff0f1; color: #b42336; overflow-wrap: anywhere; }
 .wf-start-dialog .wf-start-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
 @media (prefers-color-scheme: dark) {
   .wf-start-dialog { background: #1c2530; color: #e6edf4; border-color: #33414f; }
   .wf-start-dialog button { background: #243041; color: #e6edf4; border-color: #33414f; }
-  .wf-start-dialog .wf-start-item { border-color: #33414f; }
+  .wf-start-dialog .wf-start-select-wrap select { background: #243041; color: #e6edf4; border-color: #33414f; }
+  .wf-start-dialog .wf-start-reasons-panel { border-color: #33414f; }
   .wf-start-dialog .wf-start-error { background: #3a1f26; border-color: #7a2f3c; color: #ffc9d1; }
 }
 `
@@ -73,6 +83,8 @@ export function StartWorkflowButton(props) {
   const [selection, setSelection] = useState(null)
   const [prompt, setPrompt] = useState('')
   const [submit, setSubmit] = useState({ status: 'idle', message: '' })
+  /* #184 报错展开：选中问题配置后点图标展开，再点收起；切换选择/刷新/重开即收起。 */
+  const [reasonsOpen, setReasonsOpen] = useState(false)
 
   const entryRef = useRef(null)
   const dialogRef = useRef(null)
@@ -125,7 +137,9 @@ export function StartWorkflowButton(props) {
       if (gen !== catalogGen.current || sessionId !== openSession.current) return
       const items = Array.isArray(value?.items) ? value.items : []
       setCatalog({ status: 'ready', items, error: null })
-      setSelection((prev) => (items.some((item) => item?.workflowId === prev && item?.status !== 'invalid') ? prev : null))
+      /* #184 无效项可选：只要 id 仍在目录就保留选择（不再按 status 过滤掉无效项）。 */
+      setSelection((prev) => (items.some((item) => item?.workflowId === prev) ? prev : null))
+      setReasonsOpen(false)
     } catch (error) {
       if (gen !== catalogGen.current || sessionId !== openSession.current) return
       setCatalog({ status: 'error', items: [], error: { code: error?.code ?? 'unknown', message: error instanceof Error ? error.message : String(error) } })
@@ -138,6 +152,7 @@ export function StartWorkflowButton(props) {
     openSession.current = sessionId
     setPrompt('')
     setSelection(null)
+    setReasonsOpen(false)
     if (submitGate.current) {
       setSubmit({ status: 'working', message: '已有启动请求进行中，请等待其落定后再提交' })
     } else {
@@ -233,10 +248,19 @@ export function StartWorkflowButton(props) {
   }, [session, input?.phase, hasWorkspace, selection, prompt, runCommand, sessionId, closeDialog])
 
   const selectable = catalog.items.filter((item) => item?.status !== 'invalid')
+  const selectedItem = catalog.items.find((item) => item?.workflowId === selection) ?? null
+  const selectedReasons = selectedItem !== null && Array.isArray(selectedItem.reasons) ? selectedItem.reasons : []
+  const selectedInvalid = selectedItem !== null && selectedItem.status === 'invalid'
+  /* #184 错误图标只在选中问题配置且有具体原因可看时出现：无效项必有图标
+     （reasons 为空则面板给兜底文案），警告项有 reasons 才出现。 */
+  const showReasonsToggle = selectedItem !== null
+    && (selectedInvalid || (selectedItem.status === 'warning' && selectedReasons.length > 0))
   const entryDisabled = !gate.ok || !channelReady
-  const confirmDisabled = !gate.ok || catalog.status !== 'ready' || selection === null
+  /* #184 确认闸门扩展：selection 为空或无效都禁用（纯函数可单测）。 */
+  const confirmDisabled = !gate.ok || catalog.status !== 'ready' || !canConfirmStart(selection, catalog.items)
     || submit.status === 'working' || submitGate.current
   const hintId = 'wf-start-context-hint'
+  const reasonsId = 'wf-start-reasons-panel'
 
   return h('span', { className: 'wf-start-entry' },
     h('style', null, START_MODAL_STYLES),
@@ -255,27 +279,31 @@ export function StartWorkflowButton(props) {
         h('p', null, '工作流目录为空：请先在配置编辑器中创建并保存工作流，再刷新重试。'),
         h('button', { type: 'button', onClick: refreshCatalog }, '刷新'),
       ) : null,
-      catalog.status === 'ready' && catalog.items.length > 0 ? h('div', null,
-        h('button', { type: 'button', onClick: refreshCatalog, disabled: submit.status === 'working' }, '刷新'),
-        h('div', { className: 'wf-start-list', role: 'radiogroup', 'aria-label': '选择工作流配置' },
-          ...catalog.items.map((item) => {
-            const id = item?.workflowId
-            const invalid = item?.status === 'invalid'
-            const reasons = Array.isArray(item?.reasons) ? item.reasons : []
-            return h('label', { key: String(id), className: 'wf-start-item' },
-              h('input', {
-                type: 'radio', name: 'wf-start-choice', value: String(id),
-                checked: selection === id, disabled: invalid || submit.status === 'working',
-                onChange: () => setSelection(id),
-              }),
-              h('span', null,
-                h('code', null, `${String(id)}.yaml`),
-                item?.status === 'warning' ? h('span', { className: 'wf-start-reasons' }, `（警告仍可启动：${reasons.join('；')}）`) : null,
-                invalid ? h('span', { className: 'wf-start-reasons' }, `（不可选：${reasons.join('；')}）`) : null,
-              ),
-            )
-          }),
+      catalog.status === 'ready' && catalog.items.length > 0 ? h('div', { className: 'wf-start-select-row' },
+        h('button', { type: 'button', onClick: () => { setReasonsOpen(false); void refreshCatalog() }, disabled: submit.status === 'working' }, '刷新'),
+        h('label', { htmlFor: 'wf-start-select' }, '选择工作流配置'),
+        h('div', { className: 'wf-start-select-wrap' },
+          h('select', {
+            id: 'wf-start-select', value: selection ?? '',
+            disabled: submit.status === 'working',
+            onChange: (event) => { setSelection(event.target.value === '' ? null : event.target.value); setReasonsOpen(false) },
+          },
+            h('option', { value: '', disabled: true }, '请选择工作流配置'),
+            ...catalog.items.map((item) => h('option', { key: String(item?.workflowId), value: String(item?.workflowId) }, startOptionLabelOf(item))),
+          ),
+          showReasonsToggle ? h('button', {
+            type: 'button', className: 'wf-start-reasons-toggle',
+            'aria-haspopup': 'true', 'aria-expanded': String(reasonsOpen), 'aria-controls': reasonsId,
+            'aria-label': selectedInvalid ? `查看 ${String(selection)} 的报错详情` : `查看 ${String(selection)} 的警告详情`,
+            title: selectedInvalid ? '该配置无效，点击查看报错' : '该配置带警告，点击查看原因',
+            onClick: () => setReasonsOpen((prev) => !prev),
+          }, selectedInvalid ? '✖' : '⚠') : null,
         ),
+        showReasonsToggle && reasonsOpen ? h('div', { id: reasonsId, className: 'wf-start-reasons-panel', role: 'region', 'aria-label': '配置问题详情' },
+          selectedReasons.length > 0
+            ? h('ul', null, ...selectedReasons.map((reason, index) => h('li', { key: String(index) }, String(reason))))
+            : h('p', null, '该配置无效，暂无具体报错信息。'),
+        ) : null,
         selectable.length === 0 ? h('p', { role: 'status' }, '目录中没有可启动的有效配置（全部无效），请修正配置后刷新。') : null,
       ) : null,
       h('p', { id: hintId, className: 'wf-start-hint' }, '当前会话上下文会追加到 prompt 中。启动沿用当前会话上下文，不会另行复制历史全文。'),
