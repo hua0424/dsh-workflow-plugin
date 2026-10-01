@@ -15,7 +15,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   START_PROMPT_MAX_CHARS, normalizeStartPrompt, startCommandLineOf,
-  canStartWorkflow, executeStartWorkflow,
+  canStartWorkflow, executeStartWorkflow, startOptionLabelOf, canConfirmStart,
 } from '../web-client/src/start-submit.js'
 import { buildClientBundle } from '../web-client/build.mjs'
 
@@ -152,6 +152,53 @@ test('#179 拼合 bundle 含启动按钮注册与弹窗实现', () => {
   const outFile = buildClientBundle({ outDir: mkdtempSync(join(tmpdir(), 'wf-start-bundle-')) })
   const bundle = readFileSync(outFile, 'utf8')
   for (const key of ['StartWorkflowButton', 'startCommandLineOf', 'canStartWorkflow', 'executeStartWorkflow', 'conversation.input.left', '启动工作流']) {
+    assert.ok(bundle.includes(key), `bundle 应含 ${key}`)
+  }
+})
+
+test('#184 下拉标签：全部目录项可见，无效只带简短 error 后缀、警告带仍可启动标注', () => {
+  assert.equal(startOptionLabelOf({ workflowId: 'demo', status: 'valid', reasons: [] }), 'demo.yaml')
+  assert.equal(
+    startOptionLabelOf({ workflowId: 'warned', status: 'warning', reasons: ['hand-written protocol keyword'] }),
+    'warned.yaml（警告仍可启动）',
+  )
+  const broken = startOptionLabelOf({ workflowId: 'broken', status: 'invalid', reasons: ['bad yaml: top must be mapping'] })
+  assert.equal(broken, 'broken.yaml（error）')
+  assert.ok(!broken.includes('bad yaml'), '下拉标签不得铺 reasons 全文')
+})
+
+test('#184 确认闸门扩展：空/无效不可，valid/warning 可', () => {
+  const items = [
+    { workflowId: 'demo', status: 'valid', reasons: [] },
+    { workflowId: 'warned', status: 'warning', reasons: ['hand-written protocol keyword'] },
+    { workflowId: 'broken', status: 'invalid', reasons: ['bad yaml'] },
+  ]
+  assert.equal(canConfirmStart(null, items), false, '未选择不可确认')
+  assert.equal(canConfirmStart('', items), false)
+  assert.equal(canConfirmStart('demo', items), true)
+  assert.equal(canConfirmStart('warned', items), true, '警告仍可启动')
+  assert.equal(canConfirmStart('broken', items), false, '无效保持禁用')
+  assert.equal(canConfirmStart('ghost', items), false, '不在目录不可确认')
+})
+
+test('#184 弹窗：原生 select + 图标展开 + textarea 放大，不回退 radio 列表', () => {
+  const modal = readSrc('start-modal.js')
+  assert.ok(!modal.includes("role: 'radiogroup'") && !modal.includes('type: \'radio\''), 'radio 列表应已移除')
+  assert.ok(modal.includes('wf-start-select'), '选择区应为原生 select')
+  assert.ok(modal.includes('startOptionLabelOf('), '选项标签走纯函数')
+  assert.ok(modal.includes('canConfirmStart('), '确认禁用走纯函数（空或无效禁用）')
+  assert.ok(modal.includes('aria-expanded') && modal.includes('aria-haspopup'), '错误图标须带展开语义')
+  assert.ok(modal.includes('aria-controls') && modal.includes('配置问题详情'), '报错区语义化且与图标关联')
+  assert.ok(modal.includes('setReasonsOpen(false)'), '切换选择/刷新后收起并按新选择更新')
+  assert.ok(modal.includes('min-height: 160px'), 'prompt 输入框应放大到约 160px')
+  assert.ok(modal.includes('resize: vertical'), '输入框仍可手动纵向拉伸')
+  assert.ok(modal.includes('请选择工作流配置'), '下拉应有占位提示')
+})
+
+test('#184 拼合 bundle 含下拉与展开实现', () => {
+  const outFile = buildClientBundle({ outDir: mkdtempSync(join(tmpdir(), 'wf-start184-bundle-')) })
+  const bundle = readFileSync(outFile, 'utf8')
+  for (const key of ['startOptionLabelOf', 'canConfirmStart', 'wf-start-select', 'aria-expanded']) {
     assert.ok(bundle.includes(key), `bundle 应含 ${key}`)
   }
 })

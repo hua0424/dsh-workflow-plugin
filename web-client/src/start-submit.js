@@ -10,6 +10,29 @@
 
 export const START_PROMPT_MAX_CHARS = 8000
 
+/**
+ * #184 下拉选项标签（目录项 → option 文本，无 React 依赖，可单测）：
+ * 全部目录项都进下拉；无效项只带简短 error 后缀，不铺 reasons；
+ * 警告项带「仍可启动」简短标注；具体 reasons 由弹窗展开面板展示。
+ */
+export function startOptionLabelOf(item) {
+  const id = String(item?.workflowId ?? '')
+  if (item?.status === 'invalid') return `${id}.yaml（error）`
+  if (item?.status === 'warning') return `${id}.yaml（警告仍可启动）`
+  return `${id}.yaml`
+}
+
+/**
+ * #184 确认闸门扩展（选中项可否确认）：valid/warning 可、invalid/空/不在目录不可。
+ * 「确定启动」禁用条件由「selection 为空」扩展为「selection 为空或无效」。
+ */
+export function canConfirmStart(selection, items) {
+  if (typeof selection !== 'string' || selection === '') return false
+  const current = Array.isArray(items) ? items.find((item) => item?.workflowId === selection) : undefined
+  if (current === undefined || current === null) return false
+  return current.status !== 'invalid'
+}
+
 const WORKFLOW_ID_PATTERN = /^[a-z][a-z0-9-]*$/
 
 export function normalizeStartPrompt(prompt) {
