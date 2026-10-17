@@ -5,12 +5,14 @@
 
 ## 1. 插件是什么
 
-在 DSH（deepseek harness）中运行可配置的**串行团队工作流**（`agent-workflow/v3`）：
+**dsh-agent-team-workflow（DSH 团队工作流插件）**：在 DSH（deepseek harness）中运行可配置的**串行团队工作流**（`agent-workflow/v3`）：
 一个 **Manager**（你当前会话）按工作单（work order）逐节点推进，每个节点把任务
 派发给一个 **Role Actor**（子会话，默认节点级复用，可配置为跨节点复用），完成后由独立的
 **Judge**（只读）核验 claim（ACCEPT / REJECT / NEED_CONTEXT），通过才进入下一
 节点；全部节点完成即 Run 结束。每个节点声明有限的**命名结果**（各有自己的验收条件
 和静态目标），流程声明**返回集合**——结果是业务结论，不是 completed/failed 二分。
+
+插件 id `dsh-agent-team-workflow` 已冻结（#207 发布前决策：改 id 会导致老用户升级断裂），包名（`package.json`）、profile 补丁（`cordis.patch.yml`）与文档标题均与该 id 对齐。
 
 - 一个 **workspace**（canonical realpath）最多一个活动 Run。
 - 状态存于 `${DSH_HOME}/workflows/state.sqlite3`（默认 `~/.dsh/workflows/`）。
@@ -31,6 +33,8 @@ bundle `package.json` 的必要字段（version / dependencies / dsh / main / ty
 `package.json`，不再手抄一份；`@deepseek-ai/*` 宿主包只留在 devDependencies，出现在 dependencies 会让
 生成步骤直接失败。`--out` 必须带目录值：漏写（`--out` 为末位）只打印用法并以 2 退出，**不会**回落到
 `~/.dsh` 的真实部署目标。注意：每次 build 后都要重跑 deploy；bundle 成员变更后必须重启 DSH。
+
+**版本兼容声明（#207 发布前决策）**：本插件需要 DSH 宿主 `>= 0.2.0-rc.2`（下限范围声明；包元数据 `package.json` 的 `engines.dsh`、本手册与总览 `README.md` 三处统一表述，验收基线为 exact `0.2.0-rc.2`）。版本号保持 `package.json` 当前值，不随本轮对齐递增。
 
 **版本兼容提示**：dsh ≥ 0.1.1-rc.7 起 `compaction` 服务不再挂载在宿主平面，
 插件已改为运行期按 agent 解析（`host.ts` 的 `compactionFor`），不要在模块级

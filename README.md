@@ -1,9 +1,9 @@
-# dsh-workflow-plugin
+# dsh-agent-team-workflow（DSH 团队工作流插件）
 
 DSH Agent-Team Workflow plugin — configurable serial Agent/Subagent team
-workflows (`agent-workflow/v2`).
+workflows (`agent-workflow/v3`).
 
-**当前状态：T1–T9 的 Node Execution Runtime 重构已实现、审查并合入 `main`，A01–A30 自动化验收账本见 [`docs/testing/node-execution-runtime-acceptance.md`](docs/testing/node-execution-runtime-acceptance.md)；本仓库不自动部署——部署是需用户显式授权的独立动作（见「Installation」）。验收基线宿主为 exact DSH `0.2.0-rc.2`（对齐记录见根目录 `AGENTS.md`；0.2.0 迁移见 milestone `dsh-020-migration` / #185：devDeps 即宿主类型源，orphan 判定按新 jobs 事件语义三重匹配，FORMAT V3 存量冷读由 `test/session-format-cold-read.test.ts` 覆盖）。现行验收入口是一条命令 `pnpm run verify`（typecheck + 全量 suite + 两套受控 smoke），逐项口径见 [`docs/testing/runtime-refact-test-migration.md`](docs/testing/runtime-refact-test-migration.md)。**
+**当前状态：T1–T9 的 Node Execution Runtime 重构已实现、审查并合入 `main`，A01–A30 自动化验收账本见 [`docs/testing/node-execution-runtime-acceptance.md`](docs/testing/node-execution-runtime-acceptance.md)；本仓库不自动部署——部署是需用户显式授权的独立动作（见「Installation」）。验收基线宿主为 DSH `0.2.0-rc.2`（对齐记录见根目录 `AGENTS.md`；0.2.0 迁移见 milestone `dsh-020-migration` / #185：devDeps 即宿主类型源，orphan 判定按新 jobs 事件语义三重匹配，FORMAT V3 存量冷读由 `test/session-format-cold-read.test.ts` 覆盖）。**兼容声明（#207 发布前决策）：需要 DSH 宿主 `>= 0.2.0-rc.2`（下限范围，包元数据 `engines.dsh`、本总览与用户手册三处统一表述；验收基线为 exact `0.2.0-rc.2`）。**现行验收入口是一条命令 `pnpm run verify`（typecheck + 全量 suite + 两套受控 smoke），逐项口径见 [`docs/testing/runtime-refact-test-migration.md`](docs/testing/runtime-refact-test-migration.md)。**
 三表闭环已接通同 execution 的 REJECT/NEED_CONTEXT、Manager 定向 resume/Judge respawn、争议协议、Manager-only 有界历史，以及关闭重开后的统一恢复。Role Actor 在新 visit（含自环）前安全收口并 compact 后续接同一 continuable Session；同 execution 返工/resume 不做 Node 边界 compact，持久 Session 确认不存在时由 fresh replacement 接手完整材料。
 
 受控 Runtime/SQLite smoke 与 exact DSH `0.2.0-rc.2` 真实 Host 组合分开报告：[`A01–A30 验收账本`](docs/testing/node-execution-runtime-acceptance.md)记录 Role Activation cold continuation、真实 Basic compaction、ToolRuntime claim/Judge 与 Host interrupt 后同 execution BLOCK/resume。脚本 LLM 不代表外部模型质量，Activation cold 也不冒充完整进程重启。
@@ -39,7 +39,7 @@ fail-closed，不静默迁移。只有 root 人类显式执行 `/dsh-flow reset 
 - [`docs/work-plans/runtime-refact.md`](docs/work-plans/runtime-refact.md) — T1–T9 历史工单依赖与分票证据（已完成并合入）。
 - [`docs/design/configurable-agent-workflow-graph.md`](docs/design/configurable-agent-workflow-graph.md) — 旧版设计参考，不覆盖 refact 新规格。
 - [`docs/testing/acceptance-test-plan.md`](docs/testing/acceptance-test-plan.md) / [`report`](docs/testing/acceptance-report.md) — 原单表实现的历史验收资料（带版本标记，保留适用版本；不代表当前实现），现行入口见 [`旧测试迁移/现行验收入口`](docs/testing/runtime-refact-test-migration.md)。
-- [`docs/example/`](docs/example/) — copyable workflow config template (`workflow-template.yaml`, 仍是 v2 时代的示例、暂不可直接加载) + config/model reference for new workflows；完整 v3 组合示例见 [`v3-combined-example.yaml`](docs/example/v3-combined-example.yaml)（`workflow-template.yaml` 自身的迁移归 Issue #129）。
+- [`docs/example/`](docs/example/) — copyable v3 workflow config templates（`coding-workflow-rapid.yaml` 单仓快速、`coding-workflow.yaml` 多仓交付等，`workflow-template.yaml` 为 v2 历史遗留、不可加载、不在安装范围内）+ config/model reference for new workflows；完整 v3 组合示例见 [`v3-combined-example.yaml`](docs/example/v3-combined-example.yaml)（`workflow-template.yaml` 自身的迁移归 Issue #129，已落地为上述 v3 生产配置）。
 
 Superseded `feature-delivery/v1` designs remain available in Git history.
 
@@ -95,7 +95,7 @@ directory under the web profile (the same layout the shipped bundles use, so
 Re-deploy after every `pnpm run build` (step 2). The profile's `pnpm install`
 owns runtime deps (`yaml`, `zod`).
 
-Workflow configs live in `%DSH_HOME%\workflows\*.yaml` (e.g. `milestone-delivery.yaml`, `smoke-test.yaml`). New workflows: copy [`docs/example/workflow-template.yaml`](docs/example/workflow-template.yaml) and adapt it (see [`docs/example/README.md`](docs/example/README.md) for the model-route and config-surface reference).
+Workflow configs live in `%DSH_HOME%\workflows\*.yaml` (e.g. `milestone-delivery.yaml`, `smoke-test.yaml`). New workflows: copy [`docs/example/coding-workflow-rapid.yaml`](docs/example/coding-workflow-rapid.yaml) (v3, 单仓快速) or another v3 production template in the same directory and adapt it (see [`docs/example/README.md`](docs/example/README.md) for the model-route and config-surface reference; `workflow-template.yaml` is v2 历史遗留、不可加载，不在此安装范围内).
 
 ## Run trace logs
 

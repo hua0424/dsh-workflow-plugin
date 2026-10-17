@@ -1,4 +1,5 @@
 # dsh bundle patch: inserts the agent-team workflow plugin into the profile layer stack.
+# 插件 id 已冻结（#207 发布前决策）：保持 dsh-agent-team-workflow 不变，只对齐人类可读侧。
 - insert:
     - id: dsh-agent-team-workflow
       name: 'dsh-agent-team-workflow'
