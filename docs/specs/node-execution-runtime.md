@@ -22,7 +22,7 @@ Actor 有检查现场和自行续作的能力，不需要插件细分全部异�
 
 正常执行和恢复进入同一个推进器。记录明确时继续相应阶段；业务进展未知时，在不与旧执行冲突的前提下，提示 Actor 检查现场再继续。恢复不依赖事件回放，也不要求存在最后一条“已中断”记录。
 
-Actor 只提交 outcome 与 handoff；Judge、Manager、后继和最终用户共享 handoff。保留 Role continuable Session 跨 Node 复用与新 visit 前 compact。判定争议复用 BLOCK/resume，并由插件统一注入协作协议。
+Actor 只提交 result 与 handoff；Judge、Manager、后继和最终用户共享 handoff。保留 Role 会话复用（缺省 `node`，`continuable` 跨 Node 复用）与新 visit 前 compact。判定争议复用 BLOCK/resume，并由插件统一注入协作协议。
 
 ## User Stories
 
@@ -44,9 +44,9 @@ Actor 只提交 outcome 与 handoff；Judge、Manager、后继和最终用户共
 16. As a Role Actor, I want 在整个 Root/Child Run 复用 continuable Session, so that 历史工作经验得以延续。
 17. As a Role Actor, I want 进入下一 Node 前 compact 后继承上下文, so that 既延续经验又控制上下文规模。
 18. As a Role Actor, I want 同一工作单补充和返工继续原 Session, so that 不因普通恢复丢失当前对话。
-19. As a Role Actor, I want 每次收到完整当前 input 和 instruction（+ correction/resolution/recovery/引擎提交要求），不含 criteria；criteria 仅进 Judge packet 作为判定依据, so that 历史记忆不是接单前提。
-20. As a Role Actor, I want 只提交 outcome 与一份 handoff, so that 不必维护重复或矛盾的 summary。
-21. As a Role Actor, I want completed/failed 使用相同交接能力, so that 失败后的处理人也有完整材料。
+19. As a Role Actor, I want 每次收到完整当前 input 和 instruction（+ correction/resolution/recovery/引擎提交要求）与冻结 criteria（共同条件 + 各结果条件），criteria 与 Judge packet 同源, so that 历史记忆不是接单前提。
+20. As a Role Actor, I want 只提交 result 与一份 handoff, so that 不必维护重复或矛盾的 summary。
+21. As a Role Actor, I want 各命名结果使用相同交接能力, so that 任何结果的处理人都有完整材料。
 22. As a Role Actor, I want 接到中断工作时被提醒先检查现场, so that 不机械重跑已经完成的动作。
 23. As a Role Actor, I want 不认可 Judge 意见时有统一反馈协议, so that 我可以提交事实和请求协调而不是伪造结果。
 24. As a Judge, I want 直接读取当前 claim 的 handoff 和验收依据, so that 判断与后继实际收到的材料一致。
@@ -77,7 +77,7 @@ Run 管位置及 Role mappings；工作单管当前执行与材料；关键事�
 
 ### I4. claim 合同显式切换
 
-新 Actor claim 只含 outcome 与 handoff 业务字段；outcome 为 completed/failed，handoff 必填、非空、有界，两种 outcome 对称。取消 summary 与旧 handoffContext 的公开字段名，不接受双协议或自动 summary fallback。现有宿主绑定和 token 参数仍按控制合同保留。
+新 Actor claim 只含 result 与 handoff 业务字段；result 必须命中当前冻结节点声明的结果名，handoff 必填、非空、有界，各命名结果对称。取消 outcome（`completed|failed`）/summary 与旧 handoffContext 的公开字段名，不接受双协议或自动 summary fallback。现有宿主绑定和 token 参数仍按控制合同保留。
 
 保持既有 handoff 文本长度上限作为起点；同步更新 schema、提示、Node-local 投影、Judge packet、工具显示、恢复与测试，禁止只改首次 claim 路径。旧格式升级/只读诊断可以识别旧字段，但新运行路径不继续维护它们。
 
@@ -87,7 +87,7 @@ input 进入时固定；Manager 补充单独保存；claim 中 handoff 与本次
 
 ### I6. 五个粗粒度阶段
 
-ready、working、checking、settling、exited；BLOCK 保留原 phase。phase 表示已登记业务进度，不表达每个宿主微状态。REJECT 回同 execution 的 ready；FAIL 无 onFail 在 settling 暂停，恢复时重开工作版本。已离开工作单不可恢复。
+ready、working、checking、settling、exited；BLOCK 保留原 phase。phase 表示已登记业务进度，不表达每个宿主微状态。REJECT 回同 execution 的 ready；Program ERROR/抛错/结果未知只 BLOCK（保留参数），Manager 显式重试或用 `node_resolve_program` 事实确认后恰好推进一次。已离开工作单不可恢复。
 
 ### I7. 统一推进与原子交接
 
@@ -115,7 +115,7 @@ node_resume 保留 Manager-only/current-BLOCK 限制，可选 auto/actor/judge�
 
 Program 参数在执行前保存；确定结果直接交接，不确定效果先由 Manager 核实再显式重试/裁决。Program 的固定实现可返回安全有界 handoff，有则作为后继 input，没有新交付文本则透传原 input，不自动序列化任意 details 或合成 summary；有新产物需交接时由该 Program 明确输出。
 
-Child 首节点接收调用工作单 input，最终节点按其执行类型形成的交接文本作为父调用输出传给父后继，嵌套调用同样逐层传递，不能被父调用旧 input 覆盖。Child END、父调用 PASS 与后继登记按相同事务原则；Root/Child 不拥有互相独立的 Actor mappings。
+Child 首节点接收调用工作单 input，最终节点按其执行类型形成的交接文本作为父调用输出传给父后继，嵌套调用同样逐层传递，不能被父调用旧 input 覆盖。Child `{ return }`、父调用 onReturn 映射与后继登记按相同事务原则；Root/Child 不拥有互相独立的 Actor mappings。
 
 Reset 终止而非成功，保留材料/明细/必要 Run 快照；不能自动清理资源。新 Run 不覆盖旧历史，也不能在已知旧工作仍冲突时立即开始。
 
@@ -151,11 +151,11 @@ Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须�
 | A02 | 回边、自环、重复 Child 调用产生新 execution；resume、REJECT、replacement 保留当前 visit |
 | A03 | input、Manager 补充、claim.handoff、Program 参数和关键事件经 SQLite 关闭重开后可读 |
 | A04 | state 与对应事件要么一起提交，要么一起回滚；事件写失败后无残留事件、半个被接受的 claim/判定或提前 Judge/后继派发；失败事务不提前消费提交资格，同一真实 dispatch 可原样重试，成功后重复提交被拒绝 |
-| A05 | 新 claim 接受 outcome+非空 handoff；缺失/空/超限 handoff 及旧 summary/handoffContext 业务参数被明确拒绝，completed/failed 对称 |
-| A06 | 同一 handoff 被 Judge、Manager、后继取得；Root END 最终结果也保留，不存在单独 summary/fallback |
+| A05 | 新 claim 接受 result+非空 handoff；result 必须命中当前节点结果集，缺失/空/超限 handoff 及旧 outcome/summary/handoffContext 业务参数被明确拒绝，各命名结果对称 |
+| A06 | 同一 handoff 被 Judge、Manager、后继取得；Root 业务终局（`{ return }`）最终结果也保留，不存在单独 summary/fallback |
 | A07 | Actor → claim → Judge ACCEPT → 后继形成唯一有效推进；后继 input 是已接受 handoff 的固定快照 |
 | A08 | claim #1 → REJECT → claim #2 → ACCEPT 在同 execution，按序保留两份 claim/判定快照且关联正确；当前状态只认有效版本 |
-| A09 | REJECT 不沿 onFail；新派发收到最近拒绝依据。Actor 提出异议可 BLOCK，Manager 补充/恢复后重新提交，经 Judge 后才推进 |
+| A09 | REJECT 不做 Target 交接；新派发收到最近拒绝依据。Actor 提出异议可 BLOCK，Manager 补充/恢复后重新提交，经 Judge 后才推进 |
 | A10 | NEED_CONTEXT 保留当前有效 claim；补充先存后送，发送失败不丢；旧判定输入对应的迟到 Judge 结果被拒绝 |
 | A11 |  claim 已保存、Judge 未完成时，重开库后可继续/重建 Judge，不默认重做 Actor |
 | A12 | 前驱离开与后继创建/input/Run 指针故障注入保持原子；重复回调/恢复不产生第二个后继 |
@@ -167,9 +167,9 @@ Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须�
 | A18 | claim 后 Actor/已知工具 tail 未收口时 Judge 不开始现场核验，也不 compact/派发后继；interrupt 回执不自动解除等待 |
 | A19 | 同 Session 的旧 dispatch/Turn、重复 claim、旧 claim 的 Judge 结果、旧输入的 Judge 结果不能结算当前工作；最新 token 不能覆盖来源校验 |
 | A20 | Judge 工具面真正只读、Node-local；恢复提示只要求核验，不要求补做；Actor 无法伪装 Judge/Manager |
-| A21 | FAIL 无 onFail 保留失败和历史，settling+BLOCK；resume 重开当前工作，不重判旧 claim；有 onFail 则对称交接 |
+| A21 | Program ERROR/结果未知保留材料并 BLOCK；resolve 后恰好推进一次，不重判旧 claim |
 | A22 | Program 参数先存再执行；效果不确定不盲目重试，Manager 核实后裁决/显式重跑；确定结果无额外 LLM Judge。显式 Program handoff 传后继，没有新交付文本则透传原 input，任意 details 不被自动注入 |
-| A23 | Child 等待期间唯一活跃位置为栈顶；Child END、父 PASS 与后继一致，重复/迟到 Child 结果不二次推进；嵌套 Child 的首节点收到调用 input，最终 handoff 逐层原样到父后继而非被父旧 input 覆盖 |
+| A23 | Child 等待期间唯一活跃位置为栈顶；Child `{ return }`、父 onReturn 映射与后继一致，重复/迟到 Child 结果不二次推进；嵌套 Child 的首节点收到调用 input，最终 handoff 逐层原样到父后继而非被父旧 input 覆盖 |
 | A24 | Reset 标记终止而非成功，保留历史并撤销旧权限；新 Run 不覆盖材料，冲突旧工作未停止时不直接派发 |
 | A25 | actor/judge 恢复目标拒绝不适用 Node/阶段；不能重开 exited 或覆盖可交接结论；退回 Actor 使旧 claim/Judge 失效 |
 | A26 | Manager 可按序分页查看本 Run 指定 execution 的明细，每页最多 50 条；默认 status 不倾倒全部历史，跨 Run/非授权角色拒绝 |
@@ -206,7 +206,7 @@ Graph YAML 语法尽量保持兼容；工具 claim 合同及行为变化必须�
 | 切片 | 工作与完成条件 | 对应验收 |
 |---|---|---|
 | S0 基线与宿主适配确认 | 核实 DSH 目标版本和包类型，必要时对齐 devDependencies/lock；记录现有测试基线；固定新旧合同切换/备份策略。现有失败先说明，不归因于尚未实现的重构 | A28/A30 的前置 |
-| S1 最小真实闭环 | 引入三表与版本，接通 start → Actor 单文本 claim → 独立 Judge ACCEPT → 后继/END；状态+事件+交接事务、必需授权和收口保护同时到位，覆盖一个真实 SQLite 闭环 | A01–A07、A12、A18–A20 基础 |
+| S1 最小真实闭环 | 引入三表与版本，接通 start → Actor 单文本 claim → 独立 Judge ACCEPT → 后继/业务终局；状态+事件+交接事务、必需授权和收口保护同时到位，覆盖一个真实 SQLite 闭环 | A01–A07、A12、A18–A20 基础 |
 | S2 返工与争议 | 同 execution 多轮 claim/Judge、拒绝依据、NEED_CONTEXT、统一争议 BLOCK/resume 提示、Manager 有界历史查询；验证当前状态与历史分工 | A08–A10、A25–A27 |
 | S3 统一恢复与 Role 生命周期 | 普通 driver 接入 restart/resume/replacement，未知进度检查提示、Session 复用、新 visit compact 与故障处理；真实关闭重开库验证，无第二套恢复引擎 | A11、A13–A17、A19–A20 |
 | S4 完整 Graph 与运行控制 | FAIL 无出口、Program 不确定结果、Child 调用返回、Root/Child Role 共享、Reset 与历史、模型更换控制 | A21–A24，复核 A02/A16 |
