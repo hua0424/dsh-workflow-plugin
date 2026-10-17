@@ -4,10 +4,10 @@ import { WorkflowError, LIMITS, compactBeforeReuse, declaredResults, nodeChecker
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { resolveRoleModel } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
-import { ACTOR_RECOVERY_INSTRUCTION, SUBMISSION_CONSTRAINT, runMaterialsSection } from './texts.ts'
+import { ACTOR_RECOVERY_INSTRUCTION, MANAGER_SUBMISSION_CONSTRAINT, SUBMISSION_CONSTRAINT, runMaterialsSection } from './texts.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
-import { withTurnEndFailure } from '../plugin/turn-end.ts'
+import { isTransientJudgeFailure, withTurnEndFailure } from '../plugin/turn-end.ts'
 import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
 export interface DispatchTargets {
@@ -369,7 +369,7 @@ export class WorkflowEngine {
         const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
         const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
         const predecessor = await this.predecessorResultContext(ws, e)
-        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${runMaterialsSection(ws, run.runId)}${SUBMISSION_CONSTRAINT}`
+        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${runMaterialsSection(ws, run.runId)}${role === 'manager' ? MANAGER_SUBMISSION_CONSTRAINT : SUBMISSION_CONSTRAINT}`
         const sent = role === 'manager'
           ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
           : run.roleActors[role]
@@ -490,6 +490,38 @@ export class WorkflowEngine {
     await this.state.put(ws, row.run, row.version, [change(row.execution, ...beforeBlock, 'blocked')])
     this.trace(row.run, 'BLOCK', { workflow: row.execution.workflowId, node: row.execution.nodeId, reason: jsonField(row.execution.blockReason, LIMITS.blockReasonMax) })
     await this.notifyBlock(row.run, row.execution.blockReason, '材料已保存；Manager 可查看 status 后选择恢复目标。')
+  }
+  /**
+   * Issue #200：Judge 瞬时失败的单次自动重试。fresh 新会话重派（失败会话状态
+   * 未知，不复用）；旧会话仅 retire 撤权（revoke authorization），不 drain——
+   * drain 失败会话可能竞态，撤权已足以剥夺其提交资格（结算仍由新 Judge 的精确
+   * turn 驱动）。成功则节点照常推进（无 BLOCK 落库）；重派失败则 BLOCK 并在
+   * 原因中标注「已自动重试 1 次」与原始错误。不做退避（单次立即重投；多轮/指数
+   * 退避不在本票范围）。
+   */
+  private async retryJudgeOnce(ws: string, row: RuntimeRow, turnFailure: string | undefined): Promise<void> {
+    const { run, execution: e, version } = row
+    const oldSessionId = e.judge!.sessionId
+    e.judgeAutoRetried = true
+    e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim!.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
+    await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
+    this.trace(run, 'JUDGE-RETRY', { workflow: e.workflowId, node: e.nodeId, reason: jsonField(turnFailure ?? 'transient judge failure', LIMITS.blockReasonMax) })
+    await this.subagents.retireJudge(run, oldSessionId).catch(() => {})
+    try {
+      const cwd = await this.cwdResolver(run)
+      if (!await this.stillCurrent(ws, e, version + 1)) { await this.subagents.retireJudge(run, e.judge.sessionId).catch(() => {}); return }
+      const packet = this.judgePacket(run, e, cwd, ws)
+      const sent = await this.subagents.startJudge(run, packet)
+      const current = await this.stillCurrent(ws, e, version + 1)
+      if (!current) { await this.subagents.retireJudge(run, e.judge.sessionId).catch(() => {}); return }
+      if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
+      current.execution.judge!.messageId = sent.messageId
+      await this.state.put(ws, current.run, current.version, [change(current.execution)])
+    } catch (error) {
+      const current = await this.state.get(ws)
+      if (current?.version !== version + 1 || current.execution.executionId !== e.executionId) return
+      await this.blockRow(ws, current, withTurnEndFailure(`judge auto-retry failed (已自动重试 1 次): ${error instanceof Error ? error.message : String(error)}`, turnFailure))
+    }
   }
   private programParameters(execution: BuiltinProgramExecution, supplied: Record<string, unknown>): Record<string, unknown> {
     if (typeof supplied !== 'object' || supplied === null || Array.isArray(supplied)) throw new WorkflowError('program parameters must be an object')
@@ -704,6 +736,8 @@ export class WorkflowEngine {
       }
       delete e.claim
       delete e.judge
+      // Issue #200：REJECT 回到 ready 是全新检查轮次，自动重试预算重置。
+      delete e.judgeAutoRetried
       e.phase = 'ready'
       e.inputVersion++
       if (e.resolution?.context) e.resolution = { target: 'actor', context: e.resolution.context, inputVersion: e.inputVersion }
@@ -791,7 +825,13 @@ export class WorkflowEngine {
       await this.state.put(ws, fresh.run, fresh.version, [change(e)])
       await this.drive(ws)
     } else if (actor && e.phase === 'working') await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
-    else if (judge && e.phase === 'checking') await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim', turnFailure))
+    else if (judge && e.phase === 'checking') {
+      // Issue #200：瞬时失败有界自动重试 1 次（fresh 新会话重派）；已重试过或非瞬时
+      // （4xx 等）直接 BLOCK。fail-closed/只读不变量不变。
+      if (isTransientJudgeFailure(turnFailure) && !e.judgeAutoRetried) await this.retryJudgeOnce(ws, fresh, turnFailure)
+      else if (e.judgeAutoRetried) await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim (已自动重试 1 次)', turnFailure))
+      else await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim', turnFailure))
+    }
   }
   async handleBlock(ws: string, token: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
     const row = await this.state.get(ws)
@@ -947,6 +987,8 @@ export class WorkflowEngine {
       }
       if (sameJudgeNeedContext && oldJudge) e.previousJudge = oldJudge
       delete e.judge
+      // Issue #200：Manager 显式恢复是新的人工尝试，自动重试预算重置。
+      delete e.judgeAutoRetried
     } else {
       // v3：每个已声明结果都有静态 Target，因此不存在"已 ACCEPT 但没有出口边"的状态；
       // 只有尚可回到 Actor 重新提交的阶段才能 actor resume。
@@ -973,6 +1015,8 @@ export class WorkflowEngine {
       }
       delete e.claim
       delete e.judge
+      // Issue #200：回到 ready 是全新检查轮次，自动重试预算重置。
+      delete e.judgeAutoRetried
       e.phase = 'ready'
       // #198 单次逃生：仅 actor 目标生效；此前尚未准备才实际跳过并记审计标记
       // （本恢复的置位随同一次状态落库，drive 不再重复压缩；已准备时无压缩可跳，
@@ -1047,6 +1091,8 @@ export class WorkflowEngine {
       const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
       arrangedId = arranged.id
       e.judge = arranged
+      // Issue #200：Manager 显式重建是新的人工尝试，自动重试预算重置。
+      delete e.judgeAutoRetried
       e.blockReason = null
       run.status = 'running'
       run.blockReason = null

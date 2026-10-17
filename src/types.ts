@@ -499,6 +499,11 @@ export interface NodeExecution {
   /** REJECT/显式退回后保留的已失效旧 claim；不授予当前提交资格。 */
   previousClaim?: ExecutionClaim
   judge?: ExecutionJudge
+  /**
+   * Issue #200：本 checking 内 Judge 瞬时失败已自动重试过 1 次（有界一次的
+   * 消费标记；重试仍失败则 BLOCK 并在原因中标注，不再重试）。
+   */
+  judgeAutoRetried?: boolean
   /** 最近被替换的 Judge 身份；只保留一代，完整历史由 events 保存。 */
   previousJudge?: ExecutionJudge
   judgment?: ExecutionJudgment

@@ -84,6 +84,38 @@ export function turnEndFailure(events: ReadonlyArray<TurnEndFact>, end: TurnEndF
 }
 
 /**
+ * Issue #200：Judge 瞬时失败分类——只有明确的瞬时信号才值得自动重试 1 次。
+ * - status >= 500 / code=SERVER → 瞬时（上游 5xx）。
+ * - status 4xx / 4xx 家族码（INVALID_REQUEST / AUTH / QUOTA / RATE_LIMIT /
+ *   CONTEXT_WINDOW_EXCEEDED）→ 非瞬时，直接 BLOCK，重试无意义。
+ * - error 文本带网络/流中断痕迹（code=UNKNOWN 等无明确码时）→ 瞬时。
+ * - 其余（正常结束无诊断、kind-only 如 aborted/max-tokens/interrupted、未知码、
+ *   无结构化失败）→ 一律 fail-closed 不重试：猜错种类的重试比 BLOCK 更危险
+ *   （如 aborted 是取消意图，重试会违背调用方）。
+ */
+export function isTransientJudgeFailure(failure: string | undefined): boolean {
+  if (failure === undefined || failure === '') return false
+  const status = /status=(\d+)/.exec(failure)
+  if (status) {
+    const code = Number(status[1])
+    if (code >= 500) return true
+    // 有明确 status 且 < 500：一律非瞬时（4xx 家族与其它非 5xx 同理）。
+    return false
+  }
+  const errCode = /code=([A-Z_]+)/.exec(failure)
+  if (errCode) {
+    if (errCode[1] === 'SERVER') return true
+    if (['INVALID_REQUEST', 'AUTH', 'QUOTA', 'RATE_LIMIT', 'CONTEXT_WINDOW_EXCEEDED'].includes(errCode[1]!)) return false
+    // 未知码 fail-closed：不猜。
+    if (/network|fetch|ECONN|EPIPE|ETIMEDOUT|socket|stream|interrupt/i.test(failure)) return true
+    return false
+  }
+  // 无 status、无 code：kind-only（如 aborted/max-tokens/interrupted）或无结构化
+  // 失败——无消息文本可分类，一律 fail-closed 不重试。
+  return false
+}
+
+/**
  * 追加诊断并压到 `blockReason` 的持久化上限内。诊断本身可能来自 provider 的
  * 自由文本，因此**先截诊断**再拼基础原因：基础原因必须永远完整可见。
  */
