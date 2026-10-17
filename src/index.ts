@@ -225,7 +225,7 @@ export function apply(ctx: Context) {
     authorize,
     claim: (ws, claim, caller) => engine.handleClaim(ws, claim, caller).then(outcomeOf),
     block: (ws, nodeToken, reason, caller) => engine.handleBlock(ws, nodeToken, reason, caller).then(outcomeOf),
-    resume: (ws, nodeToken, resolutionContext, caller, target) => engine.handleResume(ws, nodeToken, resolutionContext, caller, target).then(outcomeOf),
+    resume: (ws, nodeToken, resolutionContext, caller, target, skipCompact) => engine.handleResume(ws, nodeToken, resolutionContext, caller, target, skipCompact).then(outcomeOf),
     runProgram: (ws, nodeToken, parameters, caller) => engine.handleRunProgram(ws, nodeToken, parameters, caller).then(outcomeOf),
     resolveProgram: (ws, nodeToken, result, reason, caller) => engine.handleResolveProgram(ws, nodeToken, result, reason, caller).then(outcomeOf),
     setRoleModel: (ws, roleKey, provider, modelId, caller, reasoningEffort) => engine.handleSetRoleModel(ws, roleKey, provider, modelId, caller, reasoningEffort).then(outcomeOf),

@@ -10,7 +10,7 @@
  * the caller's own flow.
  */
 import { createHash } from 'node:crypto'
-import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
+import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, compactBeforeReuse, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
 // #100：固定 program id 名单从 Program 元数据单源派生，不在这里另维护一份。
 import { BUILTIN_PROGRAM_IDS } from '../programs/metadata.ts'
 
@@ -110,6 +110,18 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
     // #60: 缺省 reuse 在此归一化为 `node`，随 definitionSnapshot 一并冻结；
     // 之后修改 YAML 只影响新启动的 Run。
     role.reuse = roleReuseMode(role)
+    // #198: 缺省 compactBeforeReuse 归一化为 `true`（显式值随快照持久化）；
+    // 存量快照缺键，运行期按开启解释，不做数据迁移。
+    role.compactBeforeReuse = compactBeforeReuse(role)
+    // 键序归一：缺省项是后追加的，直接落到末尾会与 schema 定义序
+    //（persona/model/reuse/compactBeforeReuse/tools，zod 按此输出）分叉，
+    // 导致“加载→保存→重载”业务不等价（businessEqual 按 JSON.stringify 比较）。
+    // tools 恒为末键即与 schema 序一致（model/reuse 缺省追加天然落在位）。
+    if (role.tools !== undefined) {
+      const tools = role.tools
+      delete role.tools
+      role.tools = tools
+    }
     checkPersonaProtocol(`role "${roleKey}"`, role.persona, warnings)
   }
 

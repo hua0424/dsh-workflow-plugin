@@ -194,12 +194,16 @@ export function addRoleEdit(state, key, fields) {
   if (fields.reuse !== undefined && !ROLE_REUSE_MODES.includes(fields.reuse)) {
     return { ok: false, reason: `角色 reuse 非法：仅支持 ${ROLE_REUSE_MODES.join('/')}（省略 = node）` }
   }
+  if (fields.compactBeforeReuse !== undefined && typeof fields.compactBeforeReuse !== 'boolean') {
+    return { ok: false, reason: '角色 compactBeforeReuse 非法：仅支持布尔值（省略 = 开启）' }
+  }
   const deny = normalizeDenyInput(fields.deny)
   if (!deny.ok) return deny
   const { withHistory, draft } = withRoleHistory(state)
   const role = { persona }
   if (model.value !== undefined) role.model = model.value
   if (fields.reuse !== undefined) role.reuse = fields.reuse
+  if (fields.compactBeforeReuse === false) role.compactBeforeReuse = false
   if (deny.value !== undefined) role.tools = { deny: deny.value }
   draft.roles[key] = role
   return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
@@ -228,6 +232,23 @@ export function setRoleModelEdit(state, key, model) {
   const { withHistory, draft } = withRoleHistory(state)
   if (normalized.value === undefined) delete draft.roles[key].model
   else draft.roles[key].model = normalized.value
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/** 复用前压缩开关缺省（与服务端 compactBeforeReuse 同源；省略 = 开启）。 */
+function compactBeforeReuseOf(role) {
+  return role?.compactBeforeReuse ?? true
+}
+
+/** 设置角色复用前压缩开关（开启省略归一：缺省即开启，不写多余键）。 */
+export function setRoleCompactBeforeReuseEdit(state, key, compact) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  if (!hasRole(state.draft, key)) return { ok: false, reason: `角色 "${key}" 不存在` }
+  if (typeof compact !== 'boolean') return { ok: false, reason: '角色 compactBeforeReuse 非法：仅支持布尔值' }
+  if (compactBeforeReuseOf(state.draft.roles[key]) === compact) return { ok: true, noop: true, state }
+  const { withHistory, draft } = withRoleHistory(state)
+  if (compact) delete draft.roles[key].compactBeforeReuse
+  else draft.roles[key].compactBeforeReuse = false
   return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
 }
 

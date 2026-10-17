@@ -9,12 +9,12 @@ import {
   renameRoleEdit, RESERVED_ROLE_KEYS as clientReserved,
   ROLE_REUSE_MODES as clientReuseModes,
   setJudgeDenyEdit, setJudgeModelEdit, setJudgePersonaEdit,
-  setRoleDenyEdit, setRoleModelEdit, setRolePersonaEdit, setRoleReuseEdit,
+  setRoleCompactBeforeReuseEdit, setRoleDenyEdit, setRoleModelEdit, setRolePersonaEdit, setRoleReuseEdit,
   undoEdit,
 } from '../web-client/src/edits.js'
 import {
   addRole, deleteRole, loadDraft, renameRole,
-  setJudgeDeny, setJudgeModel, setJudgePersona, setRoleDeny, setRoleModel,
+  setJudgeDeny, setJudgeModel, setJudgePersona, setRoleCompactBeforeReuse, setRoleDeny, setRoleModel,
   setRolePersona, setRoleReuse,
 } from '../src/editor/draft.ts'
 import { RESERVED_ROLE_KEYS as serverReserved, ROLE_REUSE_MODES as serverReuseModes } from '../src/types.ts'
@@ -126,6 +126,16 @@ test('T2-panel: 模型/复用/deny/ persona 镜像与 noop', () => {
   assert.ok(!('reuse' in panel.draft.roles['reviewer']))
   assert.equal(setRoleReuseEdit(panel, 'reviewer', 'sometimes').ok, false)
 
+  // #198：复用前压缩开关镜像（开启省略归一；加载归一后缺省已物化为 true，
+  // 与 #60 reuse 一致——键存在但语义等价于省略，勾选默认勾上）。
+  assert.equal(panel.draft.roles['reviewer'].compactBeforeReuse, true)
+  panel = mustOk(setRoleCompactBeforeReuseEdit(panel, 'reviewer', false))
+  assert.equal(panel.draft.roles['reviewer'].compactBeforeReuse, false)
+  panel = mustOk(setRoleCompactBeforeReuseEdit(panel, 'reviewer', true))
+  assert.ok(!('compactBeforeReuse' in panel.draft.roles['reviewer']))
+  assert.equal(setRoleCompactBeforeReuseEdit(panel, 'reviewer', 'no').ok, false)
+  assert.equal(setRoleCompactBeforeReuseEdit(panel, 'ghost', false).ok, false)
+
   panel = mustOk(setRoleDenyEdit(panel, 'reviewer', ['terminal']))
   assert.deepEqual(panel.draft.roles['reviewer'].tools, { deny: ['terminal'] })
   panel = mustOk(setRoleDenyEdit(panel, 'reviewer', undefined))
@@ -221,6 +231,14 @@ test('T2-panel: 同操作双边对比——面板镜像与服务端结果一致'
   applyBoth(
     () => setRoleReuse(session, 'reviewer', 'continuable'),
     () => setRoleReuseEdit(panel, 'reviewer', 'continuable'),
+  )
+  applyBoth(
+    () => setRoleCompactBeforeReuse(session, 'reviewer', false),
+    () => setRoleCompactBeforeReuseEdit(panel, 'reviewer', false),
+  )
+  applyBoth(
+    () => setRoleCompactBeforeReuse(session, 'reviewer', true),
+    () => setRoleCompactBeforeReuseEdit(panel, 'reviewer', true),
   )
   applyBoth(
     () => deleteRole(session, 'reviewer'),

@@ -34,6 +34,16 @@ export function roleReuseMode(role: RoleDefinition | undefined): RoleReuseMode {
   return role?.reuse ?? 'node'
 }
 
+/**
+ * #198: 复用前压缩开关。缺省 `true`（保持现行行为）：跨节点复用 continuable
+ * 会话进入新节点前执行一次边界 compact。关闭后带全量上下文直接进入，不再因
+ * 压缩失败 BLOCK。类型层 helper 与校验归一化共用这一个缺省单源；运行期读
+ * 已冻结快照（缺键即旧快照，按开启解释，不做数据迁移）。
+ */
+export function compactBeforeReuse(role: RoleDefinition | undefined): boolean {
+  return role?.compactBeforeReuse ?? true
+}
+
 /** Allowed workflow-id / role-key / node-id filename grammar. */
 export const ID_PATTERN = /^[a-z][a-z0-9-]*$/
 
@@ -165,6 +175,11 @@ export interface RoleDefinition {
    * （`manager` 是保留 roleKey，禁止出现在 `roles` 中）。
    */
   reuse?: RoleReuseMode
+  /**
+   * #198: 复用前压缩开关。省略时归一化为 `true`（显式值随冻结快照持久化）；
+   * 运行期缺键（存量快照）按开启解释。
+   */
+  compactBeforeReuse?: boolean
 }
 
 export interface JudgeRoleDefinition {
@@ -430,6 +445,11 @@ export interface ExecutionResolution {
   target: Exclude<ResumeTarget, 'auto'> | 'child'
   /** 每次 node_resume 提供的完整当前补充；respawn 不伪造补充。 */
   context?: string
+  /**
+   * #198：本次 actor 恢复是否跳过了复用前压缩（单次逃生审计标记；仅跳过
+   * 生效时记 `true`，其余恢复——含 judge/child 忽略参数——不留该键）。
+   */
+  skipCompact?: boolean
   /** 最近一次 Manager 恢复/重建决定，供事件解释，不作为新 criteria。 */
   decision?: string
   /** Judge 恢复沿普通 driver 续接持久 Session 或重新创建。 */

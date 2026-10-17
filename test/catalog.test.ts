@@ -5,7 +5,7 @@ import { validateAndNormalize, computeDefinitionHash, CatalogValidationError } f
 import { CatalogSchemaError } from '../src/catalog/schema.ts'
 import { classifyCatalogFilename } from '../src/catalog/loader.ts'
 import { scanCatalog, loadCatalogEntry } from '../src/catalog/loader.ts'
-import { roleReuseMode } from '../src/types.ts'
+import { roleReuseMode, compactBeforeReuse } from '../src/types.ts'
 import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -194,6 +194,28 @@ test('#60: manager cannot configure reuse (reserved roleKey is rejected)', () =>
     '  manager:\n    persona: Implement.\n    reuse: node',
   ))
   assert.throws(() => validateAndNormalize(config, { workflowId: 'w' }), CatalogValidationError, /reserved/)
+})
+
+test('#198: compactBeforeReuse 缺省开启并随快照冻结，显式 false 保留', () => {
+  const withFlag = (line: string) => parseCatalogConfig(configWith(
+    '  developer:\n    persona: Implement.',
+    `  developer:\n    persona: Implement.\n${line}`,
+  ))
+  // 省略 → 归一化为 true（快照里显式存在）。
+  const defaulted = validateAndNormalize(withFlag(''), { workflowId: 'compact-wf' })
+  assert.equal(defaulted.roles['developer']!.compactBeforeReuse, true)
+  // 显式 false 原样保留；显式 true 同样冻结。
+  const off = validateAndNormalize(withFlag('    compactBeforeReuse: false'), { workflowId: 'compact-wf' })
+  assert.equal(off.roles['developer']!.compactBeforeReuse, false)
+  const on = validateAndNormalize(withFlag('    compactBeforeReuse: true'), { workflowId: 'compact-wf' })
+  assert.equal(on.roles['developer']!.compactBeforeReuse, true)
+  assert.notEqual(computeDefinitionHash(defaulted), computeDefinitionHash(off))
+  // 类型层缺省单源：运行期缺键（存量快照）按开启解释。
+  assert.equal(compactBeforeReuse(undefined), true)
+  assert.equal(compactBeforeReuse({ persona: 'P' }), true)
+  assert.equal(compactBeforeReuse({ persona: 'P', compactBeforeReuse: false }), false)
+  // 非布尔值被 schema 拒绝（只阻塞声明它的那个 catalog 文件）。
+  assert.throws(() => parseCatalogConfig(withFlag('    compactBeforeReuse: yes-please')), /compactBeforeReuse/)
 })
 
 test('duplicate keys are rejected', () => {

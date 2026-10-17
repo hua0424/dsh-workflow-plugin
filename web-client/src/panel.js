@@ -25,7 +25,7 @@ import {
   renameRoleEdit, savePlanOf, setActorFieldsEdit, setChildReturnTargetEdit, setChildWorkflowIdEdit, setFlowStartNodeEdit, setJudgeDenyEdit,
   setJudgeModelEdit, setJudgePersonaEdit, setNodeResultEdit, setProgramFieldsEdit, setProgramParamEdit,
   setProgramResultEdit, setRoleDenyEdit, setRoleModelEdit,
-  setRolePersonaEdit, setRoleReuseEdit, SUPPORTED_CHECKER_IDS, undoEdit,
+  setRolePersonaEdit, setRoleReuseEdit, setRoleCompactBeforeReuseEdit, SUPPORTED_CHECKER_IDS, undoEdit,
 } from './edits.js'
 
 /** deny 文本框解析：逗号/顿号/换行分隔，逐项 trim（空白项保留，由 edits 守卫明确拒绝）。 */
@@ -123,6 +123,8 @@ function roleFormOf(draft, sel) {
     modelId: role?.model?.modelId ?? '',
     effort: role?.model?.reasoningEffort ?? '',
     reuse: role?.reuse ?? 'node',
+    // #198：草稿缺席按开启解释（勾选默认勾上）。
+    compactBeforeReuse: role?.compactBeforeReuse ?? true,
     deny: denyTextOf(role?.tools?.deny),
   }
 }
@@ -314,7 +316,7 @@ export function WorkflowConfigEditorPanel(props) {
   const dragRef = useRef(null)
   // T2 表单缓冲（纯输入态，非业务模型；业务唯一来源仍是 state.draft，经 edits.js 变更）。
   const [newRole, setNewRole] = useState({ id: '', persona: '' })
-  const [roleForm, setRoleForm] = useState({ sel: '', rename: '', persona: '', provider: '', modelId: '', effort: '', reuse: 'node', deny: '' })
+  const [roleForm, setRoleForm] = useState({ sel: '', rename: '', persona: '', provider: '', modelId: '', effort: '', reuse: 'node', compactBeforeReuse: true, deny: '' })
   const [judgeForm, setJudgeForm] = useState({ persona: '', provider: '', modelId: '', effort: '', deny: '' })
   // T3 表单缓冲与选择态（同上：纯输入态；边身份 = 源节点 + 结果名）。
   const [newFileName, setNewFileName] = useState('')
@@ -604,6 +606,14 @@ export function WorkflowConfigEditorPanel(props) {
   const applyRoleReuse = useCallback(async (reuse) => {
     const sel = roleForm.sel
     await runEdit(setRoleReuseEdit(state, sel, reuse), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm.sel, runEdit, syncRoleForm])
+
+  // #198：复用前压缩勾选框（默认勾上；改名/切换/其他编辑后经 syncRoleForm 正确回填）。
+  const applyRoleCompactBeforeReuse = useCallback(async (compact) => {
+    const sel = roleForm.sel
+    await runEdit(setRoleCompactBeforeReuseEdit(state, sel, compact), (result) => {
       syncRoleForm(result.state.draft, sel)
     })
   }, [state, roleForm.sel, runEdit, syncRoleForm])
@@ -1207,7 +1217,7 @@ export function WorkflowConfigEditorPanel(props) {
       h(RoleSection, {
         draft, roleForm, setRoleForm, newRole, setNewRole, loadModels: props.loadModels,
         onAdd: addNewRole, onSelect: selectRole, onRename: renameSelectedRole,
-        onPersona: applyRolePersona, onReuse: applyRoleReuse, onModel: applyRoleModel,
+        onPersona: applyRolePersona, onReuse: applyRoleReuse, onCompact: applyRoleCompactBeforeReuse, onModel: applyRoleModel,
         onClearModel: clearRoleModel, onDeny: applyRoleDeny, onClearDeny: clearRoleDeny,
         onDelete: deleteSelectedRole, busy: state.busy,
       }),
@@ -1287,6 +1297,15 @@ function RoleSection(props) {
         h('label', null, 'persona'),
         h(LongTextField, { title: '角色 persona', value: roleForm.persona, onChange: setField('persona') }),
         h('button', { onClick: props.onPersona, disabled: props.busy }, '应用'),
+      ),
+      h('div', null,
+        h('label', null, '复用前压缩（省略=开启；关闭后跨节点复用不再因压缩失败阻塞）'),
+        h('input', {
+          type: 'checkbox',
+          checked: roleForm.compactBeforeReuse,
+          onChange: (event) => props.onCompact(event.target.checked),
+          disabled: props.busy,
+        }),
       ),
       h('div', null,
         h('label', null, '复用粒度 reuse（省略 = node）'),
