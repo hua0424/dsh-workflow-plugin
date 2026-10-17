@@ -299,7 +299,8 @@ test('failed Actor arrangement transaction leaves visible ready BLOCK without di
     assert.equal(h.judges.length, 0)
     assert.match(blocked.execution.blockReason!, /injected Actor arrangement failure/)
     assert.equal(h.messages.length, 1)
-    assert.match(h.messages[0].text, /^Workflow BLOCK:/) // 只有通知，无Actor工作派发。
+    assert.equal(h.messages[0].text.startsWith('[node-event]'), true) // #203：BLOCK 通知首部是结构化事件。
+    assert.match(h.messages[0].text, /Workflow BLOCK:/) // 只有通知，无Actor工作派发。
     assert.deepEqual((await h.store.events('ws', blocked.execution.executionId)).map(event => event.type), ['entered', 'blocked'])
   } finally { faults.close(); h.close() }
 })
@@ -1341,7 +1342,9 @@ test('#21 F2: a cold reused Role Session dispatches without a dispatch fault', a
     assert.equal(current.execution.blockReason, null)
     assert.equal(current.execution.dispatch?.sessionId, 'worker-session')
     assert.deepEqual(h.compacts, ['worker'], 'the cold reuse still runs its node-boundary compact')
-    assert.equal(h.messages.at(-1)?.sessionId, 'worker-session')
+    const roleSends = h.messages.filter(m => m.sessionId === 'worker-session')
+    assert.match(roleSends.at(-1)!.text, /\[instruction\]/) // 发往 worker 的最后一条仍是工作派发（#203 事件只发 Manager）。
+    assert.ok(h.messages.some(m => m.sessionId === 'manager' && m.text.startsWith('[node-event]')), '复用派发伴随 Manager 可见的结构化事件')
   } finally { h.close() }
 })
 
@@ -1691,7 +1694,7 @@ test('missing Role Session is replaced in the resume transaction and correction 
     assert.equal(row.run.roleActors.worker, 'worker-replacement-2')
     assert.equal(row.execution.dispatch?.sessionId, 'worker-replacement-2')
     assert.equal(row.execution.roleBoundaryPrepared, true)
-    const replacementPrompt = h.messages.at(-1)!.text
+    const replacementPrompt = h.messages.filter(m => m.sessionId === 'worker-replacement-2').at(-1)!.text
     assert.match(replacementPrompt, /manager handoff/)
     assert.match(replacementPrompt, /\[instruction\]\nWork/)
     assert.doesNotMatch(replacementPrompt, /\[criteria\]/)
@@ -1709,7 +1712,7 @@ test('missing Role Session is replaced in the resume transaction and correction 
     assert.equal(row.execution.dispatch?.sessionId, 'worker-replacement-2')
     assert.equal(row.execution.roleBoundaryPrepared, true)
     assert.deepEqual(h.ensuredActors, ['worker-session', 'worker-replacement-2'])
-    assert.match(h.messages.at(-1)!.text, /replacement candidate/)
+    assert.match(h.messages.filter(m => m.sessionId === 'worker-replacement-2').at(-1)!.text, /replacement candidate/)
     assert.deepEqual(h.roleDrains, [], 'replacement 是 resume 事务内的替换，未离开节点，不触发节点级 drain')
   } finally { h.close() }
 })

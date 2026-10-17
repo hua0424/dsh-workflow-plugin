@@ -195,7 +195,7 @@ test('#133 AC3: 完整组合示例由真实 catalog 加载器接受，嵌套 Chi
     const outerEntry = (await h.store.execution('ws', outerCallerId))!
     assert.equal(outerEntry.nodeId, 'call-inner')
     assert.equal(outerEntry.predecessorId, undefined, 'Child 起点帧不是后继，不带前驱登记')
-    assert.match(h.messages.at(-1)!.text, /\[handoff\]\nmilestone 9 complete/)
+    assert.match(h.messages.filter(m => !m.text.startsWith('[node-event]')).at(-1)!.text, /\[handoff\]\nmilestone 9 complete/)
 
     const innerLeafId = row.execution.executionId
 
@@ -257,7 +257,7 @@ test('#133 AC3/AC4: 同一 Child 的另一个返回进另一个父后继，Progr
     assert.equal(row.execution.workflowId, 'issue-cycle', 'FAIL 的 Target 是子流程内节点')
     assert.equal(row.execution.nodeId, 'repair')
     assert.equal(row.execution.input, 'repair milestone 9')
-    assert.match(noChange.messages.at(-1)!.text, /已确认结果：FAIL（kind: result）/)
+    assert.match(noChange.messages.filter(m => !m.text.startsWith('[node-event]')).at(-1)!.text, /已确认结果：FAIL（kind: result）/)
     assert.deepEqual((await noChange.store.execution('ws', programExecutionId))!.returned, { kind: 'result', name: 'FAIL', source: programExecutionId })
 
     row = await noChange.accept('succeeded', 'gap closed')

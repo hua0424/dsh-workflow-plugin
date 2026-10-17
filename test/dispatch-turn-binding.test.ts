@@ -82,7 +82,8 @@ test('#139 跨 turn 空回合触发可见 BLOCK + Manager 通知（不静默滞�
     const blocked = await h.row()
     assert.equal(blocked.run.status, 'blocked')
     assert.equal(blocked.execution.blockReason, 'actor-turn-ended-without-result')
-    assert.equal(h.messages.at(-1), `Workflow BLOCK: actor-turn-ended-without-result\n材料已保存；Manager 可查看 status 后选择恢复目标。`)
+    assert.equal(h.messages.at(-1)!.startsWith('[node-event]'), true) // #203：BLOCK 通知首部是结构化事件。
+    assert.equal(h.messages.at(-1)!.endsWith(`Workflow BLOCK: actor-turn-ended-without-result\n材料已保存；Manager 可查看 status 后选择恢复目标。`), true)
   } finally { h.close() }
 })
 

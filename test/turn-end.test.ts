@@ -156,7 +156,8 @@ test('#29 Actor 回合无产出时，BLOCK 原因携带额度耗尽分类且 Man
     const blocked = await h.row()
     assert.equal(blocked.run.status, 'blocked')
     assert.equal(blocked.execution.blockReason, `actor-turn-ended-without-result | ${failure}`)
-    assert.equal(h.messages.at(-1), `Workflow BLOCK: ${blocked.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`)
+    assert.equal(h.messages.at(-1)!.startsWith('[node-event]'), true) // #203：BLOCK 通知首部是结构化事件。
+    assert.equal(h.messages.at(-1)!.endsWith(`Workflow BLOCK: ${blocked.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`), true)
     assert.deepEqual((await h.store.events('ws', blocked.execution.executionId)).map(event => event.type), ['entered', 'actor-arranged', 'blocked'])
   } finally { h.close() }
 })
@@ -201,7 +202,8 @@ test('#24 O1 判定回合无产出时，BLOCK 原因携带 Judge 侧额度耗尽
     assert.equal(blocked.run.status, 'blocked')
     assert.equal(blocked.execution.blockReason, `judge turn ended without judge_claim | ${failure}`)
     assert.match(blocked.execution.blockReason, /code=QUOTA status=402/)
-    assert.equal(h.messages.at(-1), `Workflow BLOCK: ${blocked.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`)
+    assert.equal(h.messages.at(-1)!.startsWith('[node-event]'), true) // #203：BLOCK 通知首部是结构化事件。
+    assert.equal(h.messages.at(-1)!.endsWith(`Workflow BLOCK: ${blocked.execution.blockReason}\n材料已保存；Manager 可查看 status 后选择恢复目标。`), true)
   } finally { h.close() }
 })
 

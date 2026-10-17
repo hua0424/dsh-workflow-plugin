@@ -193,7 +193,8 @@ test('#132 A11: PASS → Actor 后继，前驱结果为插件给出的 PASS，ha
     assert.match(h.messages.at(-1)!.text, /\[program\]\ngithub\.all-milestone-issues-complete\n请调用 node_run_program/)
     const programExecutionId = row.execution.executionId
     const judgesAfterPlan = h.judges.length
-    const messagesAfterPlan = h.messages.length
+    const liveTexts = () => h.messages.filter(m => !m.text.startsWith('[node-event]')) // #203 事件不计入派发次数。
+    const messagesAfterPlan = liveTexts().length
 
     assert.equal((await h.runProgram()).ok, true)
     assert.deepEqual(h.programCalls, [{ programId: PROGRAM_ID, parameters: PARAMS }])
@@ -202,8 +203,9 @@ test('#132 A11: PASS → Actor 后继，前驱结果为插件给出的 PASS，ha
     assert.equal(row.execution.phase, 'working')
     assert.equal(row.execution.predecessorId, programExecutionId, '直接前驱是 Program 工作单')
     assert.equal(row.execution.input, 'program artifact', 'handoff 是后继唯一的输入文本')
-    assert.equal(h.messages.length, messagesAfterPlan + 1, '只创建一个后继、只派发一次')
-    const successorText = h.messages.at(-1)!.text
+    assert.equal(liveTexts().length, messagesAfterPlan + 1, '只创建一个后继、只派发一次')
+    assert.ok(h.messages.some(m => m.text.startsWith('[node-event]')), '#203：后继进入伴随 Manager 可见的结构化事件')
+    const successorText = liveTexts().at(-1)!.text
     assert.match(successorText, /\[直接前驱结果\]\n前驱节点 program 已确认结果：PASS（kind: result）/)
     assert.doesNotMatch(successorText, /FAIL/, '后继上下文不掺入未选中的出口')
     assert.equal(h.judges.length, judgesAfterPlan, 'Program 不派 Judge，后继作为新 claim 才另派')

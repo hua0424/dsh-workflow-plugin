@@ -222,7 +222,7 @@ try {
   assert.equal((await engine.handleClaim(ws, { result: 'succeeded', handoff: 'appended wrong worker line' }, caller(current.execution.dispatch))).ok, true)
   await settleActorAndJudge('REJECT', 'existing criteria requires the exact worker ok line')
   current = await row()
-  assert.match(actorPrompts.at(-1).text, /appended wrong worker line/)
+  assert.match(actorPrompts.filter(m => !m.text.startsWith('[node-event]')).at(-1).text, /appended wrong worker line/)
   assert.deepEqual(compacts, [], 'same-execution correction must not compact')
   assert.deepEqual(drained, ['worker-1'], '节点内修正不离开节点，会话不释放')
 
