@@ -316,6 +316,8 @@ export class WorkflowEngine {
         run.callStack.push({ workflowId: node.execution.workflowId, nodeId: child.startNode, nodeToken: newNodeToken(), executionId })
         const first = this.newExecution(run, e.input, e.visit + 1)
         await this.state.put(ws, run, version, [change(e, 'child-entered'), { execution: first, expectedRevision: null, events: ['entered'] }])
+        // #203：调用层进入子流程对 Manager 不可见，补一条结构化事件（后继派发另有事件）。
+        await this.notifyNodeEvent(run, e)
         await this.drive(ws)
         return
       }
@@ -386,6 +388,9 @@ export class WorkflowEngine {
           fresh.execution.boundary!.executorSessionId = sent.childId
         }
         await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
+        // #203：派发给 Role Actor 的 working 变化对 Manager 不可见，补一条结构化事件；
+        // manager 角色的派发正文同一 turn 已 steer 给 Manager，不重复。
+        if (role !== 'manager') await this.notifyNodeEvent(fresh.run, fresh.execution)
       } catch (error) { await this.dispatchFault(ws, e, error, committedVersion) }
       return
     }
@@ -414,6 +419,8 @@ export class WorkflowEngine {
       if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
       fresh.execution.judge!.messageId = sent.messageId
       await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
+      // #203：Judge 已派发（判定中）对 Manager 不可见，补一条结构化事件。
+      await this.notifyNodeEvent(fresh.run, fresh.execution)
     } catch (error) { await this.dispatchFault(ws, e, error, committedVersion) }
   }
   /**
@@ -476,20 +483,45 @@ export class WorkflowEngine {
     await this.blockRow(ws, row, `dispatch fault: ${error instanceof Error ? error.message : String(error)}`)
   }
   /**
+   * Issue #203：节点 phase 变化时向 Manager 会话推送的结构化事件。
+   * 字段足以判断「推进/判定中/BLOCK 及原因摘要」，Manager 全程免轮询，
+   * 仅在事件缺失或需要细节时查询 workflow_status。
+   * best-effort：推送失败静默（见 notifyNodeEvent），降级为现状轮询，
+   * 绝不阻断主流程；不改变 workflow_status 查询语义。
+   */
+  private nodeEventText(run: RunState, e: NodeExecution): string {
+    const oneLine = (value: string, max: number): string => value.replace(/\s+/g, ' ').trim().slice(0, max) || '-'
+    const claimResult = e.claim?.result ?? e.previousClaim?.result ?? '-'
+    const judgment = e.judgment ? `${e.judgment.result} ${oneLine(e.judgment.reason, 200)}` : '-'
+    const returned = e.returned ? `${e.returned.kind}:${e.returned.name}` : '-'
+    const blockReason = e.blockReason ?? run.blockReason
+    return [
+      `[node-event] phase=${e.phase} node=${e.workflowId}/${e.nodeId} run=${run.runId}`,
+      `nodeToken=${e.nodeToken}`,
+      `claimResult=${claimResult} judgment=${judgment} returned=${returned}`,
+      `blockReason=${blockReason ? oneLine(blockReason, 200) : '-'}`,
+    ].join('\n')
+  }
+  private notifyNodeEvent(run: RunState, e: NodeExecution): Promise<void> {
+    // best-effort：推送失败静默，降级为现状轮询，绝不阻断主流程。
+    return (async () => { await this.targets.steerManager(run, this.nodeEventText(run, e)).catch(() => {}) })()
+  }
+  /**
    * BLOCK 的两处共用动作（#133 收口 D-130-02）：原因的单点截断，与统一
    * 「Workflow BLOCK: <原因>」前缀的 Manager 通知（通知失败静默——状态真源已提交）。
+   * #203：通知正文首部携带结构化节点事件，BLOCK 即一次 phase 变化，不另发一条。
    * 落库本身仍留在各调用点：三处的 phase/事件前缀/trace/退役 Judge 顺序不同。
    */
   private blockReason(reason: string): string { return reason.slice(0, LIMITS.blockReasonMax) }
-  private async notifyBlock(run: RunState, blockReason: string, hint: string): Promise<void> {
-    await this.targets.steerManager(run, `Workflow BLOCK: ${blockReason}\n${hint}`).catch(() => {})
+  private async notifyBlock(run: RunState, e: NodeExecution, blockReason: string, hint: string): Promise<void> {
+    await this.targets.steerManager(run, `${this.nodeEventText(run, e)}\nWorkflow BLOCK: ${blockReason}\n${hint}`).catch(() => {})
   }
   private async blockRow(ws: string, row: RuntimeRow, reason: string, ...beforeBlock: NodeExecutionEvent['type'][]): Promise<void> {
     row.run.status = 'blocked'
     row.execution.blockReason = this.blockReason(reason)
     await this.state.put(ws, row.run, row.version, [change(row.execution, ...beforeBlock, 'blocked')])
     this.trace(row.run, 'BLOCK', { workflow: row.execution.workflowId, node: row.execution.nodeId, reason: jsonField(row.execution.blockReason, LIMITS.blockReasonMax) })
-    await this.notifyBlock(row.run, row.execution.blockReason, '材料已保存；Manager 可查看 status 后选择恢复目标。')
+    await this.notifyBlock(row.run, row.execution, row.execution.blockReason, '材料已保存；Manager 可查看 status 后选择恢复目标。')
   }
   /**
    * Issue #200：Judge 瞬时失败的单次自动重试。fresh 新会话重派（失败会话状态
@@ -517,6 +549,8 @@ export class WorkflowEngine {
       if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
       current.execution.judge!.messageId = sent.messageId
       await this.state.put(ws, current.run, current.version, [change(current.execution)])
+      // #203：自动重试重派 Judge 同样是判定中变化，补一条结构化事件。
+      await this.notifyNodeEvent(current.run, current.execution)
     } catch (error) {
       const current = await this.state.get(ws)
       if (current?.version !== version + 1 || current.execution.executionId !== e.executionId) return
@@ -568,7 +602,7 @@ export class WorkflowEngine {
       e.blockReason = this.blockReason(`result "${name}" has no configured Target`)
       run.status = 'blocked'
       await this.state.put(ws, run, version, [change(e, ...events, 'blocked')])
-      await this.notifyBlock(run, e.blockReason, '材料已保存；Manager 核查后可显式恢复。')
+      await this.notifyBlock(run, e, e.blockReason, '材料已保存；Manager 核查后可显式恢复。')
       return { ok: true, run, message: e.blockReason }
     }
     // `reuse: node` 的会话生命周期止于节点：先 drain 会话（失败降级为仅撤权，不阻塞推进），
@@ -632,7 +666,11 @@ export class WorkflowEngine {
       // 业务返回名逐字呈现：cancelled 之类的业务终局不被一概渲染成交付成功。
       const chain = exited === e ? '' : `；经 Child 逐层映射：${nextName}`
       const terminal = `workflow "${run.catalogWorkflowId}" 业务终局：${completedReturn}（节点结果：${name}${chain}；run ${run.runId}）。Run 状态 completed 表示执行已结束，业务返回见上；handoff 为终局工作单原文。\n\n[handoff]\n${handoff}`
-      await this.targets.steerManager(run, terminal).catch(() => {})
+      // #203：终局本身就是 Manager 可见的通知，首部携带结构化事件，不另发一条。
+      await this.targets.steerManager(run, `${this.nodeEventText(run, exited)}\n${terminal}`).catch(() => {})
+    } else {
+      // #203：节点退出（推进到后继）对 Manager 不可见，补一条结构化事件。
+      await this.notifyNodeEvent(run, e)
     }
     return { ok: true, run, message: `${kind === 'return' ? 'return ' : ''}${name} committed` }
   }
@@ -710,6 +748,8 @@ export class WorkflowEngine {
     // lease消费就是该事务中的phase/claim更新；失败不改内存权威，没有第二本lease book。
     await this.state.put(ws, row.run, row.version, [change(e, 'claim')])
     this.trace(row.run, 'CLAIM', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result: claim.result, handoff: jsonField(claim.handoff, LIMITS.handoffMax) })
+    // #203：Actor 已提交结果（checking）对 Manager 不可见，补一条结构化事件。
+    await this.notifyNodeEvent(row.run, e)
     return { ok: true, run: row.run, message: 'claim saved; waiting for Actor safe settlement' }
   }
   async handleJudgeClaim(ws: string, token: string, result: 'ACCEPT' | 'REJECT' | 'NEED_CONTEXT', reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
@@ -745,6 +785,8 @@ export class WorkflowEngine {
       await this.state.put(ws, run, version, [change(e, 'judgment')])
       this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(rejectedJudge.sessionId!) })
       await this.subagents.retireJudge(run, rejectedJudge.sessionId!).catch(() => {})
+      // #203：REJECT 回到 ready 是 Manager 可见的判定结论，补一条结构化事件（后继重派发另有事件）。
+      await this.notifyNodeEvent(run, e)
       await this.drive(ws)
       return { ok: true, run, message: 'REJECT committed; Actor correction prepared' }
     }
@@ -761,7 +803,7 @@ export class WorkflowEngine {
       await this.state.put(ws, run, version, [change(e, 'judgment', 'blocked')])
       this.trace(run, 'JUDGE', { workflow: e.workflowId, node: e.nodeId, token: shortId(e.nodeToken), result, reason: jsonField(reason, LIMITS.reasonMax), judge: shortId(judge.sessionId!) })
       await this.subagents.retireJudge(run, judge.sessionId!).catch(() => {})
-      await this.notifyBlock(run, e.blockReason, '请用 node_resume target=judge 提供完整当前补充；已保存 claim 不会丢失。')
+      await this.notifyBlock(run, e, e.blockReason, '请用 node_resume target=judge 提供完整当前补充；已保存 claim 不会丢失。')
       return { ok: true, run, message: 'NEED_CONTEXT committed; Manager context required' }
     }
     delete e.previousJudge

@@ -241,9 +241,9 @@ test('#200 manager 节点派发用 manager 变体，actor 节点派发零变化'
     const judge = h.caller(checking.execution.judge!)
     assert.equal((await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'ACCEPT', 'verified', judge)).ok, true)
     await h.engine.handleTurnEnded('ws', judge)
-    assert.equal(h.managerTexts.length, 1)
+    assert.equal(h.managerTexts.filter(t => !t.startsWith('[node-event]')).length, 1) // #203 事件另计，不混入派发计数。
     assert.equal(h.actorTexts.length, 1)
-    const managerDispatch = h.managerTexts[0]!
+    const managerDispatch = h.managerTexts.filter(t => !t.startsWith('[node-event]'))[0]!
     const actorDispatch = h.actorTexts[0]!
     assert.ok(managerDispatch.endsWith(MANAGER_SUBMISSION_CONSTRAINT))
     assert.doesNotMatch(managerDispatch, /本轮对话是在node工作节点运行/)

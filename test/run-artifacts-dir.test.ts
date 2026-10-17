@@ -97,15 +97,15 @@ test('Manager 与 Actor 派发文本都附带绑定 workspace 算出的材料目
   try {
     await acceptFirst(h)
     const runId = (await h.row()).run.runId
-    assert.equal(h.managerTexts.length, 1)
+    assert.equal(h.managerTexts.filter(t => !t.startsWith('[node-event]')).length, 1) // #203 事件另计，不混入派发计数。
     assert.equal(h.actorTexts.length, 1)
-    for (const text of [...h.managerTexts, ...h.actorTexts]) {
+    for (const text of [...h.managerTexts.filter(t => !t.startsWith('[node-event]')), ...h.actorTexts]) {
       assert.match(text, /\[run-materials\]/)
       assert.ok(text.includes(`dir: ws/.dsh/.dsh-workflow/runs/${runId}/`))
       assert.ok(!text.includes(h.home), '不得用 cwd 猜测目录')
     }
     // 固定后缀仍在末尾：投影剥离不受影响（manager 用去 Actor 视角的变体）。
-    for (const text of h.managerTexts) assert.ok(text.endsWith(MANAGER_SUBMISSION_CONSTRAINT))
+    for (const text of h.managerTexts.filter(t => !t.startsWith('[node-event]'))) assert.ok(text.endsWith(MANAGER_SUBMISSION_CONSTRAINT))
     for (const text of h.actorTexts) assert.ok(text.endsWith(SUBMISSION_CONSTRAINT))
   } finally { h.close() }
 })
