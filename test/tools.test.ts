@@ -24,7 +24,7 @@ function makeToolHost(overrides: Partial<ToolHost> = {}): ToolHost & { calls: Ar
     },
     claim: async (ws, claim, caller) => { calls.push({ name: 'claim', args: { ws, claim, caller } }); return { ok: true, message: 'claimed' } },
     block: async (ws, nodeToken, reason) => { calls.push({ name: 'block', args: { ws, nodeToken, reason } }); return { ok: true, message: 'blocked' } },
-    resume: async (ws, nodeToken, resolutionContext, _caller, target) => { calls.push({ name: 'resume', args: { ws, nodeToken, resolutionContext, target } }); return { ok: true, message: 'resumed' } },
+    resume: async (ws, nodeToken, resolutionContext, _caller, target, skipCompact) => { calls.push({ name: 'resume', args: { ws, nodeToken, resolutionContext, target, skipCompact } }); return { ok: true, message: 'resumed' } },
     runProgram: async (ws, nodeToken, parameters) => { calls.push({ name: 'runProgram', args: { ws, nodeToken, parameters } }); return { ok: true, message: 'ran' } },
     resolveProgram: async (ws, nodeToken, result, reason) => { calls.push({ name: 'resolveProgram', args: { ws, nodeToken, result, reason } }); return { ok: true, message: 'resolved' } },
     setRoleModel: async (ws, roleKey, provider, modelId) => { calls.push({ name: 'setRoleModel', args: { ws, roleKey, provider, modelId } }); return { ok: true, message: 'set' } },
@@ -98,8 +98,21 @@ test('node_resume routes to host.resume', async () => {
   const tool = findTool(host, 'node_resume')
   const token = randomUUID()
   await tool.execute({ nodeToken: token, resolutionContext: 'fixed it', target: 'judge' }, EXEC as never)
-  assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'fixed it', target: 'judge' } })
+  assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'fixed it', target: 'judge', skipCompact: false } })
   await assert.rejects(() => tool.execute({ nodeToken: token, resolutionContext: 'fixed', surprise: true }, EXEC as never), /unsupported node_resume property/)
+})
+
+test('#198: node_resume skipCompact 直通与类型守卫', async () => {
+  const host = makeToolHost()
+  const tool = findTool(host, 'node_resume')
+  const token = randomUUID()
+  // 缺省不断言以外的行为：target 回落 auto，skipCompact 回落 false。
+  await tool.execute({ nodeToken: token, resolutionContext: 'retry once' }, EXEC as never)
+  assert.deepEqual(host.calls[0], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'retry once', target: 'auto', skipCompact: false } })
+  await tool.execute({ nodeToken: token, resolutionContext: 'skip once', target: 'actor', skipCompact: true }, EXEC as never)
+  assert.deepEqual(host.calls[1], { name: 'resume', args: { ws: 'ws-1', nodeToken: token, resolutionContext: 'skip once', target: 'actor', skipCompact: true } })
+  // 非布尔值拒绝（框架参数校验先拦一道 "must be a boolean"；工具内守卫是同语义兜底）。
+  await assert.rejects(() => tool.execute({ nodeToken: token, resolutionContext: 'x', skipCompact: 'yes' }, EXEC as never), /must be a boolean/)
 })
 
 test('node_run_program routes to host.runProgram', async () => {
@@ -335,7 +348,7 @@ test('#94: disposing one instance leaves the other instance registered and routi
   assert.equal(registryA.registered.size, 0)
   assert.equal(registryB.registered.size, b.tools.length)
   assert.equal(await registryB.execute('node_resume', { nodeToken: 't2', resolutionContext: 'still alive' }), 'resumed')
-  assert.deepEqual(b.calls, [{ name: 'resume', args: { ws: 'ws-B', nodeToken: 't2', resolutionContext: 'still alive', target: 'auto' } }])
+  assert.deepEqual(b.calls, [{ name: 'resume', args: { ws: 'ws-B', nodeToken: 't2', resolutionContext: 'still alive', target: 'auto', skipCompact: false } }])
 })
 
 // ---- command tests ----

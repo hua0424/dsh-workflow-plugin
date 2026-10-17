@@ -44,6 +44,8 @@ const executionSchema = z.object({
     target: z.enum(['actor', 'judge', 'child']), context: z.string().trim().min(LIMITS.resolutionMin).max(LIMITS.resolutionMax).optional(),
     decision: z.string().trim().min(1).max(LIMITS.reasonMax).optional(), judgeMode: z.enum(['followup', 'fresh']).optional(),
     judgeSessionId: text.optional(), inputVersion: revision,
+    // #198：单次跳过复用前压缩的审计标记（仅实际跳过时记 true）。
+    skipCompact: z.boolean().optional(),
   }).strict().optional(),
   program: z.object({
     id: text,
@@ -138,6 +140,8 @@ export function checkExecutionInvariants(run: RunState, execution: NodeExecution
   if (execution.resolution?.target === 'judge' && !currentJudgment && !execution.resolution.judgeMode) problems.push('judge resolution requires a recovery mode')
   if (execution.resolution?.target === 'judge' && currentJudgment && (execution.resolution.judgeMode || execution.resolution.judgeSessionId)) problems.push('current judgment cannot retain Judge recovery mode')
   if (execution.resolution?.target !== 'judge' && (execution.resolution?.judgeMode || execution.resolution?.judgeSessionId)) problems.push('Judge recovery metadata requires judge target')
+  // #198：跳过标记只属于实际跳过的 actor 恢复（judge/child 忽略参数，不留痕）。
+  if (execution.resolution?.skipCompact === true && execution.resolution?.target !== 'actor') problems.push('skipCompact requires actor target')
   if (execution.resolution?.judgeMode === 'followup' ? !execution.resolution.judgeSessionId : execution.resolution?.judgeSessionId !== undefined) problems.push('Judge followup requires exactly one Session id')
   if (execution.resolution?.judgeMode === 'followup') {
     const historicalNeedContext = execution.judgment?.result === 'NEED_CONTEXT' && !currentJudgment

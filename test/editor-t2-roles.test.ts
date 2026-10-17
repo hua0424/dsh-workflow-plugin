@@ -10,11 +10,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   addRole, businessEqual, deleteRole, loadDraft, previewDraft, redo, renameRole,
-  setJudgeDeny, setJudgeModel, setJudgePersona, setRoleDeny, setRoleModel,
+  setJudgeDeny, setJudgeModel, setJudgePersona, setRoleCompactBeforeReuse, setRoleDeny, setRoleModel,
   setRolePersona, setRoleReuse, undo, validateDraft,
 } from '../src/editor/draft.ts'
 import { serializeLayout } from '../src/editor/layout.ts'
-import { RESERVED_ROLE_KEYS, roleReuseMode, routeToAgentOptions } from '../src/types.ts'
+import { RESERVED_ROLE_KEYS, compactBeforeReuse, roleReuseMode, routeToAgentOptions } from '../src/types.ts'
 
 const T2_CONFIG = `
 schemaVersion: agent-workflow/v3
@@ -193,6 +193,28 @@ test('T2: reuse 双合同与 deny 省略/列表语义', () => {
   assert.deepEqual(session.draft.config.roles['reviewer']?.tools, { deny: ['terminal'] })
   assert.equal(setRoleDeny(session, 'reviewer', []).ok, false)
   assert.equal(setRoleDeny(session, 'reviewer', ['ok', ' ']).ok, false)
+  assert.equal(validateDraft(session).ok, true)
+})
+
+test('T2: #198 compactBeforeReuse 开关（开启省略归一）', () => {
+  const session = mustLoad()
+  // 加载时省略已按 #198 归一为 true（与线上行为一致，内存态不保留省略形）。
+  assert.equal(compactBeforeReuse(session.draft.config.roles['developer']), true)
+  assert.deepEqual(setRoleCompactBeforeReuse(session, 'developer', true), { ok: true })
+  assert.deepEqual(setRoleCompactBeforeReuse(session, 'developer', false), { ok: true })
+  assert.equal(session.draft.config.roles['developer']?.compactBeforeReuse, false)
+  // 指回开启时删多余键（仍等价归一），非布尔值与未知角色拒绝。
+  assert.deepEqual(setRoleCompactBeforeReuse(session, 'developer', true), { ok: true })
+  assert.equal('compactBeforeReuse' in (session.draft.config.roles['developer'] ?? {}), false)
+  assert.equal(compactBeforeReuse(session.draft.config.roles['developer']), true)
+  assert.equal(setRoleCompactBeforeReuse(session, 'developer', 'no' as never).ok, false)
+  assert.equal(setRoleCompactBeforeReuse(session, 'ghost', false).ok, false)
+  // 新增角色可一次建成关闭态；省略即开启。
+  assert.deepEqual(addRole(session, 'silent', { persona: 'Quiet.', compactBeforeReuse: false }), { ok: true })
+  assert.equal(session.draft.config.roles['silent']?.compactBeforeReuse, false)
+  assert.deepEqual(addRole(session, 'loud', { persona: 'Loud.' }), { ok: true })
+  assert.equal('compactBeforeReuse' in (session.draft.config.roles['loud'] ?? {}), false)
+  assert.deepEqual(setRoleCompactBeforeReuse(session, 'loud', true), { ok: true })
   assert.equal(validateDraft(session).ok, true)
 })
 

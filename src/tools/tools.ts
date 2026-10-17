@@ -63,7 +63,7 @@ export interface ToolHost {
   // turn's user-message id snapshot for dispatch-lease admission, A1 R2/R3).
   claim(workspaceKey: string, claim: NodeClaim, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   block(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
-  resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string, target?: 'auto' | 'actor' | 'judge'): Promise<{ ok: boolean; reason?: string; message?: string }>
+  resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string, target?: 'auto' | 'actor' | 'judge', skipCompact?: boolean): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   setRoleModel(workspaceKey: string, roleKey: string, provider: string, modelId: string, caller: string, reasoningEffort?: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -189,20 +189,22 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
 
     defineTool({
       name: 'node_resume',
-      description: 'Manager 恢复 BLOCK 的当前 Node；target=auto|actor|judge，生成新 token 并按当前材料继续。',
+      description: 'Manager 恢复 BLOCK 的当前 Node；target=auto|actor|judge，生成新 token 并按当前材料继续。skipCompact=true 时单次跳过复用前压缩（仅 actor 目标生效，打破压缩失败→BLOCK→重试的死循环；judge/child 路径忽略）。',
       parameters: {
         nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
         resolutionContext: { type: 'string', required: true, description: '完整当前补充/处理上下文（1..8000 字符；替换上次当前补充，旧值保留在 events）' },
         target: { type: 'string', enum: ['auto', 'actor', 'judge'], description: '恢复目标；默认 auto' },
+        skipCompact: { type: 'boolean', description: '单次跳过复用前压缩；缺省 false，仅 actor 目标生效' },
       },
       output: stringOut,
       async execute(args, exec) {
         const auth = await controlWorkspace(host, exec.agent, 'node_resume')
         if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
-        rejectUnknown(args, ['nodeToken', 'resolutionContext', 'target'], 'node_resume')
+        rejectUnknown(args, ['nodeToken', 'resolutionContext', 'target', 'skipCompact'], 'node_resume')
         const ctxError = lengthError('resolutionContext', args.resolutionContext, LIMITS.resolutionMin, LIMITS.resolutionMax, true)
         if (ctxError !== undefined) return `拒绝：${ctxError}`
-        return fmtResult(await host.resume(auth.workspaceKey, args.nodeToken, args.resolutionContext.trim(), auth.caller, args.target ?? 'auto'))
+        if (args.skipCompact !== undefined && typeof args.skipCompact !== 'boolean') return '拒绝：skipCompact must be a boolean when provided'
+        return fmtResult(await host.resume(auth.workspaceKey, args.nodeToken, args.resolutionContext.trim(), auth.caller, args.target ?? 'auto', args.skipCompact ?? false))
       },
     }),
 

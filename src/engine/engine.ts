@@ -1,6 +1,6 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
 import type { WorkflowConfig, NodeClaim, NodeDef, Target, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
-import { WorkflowError, LIMITS, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
+import { WorkflowError, LIMITS, compactBeforeReuse, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { resolveRoleModel } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
@@ -339,18 +339,26 @@ export class WorkflowEngine {
             if (verdict === 'active') throw new WorkflowError('previous Role execution is not safely closed')
           }
           if (!e.roleBoundaryPrepared) {
-            const compact = await this.subagents.compactRoleActor(run, role)
-            // #55：host 已自动重试仍失败时，BLOCK 文本必须自带恢复路径——事故里
-            // Manager 是自己摸索出"换模型再 resume"的（run 295ad986）。
-            if (!compact.ok) throw new WorkflowError(`node-boundary compact failed: ${compact.detail ?? 'unknown'}；Manager 可 workflow_set_role_model 切换更强模型后 node_resume 重试`)
-            const current = await this.stillCurrent(ws, e, arrangedVersion)
-            if (!current) return
-            current.execution.roleBoundaryPrepared = true
-            await this.state.put(ws, current.run, current.version, [change(current.execution)])
-            e.roleBoundaryPrepared = true
-            arrangedVersion = current.version + 1
-            committedVersion = arrangedVersion
-            if (!await this.stillCurrent(ws, e, arrangedVersion)) return
+            // #198 唯一决策点：角色 `compactBeforeReuse` 关闭即跳过本次压缩调用，
+            // 直接标记已准备（OR 的另一半——resume 单次逃生——由 handleResume 在
+            // 恢复时直接置位并记审计，不经过这里）。存活探测在压缩之外，不随开关
+            // 跳过。跳过只改内存标记，随派发落库，不额外落库。
+            if (!compactBeforeReuse(run.definitionSnapshot.roles[role])) {
+              e.roleBoundaryPrepared = true
+            } else {
+              const compact = await this.subagents.compactRoleActor(run, role)
+              // #55：host 已自动重试仍失败时，BLOCK 文本必须自带恢复路径——事故里
+              // Manager 是自己摸索出"换模型再 resume"的（run 295ad986）。
+              if (!compact.ok) throw new WorkflowError(`node-boundary compact failed: ${compact.detail ?? 'unknown'}；Manager 可 workflow_set_role_model 切换更强模型后 node_resume 重试`)
+              const current = await this.stillCurrent(ws, e, arrangedVersion)
+              if (!current) return
+              current.execution.roleBoundaryPrepared = true
+              await this.state.put(ws, current.run, current.version, [change(current.execution)])
+              e.roleBoundaryPrepared = true
+              arrangedVersion = current.version + 1
+              committedVersion = arrangedVersion
+              if (!await this.stillCurrent(ws, e, arrangedVersion)) return
+            }
           }
         }
         const correction = e.previousClaim
@@ -808,9 +816,11 @@ export class WorkflowEngine {
       } catch (error) { this.traceWarn?.(`restart reconciliation failed: ${String(error)}`) }
     }
   }
-  async handleResume(ws: string, token: string, context: string, caller: string, target: ResumeTarget = 'auto'): Promise<EngineOutcome> {
+  async handleResume(ws: string, token: string, context: string, caller: string, target: ResumeTarget = 'auto', skipCompact = false): Promise<EngineOutcome> {
     context = context.trim()
     if (!context || context.length > LIMITS.resolutionMax || !['auto', 'actor', 'judge'].includes(target)) return rejected('invalid resolution context/target')
+    // #198：单次逃生只认显式 `true`（缺省 false；非布尔由工具层拒绝）。
+    const skip = skipCompact === true
     const row = await this.state.get(ws)
     if (!row || row.run.status !== 'blocked' || row.execution.nodeToken !== token) return rejected('node_resume requires the current BLOCK/token')
     const { run, execution: e, version } = row
@@ -848,7 +858,7 @@ export class WorkflowEngine {
       run.blockReason = null
       await this.state.put(ws, run, version, [change(e, 'manager-context', 'resumed'), ...(recoveredPredecessor ? [change(recoveredPredecessor)] : [])])
       await this.drive(ws)
-      return { ok: true, run, message: 'Child caller resume committed; driver invoked' }
+      return { ok: true, run, message: `Child caller resume committed; driver invoked${skip ? ' (skipCompact ignored for child resume)' : ''}` }
     }
     if (node.execution.type !== 'actor-task') return rejected('Program recovery requires node_run_program or node_resolve_program')
     const resolvedTarget: Exclude<ResumeTarget, 'auto'> = target === 'auto'
@@ -872,6 +882,8 @@ export class WorkflowEngine {
     const oldJudgeSessionId = oldJudge?.sessionId
     let judgeMode: 'followup' | 'fresh' | undefined
     let judgeSessionId: string | undefined
+    // #198：单次逃生是否实际生效（仅 actor 目标且此前未准备时置位并记审计）。
+    let skippedCompact = false
     if (resolvedTarget === 'judge') {
       if (e.phase !== 'checking' || !e.claim || !e.dispatch || e.judgment?.result === 'ACCEPT') return rejected('judge resume requires an effective claim without a business conclusion')
       // auto never takes this branch while unsettled; explicit target=judge is the Manager's takeover decision.
@@ -962,6 +974,13 @@ export class WorkflowEngine {
       delete e.claim
       delete e.judge
       e.phase = 'ready'
+      // #198 单次逃生：仅 actor 目标生效；此前尚未准备才实际跳过并记审计标记
+      // （本恢复的置位随同一次状态落库，drive 不再重复压缩；已准备时无压缩可跳，
+      // 不留痕）。judge（含 auto 落到 judge）忽略该参数。
+      if (skip && !e.roleBoundaryPrepared) {
+        e.roleBoundaryPrepared = true
+        skippedCompact = true
+      }
     }
     if (replaceRole) {
       delete run.roleActors[role]
@@ -971,6 +990,7 @@ export class WorkflowEngine {
     e.inputVersion++
     e.resolution = {
       target: resolvedTarget, context, inputVersion: e.inputVersion,
+      ...(skippedCompact ? { skipCompact: true as const } : {}),
       ...(resolvedTarget === 'judge' ? { judgeMode: judgeMode!, ...(judgeSessionId ? { judgeSessionId } : {}) } : {}),
     }
     if (resolvedTarget === 'judge') {
@@ -991,7 +1011,10 @@ export class WorkflowEngine {
     ])
     if (oldJudgeSessionId) await this.subagents.retireJudge(run, oldJudgeSessionId).catch(() => {})
     await this.drive(ws)
-    return { ok: true, run, message: `resume ${resolvedTarget} committed; driver invoked` }
+    // #198 回执：实际跳过/忽略参数都在消息里明示，恢复记录（resolution.skipCompact）只记实际跳过。
+    const skipNote = skippedCompact ? ' (boundary compact skipped for this resume)'
+      : skip && resolvedTarget === 'judge' ? ' (skipCompact ignored for judge resume)' : ''
+    return { ok: true, run, message: `resume ${resolvedTarget} committed; driver invoked${skipNote}` }
   }
   async handleRespawnJudge(ws: string, token: string, reason = '', caller = ''): Promise<EngineOutcome> {
     reason = reason.trim()

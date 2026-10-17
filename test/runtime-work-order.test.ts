@@ -622,6 +622,76 @@ test('compact success is persisted before Queue so send failure resume does not 
   } finally { h.close() }
 })
 
+test('#198: compactBeforeReuse=false 的复用节点跳过边界 compact 且保留复用探测', async () => {
+  const config = configWithReusedWorker('continuable')
+  config.roles['worker'] = { ...config.roles['worker']!, compactBeforeReuse: false }
+  const h = harness(config)
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan ready'))
+    // work --succeeded/ACCEPT--> again：同一 worker Role 的新 visit（跨节点复用路径）。
+    const workerJudge = await acceptCurrent(h, 'worker handoff')
+    assert.equal((await h.row()).execution.nodeId, 'again')
+    await h.engine.handleTurnEnded('ws', workerJudge)
+    const row = await h.row()
+    assert.equal(row.run.status, 'running', '关闭开关后复用派发不再因 compact 阻塞')
+    assert.ok(row.execution.dispatch?.messageId)
+    assert.deepEqual(h.compacts, [], '开关关闭：跨节点复用不调用 compact')
+    assert.ok(h.lifecycle.some(entry => entry.startsWith('safe:')), '复用探测照常运行')
+  } finally { h.close() }
+})
+
+test('#198: 压缩失败 BLOCK 后无参 resume 仍 BLOCK，带参 resume 单次放行且不再调用压缩', async () => {
+  const h = harness(configWithWorker('work', 'continuable'))
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await acceptCurrent(h, 'plan ready'))
+    const firstWorkerJudge = await acceptCurrent(h, 'worker handoff', 'failed')
+    h.setCompactOutcome({ ok: false, detail: 'compaction busy: maintenance raced' })
+    await h.engine.handleTurnEnded('ws', firstWorkerJudge)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+    assert.match(blocked.execution.blockReason!, /node-boundary compact failed: compaction busy/)
+
+    // 无参 resume：重试必做压缩，再次失败仍 BLOCK（打破不了循环是预期内——逃生必须显式）。
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Retry the required Node-boundary compact.', 'manager', 'actor')).ok, true)
+    const stillBlocked = await h.row()
+    assert.equal(stillBlocked.run.status, 'blocked')
+    assert.match(stillBlocked.execution.blockReason!, /node-boundary compact failed: compaction busy/)
+    assert.deepEqual(h.compacts, ['worker', 'worker'])
+    assert.equal(stillBlocked.execution.resolution?.skipCompact, undefined, '未带参的恢复不留跳过痕')
+
+    // 带参 resume：单次跳过压缩，顺利派发；审计标记只记这一次。
+    assert.equal((await h.engine.handleResume('ws', stillBlocked.execution.nodeToken, 'Compaction outage confirmed; proceed without the boundary compact this once.', 'manager', 'actor', true)).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.run.status, 'running')
+    assert.ok(resumed.execution.dispatch?.messageId)
+    assert.deepEqual(h.compacts, ['worker', 'worker'], '逃生恢复不再调用压缩')
+    assert.equal(resumed.execution.resolution?.skipCompact, true)
+  } finally { h.close() }
+})
+
+test('#198: judge 恢复忽略 skipCompact（不留痕、不改变行为）', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const actor = h.caller((await h.row()).execution.dispatch!)
+    await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'candidate needing context' }, actor)
+    await h.engine.handleTurnEnded('ws', actor)
+    const checking = await h.row()
+    const judge1 = h.caller(checking.execution.judge!)
+    assert.equal((await h.engine.handleJudgeClaim('ws', checking.execution.nodeToken, 'NEED_CONTEXT', 'need the approved ticket decision', judge1)).ok, true)
+    const blocked = await h.row()
+    assert.equal(blocked.run.status, 'blocked')
+
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, 'Ticket explicitly approves this behavior.', 'manager', 'judge', true)).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.run.status, 'running')
+    assert.equal(resumed.execution.claim?.id, checking.execution.claim?.id)
+    assert.ok(!('skipCompact' in (resumed.execution.resolution ?? {})), 'judge 目标不留跳过痕')
+  } finally { h.close() }
+})
+
 test('a concurrent BLOCK after boundary preparation persists prevents the stale Host Queue send', async () => {
   const h = harness(configWithWorker('work', 'continuable'))
   const entered = Promise.withResolvers<void>()

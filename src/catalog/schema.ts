@@ -29,6 +29,8 @@ const roleDefinition = z
     // #60: node | continuable；省略由 validateAndNormalize 归一化为 `node`。
     // 非法取值在这里被拒（strict + enum），只阻塞声明它的那个 catalog 文件。
     reuse: z.enum(ROLE_REUSE_MODES).optional(),
+    // #198: 复用前压缩开关；省略由 validateAndNormalize 归一化为 `true`。
+    compactBeforeReuse: z.boolean().optional(),
     tools: z
       .object({
         deny: z.array(nonEmptyTrimmed).min(1),

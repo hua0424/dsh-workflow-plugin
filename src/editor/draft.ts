@@ -12,7 +12,7 @@
  */
 import { stringify } from 'yaml'
 import type { BuiltinProgramNode, ChildWorkflowNode, RoleDefinition, RoleModel, RoleReuseMode, Target, WorkflowConfig, WorkflowDef } from '../types.ts'
-import { ID_PATTERN, LIMITS, nodeOnReturn, nodeResults, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, roleReuseMode, WorkflowError } from '../types.ts'
+import { ID_PATTERN, LIMITS, compactBeforeReuse, nodeOnReturn, nodeResults, RESERVED_ROLE_KEYS, ROLE_REUSE_MODES, roleReuseMode, WorkflowError } from '../types.ts'
 import { parseCatalogConfig } from '../catalog/parse.ts'
 import { parseWorkflowConfig } from '../catalog/schema.ts'
 import { BUILTIN_CHECKER_IDS, validateAndNormalize } from '../catalog/validate.ts'
@@ -316,6 +316,8 @@ export interface NewRoleFields {
   persona: string
   model?: RoleModelInput
   reuse?: RoleReuseMode
+  /** #198：复用前压缩开关；省略 = 开启（不写多余键）。 */
+  compactBeforeReuse?: boolean
   deny?: string[]
 }
 
@@ -331,12 +333,17 @@ export function addRole(session: DraftSession, key: string, fields: NewRoleField
   if (fields.reuse !== undefined && !(ROLE_REUSE_MODES as readonly string[]).includes(fields.reuse)) {
     return { ok: false, reason: `角色 reuse 非法：仅支持 ${ROLE_REUSE_MODES.join('/')}（省略 = node）` }
   }
+  if (fields.compactBeforeReuse !== undefined && typeof fields.compactBeforeReuse !== 'boolean') {
+    return { ok: false, reason: '角色 compactBeforeReuse 非法：仅支持布尔值（省略 = 开启）' }
+  }
   const deny = normalizeDenyInput(fields.deny)
   if (!deny.ok) return deny
   pushHistory(session)
   const role: RoleDefinition = { persona }
   if (model.value !== undefined) role.model = model.value
   if (fields.reuse !== undefined) role.reuse = fields.reuse
+  // #198：开启是缺省，不写多余键（与 setRoleReuse 的 node 省略归一对称）。
+  if (fields.compactBeforeReuse === false) role.compactBeforeReuse = false
   if (deny.value !== undefined) role.tools = { deny: deny.value }
   session.draft.config.roles[key] = role
   session.draft.dirtyBusiness = true
@@ -370,6 +377,20 @@ export function setRoleModel(session: DraftSession, key: string, model: RoleMode
   return { ok: true }
 }
 
+/** 设置角色复用前压缩开关（开启省略归一：缺省即开启，不写多余键）。 */
+export function setRoleCompactBeforeReuse(session: DraftSession, key: string, compact: boolean): RoleEditResult {
+  const role = session.draft.config.roles[key]
+  if (role === undefined) return { ok: false, reason: `角色 "${key}" 不存在` }
+  if (typeof compact !== 'boolean') {
+    return { ok: false, reason: '角色 compactBeforeReuse 非法：仅支持布尔值' }
+  }
+  if (compactBeforeReuse(role) === compact) return { ok: true }
+  pushHistory(session)
+  if (compact) delete role.compactBeforeReuse
+  else role.compactBeforeReuse = false
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
 /** 设置角色复用粒度（node 省略归一：缺省即 node，不写多余键）。 */
 export function setRoleReuse(session: DraftSession, key: string, reuse: RoleReuseMode): RoleEditResult {
   const role = session.draft.config.roles[key]
