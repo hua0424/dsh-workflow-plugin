@@ -11,7 +11,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { runArtifactsDir, runMaterialsSection, SUBMISSION_CONSTRAINT } from '../src/engine/texts.ts'
+import { runArtifactsDir, runMaterialsSection, MANAGER_SUBMISSION_CONSTRAINT, SUBMISSION_CONSTRAINT } from '../src/engine/texts.ts'
 import { compressDispatchToHandoff } from '../src/judge/projection.ts'
 import { renderJudgePrompt } from '../src/judge/checker.ts'
 import { runMaterialsSection as hostSection } from '../src/engine/texts.ts'
@@ -103,9 +103,10 @@ test('Manager 与 Actor 派发文本都附带绑定 workspace 算出的材料目
       assert.match(text, /\[run-materials\]/)
       assert.ok(text.includes(`dir: ws/.dsh/.dsh-workflow/runs/${runId}/`))
       assert.ok(!text.includes(h.home), '不得用 cwd 猜测目录')
-      // 固定后缀仍在末尾：投影剥离不受影响。
-      assert.ok(text.endsWith(SUBMISSION_CONSTRAINT))
     }
+    // 固定后缀仍在末尾：投影剥离不受影响（manager 用去 Actor 视角的变体）。
+    for (const text of h.managerTexts) assert.ok(text.endsWith(MANAGER_SUBMISSION_CONSTRAINT))
+    for (const text of h.actorTexts) assert.ok(text.endsWith(SUBMISSION_CONSTRAINT))
   } finally { h.close() }
 })
 

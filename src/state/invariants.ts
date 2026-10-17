@@ -36,6 +36,8 @@ const executionSchema = z.object({
   boundary: z.object({ dispatchedAt: revision, managerFromSeq: revision, executorSessionId: text.optional(), executorDispatchMessageId: text.optional() }).strict().optional(),
   dispatch: dispatch.optional(), claim: claim.optional(), previousClaim: claim.optional(),
   judge: judge.optional(), previousJudge: judge.optional(),
+  // Issue #200：Judge 有界自动重试 1 次的消费标记（旧行无该键 = 未重试）。
+  judgeAutoRetried: z.boolean().optional(),
   judgment: z.object({
     result: z.enum(['ACCEPT', 'REJECT', 'NEED_CONTEXT']), reason: z.string().trim().min(1).max(LIMITS.reasonMax),
     claimId: text, judgeDispatchId: text, judgeSessionId: text, inputVersion: revision,

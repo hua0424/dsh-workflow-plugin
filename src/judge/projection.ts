@@ -12,7 +12,7 @@
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import { isAppendSurfaceEvent, deriveEventMessage } from '@deepseek-ai/dsh-session'
 import type { NodeContextBoundary } from '../types.ts'
-import { SUBMISSION_CONSTRAINT } from '../engine/texts.ts'
+import { SUBMISSION_CONSTRAINT_VARIANTS } from '../engine/texts.ts'
 import { isWorkflowDispatchSource } from '../message-sources.ts'
 
 /** Max projected transcript length in characters (defensive bound, #45 P3 保留). */
@@ -109,10 +109,14 @@ export function projectSessionSurface(session: ProjectionSource, fromSeq: number
  * A3 R1/AC6: the engine's fixed submission constraint is injected into the
  * dispatch text but must never reach the Judge. Strip the exact fixed suffix
  * (instruction/handoff/resolution原文 are preserved verbatim).
+ * Issue #200（并入原 #204）：派发按 handler 分 actor/manager 变体，剥离按变体
+ * 集合匹配——先匹配更长的 actor 变体，再匹配 manager 变体。
  */
 function stripSubmissionConstraint(text: string): string {
-  if (!text.endsWith(SUBMISSION_CONSTRAINT.trim())) return text
-  return text.slice(0, text.length - SUBMISSION_CONSTRAINT.trim().length)
+  for (const variant of SUBMISSION_CONSTRAINT_VARIANTS) {
+    if (text.endsWith(variant.trim())) return text.slice(0, text.length - variant.trim().length)
+  }
+  return text
 }
 
 /**
