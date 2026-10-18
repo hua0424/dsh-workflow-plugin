@@ -366,7 +366,8 @@ export function apply(ctx: Context) {
     async init(options: InitOptions) {
       return runInitIntoHome(options)
     },
-    async reset(agent, workspaceKey, mode) {      const diagnostic = stateAccess.maintenanceDiagnostic()
+    async reset(agent, workspaceKey, mode) {
+      const diagnostic = stateAccess.maintenanceDiagnostic()
       if (diagnostic) {
         if (mode !== 'incompatible-store') return { ok: false, reason: maintenanceText(diagnostic) }
         if (!isRootCommandAgent(agent)) return { ok: false, reason: 'incompatible-store cutover is root-command-only; subagent/diagnostic Sessions are not authorized' }

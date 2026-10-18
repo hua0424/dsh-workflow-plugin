@@ -97,6 +97,29 @@ describe('runInit', () => {
     assert.match(result.text, /OK cordis\.patch\.yml/)
   })
 
+  it('preset --force：嵌套声明差异覆盖后内置行与用户行的 !!js 标签都不丢', () => {
+    writeFileSync(join(home, 'cordis.patch.yml'),
+      '- name: user-plugin\n  config:\n    flag: !!js process.platform === \'linux\'\n'
+      + '- insert:\n    - id: preset-manager\n      name: old\n', 'utf8')
+    const result = runInit(home, SOURCES, { full: false, force: true, dryRun: false })
+    assert.equal(result.ok, true)
+    assert.match(result.text, /overwritten cordis\.patch\.yml/)
+    const text = readFileSync(join(home, 'cordis.patch.yml'), 'utf8')
+    assert.match(text, /user-plugin/)
+    assert.match(text, /flag: !!js process\.platform === 'linux'/)
+    assert.match(text, /disabled: !!js process\.platform === 'win32'/)
+    assert.match(result.text, /OK cordis\.patch\.yml/)
+  })
+
+  it('preset --force：顶层单声明替换同样保 tag', () => {
+    writeFileSync(join(home, 'cordis.patch.yml'), '- id: preset-manager\n  name: old\n', 'utf8')
+    const result = runInit(home, SOURCES, { full: false, force: true, dryRun: false })
+    assert.equal(result.ok, true)
+    const text = readFileSync(join(home, 'cordis.patch.yml'), 'utf8')
+    assert.match(text, /disabled: !!js process\.platform === 'win32'/)
+    assert.match(result.text, /OK cordis\.patch\.yml/)
+  })
+
   it('遗留模板不可装：源目录扫描不到 workflow-template', () => {
     const ids = SOURCES.workflows.map(item => item.id)
     assert.equal(ids.includes('workflow-template'), false)

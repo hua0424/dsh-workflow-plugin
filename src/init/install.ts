@@ -13,7 +13,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join, basename } from 'node:path'
-import { parseDocument, stringify as yamlStringify } from 'yaml'
+import { parseDocument, YAMLMap, YAMLSeq, type ParsedNode } from 'yaml'
 import { CATALOG_DIR_NAME, ID_PATTERN } from '../types.ts'
 import { parseCatalogConfig } from '../catalog/parse.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
@@ -243,9 +243,8 @@ function applyPreset(home: string, presetSourceText: string, force: boolean, dry
   if (problem !== undefined || !Array.isArray(ours) || ours.length === 0) {
     return { outcome: { status: 'error', reason: `内置 preset 资源结构异常：${problem ?? '空列表'}` }, mergedText: undefined }
   }
-  const ourRow = (ours as unknown[])[0]
   // 源声明行与已安装声明行必须同层比较：源本身也经 findPresetRows 定位
-  //（源是 `- insert:` 包裹形状时 ourRow 是外壳，直接比较会永不等）。
+  //（源是 `- insert:` 包裹形状时顶层首行是外壳，直接比较会永不等）。
   const ourRefs = findPresetRows(ours)
   if (ourRefs.length !== 1) {
     return { outcome: { status: 'error', reason: '内置 preset 资源中 preset-manager 声明不是恰好一处' }, mergedText: undefined }
@@ -297,28 +296,42 @@ function applyPreset(home: string, presetSourceText: string, force: boolean, dry
       : { outcome: { status: 'skipped-differs', hint }, mergedText: currentText }
   }
   if (dryRun) return { outcome: { status: 'dry-run-write' }, mergedText: currentText }
-  // --force：备份原文件后重写（只替换同 id 声明，其余行保留；YAML round-trip
-  // 可能丢失原注释，备份即回退路径）。
+  // --force：备份原文件后在 Document AST 上替换同 id 声明，其余节点原样保留
+  //（toJS()+stringify 重写会丢 !!js 等自定义标签与注释，备份即回退路径）。
   const backup = backupPath(target)
   writeFileSync(backup, currentText, 'utf8')
-  let merged: string
-  if (refs.length === 1 && refs[0]!.kind === 'top') {
-    merged = yamlStringify(rows.map((row, index) => (index === refs[0]!.index ? ourRow : row)))
-  } else {
-    const kept: unknown[] = []
-    rows.forEach((row, index) => {
-      if (refs.some(ref => ref.kind === 'top' && ref.index === index)) return
-      if (typeof row === 'object' && row !== null && Array.isArray((row as Record<string, unknown>)['insert'])) {
-        const record = row as unknown as { insert: unknown[] }
-        kept.push({ ...(row as Record<string, unknown>), insert: record.insert.filter(item =>
-          typeof item !== 'object' || item === null || (item as Record<string, unknown>)['id'] !== PRESET_ROW_ID) })
-        return
-      }
-      kept.push(row)
-    })
-    kept.push(ourRow)
-    merged = yamlStringify(kept)
+  const currentDoc = parseDocument(currentText)
+  const docSeq = currentDoc.contents
+  const ourDocSeq = parseDocument(presetSourceText).contents
+  if (!(docSeq instanceof YAMLSeq) || !(ourDocSeq instanceof YAMLSeq) || ourDocSeq.items.length === 0) {
+    return { outcome: { status: 'error', reason: `${target} 文档结构异常，未改动目标文件（原文件已备份到 ${backup}）` }, mergedText: undefined }
   }
+  const ourNode = ourDocSeq.items[0] as ParsedNode
+  if (refs.length === 1 && refs[0]!.kind === 'top') {
+    docSeq.items[refs[0]!.index] = ourNode.clone() as ParsedNode
+  } else {
+    // 先删容器内嵌套声明（不影响顶层下标），再倒序删顶层行，最后追加内置声明。
+    const nestedByContainer = new Map<number, number[]>()
+    for (const ref of refs) {
+      if (ref.kind !== 'insert') continue
+      const list = nestedByContainer.get(ref.container!)
+      if (list === undefined) nestedByContainer.set(ref.container!, [ref.index])
+      else list.push(ref.index)
+    }
+    for (const [containerIndex, nestedIndexes] of nestedByContainer) {
+      const container = docSeq.items[containerIndex]
+      const insert = container instanceof YAMLMap ? container.get('insert', true) : undefined
+      if (!(insert instanceof YAMLSeq)) {
+        return { outcome: { status: 'error', reason: `${target} 文档结构异常，未改动目标文件（原文件已备份到 ${backup}）` }, mergedText: undefined }
+      }
+      for (const nestedIndex of [...nestedIndexes].sort((a, b) => b - a)) insert.items.splice(nestedIndex, 1)
+    }
+    for (const topIndex of refs.filter(ref => ref.kind === 'top').map(ref => ref.index).sort((a, b) => b - a)) {
+      docSeq.items.splice(topIndex, 1)
+    }
+    docSeq.items.push(ourNode.clone() as ParsedNode)
+  }
+  const merged = currentDoc.toString()
   writeFileSync(target, merged, 'utf8')
   return { outcome: { status: 'overwritten', backup }, mergedText: merged }
 }

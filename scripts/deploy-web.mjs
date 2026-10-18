@@ -19,6 +19,7 @@ import { cpSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } fr
 import { join, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { FULL_WORKFLOW_IDS } from '../src/init/install.ts'
 
 /** 从仓库 package.json 选取 bundle 需要的字段；宿主包出现在 dependencies 即拒绝。 */
 export function bundlePackageJson(pkg) {
@@ -39,15 +40,10 @@ export function bundlePackageJson(pkg) {
   }
 }
 
-/** #209：一键安装的生产模板 id（与 `src/init/install.ts` 的 FULL_WORKFLOW_IDS 同源；
+/** #209：一键安装的生产模板 id（`src/init/install.ts` FULL_WORKFLOW_IDS 的单源引用；
  * 部署时从 `docs/example/<id>.yaml` 逐字 vendors 进 bundle `resources/workflows/`，
  * 遗留模板 workflow-template 与组合示例不在此列）。 */
-export const INIT_WORKFLOW_IDS = [
-  'coding-workflow-rapid',
-  'coding-workflow',
-  'coding-workflow-single',
-  'coding-workflow-rapid-multi',
-]
+export const INIT_WORKFLOW_IDS = [...FULL_WORKFLOW_IDS]
 
 /** 把 repoRoot 的构建产物与方法返回的元数据写进 target；返回写出的 manifest。 */
 export function deployBundle({ repoRoot, target }) {
