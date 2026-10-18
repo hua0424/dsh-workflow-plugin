@@ -10,6 +10,7 @@ import type { CommandDefinition, CommandResult } from '@deepseek-ai/dsh-commands
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
 import { boundContextSummary, createUserMessage } from '@deepseek-ai/dsh-llm'
+import { parseInitArgs, type InitOptions } from '../init/install.ts'
 import { workflowNoticeSource } from '../message-sources.ts'
 // Type-only：解析 ctx.get('sessionProjections')。#85 读宿主 UI 用的同一个 blank bit；
 // 服务缺席（未挂 session-controller 的宿主）时激活降级为 seq 启发式。
@@ -25,6 +26,11 @@ export interface CommandHost {
   reset(agent: Agent, workspaceKey: string | undefined, mode: 'compatible' | 'incompatible-store'): Promise<{ ok: boolean; reason?: string; message?: string }>
   /** provider 注册 + modelId 本地列表 + reasoningEffort 档位静态检查：逐角色报告，永不阻断加载。 */
   check(workflowId: string): Promise<{ ok: boolean; reason?: string; message?: string }>
+  /**
+   * #209：一键安装（最小集默认，--full 全量）。对话内命令不支持 --home，
+   * 永远装进当前 DSH home；ok=false 时 text 即报告正文（含校验问题）。
+   */
+  init(options: InitOptions): Promise<{ ok: boolean; text: string }>
 }
 
 export function isRootCommandAgent(agent: Agent): boolean {
@@ -122,13 +128,14 @@ const USAGE = `用法：
 /dsh-flow status                      查看当前 workspace 的 Run 状态
 /dsh-flow reset                       终止当前 workspace 的活动 Run（不取消外部动作）
 /dsh-flow reset --incompatible-store  备份并退出整个不兼容 State Store
-/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表 + 思考档位（只报告，不阻断）`
+/dsh-flow check <workflow-id>         静态检查各角色 provider 注册 + modelId 本地列表 + 思考档位（只报告，不阻断）
+/dsh-flow init [--full] [--force] [--dry-run]  一键安装通用 Manager preset + 默认工作流（最小集默认；--full 全量）`
 
 export function makeDshFlowCommand(host: CommandHost, activate?: SessionActivator): CommandDefinition {
   const command: CommandDefinition = {
     name: 'dsh-flow',
-    description: 'Agent-team workflow 控制：list / start / status / reset / check',
-    input: { hint: 'list | start <workflow-id> [text] | status | reset | check <workflow-id>' },
+    description: 'Agent-team workflow 控制：list / start / status / reset / check / init',
+    input: { hint: 'list | start <workflow-id> [text] | status | reset | check <workflow-id> | init [--full] [--force] [--dry-run]' },
     recordInput: true,
     async handler(invocation) {
       const raw = invocation.rawInput.trim()
@@ -189,6 +196,17 @@ export function makeDshFlowCommand(host: CommandHost, activate?: SessionActivato
           const outcome = await host.check(workflowId)
           if (!outcome.ok) return { kind: 'error', text: `check 失败：${outcome.reason ?? '未知错误'}` }
           return { kind: 'success', text: outcome.message ?? 'check done' }
+        }
+        case 'init': {
+          // #209：对话内命令不支持 --home（永远装进当前 DSH home），要装别处用仓库侧脚本。
+          if (rest.includes('--home')) {
+            return { kind: 'error', text: `对话内 init 不支持 --home（只装进当前 DSH home）；要指定目录请用仓库侧脚本 node scripts/dsh-workflow-init.mjs --home <目录>；${USAGE}` }
+          }
+          const parsed = parseInitArgs(rest)
+          if (parsed.error !== undefined) return { kind: 'error', text: `${parsed.error}` }
+          if (parsed.help === true) return { kind: 'success', text: `/dsh-flow init [--full] [--force] [--dry-run]\n缺省安装最小集与通用 Manager preset；--full 全量；--force 备份后覆盖；--dry-run 只报告不写入。` }
+          const outcome = await host.init(parsed.options)
+          return outcome.ok ? { kind: 'success', text: outcome.text } : { kind: 'error', text: outcome.text }
         }
         default:
           return { kind: 'error', text: `未知子命令 "${verb}"；${USAGE}` }

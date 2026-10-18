@@ -39,6 +39,16 @@ export function bundlePackageJson(pkg) {
   }
 }
 
+/** #209：一键安装的生产模板 id（与 `src/init/install.ts` 的 FULL_WORKFLOW_IDS 同源；
+ * 部署时从 `docs/example/<id>.yaml` 逐字 vendors 进 bundle `resources/workflows/`，
+ * 遗留模板 workflow-template 与组合示例不在此列）。 */
+export const INIT_WORKFLOW_IDS = [
+  'coding-workflow-rapid',
+  'coding-workflow',
+  'coding-workflow-single',
+  'coding-workflow-rapid-multi',
+]
+
 /** 把 repoRoot 的构建产物与方法返回的元数据写进 target；返回写出的 manifest。 */
 export function deployBundle({ repoRoot, target }) {
   if (!existsSync(join(repoRoot, 'lib', 'index.js'))) {
@@ -59,6 +69,20 @@ export function deployBundle({ repoRoot, target }) {
     cpSync(clientDist, join(target, 'web-client', 'dist', 'client.js'))
   }
   writeFileSync(join(target, 'cordis.patch.yml'), readFileSync(join(repoRoot, 'cordis.patch.yml'), 'utf8'), 'utf8')
+  // #209：一键安装的内置资源随 bundle 携带（bundle 布局优先，见 resolveInitSources）。
+  const presetSrc = join(repoRoot, 'resources', 'preset-manager.patch.yml')
+  if (!existsSync(presetSrc)) {
+    throw new Error('resources/preset-manager.patch.yml missing — cannot ship init resources')
+  }
+  mkdirSync(join(target, 'resources', 'workflows'), { recursive: true })
+  cpSync(presetSrc, join(target, 'resources', 'preset-manager.patch.yml'))
+  for (const id of INIT_WORKFLOW_IDS) {
+    const src = join(repoRoot, 'docs', 'example', `${id}.yaml`)
+    if (!existsSync(src)) {
+      throw new Error(`docs/example/${id}.yaml missing — cannot ship init resources`)
+    }
+    cpSync(src, join(target, 'resources', 'workflows', `${id}.yaml`))
+  }
   writeFileSync(join(target, 'package.json'), JSON.stringify(manifest, null, 2) + '\n', 'utf8')
   return { target, manifest }
 }

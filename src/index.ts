@@ -9,6 +9,9 @@ import { Context } from '@deepseek-ai/cordis'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionId } from '@deepseek-ai/dsh-session'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { resolveInitSources, runInit, type InitOptions } from './init/install.ts'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
 import { endedSessionUserMessageIds, endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { turnEndFailure, type TurnEndFact } from './plugin/turn-end.ts'
@@ -36,6 +39,18 @@ export const inject = ['commands', 'tools', 'subagents', 'agents', 'sessions', '
 
 export function apply(ctx: Context) {
   const home = resolveDshHome()
+  // #209：插件根 = 构建产物 lib/ 的上一级（部署 bundle 根）或源码 src/ 的上一级
+  // （仓库根）；resolveInitSources 两种布局都认（bundle 优先），薄封装与命令同源。
+  const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
+  const runInitIntoHome = (options: InitOptions): { ok: boolean; text: string } => {
+    let sources: ReturnType<typeof resolveInitSources>
+    try {
+      sources = resolveInitSources(pluginRoot)
+    } catch (error) {
+      return { ok: false, text: `初始化资源缺失，未写入：${String(error)}` }
+    }
+    return runInit(home, sources, options)
+  }
   const stateAccess = new StateAccess(home)
   const store = () => stateAccess.current()
   ctx.effect(() => () => stateAccess.close())
@@ -348,8 +363,10 @@ export function apply(ctx: Context) {
         return { ok: false, reason: String(error) }
       }
     },
-    async reset(agent, workspaceKey, mode) {
-      const diagnostic = stateAccess.maintenanceDiagnostic()
+    async init(options: InitOptions) {
+      return runInitIntoHome(options)
+    },
+    async reset(agent, workspaceKey, mode) {      const diagnostic = stateAccess.maintenanceDiagnostic()
       if (diagnostic) {
         if (mode !== 'incompatible-store') return { ok: false, reason: maintenanceText(diagnostic) }
         if (!isRootCommandAgent(agent)) return { ok: false, reason: 'incompatible-store cutover is root-command-only; subagent/diagnostic Sessions are not authorized' }
