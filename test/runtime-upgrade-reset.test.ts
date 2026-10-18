@@ -306,6 +306,7 @@ test('plain reset command passes the invoking Agent and compatible mode to Comma
     start: async () => ({ ok: false }),
     status: async () => ({ ok: false }),
     reset: async (...args: unknown[]) => { calls.push(args); return { ok: true, message: 'terminated' } },
+    init: async () => ({ ok: true, text: '' }),
   }
   const agent = { session: { id: 'manager', header: {} } }
   const result = await makeDshFlowCommand(host).handler({ commandId: 'x' as never, agent: agent as never, rawInput: 'reset', attachments: [], signal: new AbortController().signal })
@@ -532,6 +533,7 @@ test('incompatible reset flag is strict and only root command Agents qualify for
     currentWorkspaceKey: async () => 'ws', list: async () => ({ entries: [], diagnostics: [] }),
     start: async () => ({ ok: false }), status: async () => ({ ok: false }),
     reset: async (...args: unknown[]) => { calls.push(args); return { ok: true } },
+    init: async () => ({ ok: true, text: '' }),
   }
   const root = { session: { id: 'root', header: {} } }
   const child = { session: { id: 'child', header: { parentSession: 'root' } } }

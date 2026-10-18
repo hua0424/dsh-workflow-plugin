@@ -360,6 +360,7 @@ function makeCommandHost(overrides: Partial<CommandHost> = {}): CommandHost {
     start: async (_agent, _ws, workflowId, extra) => ({ ok: true, message: `started ${workflowId} [${extra}]` }),
     status: async () => ({ ok: true, status: { status: 'running' } }),
     reset: async () => ({ ok: true, message: 'removed' }),
+    init: async () => ({ ok: true, text: '完成。' }),
     ...overrides,
   }
 }
@@ -427,6 +428,32 @@ test('dsh-flow unknown verb returns usage', async () => {
   const result = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'frobnicate', attachments: [], signal: new AbortController().signal })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /未知子命令/)
+})
+
+test('#209: dsh-flow init 把开关透传给 host，失败正文原样返回 error', async () => {
+  const seen: unknown[] = []
+  const cmd = makeDshFlowCommand(makeCommandHost({
+    init: async (options) => { seen.push(options); return { ok: true, text: '完成。' } },
+  }))
+  const ok = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'init --full --force', attachments: [], signal: new AbortController().signal })
+  assert.equal(ok.kind, 'success')
+  assert.deepEqual(seen, [{ full: true, force: true, dryRun: false }])
+  const bad = makeDshFlowCommand(makeCommandHost({
+    init: async () => ({ ok: false, text: 'PROBLEM x：校验失败' }),
+  }))
+  const failed = await bad.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'init', attachments: [], signal: new AbortController().signal })
+  assert.equal(failed.kind, 'error')
+  assert.match(failed.text ?? '', /PROBLEM/)
+})
+
+test('#209: dsh-flow init 拒绝 --home 与未知参数', async () => {
+  const cmd = makeDshFlowCommand(makeCommandHost())
+  const home = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'init --home /tmp/x', attachments: [], signal: new AbortController().signal })
+  assert.equal(home.kind, 'error')
+  assert.match(home.text, /不支持 --home/)
+  const bogus = await cmd.handler({ commandId: 'x' as never, agent: {} as never, rawInput: 'init --bogus', attachments: [], signal: new AbortController().signal })
+  assert.equal(bogus.kind, 'error')
+  assert.match(bogus.text, /未知参数/)
 })
 
 // ---- #85 blank-session activation ----

@@ -10,7 +10,7 @@ pnpm run typecheck     # node node_modules/typescript/bin/tsc -p tsconfig.json -
 pnpm run test:suite    # node --test --test-isolation=none "test/*.test.ts"（受限环境等价全量入口）
 pnpm test              # 同一全量套件，标准按文件隔离子进程写法（Node 22.x 无法用 --test-isolation 时用它）
 pnpm run test:smoke    # 统一受控 smoke 入口 = scripts/t3-smoke.mjs && scripts/e2e-smoke.mjs
-pnpm run test:real-host  # node test/runtime-real-host.test.ts（exact 0.1.5-rc.2 真实 Host，单文件直跑；与受控 smoke 分开报告）
+pnpm run test:real-host  # node test/runtime-real-host.test.ts（exact 0.2.0-rc.2 真实 Host，单文件直跑；与受控 smoke 分开报告）
 ```
 
 两套受控 smoke 的分工（合起来才是完整受控闭环，任一单独跑都不完整）：
@@ -39,7 +39,7 @@ pnpm run test:real-host  # node test/runtime-real-host.test.ts（exact 0.1.5-rc.
 | Actor tail、精确 message 来源、旧 dispatch/Turn、重复 claim、claim/BLOCK 竞争 | `runtime-work-order.test.ts`: `Actor tail and stale turn-end...`、`same Role across visits...old dispatch cannot claim`；`runtime-store-safety.test.ts`: Manager Actor exact message、BLOCK event rollback、sibling mapping drift |
 | claim/Judgment/后继事务失败与 CAS winner | `runtime-store-safety.test.ts`: claim event retry、ACCEPT/successor rollback、competing SQLite CAS；`runtime-work-order.test.ts`: failed Actor/Judge arrangement、late preparation、concurrent BLOCK gates |
 | REJECT correction、NEED_CONTEXT、Manager 补充、Judge respawn/drain、旧 Judge 失权 | `runtime-work-order.test.ts`: REJECT、NEED_CONTEXT、supplement→REJECT、respawn、三组 drain/CAS 回归；`single-handoff.test.ts` 保留单文本材料闭环 |
-| failed→onFail 与 failed 无出口 BLOCK/reopen | `runtime-program-child-fail.test.ts`: `accepted Actor FAIL without onFail reopens...`；`scripts/e2e-smoke.mjs` 覆盖 failed onFail 自环、同 Role 新 visit |
+| failed→onFail 与 failed 无出口 BLOCK/reopen | `runtime-program-child-fail.test.ts`: `Program FAIL routes its explicit handoff through the FAIL result target without a Judge`、`explicit Program retry rotates invocation identity and ignores the late first result`；`scripts/e2e-smoke.mjs` 覆盖 failed onFail 自环、同 Role 新 visit |
 | restart、无 interrupted 记录、dispatch 回执丢失、Role/Judge cold 恢复 | `runtime-work-order.test.ts` 的 17 项 recovery 组：working reopen、unknown/missing Session、settled/unsettled claim、Judge followup/fresh、前驱安全收口、多 workspace CAS |
 | Role Session 复用、首次/新 visit compact、同 execution 不 compact、busy/failure/Queue 窗口 | `runtime-work-order.test.ts`: Role reuse/compact、correction、compact failure retry、prepared-before-Queue、并发 BLOCK；`host-compact.test.ts` 覆盖真实 Host Adapter 的 compact 与 availability |
 | model override active/idle/replacement/route validation | `runtime-program-child-fail.test.ts`: `model override safely replaces one blocked Role once...`；`tools.test.ts` 覆盖工具 schema/路由；Runtime 使用 `normalizeModelRoute` |

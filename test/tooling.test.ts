@@ -16,8 +16,9 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
 import { StateStore } from '../src/state/store.ts'
+import { resolveInitSources } from '../src/init/install.ts'
 import { inspectStateDb, parseDiagnosticArgs } from '../scripts/check-state-rows.mjs'
-import { bundlePackageJson, deployBundle, parseDeployArgs } from '../scripts/deploy-web.mjs'
+import { bundlePackageJson, deployBundle, INIT_WORKFLOW_IDS, parseDeployArgs } from '../scripts/deploy-web.mjs'
 
 const repoRoot = fileURLToPath(new URL('..', import.meta.url))
 const repoPackage = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8'))
@@ -122,6 +123,15 @@ test('#101 隔离 bundle：deployBundle 只写隔离目标，产物版本/依赖
     // dsh.client 声明要求随部署携带 ./client bundle（宿主扫描 fail-loud，此处同语义）。
     mkdirSync(join(fakeRepo, 'web-client', 'dist'), { recursive: true })
     writeFileSync(join(fakeRepo, 'web-client', 'dist', 'client.js'), '/* stub client */\n')
+    // #209：一键安装的内置资源随 bundle 携带（用仓库真文件，保证可解析可安装）。
+    mkdirSync(join(fakeRepo, 'resources'), { recursive: true })
+    writeFileSync(join(fakeRepo, 'resources', 'preset-manager.patch.yml'),
+      readFileSync(join(repoRoot, 'resources', 'preset-manager.patch.yml'), 'utf8'))
+    mkdirSync(join(fakeRepo, 'docs', 'example'), { recursive: true })
+    for (const id of INIT_WORKFLOW_IDS) {
+      writeFileSync(join(fakeRepo, 'docs', 'example', `${id}.yaml`),
+        readFileSync(join(repoRoot, 'docs', 'example', `${id}.yaml`), 'utf8'))
+    }
     const target = join(dir, 'isolated-bundle')
     const { manifest } = deployBundle({ repoRoot: fakeRepo, target })
     const written = JSON.parse(readFileSync(join(target, 'package.json'), 'utf8'))
@@ -132,6 +142,13 @@ test('#101 隔离 bundle：deployBundle 只写隔离目标，产物版本/依赖
     assert.equal(existsSync(join(target, 'lib', 'nested', 'x.js')), true)
     assert.equal(existsSync(join(target, 'web-client', 'dist', 'client.js')), true, 'dsh.client 声明时客户端 bundle 必须随部署写出')
     assert.match(readFileSync(join(target, 'cordis.patch.yml'), 'utf8'), /dsh-agent-team-workflow/)
+    // #209：隔离 bundle 内的安装源可解析（bundle 布局优先，不碰真实用户目录）。
+    const bundleSources = resolveInitSources(target)
+    assert.deepEqual(bundleSources.workflows.map(item => item.id).sort(), [...INIT_WORKFLOW_IDS].sort())
+    assert.match(readFileSync(bundleSources.presetFile, 'utf8'), /preset-manager/)
+    // #209：缺内置资源时 fail-closed（与 client bundle 缺失同语义）。
+    rmSync(join(fakeRepo, 'resources'), { recursive: true, force: true })
+    assert.throws(() => deployBundle({ repoRoot: fakeRepo, target: join(dir, 'no-resources') }), /preset-manager\.patch\.yml missing/)
     assert.throws(() => deployBundle({ repoRoot: join(dir, 'empty'), target }), /lib\/index\.js missing/)
     // 声明了 dsh.client 但 bundle 缺失：fail-closed，与宿主激活扫描同语义。
     rmSync(join(fakeRepo, 'web-client'), { recursive: true, force: true })

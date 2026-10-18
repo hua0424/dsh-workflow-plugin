@@ -1,0 +1,74 @@
+# 通用 Manager preset（`dsh-workflow-init` 一键安装的内置资源）。
+#
+# 这是一个标准的 `@deepseek-ai/dsh-agent-preset` 声明行：所有子行引用的都是宿主
+# 已出货的包（与 web bundle `presets/standard.patch.yml` 同名同 shape），不引用
+# 未经验证的解析语义。工作流命令（/dsh-flow）与工作流工具由 profile 层插件提供，
+# 不在这里重复声明；本 preset 只保证 Manager 会话有分派所需的最小面：
+# persona/说明、shell 与文件只读面、任务与提问工具，以及分派 Role Actor 用的
+# subagent spawn/fork（continuable，与 `reuse: continuable` 的跨节点复用一致）。
+# 用户后续在 home patch 里改动本声明（改名/加工具）不受安装影响：同 id 已存在
+# 且内容不同时安装默认跳过并提示差异，`--force` 才备份后覆盖。
+- insert:
+    - id: preset-manager
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: manager
+        name: 团队工作流 Manager（通用）
+        description: 运行 dsh-agent-team-workflow 的通用 Manager 会话面（分派 Role Actor + 基础工具）。
+        order: 2
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              suffix: Your working directory is {{cwd}}.
+              prefix: You are a team-workflow Manager coordinating role subagents.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelectionSettings: true
+                  backgroundMode: continuable
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+                  backgroundMode: continuable
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
