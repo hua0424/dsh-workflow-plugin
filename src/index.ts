@@ -25,6 +25,7 @@ import { authorizeToolCall } from './tools/authz.ts'
 import { installEditorRpc } from './editor/rpc.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, managerRouteOf, programHost, type HostAdapters } from './plugin/host.ts'
+import { RolePresetBook } from './plugin/presets.ts'
 import {
   judgeAdmissionInWorkOrder, makeParticipantIndex, participantInWorkOrder, participantServicesOf,
   type WorkOrderFacts,
@@ -165,7 +166,9 @@ export function apply(ctx: Context) {
   // #100：HostAdapters 只保留适配层真正读取的 Seam（cwd 由 engine.cwdResolver 提供）；
   // Program 执行不依赖 Host，直接用常量 programHost。#118 D-91-2：旧 Run 兜底回调
   // 已裁掉——无 `delegationRoute` 的行读取侧显式落空（host.ts routeOf）。
-  const adapters: HostAdapters = { ctx, managerAgentOf: managerOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession }
+  // #216：动态 Agent Preset 台账（persona/deny 组装），随 Run 生命周期注销。
+  const presetBook = new RolePresetBook()
+  const adapters: HostAdapters = { ctx, managerAgentOf: managerOf, registerJudgeSession, revokeJudgeSession, registerRoleActorSession, presets: presetBook }
   const subagentHost = makeSubagentHost(adapters, participants)
   const engine: WorkflowEngine = new WorkflowEngine(
     makeDispatchTargets(adapters),
@@ -187,6 +190,10 @@ export function apply(ctx: Context) {
   // logger (once per run, never in a loop).
   engine.traceWarn = (message) => {
     ctx.logger.warn(message)
+  }
+  // #216：Run 终局（completed/terminated/reset）注销该 Run 的全部动态 preset。
+  engine.runClosed = (run) => {
+    void presetBook.releaseRun(ctx, run.runId).catch(error => ctx.logger.warn(`workflow preset cleanup failed: ${String(error)}`))
   }
 
   /** Resolve one session's workspace: recorded mapping first, then cwd realpath. */
@@ -451,6 +458,8 @@ export function apply(ctx: Context) {
     disposeCommand()
     for (const dispose of disposeTools) dispose()
     for (const dispose of disposeEditorRpcFns.splice(0)) dispose()
+    // #216：插件卸载注销全部动态 preset（best-effort）。
+    void presetBook.releaseAll(ctx).catch(() => {})
   })
 
   // ---- Host restart reconciliation (design §4.2 H1) ----

@@ -114,6 +114,8 @@ export class WorkflowEngine {
   actorActivity: (sessionId: string) => Promise<'active' | 'idle' | 'unknown'> = async () => 'unknown'
   managerRoute: (sessionId: string) => Promise<SpawnAgentOptions> = async () => ({})
   traceWarn: ((message: string) => void) | undefined
+  /** #216：Run 终局（completed/terminated）通知宿主适配层（动态 preset 注销等）；best-effort。 */
+  runClosed: ((run: RunState) => void) | undefined
   private readonly targets: DispatchTargets
   private readonly subagents: SubagentHost
   private readonly programs: ProgramHost
@@ -663,6 +665,8 @@ export class WorkflowEngine {
     if (released) this.trace(run, 'RELEASE', { workflow: e.workflowId, role: released.role, drained: released.drained })
     if (completedReturn !== undefined) {
       this.traceWarned.delete(run.runId)
+      // #216：Run 终局通知（动态 preset 注销等），best-effort。
+      try { this.runClosed?.(run) } catch { /* 终局通知失败不影响推进结果 */ }
       // 业务返回名逐字呈现：cancelled 之类的业务终局不被一概渲染成交付成功。
       const chain = exited === e ? '' : `；经 Child 逐层映射：${nextName}`
       const terminal = `workflow "${run.catalogWorkflowId}" 业务终局：${completedReturn}（节点结果：${name}${chain}；run ${run.runId}）。Run 状态 completed 表示执行已结束，业务返回见上；handoff 为终局工作单原文。\n\n[handoff]\n${handoff}`
@@ -1303,6 +1307,8 @@ export class WorkflowEngine {
     topFrame(row.run).nodeToken = row.execution.nodeToken
     await this.state.put(ws, row.run, row.version, [change(row.execution, 'terminated')])
     if (judgeSessionId) await this.subagents.retireJudge(row.run, judgeSessionId).catch(() => {})
+    // #216：reset 即 Run 终局，同样通知宿主释放资源（动态 preset 等）。
+    try { this.runClosed?.(row.run) } catch { /* 终局通知失败不影响 reset 结果 */ }
     this.traceWarned.delete(row.run.runId)
     return { ok: true, run: row.run, message: `${TERMINATED_REASON}; saved Run history retained` }
   }

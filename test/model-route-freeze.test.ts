@@ -2,11 +2,12 @@
  * Issue #91: 默认模型路由按 Run 冻结，消除跨 workspace 串用。
  *
  * 已确认 seam：真实 Engine + 临时 SQLite（不触真实 DSH home）+ 受控 Host
- * （捕获真实提交给 `ctx.subagents.startContinuable` 的 agentOptions）。
+ * （捕获真实提交给 `ctx.subagents.startActivation` 的 agentOptions）。
  * 冻结来源用 DSH 固定版本正式 helper `parentAgentOptionsForDelegation`。
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { RolePresetBook } from '../src/plugin/presets.ts'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -259,7 +260,7 @@ function judgeInput(run: RunState, judgeSessionId: string): JudgeSpawnInput {
 }
 
 /**
- * 真实 `makeSubagentHost` 的受控 ctx：捕获 spawn（`startContinuable`）与 compact
+ * 真实 `makeSubagentHost` 的受控 ctx：捕获 spawn（`startActivation`）与 compact
  * fallback（`agents.resume`）边界实际收到的 agentOptions，并让 Judge spawn 的
  * fail-closed 工具面断言可以通过。#118 D-91-2：host 无 legacyRoute 兜底。
  */
@@ -282,11 +283,11 @@ function realHost(
   const ctx = {
     subagents: {
       queue,
-      async startContinuable(spec: { label: string; childId?: unknown; request: { agentOptions?: { provider?: string; model?: string } } }) {
+      async startActivation(spec: { label: string; childId?: unknown; request: { agentOptions?: { provider?: string; model?: string } } }) {
         spawns.push({ label: spec.label, agentOptions: spec.request.agentOptions })
         return { childId: spec.childId === undefined ? 'child-1' : String(spec.childId), messageId: 'message-1' }
       },
-      async drainContinuableChildren() {},
+      async drainChildren() {},
     },
     agents: {
       get: (id: unknown) => (String(id) === judgeSessionId ? judgeChild : undefined),
@@ -305,6 +306,7 @@ function realHost(
     ctx,
     managerAgentOf: run => managers.get(run.managerSessionId),
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
   }
   return { host: makeSubagentHost(adapters, testParticipants(ctx)), spawns, resumes }
 }
