@@ -1,5 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { RolePresetBook, rolePresetId } from '../src/plugin/presets.ts'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
 import type { Context } from '@deepseek-ai/cordis'
@@ -67,6 +68,7 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
     ctx: { subagents: queue, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
   }
   const run = makeRun('sess-dev')
   const dispatch = makeDispatchTargets(adapters)
@@ -97,9 +99,10 @@ test('Role and Judge continuation use host distinct-turn queue with exact Manage
 test('Judge drain propagates missing Manager and host drain failures', async () => {
   const manager = { session: { id: 'manager' } } as unknown as Agent
   const adapters: HostAdapters = {
-    ctx: { subagents: { drainContinuableChildren: async () => { throw new Error('drain failed') } }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
+    ctx: { subagents: { drainChildren: async () => { throw new Error('drain failed') } }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
     managerAgentOf: () => manager,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
   }
   const host = makeSubagentHost(adapters, testParticipants(adapters.ctx))
   await assert.rejects(host.drainJudge(makeRun(undefined), 'judge-old'), /drain failed/)
@@ -107,14 +110,14 @@ test('Judge drain propagates missing Manager and host drain failures', async () 
   await assert.rejects(host.drainJudge(makeRun(undefined), 'judge-old'), /manager agent is not live/)
 })
 
-// #32 D-001：startContinuable（首次角色派发、Judge spawn）与 drainContinuableChildren
+// #32 D-001：startActivation（首次角色派发、Judge spawn）与 drainChildren
 // 此前是"无界 await + 死 signal"，挂起时可永久 pending 触发它的 turn。
-test('spawn and drain seams: a hanging startContinuable times out with its stage name and aborts the caller signal', async () => {
+test('spawn and drain seams: a hanging startActivation times out with its stage name and aborts the caller signal', async () => {
   await withShortTimeouts({ spawn: 20, drain: 20 }, async () => {
     const manager = { session: { id: 'manager', seq: 0, snapshotEvents: () => [], header: {} } } as unknown as Agent
     const signals: AbortSignal[] = []
     const subagents = {
-      async startContinuable(spec: { signal: AbortSignal }) {
+      async startActivation(spec: { signal: AbortSignal }) {
         signals.push(spec.signal)
         return new Promise<never>(() => {})
       },
@@ -123,6 +126,7 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
       ctx: { subagents, tools: { schemas: () => [] }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
     }
     const host = makeSubagentHost(adapters, testParticipants(adapters.ctx))
     const run = makeRun(undefined)
@@ -139,13 +143,14 @@ test('spawn and drain seams: a hanging startContinuable times out with its stage
   })
 })
 
-test('drain seam: a hanging drainContinuableChildren fails closed instead of pending forever', async () => {
+test('drain seam: a hanging drainChildren fails closed instead of pending forever', async () => {
   await withShortTimeouts({ drain: 20 }, async () => {
     const manager = { session: { id: 'manager' } } as unknown as Agent
     const adapters: HostAdapters = {
-      ctx: { subagents: { drainContinuableChildren: async () => new Promise<never>(() => {}) }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
+      ctx: { subagents: { drainChildren: async () => new Promise<never>(() => {}) }, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
     }
     await assert.rejects(makeSubagentHost(adapters, testParticipants(adapters.ctx)).drainJudge(makeRun(undefined), 'judge-old'),
       /timeout after 20ms at stage "drain"/)
@@ -250,6 +255,7 @@ function makeHost(options: {
     registerJudgeSession: () => {},
     revokeJudgeSession: () => {},
     registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
   }
   return { host: makeSubagentHost(adapters, testParticipants(adapters.ctx)), materialized }
 }
@@ -444,21 +450,26 @@ test('cold actor with no backend anywhere: still materializes and disposes, comp
   assert.equal(f.warns.length, 1)
 })
 
-test('cold maintenance resume joins the live manager preset inside the creation window', async () => {
+test('cold maintenance resume mounts the role preset by id inside the creation window (#216)', async () => {
   const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
-  const joins: Array<{ agentCtx: unknown; parentCtx: unknown }> = []
+  const mounts: Array<{ agentCtx: unknown; id: string }> = []
+  const registered: string[] = []
   const manager = { id: 'manager', ctx: { tag: 'manager-ctx' } } as unknown as Agent
+  const run = makeRun('sess-dev')
   const { host } = makeHost({
     ...f, manager, compactResult: null,
     presets: {
       serviceFor: () => undefined,
-      composeFrom: (agentCtx, parentCtx) => { joins.push({ agentCtx, parentCtx }) },
+      composedPreset: () => undefined,
+      async register(definition: { id: string }) { registered.push(definition.id); return async () => {} },
+      async mount(agentCtx: unknown, id: string) { mounts.push({ agentCtx, id }) },
     },
   })
-  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'cold: no compactable range' })
+  assert.deepEqual(await host.compactRoleActor(run, 'developer'), { ok: true, detail: 'cold: no compactable range' })
   assert.equal(typeof f.resumes[0]!.setup, 'function', 'resume must carry the joining setup when the manager is live')
-  assert.equal(joins.length, 1)
-  assert.equal((joins[0]!.parentCtx as { tag?: string }).tag, 'manager-ctx')
+  assert.deepEqual(registered, [rolePresetId(run.runId, 'developer')], '冷物化前幂等注册角色派生 preset')
+  assert.equal(mounts.length, 1)
+  assert.equal(mounts[0]!.id, rolePresetId(run.runId, 'developer'))
   assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
 })
 
@@ -563,6 +574,7 @@ test('dispatch seams: a hanging prompt queue times out with its stage name and a
       ctx: { subagents: queue, jobs: { events: { subscribe: () => () => {} } }, effect: () => {} } as unknown as Context,
       managerAgentOf: () => manager,
       registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
     }
     const run = makeRun('sess-dev')
     await assert.rejects(makeDispatchTargets(adapters).sendRoleActor(run, 'developer', 'next node'),
@@ -650,6 +662,7 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
   const host = makeSubagentHost({
     ctx, managerAgentOf: () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
   }, testParticipants(ctx))
   assert.equal(await host.roleSessionAvailability('live-session'), 'available')
   assert.equal(await host.roleSessionAvailability('durable-session'), 'available')
@@ -659,6 +672,7 @@ test('Role/Judge Session availability distinguishes durable absence from unreada
     ...({ ctx: { ...ctx, get: () => undefined } as unknown as Context } as HostAdapters),
     managerAgentOf: () => undefined,
     registerJudgeSession: () => {}, revokeJudgeSession: () => {}, registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
   }, testParticipants(ctx))
   assert.equal(await noService.roleSessionAvailability('cold-session'), 'unknown')
 })

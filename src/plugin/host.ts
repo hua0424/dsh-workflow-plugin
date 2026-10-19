@@ -12,7 +12,7 @@ import { ManualCompactionError, type CompactionEngine } from '@deepseek-ai/dsh-c
 import type {} from '@deepseek-ai/dsh-agent-preset-registry'
 import { parentAgentOptionsForDelegation } from '@deepseek-ai/dsh-subagent'
 import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
-import type { ContinuableStartSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
+import type { SubagentActivationSpec, SubagentRuntime } from '@deepseek-ai/dsh-subagent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError, type SessionHandle, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
@@ -29,6 +29,7 @@ import { projectNodeLocal, type ProjectionSource } from '../judge/projection.ts'
 import { renderJudgePrompt } from '../judge/checker.ts'
 import { runMaterialsSection } from '../engine/texts.ts'
 import type { ParticipantIndex } from './participants.ts'
+import type { RolePresetBook } from './presets.ts'
 
 /** Optional Host service used by the continuation manager for cold Session reads. */
 function sessionPersistence(ctx: Context): SessionPersistence | undefined {
@@ -175,6 +176,9 @@ function compactRetryDelayMs(): number {
 /** 本插件一切 workflow 派发的 durable provenance（自声明 kind，见 message-sources.ts）。 */
 const PLUGIN_SOURCE = WORKFLOW_DISPATCH_SOURCE
 
+/** #216：Judge 派生 preset 的 scope 名（角色用 roleKey 本身）。 */
+const JUDGE_PRESET_SCOPE = 'judge'
+
 /**
  * Queue one dispatcher turn to a continuable child, bounded by the `send` SLO.
  * Every send site shares this shape so the timeout and the abort wiring cannot
@@ -188,19 +192,27 @@ async function queueDispatch(subagents: SubagentRuntime, parent: Agent, childId:
 }
 
 /**
- * Bounded `startContinuable` (首次角色派发 / Judge spawn, #32 D-001). The host
- * contract gives the caller's signal ownership only until inbox acceptance, so
- * a timeout here aborts the still-pending lookup/materialization instead of
- * leaving a dead signal behind.
+ * Bounded `startActivation` (首次角色派发 / Judge spawn, #32 D-001; Issue #216
+ * 由 startContinuable 迁移). The host contract gives the caller's signal
+ * ownership only until inbox acceptance, so a timeout here aborts the
+ * still-pending lookup/materialization instead of leaving a dead signal
+ * behind. `delivery: 'parent'` 是必填——本插件从不消费 activation 的 result
+ * 句柄，结算仍走 session/event 观察。
  */
-function startContinuableWithin(subagents: Pick<SubagentRuntime, 'startContinuable'>, spec: Omit<ContinuableStartSpec, 'signal'>, stage: string): ReturnType<SubagentRuntime['startContinuable']> {
+function startActivationWithin(subagents: Pick<SubagentRuntime, 'startActivation'>, spec: Omit<SubagentActivationSpec, 'signal' | 'delivery'>, stage: string): Promise<import('@deepseek-ai/dsh-subagent').SubagentActivation & { messageId: import('@deepseek-ai/dsh-llm').MessageId }> {
   const controller = new AbortController()
-  return withTimeout(subagents.startContinuable({ ...spec, signal: controller.signal }), DISPATCH_TIMEOUTS.spawn, stage, controller)
+  return withTimeout(subagents.startActivation({ ...spec, signal: controller.signal, delivery: 'parent' }), DISPATCH_TIMEOUTS.spawn, stage, controller)
+    .then(started => {
+      // 本插件只用本地后端（provider 'spawn'），startLocal 保证 messageId；缺失即
+      // 视为技术故障（fail-closed），不向引擎回传 undefined。
+      if (started.messageId === undefined) throw new WorkflowError(`${stage}: activation was accepted without a message id`)
+      return started as typeof started & { messageId: import('@deepseek-ai/dsh-llm').MessageId }
+    })
 }
 
-/** `drainContinuableChildren` takes no signal: a hang is abandoned, never awaited forever. */
-function drainWithin(subagents: Pick<SubagentRuntime, 'drainContinuableChildren'>, parent: Agent, childIds: readonly SessionId[]): Promise<void> {
-  return withTimeout(subagents.drainContinuableChildren(parent, childIds), DISPATCH_TIMEOUTS.drain, 'drain')
+/** `drainChildren` takes no signal: a hang is abandoned, never awaited forever. */
+function drainWithin(subagents: Pick<SubagentRuntime, 'drainChildren'>, parent: Agent, childIds: readonly SessionId[]): Promise<void> {
+  return withTimeout(subagents.drainChildren(parent, childIds), DISPATCH_TIMEOUTS.drain, 'drain')
 }
 
 export function makeStateHost(source: StateStore | (() => StateStore)): StateHost {
@@ -237,6 +249,8 @@ export interface HostAdapters {
   revokeJudgeSession(sessionId: string): void
   /** Register a role-actor session↔(workspace,roleKey) mapping at creation time. */
   registerRoleActorSession(sessionId: string, roleKey: string, cwd: string | undefined): void
+  /** #216：按 Run+角色动态注册/注销派生 Agent Preset 的台账。 */
+  presets: RolePresetBook
 }
 
 export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
@@ -305,6 +319,31 @@ export function managerRouteOf(agent: Agent | undefined): SpawnAgentOptions {
  * 历史事实，交给宿主 spawn 的正式继承语义解析。因此同一插件实例里多个
  * workspace 交错运行时，谁都不会读到别人的路由。
  */
+/**
+ * Issue #216：Role/Judge 派生 preset 的幂等组装入口（spawn 前 / 存量会话
+ * followup 前 / 冷物化前都要确保已注册——进程重启后注册表为空，冷 resume 需要
+ * 同 id preset 可 mount）。persona 是 Issue #140 的唯一组合点（公共 + 角色，
+ * 缺省原样）；deny 未显式传入时按 Manager 工具面求交集（restrict 对未知
+ * global 名抛错，fail-closed）。
+ */
+async function ensureRolePreset(adapters: HostAdapters, run: RunState, scope: string, manager: Agent, deny?: readonly string[]): Promise<string | undefined> {
+  const persona = scope === JUDGE_PRESET_SCOPE
+    ? judgeSpawnPlan(run, run.delegationRoute).persona
+    : roleActorPersona(run, scope)
+  // fake ctx（单测）可能没有 get/tools；preset 服务缺席时台账层走降级告警，
+  // deny 交集（需要 Manager 工具面）也随之跳过——本就无处可装。
+  const presetsSvc = (adapters.ctx as { get?: (key: string) => unknown }).get?.('agentPresets')
+  const rawDeny = deny ?? (scope === JUDGE_PRESET_SCOPE
+    ? judgeSpawnPlan(run, run.delegationRoute).toolFilter.deny
+    : roleDenyList(run, scope))
+  // fake ctx（单测）可能没有 get/tools；preset 服务缺席或工具面不可见时 deny
+  // 交集随之跳过（无处可装），台账层仍走降级/注册路径。注意不得解构
+  // `tools.schemas`——它是依赖 `this` 的方法。
+  const toolsSvc = (adapters.ctx as { tools?: { schemas?: (agent: Agent) => Array<{ name: string }> } }).tools
+  const effectiveDeny = presetsSvc === undefined || toolsSvc?.schemas === undefined ? [] : knownDenyList(rawDeny, toolsSvc.schemas(manager).map(schema => schema.name))
+  return adapters.presets.ensure(adapters.ctx, manager, run.runId, scope, persona, effectiveDeny)
+}
+
 export function makeSubagentHost(adapters: HostAdapters, participants: ParticipantIndex): SubagentHost {
   /** #91: 本 Run 冻结值；旧 Run 无该字段即 undefined（宿主继承）。 */
   const routeOf = (run: RunState): DelegationRoute | undefined => run.delegationRoute
@@ -335,30 +374,32 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
     // #99：观察与收口证据的寿命由参与者索引统一持有（src/plugin/participants.ts）。
     safeToInspect: sessionId => participants.safeToInspect(sessionId),
     async ensureRoleActor(run, roleKey, initialText) {
+      const manager = adapters.managerAgentOf(run)
+      if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const existing = run.roleActors[roleKey]
       if (existing !== undefined) {
         // Not expected: the engine checks this before calling. Followup is the
-        // correct continuation for an existing mapping.
-        const manager = adapters.managerAgentOf(run)
-        if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+        // correct continuation for an existing mapping. Preset 幂等重建：进程
+        // 重启后注册表为空，冷 resume 需要同 id preset 可 mount。
+        await ensureRolePreset(adapters, run, roleKey, manager)
         const messageId = await queueDispatch(adapters.ctx.subagents, manager, existing, initialText)
         return { childId: existing, messageId }
       }
-      const manager = adapters.managerAgentOf(run)
-      if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const roleDef = run.definitionSnapshot.roles[roleKey]
       if (roleDef === undefined) throw new WorkflowError(`unknown role "${roleKey}"`)
       const route = resolveRoleModel(run, roleKey, routeOf(run))
-      const deny = roleDenyList(run, roleKey)
-      const started = await startContinuableWithin(adapters.ctx.subagents, {
+      // Issue #216：persona/deny 不再走 spawn 请求（0.2.1 已移除该字段），改为
+      // 动态 preset 组装；deny 名单按 Manager 实际工具面求交集——restrict 对
+      // 未知 global 名直接抛错（fail-closed），deny 一个不存在的工具本就是 no-op。
+      const deny = knownDenyList(roleDenyList(run, roleKey), adapters.ctx.tools.schemas(manager).map(schema => schema.name))
+      const agentPreset = await ensureRolePreset(adapters, run, roleKey, manager, deny)
+      const started = await startActivationWithin(adapters.ctx.subagents, {
         provider: 'spawn',
         label: `workflow-role:${roleKey}`,
         request: {
           prompt: textBlocks(initialText),
           parent: manager,
-          // Issue #140：Role Actor persona 唯一组合点（公共 + 角色，缺省原样）。
-          persona: roleActorPersona(run, roleKey),
-          toolFilter: deny.length > 0 ? { deny } : undefined,
+          ...(agentPreset === undefined ? {} : { agentPreset }),
           agentOptions: spawnAgentOptions(route),
         },
       }, `spawn role ${roleKey}`)
@@ -382,8 +423,11 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
       // profile 中并不存在，deny 一个不存在的工具本就是 no-op，因此按 Judge 继承
       // 到的实际工具面求交集，而不是让 spawn 直接 fault。
       const deny = knownDenyList(plan.toolFilter.deny, adapters.ctx.tools.schemas(manager).map(schema => schema.name))
+      // Issue #216：persona/deny 组装进派生 preset（judgeSpawnPlan 的 persona 与
+      // 交集后的 deny），spawn 请求只带 agentPreset。
+      const agentPreset = await ensureRolePreset(adapters, run, JUDGE_PRESET_SCOPE, manager, deny)
 
-      const started = await startContinuableWithin(adapters.ctx.subagents, {
+      const started = await startActivationWithin(adapters.ctx.subagents, {
         provider: 'spawn',
         label: judgeLabel(topFrame(run).nodeId),
         // P1: use the engine-reserved id, which was persisted BEFORE child
@@ -393,8 +437,7 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
         request: {
           prompt: textBlocks(prompt),
           parent: manager,
-          persona: plan.persona,
-          toolFilter: deny.length > 0 ? { deny } : undefined,
+          ...(agentPreset === undefined ? {} : { agentPreset }),
           agentOptions: spawnAgentOptions(plan.agentOptions),
         },
       }, 'spawn judge')
@@ -430,6 +473,8 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
     async followupJudge(run, judgeSessionId, input) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
+      // 幂等重建（进程重启后冷 resume 需要同 id preset 可 mount）。
+      await ensureRolePreset(adapters, run, JUDGE_PRESET_SCOPE, manager)
       const messageId = await queueDispatch(adapters.ctx.subagents, manager, judgeSessionId, await judgePrompt(run, input))
       adapters.registerJudgeSession(judgeSessionId, input.cwd)
       return { messageId }
@@ -450,6 +495,8 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       // #32 D-001：drain 无 signal 形参，挂起只能放弃等待（fail-closed），不能永久 pending。
       await drainWithin(adapters.ctx.subagents, manager, [SessionId(judgeSessionId)])
+      // #216：换代/重建即注销该 Judge preset；respawn 会在下一次 startJudge 重新注册。
+      await adapters.presets.release(adapters.ctx, run.runId, JUDGE_PRESET_SCOPE)
     },
 
     async drainRoleActor(run, roleKey) {
@@ -457,9 +504,12 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
       if (childId === undefined) return
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
-      // 与 Judge 同一条有界路径：`drainContinuableChildren` 无 signal，挂起即放弃等待；
+      // 与 Judge 同一条有界路径：`drainChildren` 无 signal，挂起即放弃等待；
       // 失败由引擎降级为仅删映射撤权（reuse: node 的离开节点释放）。冷会话是 no-op。
       await drainWithin(adapters.ctx.subagents, manager, [SessionId(childId)])
+      // #216：`reuse: node` 离开节点即注销角色 preset；continuable 角色不 drain，
+      // preset 由 Run 终局统一注销。
+      await adapters.presets.release(adapters.ctx, run.runId, roleKey)
     },
 
     /**
@@ -538,6 +588,10 @@ async function compactOnce(
   }
   const route = resolveRoleModel(run, roleKey, runRoute)
   const manager = adapters.managerAgentOf(run)
+  // #216：冷物化必须按角色的派生 preset mount（不再是 Manager 的组合 preset），
+  // compaction 后端等隔离域服务才解析得到；幂等重建也覆盖进程重启后的场景。
+  const agentPreset = manager === undefined ? undefined
+    : await ensureRolePreset(adapters, run, roleKey, manager).catch(() => adapters.presets.idOf(run.runId, roleKey))
   const resuming = adapters.ctx.agents.resume({
       resumeSessionId: childId as SessionId,
       // #93：本次 attempt 的 signal 直达 resume 的持久化 load/setup 窗口
@@ -551,18 +605,22 @@ async function compactOnce(
       // latest routed request), so the summary model may differ from the
       // actor's model.
       agentOptions: spawnAgentOptions(route),
-      // Maintenance materialization must join the parent preset too: the
-      // compaction backend (and every model-facing row) lives in the
-      // preset's isolate domain, and an unjoined agent resolves no backend
-      // via serviceFor (dsh also warns about publishing unjoined agents).
-      // Mirrors applyChildComposition's join step only — persona/tool
-      // filter are turn-facing and irrelevant to a compact-only surface.
-      // Join failure degrades to the host-plane fallback / skip below, so
-      // it is logged rather than failing the resume.
+      // Maintenance materialization must join a preset too: the compaction
+      // backend (and every model-facing row) lives in the preset's isolate
+      // domain, and an unjoined agent resolves no backend via serviceFor
+      // (dsh also warns about publishing unjoined agents). 优先按本角色派生
+      // preset mount；未注册（preset 服务缺席/降级）时回退 Manager 的组合
+      // preset——两者都无则不 join。Join 失败降级为宿主平面回退 / 跳过，
+      // 因此记日志而不是让 resume 失败。
       ...(manager === undefined ? {} : {
         setup: ((agentCtx: Context) => {
+          const presets = agentCtx.get('agentPresets')
+          if (presets === undefined) return
           try {
-            agentCtx.get('agentPresets')?.composeFrom(agentCtx, manager.ctx)
+            if (agentPreset !== undefined) void presets.mount(agentCtx, agentPreset).catch(error => {
+              agentCtx.logger.warn(`workflow maintenance preset mount skipped: ${errorDetail(error)}`)
+            })
+            else presets.composeFrom(agentCtx, manager.ctx)
           } catch (error) {
             agentCtx.logger.warn(`workflow maintenance preset join skipped: ${errorDetail(error)}`)
           }

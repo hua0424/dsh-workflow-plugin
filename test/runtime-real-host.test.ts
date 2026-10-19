@@ -7,7 +7,7 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { mountAgentLoopTestDependencies } from '@deepseek-ai/dsh-agent-loop-testkit'
 // 0.1.5 起 SessionProjectionRegistry 由 mountAgentLoopTestDependencies 内置挂载。
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
@@ -15,6 +15,8 @@ import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
+import * as CordisLoader from '@deepseek-ai/cordis-plugin-loader'
+import AgentPresetRegistry from '@deepseek-ai/dsh-agent-preset-registry'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { LlmAdapter, ToolCallId, type GenerateOptions, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
@@ -85,6 +87,8 @@ class A30Adapter extends LlmAdapter {
   readonly firstRoleReleased = Promise.withResolvers<void>()
   readonly secondRoleStarted = Promise.withResolvers<void>()
   readonly trace: string[] = []
+  /** #216：Judge 请求的实际工具面快照（deny 收敛断言）。 */
+  readonly judgeSurfaces: string[][] = []
   roleSessionId: string | undefined
   blockedSeen = false
   private managerClaimed = false
@@ -116,6 +120,7 @@ class A30Adapter extends LlmAdapter {
     let chunks: StreamChunk[]
 
     if (tools.has('judge_claim') && !tools.has('node_claim')) {
+      this.judgeSurfaces.push([...tools])
       if (this.firstRoleClaimed && !this.firstRoleJudgeReleased && this.compactionRequests.length === 0) {
         await this.firstRoleReleased.promise
         this.firstRoleJudgeReleased = true
@@ -256,6 +261,19 @@ workflow:
 
   try {
     await mountAgentLoopTestDependencies(ctx)
+    // 0.2.1 起 SubagentRuntime 静态 inject=['workingDirectory'] 且子代理创建
+    // 需要 `set`：testkit 的 fixture 不含 set，这里提供完整最小桩。
+    ctx.provide('workingDirectory', {
+      defaultDirectory: workspace,
+      get: (session: { header: { cwd?: string } }) => session.header.cwd ?? workspace,
+      ensure: (agent: { session: { header: { cwd?: string } } }) =>
+        Promise.resolve(agent.session.header.cwd ?? workspace),
+      set: () => Promise.resolve(),
+    })
+    // #216：persona/deny 组装走 Agent Preset——真实宿主侧挂 loader + registry + persona。
+    await ctx.plugin(CordisLoader.Loader)
+    await ctx.plugin(AgentPresetRegistry, { default: 'a30-base' })
+    await ctx.get('agentPresets').register({ id: 'a30-base', plugins: [] })
     await ctx.plugin(JsonlSessionPersistence, { root: sessions, compression: 'none', packChunks: false })
     await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
     await ctx.plugin(AgentLoop, { agents: [] })
@@ -366,6 +384,21 @@ workflow:
     assert.ok(roleEnds.length >= 2)
     assert.ok(roleEnds.every(end => lifecycleStarts.get(end.runId)?.id === roleSessionId))
     assert.equal(roleEnds[0]!.released, true, 'first Role Activation must be released before cold continuation')
+
+    // #216 断言一：preset 组装下 Judge deny 实际收敛工具面——
+    // Judge 请求携带 judge_claim 且不携带 workflow 控制工具（node_claim 等）。
+    assert.ok(adapter.judgeSurfaces.length > 0, 'Judge must have issued at least one request')
+    for (const surface of adapter.judgeSurfaces) {
+      assert.ok(surface.includes('judge_claim'), `Judge surface must keep judge_claim: ${surface.join(',')}`)
+      for (const denied of ['node_claim', 'node_block', 'node_resume', 'node_run_program', 'node_resolve_program'])
+        assert.ok(!surface.includes(denied), `Judge surface must not expose ${denied}: ${surface.join(',')}`)
+    }
+    // #216 断言二：动态 preset 注册/注销与 Run 生命周期严格配对——
+    // Run 完成后注册表不得残留 dsh-wf-* 派生 preset。
+    const registry = ctx.get('agentPresets')
+    assert.ok(registry)
+    const leftover = (await registry.list()).filter((preset: { id: string }) => preset.id.startsWith('dsh-wf-'))
+    assert.deepEqual(leftover.map((preset: { id: string }) => preset.id), [], `Run 完成后动态 preset 必须全部注销: ${JSON.stringify(leftover)}`)
   } finally {
     adapter.resumeGate.resolve()
     await ctx.fiber.dispose()

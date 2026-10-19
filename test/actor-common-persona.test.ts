@@ -18,6 +18,7 @@ import { validateAndNormalize, computeDefinitionHash, CatalogValidationError } f
 import { CatalogSchemaError } from '../src/catalog/schema.ts'
 import { roleActorPersona, ACTOR_PERSONA_SEPARATOR, judgeSpawnPlan } from '../src/roles/roles.ts'
 import { makeSubagentHost, makeStateHost, type HostAdapters } from '../src/plugin/host.ts'
+import { RolePresetBook, rolePresetId } from '../src/plugin/presets.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { StateStore } from '../src/state/store.ts'
 import { newNodeToken } from '../src/state/invariants.ts'
@@ -138,18 +139,31 @@ test('Role Actor system prompt 冷恢复一致：重复组合不叠加、快照�
   assert.equal(roleActorPersona(reloaded, 'developer'), first)
 })
 
-test('Role Actor system prompt 已组合：spawn 路径使用同一组合结果（两个角色）', async () => {
+test('Role Actor system prompt 已组合：spawn 路径经派生 preset 使用同一组合结果（两个角色）', async () => {
   const run = makeRun(normalized(configText(withCommon)))
-  const seen: string[] = []
+  const spawned: string[] = []
+  const registered: Array<{ id: string; prefix: string }> = []
   const manager = { session: { id: 'manager', seq: 0, snapshotEvents: () => [], header: { cwd: 'cwd' } } } as unknown as Agent
   const adapters: HostAdapters = {
     ctx: {
       subagents: {
-        async startContinuable(spec: { label: string; request: { persona: string } }) {
-          seen.push(`${spec.label}::${spec.request.persona}`)
-          return { childId: `sess-${seen.length}`, messageId: `message-${seen.length}` }
+        // Issue #216：spawn 请求不再带 persona/toolFilter，只带派生 preset id。
+        async startActivation(spec: { request: { agentPreset?: string } }) {
+          spawned.push(spec.request.agentPreset ?? '<none>')
+          return { childId: `sess-${spawned.length}`, messageId: `message-${spawned.length}` }
         },
       },
+      // 0.2.1 起子会话 persona 走 dsh-persona 行：断言派生 preset 的注册定义。
+      get: (key: string) => key === 'agentPresets' ? {
+        composedPreset: () => undefined,
+        readDocument: async () => ({ agentPreset: 'parent', content: '' }),
+        async register(definition: { id: string; plugins: Array<{ name: string; config?: { prefix?: string } }> }) {
+          const persona = definition.plugins.find((row: { name: string }) => row.name === '@deepseek-ai/dsh-persona')
+          registered.push({ id: definition.id, prefix: persona?.config?.prefix ?? '' })
+          return async () => {}
+        },
+      } : undefined,
+      tools: { schemas: () => [] },
       jobs: { events: { subscribe: () => () => {} } },
       effect: () => {},
     } as unknown as Context,
@@ -157,14 +171,16 @@ test('Role Actor system prompt 已组合：spawn 路径使用同一组合结果�
     registerJudgeSession: () => {},
     revokeJudgeSession: () => {},
     registerRoleActorSession: () => {},
+    presets: new RolePresetBook(),
   }
   const host = makeSubagentHost(adapters, testParticipants(adapters.ctx))
   await host.ensureRoleActor(run, 'developer', 'initial')
   await host.ensureRoleActor(run, 'reviewer', 'initial')
-  assert.deepEqual(seen, [
-    `workflow-role:developer::${COMMON}\n\n${DEV_PERSONA}`,
-    `workflow-role:reviewer::${COMMON}\n\n${REVIEWER_PERSONA}`,
+  assert.deepEqual(registered.map(row => row.prefix), [
+    `${COMMON}\n\n${DEV_PERSONA}`,
+    `${COMMON}\n\n${REVIEWER_PERSONA}`,
   ])
+  assert.deepEqual(spawned, [rolePresetId(run.runId, 'developer'), rolePresetId(run.runId, 'reviewer')])
 })
 
 // ── Manager/Judge 未覆盖 ────────────────────────────────────────────────────
