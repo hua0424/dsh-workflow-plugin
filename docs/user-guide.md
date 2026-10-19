@@ -34,7 +34,7 @@ bundle `package.json` 的必要字段（version / dependencies / dsh / main / ty
 生成步骤直接失败。`--out` 必须带目录值：漏写（`--out` 为末位）只打印用法并以 2 退出，**不会**回落到
 `~/.dsh` 的真实部署目标。注意：每次 build 后都要重跑 deploy；bundle 成员变更后必须重启 DSH。
 
-**版本兼容声明（#207 发布前决策）**：本插件需要 DSH 宿主 `>= 0.2.0-rc.2`（下限范围声明；包元数据 `package.json` 的 `engines.dsh`、本手册与总览 `README.md` 三处统一表述，验收基线为 exact `0.2.0-rc.2`）。版本号保持 `package.json` 当前值，不随本轮对齐递增。
+**版本兼容声明（#207 发布前决策）**：本插件需要 DSH 宿主 `>= 0.2.1-rc.2`（下限范围声明；包元数据 `package.json` 的 `engines.dsh`、本手册与总览 `README.md` 三处统一表述，验收基线为 exact `0.2.1-rc.2`）。版本号保持 `package.json` 当前值，不随本轮对齐递增。
 
 **版本兼容提示**：dsh ≥ 0.1.1-rc.7 起 `compaction` 服务不再挂载在宿主平面，
 插件已改为运行期按 agent 解析（`host.ts` 的 `compactionFor`），不要在模块级

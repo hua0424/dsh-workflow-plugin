@@ -79,5 +79,24 @@
     "node": ">=22.19.0",
     "dsh": ">=0.2.1-rc.2"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "author": "hua0424",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hua0424/dsh-workflow-plugin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hua0424/dsh-workflow-plugin/issues"
+  },
+  "homepage": "https://github.com/hua0424/dsh-workflow-plugin#readme",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "agent-workflow",
+    "workflow",
+    "multi-agent",
+    "team-workflow"
+  ]
 }
