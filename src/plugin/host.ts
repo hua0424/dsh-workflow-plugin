@@ -18,6 +18,7 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import { SessionPersistenceNotFoundError, type SessionHandle, type SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { StateStore } from '../state/store.ts'
 import { WORKFLOW_DISPATCH_SOURCE } from '../message-sources.ts'
+import { makeDispatchLifecycleTracker, observeActivationResult } from './dispatch-lifecycle.ts'
 import type { DelegationRoute, RunState, SpawnAgentOptions } from '../types.ts'
 import { routeToAgentOptions, WorkflowError } from '../types.ts'
 import type { DispatchTargets, StateHost, SubagentHost, ProgramHost } from '../engine/engine.ts'
@@ -196,8 +197,8 @@ async function queueDispatch(subagents: SubagentRuntime, parent: Agent, childId:
  * 由 startContinuable 迁移). The host contract gives the caller's signal
  * ownership only until inbox acceptance, so a timeout here aborts the
  * still-pending lookup/materialization instead of leaving a dead signal
- * behind. `delivery: 'parent'` 是必填——本插件从不消费 activation 的 result
- * 句柄，结算仍走 session/event 观察。
+ * behind. `delivery: 'parent'` 是必填——派发回执只认受理身份；result 句柄仅
+ * Issue #221 的待对账观察消费其终态（不等待），结算仍走 turn/end + 终态信号。
  */
 function startActivationWithin(subagents: Pick<SubagentRuntime, 'startActivation'>, spec: Omit<SubagentActivationSpec, 'signal' | 'delivery'>, stage: string): Promise<import('@deepseek-ai/dsh-subagent').SubagentActivation & { messageId: import('@deepseek-ai/dsh-llm').MessageId }> {
   const controller = new AbortController()
@@ -347,6 +348,8 @@ async function ensureRolePreset(adapters: HostAdapters, run: RunState, scope: st
 export function makeSubagentHost(adapters: HostAdapters, participants: ParticipantIndex): SubagentHost {
   /** #91: 本 Run 冻结值；旧 Run 无该字段即 undefined（宿主继承）。 */
   const routeOf = (run: RunState): DelegationRoute | undefined => run.delegationRoute
+  // Issue #221：派发生命周期终止信号的待对账观察（引擎只在发布/结算点读写）。
+  const lifecycle = makeDispatchLifecycleTracker()
   async function judgePrompt(run: RunState, input: import('../engine/engine.ts').JudgeSpawnInput): Promise<string> {
     const manager = adapters.managerAgentOf(run)
     if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
@@ -373,6 +376,9 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
   return {
     // #99：观察与收口证据的寿命由参与者索引统一持有（src/plugin/participants.ts）。
     safeToInspect: sessionId => participants.safeToInspect(sessionId),
+    // Issue #221：待对账观察的唯一持有者（引擎经此读写，index.ts 的生命周期
+    // 监听经此记录世代/转发终态）。
+    dispatchLifecycle: lifecycle,
     async ensureRoleActor(run, roleKey, initialText) {
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
@@ -407,6 +413,9 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
       // turn may end before the engine persists roleActors, and its node_claim
       // authorization needs this mapping.
       adapters.registerRoleActorSession(started.childId, roleKey, manager.session.header.cwd)
+      // Issue #221：只消费 result 终态做待对账观察（resolve 非 completed 或
+      // reject 都记失败），不等待它才返回派发回执——受理不等于执行完成。
+      observeActivationResult(lifecycle, started.childId, started.result)
       return { childId: started.childId, messageId: started.messageId }
     },
 
@@ -459,6 +468,8 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
         throw new WorkflowError(surfaceProblem)
       }
       adapters.registerJudgeSession(started.childId, input.cwd)
+      // Issue #221：同角色首建——只观察 result 终态，不等待它才返回回执。
+      observeActivationResult(lifecycle, started.childId, started.result)
       return { judgeSessionId: started.childId, messageId: started.messageId }
     },
 
@@ -486,11 +497,16 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
       // and awaits its quiescence (a self-deadlock); the settlement watcher
       // releases the Activation automatically once the Judge's turn ends.
       void run
+      // Issue #221：撤权即释放该会话的待对账条目（结算仍由新 Judge 的精确
+      // turn/end 驱动；旧世代的迟到终态由身份/世代校验丢弃）。
+      lifecycle.forget(judgeSessionId)
       adapters.revokeJudgeSession(judgeSessionId)
     },
 
     async drainJudge(run, judgeSessionId) {
       const manager = adapters.managerAgentOf(run)
+      // Issue #221：先释放待对账条目——drain 触发的旧世代终态不得影响后继状态。
+      lifecycle.forget(judgeSessionId)
       adapters.revokeJudgeSession(judgeSessionId)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       // #32 D-001：drain 无 signal 形参，挂起只能放弃等待（fail-closed），不能永久 pending。
@@ -502,6 +518,8 @@ export function makeSubagentHost(adapters: HostAdapters, participants: Participa
     async drainRoleActor(run, roleKey) {
       const childId = run.roleActors[roleKey]
       if (childId === undefined) return
+      // Issue #221：先释放待对账条目——drain 触发的旧世代终态不得影响后继状态。
+      lifecycle.forget(childId)
       const manager = adapters.managerAgentOf(run)
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       // 与 Judge 同一条有界路径：`drainChildren` 无 signal，挂起即放弃等待；

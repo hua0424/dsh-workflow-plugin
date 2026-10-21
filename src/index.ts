@@ -283,6 +283,9 @@ export function apply(ctx: Context) {
   // for a cold-resumed child (#99).
   ctx.on('subagent/start', (info) => {
     if (stateAccess.maintenanceDiagnostic()) return
+    // Issue #221：同步记录活动周期世代（start 边先于身份发布到达；终态按
+    // runId 区分同 Session 的不同世代）。
+    subagentHost.dispatchLifecycle?.noteStart(String(info.id), String(info.runId))
     const agent = ctx.agents.get(info.id)
     if (agent === undefined) return
     const parentId = agent.session.header.parentSession
@@ -298,6 +301,33 @@ export function apply(ctx: Context) {
       const admission = participantInWorkOrder(workOrderFactsOf(row), info.id)
       if (admission !== undefined) participants.adopt(info.id, ws, admission)
     })()
+  })
+
+  // Issue #221：宿主生命周期终止信号收口。终态只做待对账观察：条目缺席则
+  // 缓存（等身份发布时对账），条目在位则转交引擎在 append 回调之外结算。
+  // 绝不解析父会话的自然语言通知判断终态。
+  ctx.on('subagent/end', (info) => {
+    if (stateAccess.maintenanceDiagnostic()) return
+    const tracker = subagentHost.dispatchLifecycle
+    if (tracker === undefined) return
+    const sessionId = String(info.id)
+    const end = {
+      runId: String(info.runId),
+      stopReason: String(info.stopReason),
+      ...(typeof info.provider === 'string' ? { provider: info.provider } : {}),
+    }
+    setImmediate(() => {
+      void (async () => {
+        try {
+          const tracked = tracker.peek(sessionId)
+          const ws = tracked?.workspaceKey ?? await workspaceOfSession(sessionId)
+          if (ws === undefined) return
+          await engine.handleActivationSettled(ws, sessionId, end)
+        } catch (error) {
+          ctx.logger.warn(`workflow activation settlement failed: ${String(error)}`)
+        }
+      })()
+    })
   })
 
   // ---- Command host ----
@@ -458,6 +488,8 @@ export function apply(ctx: Context) {
     disposeCommand()
     for (const dispose of disposeTools) dispose()
     for (const dispose of disposeEditorRpcFns.splice(0)) dispose()
+    // Issue #221：插件卸载清理待对账观察资源。
+    subagentHost.dispatchLifecycle?.clear()
     // #216：插件卸载注销全部动态 preset（best-effort）。
     void presetBook.releaseAll(ctx).catch(() => {})
   })
