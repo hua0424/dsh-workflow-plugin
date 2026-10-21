@@ -17,6 +17,7 @@ import { parseCatalogConfig } from '../src/catalog/parse.ts'
 import { validateAndNormalize, computeDefinitionHash, CatalogValidationError } from '../src/catalog/validate.ts'
 import { CatalogSchemaError } from '../src/catalog/schema.ts'
 import { roleActorPersona, ACTOR_PERSONA_SEPARATOR, judgeSpawnPlan } from '../src/roles/roles.ts'
+import { ROLE_ACTOR_SUBMISSION_PROTOCOL } from '../src/engine/texts.ts'
 import { makeSubagentHost, makeStateHost, type HostAdapters } from '../src/plugin/host.ts'
 import { RolePresetBook, rolePresetId } from '../src/plugin/presets.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
@@ -74,28 +75,37 @@ function makeRun(config: WorkflowConfig): RunState {
   }
 }
 
+/**
+ * Issue #226：组合结果末尾始终追加固定提交协议（系统 persona），本文件断言的是
+ * 业务 persona 部分——公共 persona 与角色 persona 的内容、trim 与相对顺序不变。
+ */
+function businessPersona(persona: string): string {
+  const suffix = `${ACTOR_PERSONA_SEPARATOR}${ROLE_ACTOR_SUBMISSION_PROTOCOL}`
+  return persona.endsWith(suffix) ? persona.slice(0, -suffix.length) : persona
+}
+
 // ── Role Actor system prompt 已组合 ───────────────────────────────────────────
 
 test('Role Actor system prompt 已组合：公共在前、角色在后、单一固定分隔符（两个角色）', () => {
   const run = makeRun(normalized(configText(withCommon)))
   assert.equal(ACTOR_PERSONA_SEPARATOR, '\n\n')
-  assert.equal(roleActorPersona(run, 'developer'), `${COMMON}\n\n${DEV_PERSONA}`)
-  assert.equal(roleActorPersona(run, 'reviewer'), `${COMMON}\n\n${REVIEWER_PERSONA}`)
+  assert.equal(businessPersona(roleActorPersona(run, 'developer')), `${COMMON}\n\n${DEV_PERSONA}`)
+  assert.equal(businessPersona(roleActorPersona(run, 'reviewer')), `${COMMON}\n\n${REVIEWER_PERSONA}`)
 })
 
-test('Role Actor system prompt 缺省行为：未配置时角色 persona 原样返回', () => {
+test('Role Actor system prompt 缺省行为：未配置公共 persona 时角色 persona 后接固定协议', () => {
   const config = normalized(configText())
   assert.equal('actorCommonPersona' in config, false)
   const run = makeRun(config)
-  assert.equal(roleActorPersona(run, 'developer'), DEV_PERSONA)
-  assert.equal(roleActorPersona(run, 'reviewer'), REVIEWER_PERSONA)
+  assert.equal(businessPersona(roleActorPersona(run, 'developer')), DEV_PERSONA)
+  assert.equal(businessPersona(roleActorPersona(run, 'reviewer')), REVIEWER_PERSONA)
 })
 
 test('Role Actor system prompt 已组合：存在时 trim 并冻结进 definition 快照', () => {
   const config = normalized(configText('actorCommonPersona: "  前后空格约定。  "\n'))
   assert.equal(config.actorCommonPersona, '前后空格约定。')
   const run = makeRun(config)
-  assert.equal(roleActorPersona(run, 'developer'), '前后空格约定。\n\n开发角色专属职责。')
+  assert.equal(businessPersona(roleActorPersona(run, 'developer')), '前后空格约定。\n\n开发角色专属职责。')
   // 冻结：含字段与缺省配置的 definitionHash 不同
   assert.notEqual(computeDefinitionHash(config), computeDefinitionHash(normalized(configText())))
 })
@@ -176,10 +186,12 @@ test('Role Actor system prompt 已组合：spawn 路径经派生 preset 使用�
   const host = makeSubagentHost(adapters, testParticipants(adapters.ctx))
   await host.ensureRoleActor(run, 'developer', 'initial')
   await host.ensureRoleActor(run, 'reviewer', 'initial')
-  assert.deepEqual(registered.map(row => row.prefix), [
+  assert.deepEqual(registered.map(row => businessPersona(row.prefix)), [
     `${COMMON}\n\n${DEV_PERSONA}`,
     `${COMMON}\n\n${REVIEWER_PERSONA}`,
   ])
+  // Issue #226：派生 preset 的 persona 恰含一份固定提交协议（在业务 persona 之后）。
+  for (const row of registered) assert.equal(row.prefix.split(ROLE_ACTOR_SUBMISSION_PROTOCOL).length - 1, 1)
   assert.deepEqual(spawned, [rolePresetId(run.runId, 'developer'), rolePresetId(run.runId, 'reviewer')])
 })
 

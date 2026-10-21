@@ -64,14 +64,15 @@ export function validateAndNormalize(config: WorkflowConfig, extra?: { workflowI
   }
 
 /** #42 P5 (#46): persona keywords that duplicate the engine-owned submission
- * protocol — the protocol is single-sourced in SUBMISSION_CONSTRAINT.
+ * protocol — the protocol is single-sourced in ROLE_ACTOR_SUBMISSION_PROTOCOL
+ * (Issue #226，拼入 Role Actor system persona，不再逐次派发追加）。
  * #59: drift risk only, so this is a non-blocking warning, never a problem. */
 const PERSONA_PROTOCOL_KEYWORDS = ['node_claim', 'judge_claim', 'send_message']
 
 function checkPersonaProtocol(label: string, persona: string, warnings: string[]): void {
   const hit = PERSONA_PROTOCOL_KEYWORDS.find(keyword => persona.includes(keyword))
   if (hit !== undefined) {
-    warnings.push(`${label} persona must not hand-write submission protocol (found "${hit}"); the submission protocol is engine-owned (SUBMISSION_CONSTRAINT) — keep only business discipline in persona (migration: docs/user-guide.md §4)`)
+    warnings.push(`${label} persona must not hand-write submission protocol (found "${hit}"); the submission protocol is engine-owned (ROLE_ACTOR_SUBMISSION_PROTOCOL) — keep only business discipline in persona (migration: docs/user-guide.md §4)`)
   }
 }
 

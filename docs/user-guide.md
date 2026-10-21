@@ -129,9 +129,11 @@ roles:
 
 ## 4. 提交协议单源化：旧 catalog 迁移指引
 
-提交协议只有引擎一个来源：每次派发末尾的 `[提交要求]` 段（含
-`node_claim` 最后动作条款、纯文字不提交→BLOCK、`send_message` 覆盖条款、
-REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona` 里
+提交协议只有插件一个来源：**Role Actor** 的固定提交协议随派生 preset 进入
+system persona（含 `node_claim` 最后动作条款、纯文字不提交→BLOCK、
+REJECT 分歧处理等，#226 起不再逐次追加到派发消息）；**Manager** 派发末尾
+仍是 `[提交要求]` 段（含 `send_message` 覆盖）。两处都由插件维护，**不要**在
+`roles.*.persona` 或 `judgeRole.persona` 里
 手写提交纪律句——catalog 校验会对关键词 `node_claim` / `judge_claim` /
 `send_message` 报**非阻塞警告**（#59）：文件照常进入 catalog、照常可
 `/dsh-flow start`，`/dsh-flow list` 中以 `[warn]` 单独一档提示（角色、
@@ -139,7 +141,8 @@ REJECT 分歧处理）。**不要**在 `roles.*.persona` 或 `judgeRole.persona`
 
 **工作流级公共 persona（#140 起）**：顶层可选字段 `actorCommonPersona`
 放各 Role Actor 共同遵守的约定——配置后每个 Role Actor 的 system prompt
-为「公共 persona 在前 + 空行 + 角色专属 persona 在后」，未配置时行为不变；
+为「公共 persona 在前 + 空行 + 角色专属 persona 在后 + 空行 + 插件固定提交
+协议（#226）」，未配置时为「角色专属 persona + 空行 + 固定提交协议」；
 该字段同样触发上述提交协议关键词警告。**共同约定放此字段，节点动作仍放
 instruction**（结果验收条件进各结果 `criteria`，不依赖 persona 上下文）。
 `judgeRole.persona` 与 Manager 派发不受影响。字段细节见

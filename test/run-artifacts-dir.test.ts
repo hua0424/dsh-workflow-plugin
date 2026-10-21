@@ -104,9 +104,10 @@ test('Manager 与 Actor 派发文本都附带绑定 workspace 算出的材料目
       assert.ok(text.includes(`dir: ws/.dsh/.dsh-workflow/runs/${runId}/`))
       assert.ok(!text.includes(h.home), '不得用 cwd 猜测目录')
     }
-    // 固定后缀仍在末尾：投影剥离不受影响（manager 用去 Actor 视角的变体）。
+    // 固定后缀：Manager 保留末尾变体；Issue #226 后 Actor 派发不再附固定后缀（协议
+    // 在 system persona），故不再断言 actor 派发以协议段结尾。
     for (const text of h.managerTexts.filter(t => !t.startsWith('[node-event]'))) assert.ok(text.endsWith(MANAGER_SUBMISSION_CONSTRAINT))
-    for (const text of h.actorTexts) assert.ok(text.endsWith(SUBMISSION_CONSTRAINT))
+    for (const text of h.actorTexts) assert.doesNotMatch(text, /\[提交要求\]/)
   } finally { h.close() }
 })
 
