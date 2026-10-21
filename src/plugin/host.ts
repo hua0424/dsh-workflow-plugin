@@ -273,6 +273,10 @@ export function makeDispatchTargets(adapters: HostAdapters): DispatchTargets {
       if (manager === undefined) throw new WorkflowError('manager agent is not live in this process')
       const childId = run.roleActors[roleKey]
       if (childId === undefined) throw new WorkflowError(`no actor mapped for role "${roleKey}"`)
+      // Issue #226：复用/恢复的 followup 也要确保同 id preset 已注册——进程重启后
+      // 注册表为空，不经压缩的复用路径（compactBeforeReuse=false、skipCompact
+      // resume、REJECT/BLOCK 后复用）同样需要可 mount 的 preset。幂等，已注册即返回。
+      await ensureRolePreset(adapters, run, roleKey, manager)
       // Workflow 派发必须是独立 child turn，不可用 nearest-step sendMessage。
       const messageId = await queueDispatch(adapters.ctx.subagents, manager, childId, text)
       return { messageId }

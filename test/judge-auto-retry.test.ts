@@ -225,11 +225,11 @@ test('#200 manager 变体删除 Actor 视角句与悬空占位句，其余条款
   for (const clause of ['结果只通过 node_claim 交付', '唯一 handoff', 'node_claim 必须是本轮对话的最后一个动作', '仅输出文字不视为提交', 'node_block', '不伪报结果', '收到 Judge REJECT 后', '可改选另一个合法结果']) {
     assert.ok(MANAGER_SUBMISSION_CONSTRAINT.includes(clause), `manager 变体缺条款: ${clause}`)
   }
-  // actor 变体是现状原文，零行为变化。
+  // actor 变体原文保留：Issue #226 后不再追加到新派发，仅用于历史转录的投影剥离。
   assert.match(SUBMISSION_CONSTRAINT, /本轮对话是在node工作节点运行，工作流的交付与推进只认 node_claim，不需要向父会话 send_message 汇报结果，以下汇报的说明可以忽略/)
 })
 
-test('#200 manager 节点派发用 manager 变体，actor 节点派发零变化', async () => {
+test('#200/#226 manager 节点派发用 manager 变体，actor 派发不再附固定后缀', async () => {
   const h = harness()
   try {
     await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'))
@@ -248,8 +248,12 @@ test('#200 manager 节点派发用 manager 变体，actor 节点派发零变化'
     assert.ok(managerDispatch.endsWith(MANAGER_SUBMISSION_CONSTRAINT))
     assert.doesNotMatch(managerDispatch, /本轮对话是在node工作节点运行/)
     assert.doesNotMatch(managerDispatch, /send_message/)
-    assert.ok(actorDispatch.endsWith(SUBMISSION_CONSTRAINT))
-    assert.match(actorDispatch, /本轮对话是在node工作节点运行/)
+    // Issue #226：固定协议已迁入 Role system persona，派发正文不再带副本——
+    // 含派发尾的 send_message 忽略句。
+    assert.equal(actorDispatch.endsWith(SUBMISSION_CONSTRAINT), false)
+    assert.doesNotMatch(actorDispatch, /\[提交要求\]/)
+    assert.doesNotMatch(actorDispatch, /本轮对话是在node工作节点运行/)
+    assert.doesNotMatch(actorDispatch, /send_message/)
   } finally { h.close() }
 })
 

@@ -12,6 +12,7 @@
  * runtime gate in tools/authz.ts) all derive from this one source.
  */
 import { readRoleDefModel, type DelegationRoute, type RunState } from '../types.ts'
+import { ROLE_ACTOR_SUBMISSION_PROTOCOL } from '../engine/texts.ts'
 
 /**
  * Tools the Judge must always have: the `judge_claim` protocol tool (A1 R9)
@@ -110,11 +111,15 @@ export const ACTOR_PERSONA_SEPARATOR = '\n\n'
  * Issue #140：Role Actor system persona 的唯一组合函数。spawn 路径（host.ts
  * ensureRoleActor）与冷恢复后的一切读取都走这里：只读冻结快照，
  * 不改写快照中的 role persona，因此重复调用不会叠加。
+ * Issue #226：末尾固定追加提交协议（公共 persona → 角色 persona → 固定
+ * 协议；缺省公共 persona 时为角色 persona → 固定协议）。Judge 与 Manager
+ * 不经过此函数，不受影响。
  */
 export function roleActorPersona(run: RunState, roleKey: string): string {
   const rolePersona = run.definitionSnapshot.roles[roleKey]?.persona ?? ''
   const common = run.definitionSnapshot.actorCommonPersona
-  return common === undefined ? rolePersona : `${common}${ACTOR_PERSONA_SEPARATOR}${rolePersona}`
+  const base = common === undefined ? rolePersona : `${common}${ACTOR_PERSONA_SEPARATOR}${rolePersona}`
+  return base === '' ? ROLE_ACTOR_SUBMISSION_PROTOCOL : `${base}${ACTOR_PERSONA_SEPARATOR}${ROLE_ACTOR_SUBMISSION_PROTOCOL}`
 }
 
 /**

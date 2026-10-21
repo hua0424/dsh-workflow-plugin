@@ -4,7 +4,7 @@ import { WorkflowError, LIMITS, compactBeforeReuse, declaredResults, nodeChecker
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { resolveRoleModel } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
-import { ACTOR_RECOVERY_INSTRUCTION, MANAGER_SUBMISSION_CONSTRAINT, SUBMISSION_CONSTRAINT, runMaterialsSection } from './texts.ts'
+import { ACTOR_RECOVERY_INSTRUCTION, MANAGER_SUBMISSION_CONSTRAINT, runMaterialsSection } from './texts.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { isTransientJudgeFailure, withTurnEndFailure } from '../plugin/turn-end.ts'
@@ -409,7 +409,9 @@ export class WorkflowEngine {
         const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
         const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
         const predecessor = await this.predecessorResultContext(ws, e)
-        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${runMaterialsSection(ws, run.runId)}${role === 'manager' ? MANAGER_SUBMISSION_CONSTRAINT : SUBMISSION_CONSTRAINT}`
+        // Issue #226：Role 派发不再追加固定提交协议——协议已随派生 preset 进入
+        // system persona（压缩/冷恢复后依然有效）；Manager 派发保留 manager 变体。
+        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${runMaterialsSection(ws, run.runId)}${role === 'manager' ? MANAGER_SUBMISSION_CONSTRAINT : ''}`
         const sent = role === 'manager'
           ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
           : run.roleActors[role]
