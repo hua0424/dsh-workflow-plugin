@@ -8,6 +8,7 @@ import { ACTOR_RECOVERY_INSTRUCTION, MANAGER_SUBMISSION_CONSTRAINT, SUBMISSION_C
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { isTransientJudgeFailure, withTurnEndFailure } from '../plugin/turn-end.ts'
+import { describeActivationSettlement, shortRouteLabel, type ActivationEndInfo, type DispatchLifecycleTracker } from '../plugin/dispatch-lifecycle.ts'
 import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
 export interface DispatchTargets {
@@ -56,6 +57,11 @@ export interface SubagentHost {
   compactRoleActor(run: RunState, roleKey: string): Promise<{ ok: boolean; detail?: string }>
   /** 必须覆盖普通工具 tail、已知后台写任务及未收口后代；unknown 一律 `unsafe`。 */
   safeToInspect(sessionId: string): Promise<SafeInspection>
+  /**
+   * Issue #221：派发生命周期终止信号的待对账观察（Host Adapter 持有并装配，
+   * 引擎只在发布/结算点读写）。缺席 = 旧装配/测试替身，引擎退化为既有行为。
+   */
+  dispatchLifecycle?: DispatchLifecycleTracker
 }
 export interface ProgramHost {
   run(run: RunState, programId: string, parameters: Record<string, unknown>, cwd: string): Promise<ProgramResult>
@@ -283,6 +289,36 @@ export class WorkflowEngine {
   }
 
   /** 一次触发只登记当前需要的一个安排。并发触发由数据库 CAS 仲裁，非整Promise锁。 */
+  /**
+   * Issue #221：登记一次已发布派发的待对账条目（受理不等于执行完成）。
+   * 只登记真实子代理 Activation 路径（manager steer 不是 activation 路径，
+   * 不跟踪）。条目绑定不可变 Run/执行/派发身份与真实会话身份；发布窗口内
+   * 先到达的终态由 tracker 对账后立即经 handleActivationSettled 处理。
+   */
+  private async trackDispatch(ws: string, run: RunState, e: NodeExecution, kind: 'actor' | 'judge', roleKey: string): Promise<void> {
+    const tracker = this.subagents.dispatchLifecycle
+    if (tracker === undefined) return
+    const dispatch = kind === 'actor' ? e.dispatch : e.judge
+    if (!dispatch?.sessionId || !dispatch.messageId) return
+    if (kind === 'judge' && !e.claim) return
+    const route = kind === 'judge'
+      ? shortRouteLabel((dispatch as ExecutionJudge).model)
+      : shortRouteLabel(resolveRoleModel(run, roleKey, run.delegationRoute))
+    const buffered = tracker.track({
+      workspaceKey: ws, runId: run.runId, executionId: e.executionId, nodeToken: e.nodeToken,
+      dispatchId: dispatch.id, kind, roleKey,
+      ...(route === undefined ? {} : { route }),
+      sessionId: dispatch.sessionId, messageId: dispatch.messageId,
+      epochRunId: tracker.epochOf(dispatch.sessionId),
+      ...(kind === 'judge' ? { claimId: e.claim!.id, inputVersion: e.inputVersion } : {}),
+      outcome: 'unknown',
+    })
+    if (buffered !== undefined) await this.handleActivationSettled(ws, dispatch.sessionId, buffered)
+  }
+  private forgetDispatch(sessionId: string | undefined): void {
+    if (sessionId === undefined) return
+    this.subagents.dispatchLifecycle?.forget(sessionId)
+  }
   async drive(ws: string): Promise<void> {
     const row = await this.state.get(ws)
     if (!row || row.run.status !== 'running') return
@@ -390,6 +426,9 @@ export class WorkflowEngine {
           fresh.execution.boundary!.executorSessionId = sent.childId
         }
         await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
+        // Issue #221：身份发布成功后登记待对账条目（manager steer 不是
+        // activation 路径，不跟踪）。发布前到达的终态在此对账。
+        if (role !== 'manager') await this.trackDispatch(ws, fresh.run, fresh.execution, 'actor', role)
         // #203：派发给 Role Actor 的 working 变化对 Manager 不可见，补一条结构化事件；
         // manager 角色的派发正文同一 turn 已 steer 给 Manager，不重复。
         if (role !== 'manager') await this.notifyNodeEvent(fresh.run, fresh.execution)
@@ -421,6 +460,8 @@ export class WorkflowEngine {
       if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
       fresh.execution.judge!.messageId = sent.messageId
       await this.state.put(ws, fresh.run, fresh.version, [change(fresh.execution)])
+      // Issue #221：Judge 身份发布成功后登记待对账条目。
+      await this.trackDispatch(ws, fresh.run, fresh.execution, 'judge', 'judge')
       // #203：Judge 已派发（判定中）对 Manager 不可见，补一条结构化事件。
       await this.notifyNodeEvent(fresh.run, fresh.execution)
     } catch (error) { await this.dispatchFault(ws, e, error, committedVersion) }
@@ -551,6 +592,9 @@ export class WorkflowEngine {
       if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
       current.execution.judge!.messageId = sent.messageId
       await this.state.put(ws, current.run, current.version, [change(current.execution)])
+      // Issue #221：重试派发同样登记待对账条目（旧 Judge 会话的失效终态由
+      // 世代/身份校验丢弃，不得触发第二次重试或推进）。
+      await this.trackDispatch(ws, current.run, current.execution, 'judge', 'judge')
       // #203：自动重试重派 Judge 同样是判定中变化，补一条结构化事件。
       await this.notifyNodeEvent(current.run, current.execution)
     } catch (error) {
@@ -847,6 +891,7 @@ export class WorkflowEngine {
       if (!fresh || fresh.version !== row.version || fresh.execution.executionId !== e.executionId) return
       transfer.judge.settled = true
       await this.state.put(ws, fresh.run, fresh.version, [change(transfer.owner)])
+      this.forgetDispatch(caller.sessionId)
       await this.drive(ws)
       return
     }
@@ -869,15 +914,91 @@ export class WorkflowEngine {
     if (actor && e.phase === 'checking') {
       e.dispatch!.settled = true
       await this.state.put(ws, fresh.run, fresh.version, [change(e)])
+      this.forgetDispatch(e.dispatch?.sessionId)
       await this.drive(ws)
-    } else if (actor && e.phase === 'working') await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
-    else if (judge && e.phase === 'checking') {
+    } else if (actor && e.phase === 'working') {
+      this.forgetDispatch(e.dispatch?.sessionId)
+      await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
+    } else if (judge && e.phase === 'checking') {
       // Issue #200：瞬时失败有界自动重试 1 次（fresh 新会话重派）；已重试过或非瞬时
       // （4xx 等）直接 BLOCK。fail-closed/只读不变量不变。
       if (isTransientJudgeFailure(turnFailure) && !e.judgeAutoRetried) await this.retryJudgeOnce(ws, fresh, turnFailure)
-      else if (e.judgeAutoRetried) await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim (已自动重试 1 次)', turnFailure))
-      else await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim', turnFailure))
+      else if (e.judgeAutoRetried) {
+        this.forgetDispatch(e.judge?.sessionId)
+        await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim (已自动重试 1 次)', turnFailure))
+      } else {
+        this.forgetDispatch(e.judge?.sessionId)
+        await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim', turnFailure))
+      }
     }
+  }
+  /**
+   * Issue #221：派发受理后、无 turn/end 时的宿主生命周期终止信号收口。
+   * 由 `subagent/end` 监听经 setImmediate 转交（Host append 回调之外），以及
+   * 身份发布前到达的缓存终态对账时调用。与 turn/end 结算互斥去重：
+   * - 条目缺席 → 缓存终态，等身份发布时对账（矩阵 B）；
+   * - 世代失配 → 陈旧世代的迟到信号忽略；新世代的信号缓存等新条目（矩阵 C）；
+   * - 工作单已推进/替换/BLOCK/终止，或派发身份已不符 → 条目作废，不影响当前状态；
+   * - 已接受的 claim / 已提交的业务交接永不撤销（矩阵 E 的执行完成情形只清条目）；
+   * - 明确失败且无可用 turn/end → 技术故障 BLOCK，保留 execution/claim/handoff（矩阵 A）；
+   * - 正常 completed 不是失败；不因空消息/idle/耗时推断失败（矩阵 D）；
+   * - Judge 不做第二次自动重试：无 turn/end 兜底直接 BLOCK（矩阵 F）。
+   */
+  async handleActivationSettled(ws: string, sessionId: string, end: ActivationEndInfo): Promise<void> {
+    const tracker = this.subagents.dispatchLifecycle
+    if (tracker === undefined) return
+    const entry = tracker.peek(sessionId)
+    if (entry === undefined) {
+      tracker.bufferEnd(sessionId, end)
+      return
+    }
+    if (entry.epochRunId !== undefined && entry.epochRunId !== end.runId) {
+      if (end.runId === tracker.epochOf(sessionId)) {
+        // 结束属于更新的世代：旧条目作废，缓存该信号等新身份发布时对账。
+        tracker.forget(sessionId)
+        tracker.bufferEnd(sessionId, end)
+      }
+      // 陈旧世代的迟到信号：忽略，保留当前条目。
+      return
+    }
+    const row = await this.state.get(ws)
+    if (!row || row.run.status !== 'running' || row.execution.executionId !== entry.executionId
+      || row.execution.nodeToken !== entry.nodeToken) {
+      tracker.forget(sessionId)
+      return
+    }
+    const e = row.execution
+    if (entry.kind === 'actor') {
+      const dispatch = e.dispatch
+      if (!dispatch || dispatch.id !== entry.dispatchId || dispatch.sessionId !== sessionId || dispatch.settled
+        || e.claim?.dispatchId === entry.dispatchId || e.phase !== 'working') {
+        tracker.forget(sessionId)
+        return
+      }
+    } else {
+      const judge = e.judge
+      if (!judge || judge.id !== entry.dispatchId || judge.sessionId !== sessionId || judge.settled
+        || judge.claimId !== entry.claimId || judge.inputVersion !== entry.inputVersion || e.phase !== 'checking') {
+        tracker.forget(sessionId)
+        return
+      }
+    }
+    // 明确的执行失败证据（activation.result 终态）优先于终态边。
+    if (entry.outcome !== 'failed') {
+      // 矩阵 D：正常 completed 不是失败；不因空消息、idle 或耗时推断失败。
+      if (end.stopReason === 'completed') {
+        tracker.forget(sessionId)
+        return
+      }
+      // 矩阵 E：执行已完成、仅清理失败 → 不是"Actor 无结果失败"，只清条目，
+      // 不 BLOCK、不撤销 claim/交接。
+      if (entry.outcome === 'completed') {
+        tracker.forget(sessionId)
+        return
+      }
+    }
+    await this.blockRow(ws, row, describeActivationSettlement(entry, end))
+    tracker.forget(sessionId)
   }
   async handleBlock(ws: string, token: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
     const row = await this.state.get(ws)
@@ -927,6 +1048,7 @@ export class WorkflowEngine {
           && owner.judgment.judgeDispatchId === owner.judge?.id
         if (!e.restartPending || !terminalAccepted) return rejected('predecessor Judge is not safely settled; keep BLOCK until its activity is resolved')
         owner.judge!.settled = true
+        this.forgetDispatch(owner.judge?.sessionId)
         recoveredPredecessor = owner
       }
     }
@@ -973,7 +1095,10 @@ export class WorkflowEngine {
     if (resolvedTarget === 'judge') {
       if (e.phase !== 'checking' || !e.claim || !e.dispatch || e.judgment?.result === 'ACCEPT') return rejected('judge resume requires an effective claim without a business conclusion')
       // auto never takes this branch while unsettled; explicit target=judge is the Manager's takeover decision.
-      if (!e.dispatch.settled) e.dispatch.settled = true
+      if (!e.dispatch.settled) {
+        e.dispatch.settled = true
+        this.forgetDispatch(e.dispatch.sessionId)
+      }
       const sameJudgeNeedContext = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
         && e.judgment.claimId === e.claim.id && e.judgment.inputVersion === e.inputVersion
         && e.judgment.judgeDispatchId === oldJudge.id && e.judgment.judgeSessionId === oldJudge.sessionId
