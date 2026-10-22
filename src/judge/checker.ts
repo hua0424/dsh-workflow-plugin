@@ -54,6 +54,10 @@ Submit your verdict ONLY through the \`judge_claim\` tool, exactly once, with:
 - REJECT: the claim conflicts with an existing criterion or a verifiable fact. Your reason MUST identify that criterion, cite the factual basis, and state concretely HOW to correct the work — the worker receives it verbatim for another attempt at the SAME node.
 - Use NEED_CONTEXT when information is insufficient or an existing requirement is unclear. State what is missing, why it affects judgment, and what the Manager should provide — never turn a personal preference into a new criterion and never just say "cannot judge".
 
+# Reason format (conclusion-first, truncation-safe)
+- reason 的第一行必须是「判定结果 + 一句话结论 +（REJECT/NEED_CONTEXT 时）下一步动作」，证据细节后置——通知与 status 只展示前 ~200 字符摘要，截断也不损失可行动性。
+- REJECT 首行写明修法方向；NEED_CONTEXT 首行写明 Manager 需补充什么。
+
 # Scope (strict)
 - The worker's chosen result is {workerResult}; verify it against the shared criteria and THAT result's criteria only.
 - Do NOT re-pick, rename or substitute a business result, and do NOT rule out the other exits one by one.
