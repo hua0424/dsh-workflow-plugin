@@ -248,7 +248,7 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
         roleKey: { type: 'string', required: true, description: 'roleKey 或 judge' },
         provider: { type: 'string', required: true, description: 'provider route' },
         modelId: { type: 'string', required: true, description: 'model id' },
-        reasoningEffort: { type: 'string', description: '可选思考强度（适配器自有档位 id；省略即回落目标模型默认）' },
+        reasoningEffort: { type: 'string', description: '可选思考强度（适配器自有档位 id；省略即回落目标模型默认）。档位 id 因模型而异，非法将被拒并列出合法档位' },
       },
       output: stringOut,
       async execute(args, exec) {

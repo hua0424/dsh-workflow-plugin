@@ -119,6 +119,14 @@ export class WorkflowEngine {
   cwdResolver: (run: RunState) => Promise<string> = async () => { throw new WorkflowError('cwd resolver is not wired') }
   actorActivity: (sessionId: string) => Promise<'active' | 'idle' | 'unknown'> = async () => 'unknown'
   managerRoute: (sessionId: string) => Promise<SpawnAgentOptions> = async () => ({})
+  /**
+   * #223：set_role_model 保存前三维校验（provider 注册 / modelId 本地列表 /
+   * reasoningEffort 合法档位），与 start 矩阵同源。生产装配在 `src/index.ts`
+   *（现成 `effortInfoOf` + provider-check 纯判定）；未装配时跳过（存量测试兼容）。
+   * 返回 ok:false 即拒绝并展示 reason；ok:true + note 即放行并把 note
+   * 注明进成功消息（fail-open：元数据查不到、无法判定 dimensions）。
+   */
+  validateModelRoute?: (provider: string, modelId: string, reasoningEffort?: string) => Promise<{ ok: boolean; reason?: string; note?: string }>
   traceWarn: ((message: string) => void) | undefined
   /** #216：Run 终局（completed/terminated）通知宿主适配层（动态 preset 注销等）；best-effort。 */
   runClosed: ((run: RunState) => void) | undefined
@@ -1387,6 +1395,21 @@ export class WorkflowEngine {
     if (reasoningEffort !== undefined && typeof reasoningEffort !== 'string') return rejected('reasoningEffort must be a string when provided')
     let route
     try { route = normalizeModelRoute(provider, model, reasoningEffort) } catch (error) { return rejected(error instanceof Error ? error.message : String(error)) }
+    // #223：三维校验在 normalize 之后、no-op / 探针 / mutation 之前——存量非法
+    // override 经 no-op 路径同样先被校验，不免检；judge 与普通角色走同一校验。
+    let validatedNote: string | undefined
+    if (this.validateModelRoute !== undefined) {
+      let verdict
+      try {
+        verdict = await this.validateModelRoute(route.provider, route.modelId, route.reasoningEffort)
+      } catch (error) {
+        return rejected(`model route validation failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      if (!verdict.ok) return rejected(verdict.reason ?? 'model route rejected')
+      validatedNote = verdict.note
+    }
+    const withNote = (message: string): string =>
+      validatedNote === undefined || validatedNote === '' ? message : `${message}（${validatedNote}）`
     const existing = row.run.modelOverrides[role]
     const mapped = role === 'judge' ? undefined : row.run.roleActors[role]
     // #153 T4 + #172：no-op 须比较三元件——存活会话可能仍携带
@@ -1396,7 +1419,7 @@ export class WorkflowEngine {
     // 后续派发经显式 undefined 回落模型默认，或携带显式档位）；Judge 恒无映射（Judge 会话复用由
     // resume 的三元件比较决定，#22/T1），无映射且 override 三元件全等时才可 no-op。
     if (existing?.provider === route.provider && existing.modelId === route.modelId
-      && existing.reasoningEffort === route.reasoningEffort && mapped === undefined) return { ok: true, run: row.run, message: 'model override already applied' }
+      && existing.reasoningEffort === route.reasoningEffort && mapped === undefined) return { ok: true, run: row.run, message: withNote('model override already applied') }
     const currentNode = this.nodeAt(row.run, topFrame(row.run))
     const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
     if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')
@@ -1411,7 +1434,7 @@ export class WorkflowEngine {
     if (replacesCurrentRole) row.execution.roleBoundaryPrepared = true
     await this.state.put(ws, row.run, row.version, [change(row.execution, 'model-changed')])
     this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax), ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: jsonField(route.reasoningEffort, LIMITS.reasoningEffortMax) }) })
-    return { ok: true, run: row.run, message: `model override saved for ${role}` }
+    return { ok: true, run: row.run, message: withNote(`model override saved for ${role}`) }
   }
   /**
    * `rootSession` 是 host 边界（`src/commands/dsh-flow.ts` 的 `isRootCommandAgent`）判定
