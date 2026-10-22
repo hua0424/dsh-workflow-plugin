@@ -120,7 +120,7 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
   return [
     defineTool({
       name: 'workflow_status',
-      description: '默认查看当前 Run 摘要；Manager 可显式指定 executionId/after/limit 分页查看关键历史（最多 50 条）。',
+      description: '默认查看当前 Run 摘要（judgment 含当前/历史/待判定 state、≤200 字符摘要与 judgmentRef）；Manager 可显式指定 executionId/after/limit 分页查看关键历史（最多 50 条，事件 snapshot 含判定全文，凭 judgmentRef.executionId 取回）。',
       parameters: {
         executionId: { type: 'string', description: '本 Run 的 execution ID；提供后进入 Manager-only 历史模式' },
         after: { type: 'integer', description: '稳定事件 sequence 游标（exclusive，默认 0）' },

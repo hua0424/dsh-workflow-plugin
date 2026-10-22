@@ -113,6 +113,27 @@ function resultDefOf(node: NodeDef | undefined, result: string): { criteria: str
   if (node === undefined) return undefined
   return nodeResults(node)?.[result]
 }
+/**
+ * Issue #214：判定摘要（语义词边界截断，上限 200 字符），通知与 status 共用。
+ * 先压单行，超限则在上限内最后一个空格处断开（无空格才硬切），截断也不切碎词语。
+ */
+const JUDGMENT_SUMMARY_MAX = 200
+function summarizeJudgment(reason: string, max: number = JUDGMENT_SUMMARY_MAX): string {
+  const flat = reason.replace(/\s+/g, ' ').trim()
+  if (flat.length <= max) return flat || '-'
+  const cut = flat.slice(0, max)
+  const boundary = cut.lastIndexOf(' ')
+  // ponytail: 无空格（长串英文/哈希）才硬切，这是已知上限而非通用分词。
+  return (boundary > 0 ? cut.slice(0, boundary) : cut).trimEnd() || '-'
+}
+/**
+ * Issue #214：判定对齐口径（与 invariants 同源）：judgment.claimId 与当前
+ * claim.id 且 inputVersion 对齐 = 当前判定。调用方据此区分当前判定 / 历史判定 /
+ * 待判定（有 claim 无对齐判定），不再靠 handoffPreview 变化推断。
+ */
+function alignedJudgment(e: NodeExecution): boolean {
+  return e.judgment !== undefined && e.judgment.claimId === e.claim?.id && e.judgment.inputVersion === e.inputVersion
+}
 
 
 export class WorkflowEngine {
@@ -203,6 +224,25 @@ export class WorkflowEngine {
       ...(e.resolution?.target === 'judge' ? { recovery: true } : {}),
     }
   }
+  /**
+   * Issue #214：status 的 judgment 区分当前判定 / 历史判定 / 待判定（state 字段），
+   * 判定均标注 visit 并携带所针对的 claimId 与 judgmentRef（executionId + visit）；
+   * 全文经 history 分页按 executionId 取事件 snapshot（不新增参数/工具）。
+   */
+  private statusJudgment(e: NodeExecution): {
+    state: 'current' | 'historical'; result: string; summary: string; claimId: string; visit: number; judgmentRef: { executionId: string; visit: number }
+  } | { state: 'pending'; claimId: string } | null {
+    if (alignedJudgment(e)) {
+      const judgment = e.judgment!
+      return { state: 'current', result: judgment.result, summary: summarizeJudgment(judgment.reason), claimId: judgment.claimId, visit: e.visit, judgmentRef: { executionId: e.executionId, visit: e.visit } }
+    }
+    if (e.judgment !== undefined && e.claim === undefined) {
+      const judgment = e.judgment
+      return { state: 'historical', result: judgment.result, summary: summarizeJudgment(judgment.reason), claimId: judgment.claimId, visit: e.visit, judgmentRef: { executionId: e.executionId, visit: e.visit } }
+    }
+    if (e.claim !== undefined) return { state: 'pending', claimId: e.claim.id }
+    return null
+  }
   async status(ws: string, caller = '', history?: { executionId: string; after?: number; limit?: number }) {
     const row = await this.state.get(ws)
     if (!row) return { ok: true, status: 'no active run' }
@@ -234,7 +274,7 @@ export class WorkflowEngine {
         hasClaim: execution.claim !== undefined, claimResult: execution.claim?.result ?? null,
         declaredResults: declaredResults(node),
         returned: execution.returned ? { kind: execution.returned.kind, name: execution.returned.name } : null,
-        judgment: execution.judgment ? { result: execution.judgment.result, reasonPreview: execution.judgment.reason.slice(0, 500) } : null,
+        judgment: this.statusJudgment(execution),
         inputPreview: execution.input.slice(0, 500), handoffPreview,
         blockReason: execution.blockReason ?? run.blockReason, recoveryTarget: execution.resolution?.target ?? null,
         restartPending: execution.restartPending,
@@ -545,7 +585,13 @@ export class WorkflowEngine {
   private nodeEventText(run: RunState, e: NodeExecution): string {
     const oneLine = (value: string, max: number): string => value.replace(/\s+/g, ' ').trim().slice(0, max) || '-'
     const claimResult = e.claim?.result ?? e.previousClaim?.result ?? '-'
-    const judgment = e.judgment ? `${e.judgment.result} ${oneLine(e.judgment.reason, 200)}` : '-'
+    // Issue #214：judgment 改为「verdict + ≤200 字符摘要 + judgmentRef」：有对齐判定 =
+    // 当前判定；有判定但无当前 claim = 历史判定；有 claim 无对齐判定 = 待判定（不再沿用
+    // 旧判定，避免与历史混淆）。全文经 workflow_status history 分页按 executionId 取事件 snapshot。
+    const aligned = alignedJudgment(e)
+    const judgment = aligned || (e.judgment !== undefined && e.claim === undefined)
+      ? `${e.judgment!.result} ${summarizeJudgment(e.judgment!.reason)} (${aligned ? 'current' : 'historical'} ref=${e.executionId} visit=${e.visit})`
+      : e.claim !== undefined ? 'pending' : '-'
     const returned = e.returned ? `${e.returned.kind}:${e.returned.name}` : '-'
     const blockReason = e.blockReason ?? run.blockReason
     return [
