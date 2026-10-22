@@ -1,9 +1,10 @@
 // #212 补充覆盖：已提交实现（eb7f699）的正/反/Manager 路径见
 // test/runtime-store-safety.test.ts（tokenless 两组）与 test/tools.test.ts
-// （nodeToken 省略透传）；本文件只补三处未覆盖边界：
+// （nodeToken 省略透传）；本文件只补四处未覆盖边界：
 // ① tokenless BLOCK 后 Manager resume 照常轮换 token 并重派发；
 // ② 已 BLOCK 的 Run 不再接受第二次 tokenless BLOCK；
 // ③ Manager 无 token 在 Role 节点上被拒（不削弱代次隔离）。
+// ④ 已 settled dispatch 的无 token BLOCK 被拒（session 血统命中亦拒绝）。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -106,6 +107,29 @@ test('#212 已 BLOCK 的 Run 不再接受第二次 tokenless BLOCK', async () =>
     assert.equal(row.run.status, 'blocked')
     assert.equal(row.execution.blockReason, '首次阻塞')
     assert.deepEqual(row, blocked)
+  } finally { h.cleanup() }
+})
+
+test('#212 已 settled dispatch 的无 token BLOCK 被拒且零写入', async () => {
+  const h = harness()
+  try {
+    const { row } = await atReviewer(h)
+    assert.equal(row.execution.phase, 'working')
+    assert.equal(row.execution.claim, undefined)
+    // 注入已 settled：working 期 + 无 pending claim 保持不变，仅 settled 翻转；
+    // caller 经 sessionUserMessageIds 血统命中 matches（turn 集为空），
+    // 仅靠 engine.ts gate 的 `e.dispatch?.settled` 项拒绝。
+    const settledExec = structuredClone(row.execution)
+    settledExec.dispatch!.settled = true
+    const base = (await h.store.get('ws'))!
+    await h.store.updateRow('ws', structuredClone(base.run), base.stateVersion, [{ execution: settledExec, expectedRevision: settledExec.revision, events: [] }])
+    const injected = (await h.store.get('ws'))!
+    assert.equal(injected.execution.phase, 'working')
+    assert.equal(injected.execution.claim, undefined)
+    assert.equal(injected.execution.dispatch?.settled, true)
+    const viaSessionLineage: ClaimCaller = { sessionId: 'role-reviewer', turnUserMessageIds: new Set<string>(), sessionUserMessageIds: new Set([injected.execution.dispatch!.messageId!]) }
+    assert.equal((await h.engine.handleBlock('ws', undefined, 'settled 后阻塞', viaSessionLineage)).ok, false)
+    assert.deepEqual(await h.store.get('ws'), injected, '拒绝路径不产生任何状态写入')
   } finally { h.cleanup() }
 })
 

@@ -240,6 +240,29 @@ test('tokenless node_block: current dispatch Actor blocks with its business reas
   } finally { f.cleanup() }
 })
 
+// #212 反例：派发已 settled（旧代次）时 lease 门必须拒绝（钉住 e.dispatch?.settled 检查项）。
+test('tokenless node_block: settled dispatch no longer qualifies as the current lease and is rejected', async () => {
+  const f = await fixture(true)
+  try {
+    await f.engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan artifact' }, f.actor)
+    await f.engine.handleTurnEnded('ws', f.actor)
+    const row = (await f.store.get('ws'))!
+    const planJudge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set(['judge-message-1']) }
+    await f.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified', planJudge)
+    await f.engine.handleTurnEnded('ws', planJudge)
+    const working = (await f.store.get('ws'))!
+    assert.equal(working.execution.phase, 'working')
+    // 注入 settled=true，其余 lease 条件（working、无 claim、caller 匹配）保持成立
+    const settledExec = structuredClone(working.execution)
+    settledExec.dispatch!.settled = true
+    await f.store.updateRow('ws', structuredClone(working.run), working.stateVersion, [{ execution: settledExec, expectedRevision: settledExec.revision, events: [] }])
+    const baseline = (await f.store.get('ws'))!
+    const reviewer: ClaimCaller = { sessionId: 'role-reviewer', turnUserMessageIds: new Set([baseline.execution.dispatch!.messageId!]) }
+    assert.equal((await f.engine.handleBlock('ws', undefined, 'stale settled lease', reviewer)).ok, false)
+    assert.deepEqual(await f.store.get('ws'), baseline, '拒绝路径零状态写入')
+  } finally { f.cleanup() }
+})
+
 // #212：checking 期（已有 pending claim）不提供无 token 出口；Manager 带 token 路径回归不变。
 test('tokenless node_block: rejected once a claim is pending (checking phase); Manager token path unchanged', async () => {
   const f = await fixture(true)
