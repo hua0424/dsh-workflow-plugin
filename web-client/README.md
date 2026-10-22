@@ -1,6 +1,6 @@
 # Web 配置编辑器
 
-编辑器通过宿主 `main` 面板和 `sidebar.panellist` 注册，React 使用宿主共享实例。浏览器通过 File System Access API 打开用户授权目录；解析、校验、预览、布局补齐和程序元数据经宿主 RPC 调用，保存仍由用户点击触发。
+编辑器通过宿主 `settings.section` 注册为设置页一页「工作流配置」（#219 起，入口不再占侧栏图标位），React 使用宿主共享实例。浏览器通过 File System Access API 打开用户授权目录；解析、校验、预览、布局补齐和程序元数据经宿主 RPC 调用，保存仍由用户点击触发。
 
 ## 界面与操作
 
