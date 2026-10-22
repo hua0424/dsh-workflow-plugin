@@ -75,7 +75,7 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 
 Engine invariants（改动 engine/state 前必读，详见 CONTEXT.md）：
 
-- 所有 Node mutation 必须携带 current `nodeToken`（每次 node 进入/resume/replacement 轮换的 UUID）；Actor 一律以 `workflow_status` 返回的最新 token 为准.
+- 所有 Node mutation 必须携带 current `nodeToken`（每次 node 进入/resume/replacement 轮换的 UUID）；Actor 一律以 `workflow_status` 返回的最新 token 为准。唯一例外（#212）：`node_block` 可省略 nodeToken，改按派发 lease 绑定识别 Actor（仅 working 期、无 pending claim、未 settled 的当前派发本人时受理）.
 - Judge 是只读 + fail-closed：技术故障进入 BLOCK；禁止从 Judge 自己的 judge_claim turn 内 drain 自己.
 - 自动 BLOCK 的状态写入必须 defer，不能在 `session/event` 回调内同步 append 同一 Session.
 - 一个 workspace（canonical realpath）最多一个 Run；状态存于 `${DSH_HOME}/workflows/state.sqlite3`.
