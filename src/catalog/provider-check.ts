@@ -134,7 +134,9 @@ export function collectRoleRoutes(config: WorkflowConfig): Array<{ role: string;
 
 /**
  * 对给定 provider 清单 + 本地模型列表事实 + 档位事实做静态判定；available
- * 为已注册 provider id 集。纯函数：同一输入同一报告，check/start 共用。
+ * 为已注册 provider id 集。纯函数：同一输入同一报告，check/start 共用同一规则。
+ * #223：单路由判定抽为 `checkSingleProviderRoute` 导出，`workflow_set_role_model`
+ * 保存前校验与 start 矩阵同源（同一函数、同一语义）。
  */
 export function checkCatalogProviders(
   workflowId: string,
@@ -143,51 +145,67 @@ export function checkCatalogProviders(
   lists?: ModelListFacts,
   efforts?: EffortFacts,
 ): ProviderCheckReport {
-  const known = available instanceof Set ? available : new Set(available)
-  const rows: ProviderCheckRow[] = collectRoleRoutes(config).map(({ role, provider, modelId, effort }) => {
-    if (provider === undefined) {
-      return { role, provider: null, modelId: modelId ?? null, ok: true, reason: '未配置 model，运行时继承 Manager route', modelList: 'inherited' as const, effort: 'not-applicable' as const, effortDetail: null }
-    }
-    if (!known.has(provider)) {
-      return { role, provider, modelId: modelId ?? null, ok: false, reason: `provider "${provider}" 未在当前 profile 注册`, modelList: 'provider-unregistered' as const, effort: 'not-applicable' as const, effortDetail: null }
-    }
-    const failure = lists?.failures?.get(provider)
-    if (failure !== undefined) {
-      return {
-        role, provider, modelId: modelId ?? null, ok: true,
-        reason: `无法解析 provider "${provider}" 的本地模型列表（${failure}）；已跳过 modelId 与后续档位检查，允许尝试启动（不代表模型可用）`,
-        modelList: 'list-unavailable' as const, effort: 'not-applicable' as const, effortDetail: null,
-      }
-    }
-    const models = lists?.models?.get(provider)
-    if (models === undefined) {
-      return {
-        role, provider, modelId: modelId ?? null, ok: true,
-        reason: `未查询 provider "${provider}" 的本地模型列表；已跳过 modelId 与后续档位检查，允许尝试启动（不代表模型可用）`,
-        modelList: 'list-unavailable' as const, effort: 'not-applicable' as const, effortDetail: null,
-      }
-    }
-    if (models.length === 0) {
-      return {
-        role, provider, modelId: modelId ?? null, ok: false,
-        reason: `provider "${provider}" 的本地模型列表为空（未实现 listModels 的适配器视为不可用）；请检查该 provider 的本地配置`,
-        modelList: 'empty-list' as const, effort: 'not-applicable' as const, effortDetail: null,
-      }
-    }
-    if (modelId !== undefined && !models.includes(modelId)) {
-      return {
-        role, provider, modelId, ok: false,
-        reason: `modelId "${modelId}" 不在 provider "${provider}" 的本地模型列表中；请先在本地 settings/config 声明该模型后再 start`,
-        modelList: 'unlisted' as const, effort: 'not-applicable' as const, effortDetail: null,
-      }
-    }
-    // T3：只有 listed 才进入档位阶段；未配置 effort 不查询思考元数据。
-    if (effort === undefined) {
-      return { role, provider, modelId: modelId ?? null, ok: true, reason: 'provider 已注册；modelId 在本地模型列表中', modelList: 'listed' as const, effort: 'not-configured' as const, effortDetail: null }
-    }
-    return judgeEffort(role, provider, modelId as string, effort, efforts)
-  })
+  const rows: ProviderCheckRow[] = collectRoleRoutes(config).map(({ role, provider, modelId, effort }) =>
+    checkSingleProviderRoute(role, provider, modelId, effort, available, lists, efforts))
   return { workflowId, ok: rows.every(row => row.ok), rows }
+}
+
+/**
+ * #223：单条模型路由的纯判定（`checkCatalogProviders` 每行的同源实现）。
+ * provider/modelId/effort 均为“配置值”（undefined = 未配置该分量）；set_role_model
+ * 调用时 provider/modelId 必在场（normalize 已保证非空），effort 缺席即不查档位。
+ */
+export function checkSingleProviderRoute(
+  role: string,
+  provider: string | undefined,
+  modelId: string | undefined,
+  effort: string | undefined,
+  available: ReadonlySet<string> | readonly string[],
+  lists?: ModelListFacts,
+  efforts?: EffortFacts,
+): ProviderCheckRow {
+  const known = available instanceof Set ? available : new Set(available)
+  if (provider === undefined) {
+    return { role, provider: null, modelId: modelId ?? null, ok: true, reason: '未配置 model，运行时继承 Manager route', modelList: 'inherited' as const, effort: 'not-applicable' as const, effortDetail: null }
+  }
+  if (!known.has(provider)) {
+    return { role, provider, modelId: modelId ?? null, ok: false, reason: `provider "${provider}" 未在当前 profile 注册`, modelList: 'provider-unregistered' as const, effort: 'not-applicable' as const, effortDetail: null }
+  }
+  const failure = lists?.failures?.get(provider)
+  if (failure !== undefined) {
+    return {
+      role, provider, modelId: modelId ?? null, ok: true,
+      reason: `无法解析 provider "${provider}" 的本地模型列表（${failure}）；已跳过 modelId 与后续档位检查，允许尝试启动（不代表模型可用）`,
+      modelList: 'list-unavailable' as const, effort: 'not-applicable' as const, effortDetail: null,
+    }
+  }
+  const models = lists?.models?.get(provider)
+  if (models === undefined) {
+    return {
+      role, provider, modelId: modelId ?? null, ok: true,
+      reason: `未查询 provider "${provider}" 的本地模型列表；已跳过 modelId 与后续档位检查，允许尝试启动（不代表模型可用）`,
+      modelList: 'list-unavailable' as const, effort: 'not-applicable' as const, effortDetail: null,
+    }
+  }
+  if (models.length === 0) {
+    return {
+      role, provider, modelId: modelId ?? null, ok: false,
+      reason: `provider "${provider}" 的本地模型列表为空（未实现 listModels 的适配器视为不可用）；请检查该 provider 的本地配置`,
+      modelList: 'empty-list' as const, effort: 'not-applicable' as const, effortDetail: null,
+    }
+  }
+  if (modelId !== undefined && !models.includes(modelId)) {
+    return {
+      role, provider, modelId, ok: false,
+      reason: `modelId "${modelId}" 不在 provider "${provider}" 的本地模型列表中；请先在本地 settings/config 声明该模型后再 start`,
+      modelList: 'unlisted' as const, effort: 'not-applicable' as const, effortDetail: null,
+    }
+  }
+  // T3：只有 listed 才进入档位阶段；未配置 effort 不查询思考元数据。
+  if (effort === undefined) {
+    return { role, provider, modelId: modelId ?? null, ok: true, reason: 'provider 已注册；modelId 在本地模型列表中', modelList: 'listed' as const, effort: 'not-configured' as const, effortDetail: null }
+  }
+  return judgeEffort(role, provider, modelId as string, effort, efforts)
 }
 
 /**
@@ -240,9 +258,11 @@ function judgeEffort(role: string, provider: string, modelId: string, effort: st
       effortDetail: `思考档位 "${effort}" 在模型 ${route} 的支持列表中`,
     }
   }
+  // #223：阻断必须列出该模型合法档位（调用方照单改写，不再靠外部元数据反推）。
+  const supported = info.reasoning.efforts.map(candidate => `"${candidate.id}"`).join('、')
   return {
     role, provider, modelId, ok: false,
-    reason: `思考档位 "${effort}" 不在模型 ${route} 的支持列表中；请改用该模型支持的档位或去掉该角色的 reasoningEffort`,
+    reason: `思考档位 "${effort}" 不在模型 ${route} 的支持列表中（该模型合法档位：${supported}）；请改用支持的档位或去掉该角色的 reasoningEffort`,
     modelList: 'listed' as const, effort: 'blocked' as const, effortDetail: null,
   }
 }

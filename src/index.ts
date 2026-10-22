@@ -16,7 +16,7 @@ import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceD
 import { endedSessionUserMessageIds, endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { turnEndFailure, type TurnEndFact } from './plugin/turn-end.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
-import { checkCatalogProvidersWithModelListsAndEfforts, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
+import { checkCatalogProvidersWithModelListsAndEfforts, checkSingleProviderRoute, queryEffortInfo, queryModelLists, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
 import { WorkflowEngine } from './engine/engine.ts'
 import { WorkflowError } from './types.ts'
 import type { RunState, NodeExecution } from './types.ts'
@@ -180,6 +180,25 @@ export function apply(ctx: Context) {
   // F22 / #91：Run 启动时冻结 Manager 的默认路由，冻结值随 Run row 持久化。
   // #118 D-91-3：取源语义唯一生产实现在 host.ts `managerRouteOf`，测试同源断言。
   engine.managerRoute = async (managerSessionId: string) => managerRouteOf(ctx.agents.get(managerSessionId as SessionId))
+  // #223：set_role_model 保存前三维校验（provider 注册 / modelId 本地列表 /
+  // reasoningEffort 合法档位），与 start 矩阵同源（同一纯判定 `checkSingleProviderRoute`）。
+  // 查询失败的维度 fail-open：放行并把「未校验」注明进成功消息；确定误配一律拒绝。
+  engine.validateModelRoute = async (provider: string, modelId: string, reasoningEffort?: string) => {
+    const available = ctx.llm.listProviders().map(item => item.id)
+    const { models, failures } = await queryModelLists([provider],
+      async name => (await ctx.llm.listModels(name)).map(model => model.id))
+    const listed = models.get(provider)?.includes(modelId) === true
+    const { info, failures: effortFailures } = listed && reasoningEffort !== undefined
+      ? await queryEffortInfo([{ provider, modelId }], effortInfoOf)
+      : { info: undefined, failures: undefined }
+    const row = checkSingleProviderRoute('set_role_model', provider, modelId, reasoningEffort, available,
+      { models, failures }, info === undefined ? undefined : { info, failures: effortFailures })
+    if (!row.ok) return { ok: false, reason: row.effortDetail === null ? row.reason : `${row.reason}；${row.effortDetail}` }
+    const notes: string[] = []
+    if (row.modelList === 'list-unavailable') notes.push(`modelId 未校验：${row.reason}`)
+    if (row.effort === 'skipped') notes.push(`档位未校验：${row.effortDetail}`)
+    return { ok: true, ...(notes.length === 0 ? {} : { note: notes.join('；') }) }
+  }
   // F13: actor-activity oracle for resume/model-switch checks.
   engine.actorActivity = async (actorSessionId: string) => {
     const agent = ctx.agents.get(actorSessionId as SessionId)
