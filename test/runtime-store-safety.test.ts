@@ -217,6 +217,18 @@ test('tokenless node_block: current dispatch Actor blocks with its business reas
     // 反：同会话但派发 ID 不在其血统集（跨 turn 旧快照）→ 拒绝
     const wrongTurn: ClaimCaller = { sessionId: 'role-reviewer', turnUserMessageIds: new Set<string>() }
     assert.equal((await f.engine.handleBlock('ws', undefined, 'stale turn', wrongTurn)).ok, false)
+    // 反：dispatch 身份尚未发布（sessionId 未绑定）→ matches 不成立，拒绝
+    const unpublishedExec = structuredClone(row.execution)
+    delete unpublishedExec.dispatch!.sessionId
+    await f.store.updateRow('ws', structuredClone(row.run), row.stateVersion, [{ execution: unpublishedExec, expectedRevision: unpublishedExec.revision, events: [] }])
+    const anonymous: ClaimCaller = { sessionId: 'role-reviewer', turnUserMessageIds: new Set([unpublishedExec.dispatch!.messageId!]) }
+    assert.equal((await f.engine.handleBlock('ws', undefined, 'before identity', anonymous)).ok, false)
+    // 恢复派发身份后重取基线，继续正/反断言
+    const restoredExec = (await f.store.get('ws'))!.execution
+    restoredExec.dispatch!.sessionId = 'role-reviewer'
+    const mid = (await f.store.get('ws'))!
+    await f.store.updateRow('ws', structuredClone(mid.run), mid.stateVersion, [{ execution: restoredExec, expectedRevision: restoredExec.revision, events: [] }])
+    row = (await f.store.get('ws'))!
     assert.deepEqual(await f.store.get('ws'), row, '拒绝路径不产生任何状态写入')
 
     // 正：当前派发 Actor 无 token BLOCK，blockReason 为业务原因
