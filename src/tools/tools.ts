@@ -62,7 +62,7 @@ export interface ToolHost {
   // the calling agent's session — for claim/block it also carries the calling
   // turn's user-message id snapshot for dispatch-lease admission, A1 R2/R3).
   claim(workspaceKey: string, claim: NodeClaim, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
-  block(workspaceKey: string, nodeToken: string, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
+  block(workspaceKey: string, nodeToken: string | undefined, reason: string, caller: ClaimCaller): Promise<{ ok: boolean; reason?: string; message?: string }>
   resume(workspaceKey: string, nodeToken: string, resolutionContext: string, caller: string, target?: 'auto' | 'actor' | 'judge', skipCompact?: boolean): Promise<{ ok: boolean; reason?: string; message?: string }>
   runProgram(workspaceKey: string, nodeToken: string, parameters: Record<string, unknown>, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
   resolveProgram(workspaceKey: string, nodeToken: string, result: 'PASS' | 'FAIL', reason: string, caller: string): Promise<{ ok: boolean; reason?: string; message?: string }>
@@ -170,9 +170,9 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
 
     defineTool({
       name: 'node_block',
-      description: '把当前 Node 置为 BLOCK（暂停）。不执行 Checker/Edge。这必须是当前 Turn 的最后一个动作。',
+      description: '把当前 Node 置为 BLOCK（暂停）。不执行 Checker/Edge。这必须是当前 Turn 的最后一个动作。nodeToken 可省略：省略时按当前派发 lease 绑定识别 Actor 身份（仅 working 期且无 pending claim 时受理）。',
       parameters: {
-        nodeToken: { type: 'string', required: true, description: '当前 Node 的 nodeToken' },
+        nodeToken: { type: 'string', description: '当前 Node 的 nodeToken；Actor 无 token 时可省略，改按派发 lease 绑定识别' },
         reason: { type: 'string', required: true, description: 'BLOCK 原因（1..4000 字符）' },
       },
       output: stringOut,
@@ -181,7 +181,8 @@ export function makeWorkflowTools(host: ToolHost): ToolDefinition[] {
         if (auth.workspaceKey === null) return `拒绝：${auth.reason}`
         const reasonError = lengthError('reason', args.reason, 1, LIMITS.blockReasonMax, true)
         if (reasonError !== undefined) return `拒绝：${reasonError}`
-        const outcome = await host.block(auth.workspaceKey, args.nodeToken, args.reason.trim(), claimCallerOf(exec))
+        if (args.nodeToken !== undefined && (typeof args.nodeToken !== 'string' || !args.nodeToken.trim())) return '拒绝：nodeToken 必须是非空字符串或省略'
+        const outcome = await host.block(auth.workspaceKey, args.nodeToken === undefined ? undefined : args.nodeToken.trim(), args.reason.trim(), claimCallerOf(exec))
         if (outcome.ok) exec.concludeTurn()
         return fmtResult(outcome)
       },

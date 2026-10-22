@@ -93,6 +93,17 @@ test('node_block routes to host.block and concludes the turn on success', async 
   assert.equal(concluded, true)
 })
 
+// #212：nodeToken 可省略（lease 绑定路径）；提供时必须是非空字符串。
+test('node_block without nodeToken passes undefined to host.block; blank token rejected', async () => {
+  const host = makeToolHost()
+  const tool = findTool(host, 'node_block')
+  const exec = { ...EXEC, concludeTurn: () => {} }
+  await tool.execute({ reason: 'authorization gap' }, exec as never)
+  assert.deepEqual(host.calls[0], { name: 'block', args: { ws: 'ws-1', nodeToken: undefined, reason: 'authorization gap' } })
+  assert.equal(await tool.execute({ nodeToken: '  ', reason: 'blank token' }, exec as never), '拒绝：nodeToken 必须是非空字符串或省略')
+  assert.equal(host.calls.length, 1)
+})
+
 test('node_resume routes to host.resume', async () => {
   const host = makeToolHost()
   const tool = findTool(host, 'node_resume')

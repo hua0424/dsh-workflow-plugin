@@ -1056,9 +1056,18 @@ export class WorkflowEngine {
     await this.blockRow(ws, row, describeActivationSettlement(entry, end))
     tracker.forget(sessionId)
   }
-  async handleBlock(ws: string, token: string, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
+  async handleBlock(ws: string, token: string | undefined, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
     const row = await this.state.get(ws)
-    if (!row || row.run.status !== 'running' || row.execution.nodeToken !== token) return rejected('no current running Node/token')
+    if (!row || row.run.status !== 'running') return rejected('no current running Node/token')
+    // #212：Actor 无 token 显式 BLOCK——与 node_claim 的派发 lease 绑定同构：
+    // 仅当前未 settled 派发的本人、working 期且无 pending claim 时受理，
+    // blockReason 为业务原因而非 actor-turn-ended-without-result。
+    if (token === undefined) {
+      const e = row.execution
+      if (e.phase !== 'working' || e.claim || e.dispatch?.settled || !matches(e.dispatch, caller)) {
+        return rejected('tokenless node_block requires the current unsettled dispatch in working phase without a pending claim')
+      }
+    } else if (row.execution.nodeToken !== token) return rejected('no current running Node/token')
     reason = reason.trim()
     if (!reason || reason.length > LIMITS.blockReasonMax) return rejected('invalid block reason')
     const node = this.nodeAt(row.run, topFrame(row.run))
