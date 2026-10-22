@@ -132,6 +132,8 @@ export const EDITOR_STYLES = `
 .wf-editor :is(.wf-result-rename, .wf-return) > input { width: auto; flex: 1 1 100px; }
 .wf-editor .wf-inspector-content :is(div, span, details):has(> label) > button,
 .wf-editor :is(.wf-result-rename, .wf-return) > button { margin: 0; flex: 0 0 auto; }
+.wf-editor label.wf-compact-toggle { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.wf-editor .wf-compact-toggle input[type="checkbox"] { width: auto; margin: 0; padding: 0; flex: 0 0 auto; }
 .wf-editor .wf-long-text { min-width: 0; flex: 1 1 170px; }
 .wf-editor button.wf-text-preview { display: block; width: 100%; margin: 0; text-align: left; white-space: pre-wrap; overflow: hidden; max-height: 76px; font-family: ui-monospace, Consolas, monospace; }
 .wf-editor .wf-text-dialog { width: min(1000px, 92vw); max-width: 92vw; height: min(780px, 88vh); max-height: 88vh; padding: 22px; border: 1px solid var(--wf-border); border-radius: 12px; color: var(--wf-text); background: var(--wf-surface); }
