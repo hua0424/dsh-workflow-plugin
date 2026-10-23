@@ -124,7 +124,7 @@ export function effortRouteKey(provider: string, modelId: string): string {
  * 收集 catalog 全部待查角色：roles 各键 + judgeRole（键名固定 `judge`）。def 层读取走共享单源。
  * #235：配置了 `fallbackModel` 的角色额外产生一行备用路由（角色名带 `（备用模型）`
  * 后缀）——主备执行同一套启动前静态校验，备用误配同样阻断启动。Judge 备用路由
- * 属 #236，此处不收集。
+ * 属 #236，同样收集（`judge（备用模型）`）。
  */
 export function collectRoleRoutes(config: WorkflowConfig): Array<{ role: string; provider?: string; modelId?: string; effort?: string }> {
   const routes: Array<{ role: string; provider?: string; modelId?: string; effort?: string }> = []
@@ -138,6 +138,10 @@ export function collectRoleRoutes(config: WorkflowConfig): Array<{ role: string;
   }
   const judge = readRoleDefModel(config, 'judge')
   routes.push({ role: 'judge', provider: judge?.provider, modelId: judge?.modelId, effort: judge?.reasoningEffort })
+  const judgeFallback = readRoleFallbackModel(config, 'judge')
+  if (judgeFallback !== undefined) {
+    routes.push({ role: 'judge（备用模型）', provider: judgeFallback.provider, modelId: judgeFallback.modelId, effort: judgeFallback.reasoningEffort })
+  }
   return routes
 }
 

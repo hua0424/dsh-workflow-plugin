@@ -144,14 +144,13 @@ export function readRoleDefModel(
 }
 
 /**
- * #235：catalog def 层 → 备用路由的共享单源。只对普通角色生效（Judge 备用
- * 路由属 #236，schema 层仍拒绝 `judgeRole.fallbackModel`）。
+ * #235/#236：catalog def 层 → 备用路由的共享单源（普通角色与 Judge 同一读取口）。
  */
 export function readRoleFallbackModel(
   config: Pick<WorkflowConfig, 'roles' | 'judgeRole'>,
   roleKey: 'judge' | string,
 ): RoleModel | undefined {
-  return roleKey === 'judge' ? undefined : config.roles[roleKey]?.fallbackModel
+  return roleKey === 'judge' ? config.judgeRole.fallbackModel : config.roles[roleKey]?.fallbackModel
 }
 
 /**
@@ -193,8 +192,7 @@ export interface RoleDefinition {
    * #235：该角色唯一的备用模型路由（可选；无备用链、不含 Manager）。
    * provider+modelId 必须与主路由不同（仅 effort 不同不构成备用——同一模型
    * 再试一次不属于故障切换）；省略 `reasoningEffort` 即用备用模型的默认档位，
-   * 不继承主分辨率或 Manager 档位。`judgeRole.fallbackModel` 属 #236，schema
-   * 当前仍拒绝该键。
+   * 不继承主分辨率或 Manager 档位。
    */
   fallbackModel?: RoleModel
   tools?: { deny: string[] }
@@ -213,6 +211,12 @@ export interface RoleDefinition {
 export interface JudgeRoleDefinition {
   persona: string
   model?: RoleModel
+  /**
+   * #236：Judge 唯一的备用模型路由（与普通角色同形状同规则，无备用链）。
+   * Judge 省略 `model` 时主路由是启动时冻结的继承路由，备用与它同样须
+   * provider+modelId 不同（启动前由 startRun 的 fallbackClash 判定）。
+   */
+  fallbackModel?: RoleModel
   /** Extra tool names to hide from the Judge, on top of the plugin default deny list. */
   tools?: { deny: string[] }
 }

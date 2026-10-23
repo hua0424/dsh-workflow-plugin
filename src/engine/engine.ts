@@ -297,7 +297,7 @@ export class WorkflowEngine {
    */
   private roleRoutesView(run: RunState): Array<{ role: string; stage: string; route: string; fallback: string | null; reason: string | null; autoSwitches: number }> {
     const roles = new Set(Object.keys(run.roleRoutes ?? {}))
-    for (const role of Object.keys(run.definitionSnapshot.roles)) {
+    for (const role of [...Object.keys(run.definitionSnapshot.roles), 'judge']) {
       if (readRoleFallbackModel(run.definitionSnapshot, role) !== undefined) roles.add(role)
     }
     return [...roles].sort().map((role) => {
@@ -400,12 +400,12 @@ export class WorkflowEngine {
     this.subagents.dispatchLifecycle?.forget(sessionId)
   }
   /**
-   * #235：启动期主备冲突检查——配置了 `fallbackModel` 的角色，其生效主路由
-   * （显式 `model`，缺省为本 Run 冻结的默认路由）与备用路由的 provider+modelId
-   * 必须不同。返回拒绝原因或 undefined。
+   * #235/#236：启动期主备冲突检查——配置了 `fallbackModel` 的角色（含 Judge），
+   * 其生效主路由（显式 `model`，缺省为本 Run 冻结的默认路由）与备用路由的
+   * provider+modelId 必须不同。返回拒绝原因或 undefined。
    */
   private fallbackClash(run: RunState): string | undefined {
-    for (const roleKey of Object.keys(run.definitionSnapshot.roles)) {
+    for (const roleKey of [...Object.keys(run.definitionSnapshot.roles), 'judge']) {
       const fallback = readRoleFallbackModel(run.definitionSnapshot, roleKey)
       if (fallback === undefined) continue
       if (sameModelRoute(rolePrimaryRoute(run, roleKey, run.delegationRoute), fallback)) {
@@ -1031,6 +1031,19 @@ export class WorkflowEngine {
       this.forgetDispatch(e.dispatch?.sessionId)
       await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
     } else if (judge && e.phase === 'checking') {
+      // #236：配置了 Judge 备用路由时，合格故障且已安全收口就直接切 B——不再叠加
+      // #200 的同主模型 fresh 重试；B 终止失败直接 BLOCK，不追加插件级自动重试。
+      if (roleFallbackRoute(fresh.run, 'judge') !== undefined) {
+        if (await this.tryJudgeFailover(ws, fresh, failureFacts)) return
+        this.forgetDispatch(e.judge?.sessionId)
+        // 备用已用尽（B 之后再失败）与故障不合格/未配置路由分开报：前者明确告诉
+        // Manager 预算已消耗完，后者保持旧语义（含认证/额度等不换模的判定）。
+        const exhausted = effectiveRoleRouteStage(fresh.run, 'judge') === 'fallback'
+        await this.blockRow(ws, fresh, withTurnEndFailure(exhausted
+          ? 'judge turn ended without judge_claim (备用模型已用尽，不再自动重试)'
+          : 'judge turn ended without judge_claim', turnFailure))
+        return
+      }
       // Issue #200：瞬时失败有界自动重试 1 次（fresh 新会话重派）；已重试过或非瞬时
       // （4xx 等）直接 BLOCK。fail-closed/只读不变量不变。
       if (isTransientJudgeFailure(turnFailure) && !e.judgeAutoRetried) await this.retryJudgeOnce(ws, fresh, turnFailure)
@@ -1111,6 +1124,75 @@ export class WorkflowEngine {
     await this.targets.steerManager(run, `${this.nodeEventText(run, e)}\nWorkflow MODEL FALLBACK: role=${role} ${from} → ${to}（${next}，本轮第 ${autoSwitches} 次自动切换，原因 ${reason}）\n该角色已用新路由重新派发，无需批准；再次合格故障将 BLOCK。`).catch(() => {})
     await this.drive(ws)
     return true
+  }
+  /**
+   * #236：Judge 单备用模型的安全恢复（A→B→BLOCK，与 Actor 同构但判定材料不变）。
+   *
+   * 前提由调用点保证：Judge 的本 Turn 已结束且会话已安全收口（unsafe/waiting 在更早
+   * 分支 BLOCK/return），执行仍在 `checking` 且 claim/judge 均有效。切换只换派发
+   * 路由：claim、判定材料、冻结 criteria 与 inputVersion 原样保留，新 Judge 继续判
+   * 同一个 claim（不补做 Actor 的工作），旧会话只撤权（不在 Judge 自己的判定调用里
+   * drain 自己）。
+   *
+   * 预算与普通角色独立（`roleRoutes.judge`）并随 Run 行持久化：node_resume/Host 重启
+   * 都不刷新；切到 B 后本 Run 后续判定保持 B，B 再失败直接 BLOCK（不叠加插件级重试，
+   * 也不回到 A）。返回 `true` 表示已切 B 并重派；`false` 交回 BLOCK 路径（未配置备用、
+   * 故障不合格、预算用尽、主备同路由等）。
+   */
+  private async tryJudgeFailover(ws: string, row: RuntimeRow, facts: ActorFailureFacts | undefined): Promise<boolean> {
+    const { run, execution: e, version } = row
+    if (e.phase !== 'checking' || !e.claim || !e.judge) return false
+    const fallback = roleFallbackRoute(run, 'judge')
+    // 未配置备用路由 = 不引入人工恢复链：调用点保留 #200 的同模型重试一次。
+    if (fallback === undefined) return false
+    const verdict = classifyActorFailure(facts)
+    if (facts === undefined || !verdict.eligible) return false
+    const stage = effectiveRoleRouteStage(run, 'judge')
+    if (stage === 'fallback') return false
+    // 纵深防御：主备同 provider+modelId（仅 effort 不同）等于同一模型再试一次。
+    if (sameModelRoute(rolePrimaryRoute(run, 'judge', run.delegationRoute), fallback)) return false
+    const next = stage === 'manual' ? 'primary' : 'fallback'
+    const target = next === 'primary' ? rolePrimaryRoute(run, 'judge', run.delegationRoute) : fallback
+    const from = shortRouteLabel(resolveRoleModel(run, 'judge', run.delegationRoute)) ?? 'unknown'
+    const to = shortRouteLabel(target) ?? 'unknown'
+    const autoSwitches = (run.roleRoutes?.judge?.autoSwitches ?? 0) + 1
+    const reason = `${verdict.kind} ${describeActorFailure(facts)}`
+    const previousSessionId = e.judge.sessionId
+    // 离开人工路由即撤销该 override（与 Actor 同义）；切 B 后用 B，新 Run 才回 A。
+    if (stage === 'manual') delete run.modelOverrides.judge
+    run.roleRoutes = { ...(run.roleRoutes ?? {}), judge: { stage: next, reason, autoSwitches } }
+    // 判定材料与 inputVersion 不变：新 Judge 判同一 claim，旧会话的迟到提交/Turn 结算
+    // 因 e.judge 身份失配被丢弃（预算不会被扣第二次）。判定中不刷新同模型重试预算。
+    e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: target }
+    await this.state.put(ws, run, version, [change(e, 'model-changed', 'judge-arranged')])
+    this.forgetDispatch(previousSessionId)
+    await this.subagents.retireJudge(run, previousSessionId).catch(() => {})
+    this.trace(run, 'MODEL-FALLBACK', {
+      workflow: e.workflowId, node: e.nodeId, role: 'judge',
+      from: jsonField(from, LIMITS.modelIdMax), to: jsonField(to, LIMITS.modelIdMax),
+      stage: next, switch: autoSwitches, reason: jsonField(reason, LIMITS.blockReasonMax),
+    })
+    // 成功切换主动通知 Manager（无需批准）；best-effort，绝不阻断重派。
+    await this.targets.steerManager(run, `${this.nodeEventText(run, e)}\nWorkflow MODEL FALLBACK: role=judge ${from} → ${to}（${next}，本轮第 ${autoSwitches} 次自动切换，原因 ${reason}）\nJudge 已用新路由重新派发判定同一 claim，无需批准；备用模型再次合格故障将 BLOCK。`).catch(() => {})
+    try {
+      const cwd = await this.cwdResolver(run)
+      if (!await this.stillCurrent(ws, e, version + 1)) { await this.subagents.retireJudge(run, e.judge.sessionId).catch(() => {}); return true }
+      const packet = this.judgePacket(run, e, cwd, ws)
+      const sent = await this.subagents.startJudge(run, packet)
+      const current = await this.stillCurrent(ws, e, version + 1)
+      if (!current) { await this.subagents.retireJudge(run, e.judge.sessionId).catch(() => {}); return true }
+      if (sent.judgeSessionId !== e.judge.sessionId || !sent.messageId) throw new WorkflowError('Host returned mismatched Judge identity')
+      current.execution.judge!.messageId = sent.messageId
+      await this.state.put(ws, current.run, current.version, [change(current.execution)])
+      await this.trackDispatch(ws, current.run, current.execution, 'judge', 'judge')
+      await this.notifyNodeEvent(current.run, current.execution)
+      return true
+    } catch (error) {
+      const current = await this.state.get(ws)
+      if (current?.version !== version + 1 || current.execution.executionId !== e.executionId) return true
+      await this.blockRow(ws, current, withTurnEndFailure(`judge failover dispatch failed (备用路由 ${to}): ${error instanceof Error ? error.message : String(error)}`, undefined))
+      return true
+    }
   }
   /**
    * Issue #221：派发受理后、无 turn/end 时的宿主生命周期终止信号收口。
@@ -1612,7 +1694,9 @@ export class WorkflowEngine {
     if (mapped) delete row.run.roleActors[role]
     if (replacesCurrentRole) row.execution.roleBoundaryPrepared = true
     // #235：显式设置模型即开新一轮（C → 主 → 备用），本轮自动切换预算归零；
-    // C 允许与主/备用相同（人工要求在该路由上再试一次）。Judge 无备用链，不写阶段表。
+    // C 允许与主/备用相同（人工要求在该路由上再试一次）。#236：Judge 已有人工
+    // 路由（override 即 manual），但「人工设置 C 后的全新恢复轮次」属 #237，本节点
+    // 不改写 Judge 的阶段表/预算（避免提前交付下一票语义）。
     if (role !== 'judge') row.run.roleRoutes = { ...(row.run.roleRoutes ?? {}), [role]: { stage: 'manual', reason: 'manager-set', autoSwitches: 0 } }
     await this.state.put(ws, row.run, row.version, [change(row.execution, 'model-changed')])
     this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax), ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: jsonField(route.reasoningEffort, LIMITS.reasoningEffortMax) }) })
