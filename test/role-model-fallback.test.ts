@@ -21,7 +21,7 @@ import { makeStateHost } from '../src/plugin/host.ts'
 import { turnEndFailure, turnEndFailureFacts, type TurnEndFact } from '../src/plugin/turn-end.ts'
 import { judgeSpawnPlan, resolveRoleModel } from '../src/roles/roles.ts'
 import { StateStore } from '../src/state/store.ts'
-import { routeToAgentOptions, type RunState, type SpawnAgentOptions, type WorkflowConfig } from '../src/types.ts'
+import { routeToAgentOptions, sameRouteIdentity, type RunState, type SpawnAgentOptions, type WorkflowConfig } from '../src/types.ts'
 import { businessEqual, loadDraft, previewDraft, redo, setJudgeFallbackModel, setJudgeModel, setRoleFallbackModel, undo } from '../src/editor/draft.ts'
 import { serializeLayout } from '../src/editor/layout.ts'
 import { buildClientBundle, bundleSources } from '../web-client/build.mjs'
@@ -1274,6 +1274,71 @@ test('#243 R1 在途判定期间人工设 C：C 未实派，通知/trace 归因�
     assert.match(h.trace(), /MODEL-FALLBACK .*role=judge from="人工路由未实派" to="jprimary\/jprimary-model" stage=primary switch=1/)
     assert.doesNotMatch(h.trace(), /MODEL-FALLBACK .*from="manual\/manual-model"/)
   } finally { h.close(); rmSync(traceDir, { recursive: true, force: true }) }
+})
+
+test('#243 MF-1 在途判定期间人工设同模型异档位 C：C 未实派，from 不得写成含 effort 的 C 标签', async () => {
+  const traceDir = mkdtempSync(join(tmpdir(), 'workflow-role-fallback-trace-'))
+  const h = harness(judgeConfig(), traceDir)
+  try {
+    await h.start()
+    const judging = await h.toChecking()
+    const dispatched = (await h.row()).execution.judge!.model
+    assert.deepEqual(dispatched, { provider: 'jprimary', modelId: 'jprimary-model' }, '在途判定实际走主模型（无显式档位）')
+
+    // 人工设 C：与在途派发同 provider+modelId、仅档位不同。#237 允许并开新一轮，
+    // 但判定已派发未结算 → C 只从下一次判定生效，本次从未实派。
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'judge', 'jprimary', 'jprimary-model', 'manager', 'high')).ok, true)
+    const arranged = await h.row()
+    assert.deepEqual(arranged.run.modelOverrides.judge, { provider: 'jprimary', modelId: 'jprimary-model', reasoningEffort: 'high' })
+    assert.deepEqual(arranged.execution.judge!.model, dispatched, '设置不重派、不替换在途判定')
+
+    const spawnsBefore = h.spawns.length
+    await h.engine.handleTurnEnded('ws', judging, FAILOVER_503.text, FAILOVER_503.facts)
+    const row = await h.row()
+    assert.equal(row.run.status, 'running')
+    assert.deepEqual(row.run.roleRoutes?.judge, { stage: 'primary', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+    assert.equal(row.run.modelOverrides.judge, undefined, '离开人工阶段即撤销 C')
+
+    const notices = h.messages.filter(message => message.includes('Workflow MODEL FALLBACK'))
+    assert.equal(notices.length, 1)
+    assert.match(notices[0]!, /role=judge 人工路由未实派 → jprimary\/jprimary-model（primary，本轮第 1 次自动切换，原因 server-5xx code=SERVER status=503）/)
+    assert.doesNotMatch(notices[0]!, /jprimary\/jprimary-model\/high →/, '同 provider+modelId 异档位也是另一条未实派的路由，不得写成来源')
+    // trace 与通知同源：同一个中性标注，不存在「通知说中性、trace 说 C」的分叉。
+    assert.match(h.trace(), /MODEL-FALLBACK .*role=judge from="人工路由未实派" to="jprimary\/jprimary-model" stage=primary switch=1/)
+    assert.doesNotMatch(h.trace(), /MODEL-FALLBACK .*from="jprimary\/jprimary-model\/high"/)
+
+    const respawn = judgeSpawns(h.spawns, spawnsBefore)
+    assert.equal(respawn.length, 1, '只重派一次')
+    assert.equal(respawn[0]!.agentOptions?.provider, 'jprimary')
+    assert.equal(respawn[0]!.agentOptions?.model, 'jprimary-model')
+    assert.equal(respawn[0]!.agentOptions?.reasoningEffort, undefined, 'C 已撤销：重派走主模型默认档位')
+  } finally { h.close(); rmSync(traceDir, { recursive: true, force: true }) }
+})
+
+test('#243 MF-1 反向锁：C 真的实派时 from 就是带 effort 的 C 标签（收紧谓词不误判）', async () => {
+  const h = harness(judgeConfig())
+  try {
+    await h.start()
+    // 开新一轮前先设 C：本次判定派发在 C 上，失败发生在这条真实路由上。
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'judge', 'jmanual', 'jmanual-model', 'manager', 'high')).ok, true)
+    const spawnsBefore = h.spawns.length
+    await h.engine.handleTurnEnded('ws', await h.toChecking(), FAILOVER_503.text, FAILOVER_503.facts)
+    const row = await h.row()
+    assert.deepEqual(row.run.roleRoutes?.judge, { stage: 'primary', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+    const notices = h.messages.filter(message => message.includes('Workflow MODEL FALLBACK'))
+    assert.equal(notices.length, 1)
+    assert.match(notices[0]!, /role=judge jmanual\/jmanual-model\/high → jprimary\/jprimary-model（primary，本轮第 1 次自动切换/)
+    assert.doesNotMatch(notices[0]!, /人工路由未实派/, 'C 实派时不得退化成中性标注')
+    assert.equal(judgeSpawns(h.spawns, spawnsBefore).at(-1)!.agentOptions?.provider, 'jprimary')
+  } finally { h.close() }
+})
+
+test('#243 MF-1 sameRouteIdentity 三元件全等：缺席键 ≠ 显式键', () => {
+  assert.equal(sameRouteIdentity({ provider: 'p', modelId: 'm' }, { provider: 'p', modelId: 'm' }), true)
+  assert.equal(sameRouteIdentity({ provider: 'p', modelId: 'm', reasoningEffort: 'high' }, { provider: 'p', modelId: 'm', reasoningEffort: 'high' }), true)
+  assert.equal(sameRouteIdentity({ provider: 'p', modelId: 'm' }, { provider: 'p', modelId: 'm', reasoningEffort: 'high' }), false,
+    '同一模型的另一档位是另一条路由')
+  assert.equal(sameRouteIdentity(undefined, { provider: 'p', modelId: 'm' }), false)
 })
 
 test('#243 R1 推广：备用阶段运行中人工设 C，C 未实派同样写中性标注（R2 直接用例）', async () => {

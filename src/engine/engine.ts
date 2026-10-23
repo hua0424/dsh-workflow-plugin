@@ -1,6 +1,6 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
 import type { WorkflowConfig, NodeClaim, NodeDef, Target, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
-import { WorkflowError, LIMITS, compactBeforeReuse, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, readRoleDefModel, readRoleFallbackModel, roleKeysWithJudge, sameModelRoute, type SpawnAgentOptions } from '../types.ts'
+import { WorkflowError, LIMITS, compactBeforeReuse, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, readRoleDefModel, readRoleFallbackModel, roleKeysWithJudge, sameModelRoute, sameRouteIdentity, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
 import { effectiveRoleRouteStage, resolveRoleModel, roleFallbackRoute, rolePrimaryRoute } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
@@ -1181,9 +1181,11 @@ export class WorkflowEngine {
     const target = next === 'primary' ? rolePrimaryRoute(run, 'judge', run.delegationRoute) : fallback
     // #243 R1：判定已派发未结算期间人工设 C 时，C 不参与本次判定，授权只从下一次判定
     // 派发生效（spec）。`e.judge.model` 记录的是本次派发实际用的路由，与 C 不一致即
-    // 证明 C 从未实派——此时不得把 C 写成来源。
+    // 证明 C 从未实派——此时不得把 C 写成来源。身份比较必须含档位（三元件全等）：
+    // 人工设同 provider+modelId 异档位的 C 是另一条路由，只看 provider+modelId 会把
+    // 从未实派的 C 谎报成来源（审查 MF-1）。
     const manualNotDispatched = stage === 'manual'
-      && !sameModelRoute(e.judge.model ?? {}, run.modelOverrides.judge ?? {})
+      && !sameRouteIdentity(e.judge.model, run.modelOverrides.judge)
     const from = manualNotDispatched
       ? MANUAL_ROUTE_NOT_DISPATCHED
       : shortRouteLabel(resolveRoleModel(run, 'judge', run.delegationRoute)) ?? 'unknown'
