@@ -99,6 +99,8 @@ Role（含 judgeRole）的模型路由由 provider、modelId 与可选思考强�
 
 **Model Recovery Cycle（模型恢复轮次）**：一次获授权的有限模型故障恢复过程，授权来自 Run 的显式备用配置或 Manager 的再次人工设置。自动切换、普通恢复与进程重启不构成新一轮授权。「再次人工设置」对 Role Actor 与 Judge 同规则（#237）：C 与 A/B 相同也开新一轮，只有当前已在人工阶段（stage=manual、预算 0）且路由三元件相同时才算无需变更。人工阶段的激活路由、来源与预算记在 `run.roleRoutes`（持久化，node_resume/重启不刷新）。
 
+**已实派路由 / 未实派人工路由（Dispatched Route / Undispatched Manual Route）**：切换素材里的来源只写“这次失败派发实际走过的路由”。人工设置只授权下一次派发、不替换在途派发，因此该在途派发失败时来源标为「人工路由未实派」，而不是刚设置、从未运行的 C（#243）。
+
 以上概念已在 #235（Actor 备用链）、#236（Judge 备用链）与 #237（人工换模新轮次）落地；备用配置仅随新 Run 的 Definition Snapshot 生效，不通过编辑配置追改在途 Run。已确认的行为边界见[单备用模型故障切换规格](docs/specs/role-model-fallback.md)，授权与安全取舍见 [ADR-0004](docs/adr/0004-role-model-fallback-authorization.md)。
 
 ## Judge Role / Judge Agent
