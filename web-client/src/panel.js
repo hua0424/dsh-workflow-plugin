@@ -305,6 +305,7 @@ async function writeTextFile(dir, name, text) {
 
 export function WorkflowConfigEditorPanel(props) {
   const editorRpc = props.editorRpc
+  const layout = props.layout ?? null
   const [dir, setDir] = useState(null)
   const [capError, setCapError] = useState(null)
   const [restoreCandidate, setRestoreCandidate] = useState(null)
@@ -1073,6 +1074,21 @@ export function WorkflowConfigEditorPanel(props) {
     }
   }, [dir, state.draft, state.selected, state.workflowId, state.dirtyBusiness, state.dirtyLayout, state.positions, call])
 
+  /* #177 返回对话：宿主 LayoutController.selectPanel(null) 回到原 Conversation。
+     脏检查复用编辑器现有 window.confirm 交互（与打开目录/切换文件一致）；
+     取消留在编辑器保留全部状态，确认放弃未保存修改并返回（不自动保存、
+     不恢复草稿）；忙碌期间按钮禁用；不碰 Session/workspace/Run。 */
+  const backToConversation = useCallback(() => {
+    if (state.busy) return
+    if (isDirty(state) && !window.confirm('有未保存的修改，返回对话将放弃它们。继续吗？')) return
+    const select = layout?.selectPanel
+    if (typeof select !== 'function') {
+      setState((prev) => ({ ...prev, problems: ['返回对话不可用：宿主面板控制器缺失（未重载页面或更换会话）'] }))
+      return
+    }
+    select.call(layout, null)
+  }, [state, layout])
+
   const draft = state.draft
   const flows = draft === null
     ? []
@@ -1085,6 +1101,7 @@ export function WorkflowConfigEditorPanel(props) {
   return h('div', { className: 'wf-editor' },
     h('style', null, EDITOR_STYLES),
     h('div', { className: 'wf-header' },
+      h('button', { type: 'button', onClick: backToConversation, disabled: state.busy, 'aria-label': '返回对话' }, '返回对话'),
       h('div', null, h('h2', null, '工作流配置'), h('p', null, '在画布上连接节点，在右侧编辑执行属性。')),
       h('span', { className: 'wf-badge' }, state.selected ?? '配置编辑器'),
     ),
@@ -2017,5 +2034,14 @@ function NodeCanvas(props) {
       ),
     ),
     h('div', { className: 'wf-canvas-help' }, '空白处右键/中键自由平移 · 滚轮平移 · 拖动标题移动节点 · 点击连线高亮，拖动圆点调整折线 · ★ 入口'),
+  )
+}
+
+export function WorkflowConfigEditorIcon() {
+  return h('svg', { width: 16, height: 16, viewBox: '0 0 16 16', 'aria-hidden': true },
+    h('rect', { x: 2, y: 2, width: 5, height: 5, fill: 'currentColor' }),
+    h('rect', { x: 9, y: 2, width: 5, height: 5, fill: 'currentColor', opacity: 0.5 }),
+    h('rect', { x: 2, y: 9, width: 5, height: 5, fill: 'currentColor', opacity: 0.5 }),
+    h('rect', { x: 9, y: 9, width: 5, height: 5, fill: 'currentColor' }),
   )
 }

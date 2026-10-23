@@ -97,7 +97,7 @@ return { ModelFields, modelChoices, readModelCatalog };
 })();
 var __panel = (function () {
 ${panel}
-return { WorkflowConfigEditorPanel };
+return { WorkflowConfigEditorPanel, WorkflowConfigEditorIcon };
 })();
 var __startModal = (function () {
 ${startSubmit}
