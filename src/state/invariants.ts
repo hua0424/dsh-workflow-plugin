@@ -25,6 +25,13 @@ const runSchema = z.object({
   // #149 T1: 冻结值携带 Manager 档位（有则收录），使未配 model 的角色沿既有
   // 继承行为拿到同一档位；显式 model 省略 effort 的清除只发生在派发边界。
   delegationRoute: z.object({ provider: text.optional(), modelId: text.optional(), reasoningEffort: text.optional() }).strict().optional(),
+  // #235：角色路由阶段 + 切换原因 + 本轮预算消耗；旧 Run 无该字段（= 旧解析行为）。
+  // 原因串是有界诊断（脱敏：只含故障码/状态码），不做自由文本校验。
+  roleRoutes: z.record(z.string(), z.object({
+    stage: z.enum(['primary', 'fallback', 'manual']),
+    reason: z.string().max(LIMITS.blockReasonMax).optional(),
+    autoSwitches: z.number().int().nonnegative().optional(),
+  }).strict()).optional(),
   // v3: 已确认的业务终局（名字 + 终局来源 executionId）；handoff 不做第二份镜像。
   businessReturn: z.object({ name: z.string().regex(ID_PATTERN), source: text }).strict().optional(),
 }).strict()
@@ -48,6 +55,8 @@ const executionSchema = z.object({
     judgeSessionId: text.optional(), inputVersion: revision,
     // #198：单次跳过复用前压缩的审计标记（仅实际跳过时记 true）。
     skipCompact: z.boolean().optional(),
+    // #235：自动切换备用路由时随恢复材料落库的切换说明（派发正文独立成段）。
+    failover: z.string().trim().min(1).max(LIMITS.blockReasonMax).optional(),
   }).strict().optional(),
   program: z.object({
     id: text,
@@ -189,6 +198,8 @@ export function checkStateInvariants(run: RunState, execution?: NodeExecution): 
   }
   for (const key of Object.keys(run.roleActors)) if (!(key in run.definitionSnapshot.roles)) problems.push(`unknown roleActors key: ${key}`)
   for (const key of Object.keys(run.modelOverrides)) if (key !== 'judge' && !(key in run.definitionSnapshot.roles)) problems.push(`unknown modelOverrides key: ${key}`)
+  // #235：阶段表只允许快照内普通角色（Judge 备用路由属 #236；Manager 无备用链）。
+  for (const key of Object.keys(run.roleRoutes ?? {})) if (!(key in run.definitionSnapshot.roles)) problems.push(`unknown roleRoutes key: ${key}`)
   if (execution) {
     problems.push(...checkExecutionInvariants(run, execution))
     if (run.status === 'blocked' && !(run.blockReason?.trim() || execution.blockReason?.trim())) problems.push('blocked run requires a control or execution reason')

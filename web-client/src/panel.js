@@ -24,7 +24,7 @@ import {
   parseNewFilenameEdit, redoEdit, renameFlowReturnEdit, renameNodeEdit, renameNodeResultEdit, renameSubflowEdit,
   renameRoleEdit, savePlanOf, setActorFieldsEdit, setChildReturnTargetEdit, setChildWorkflowIdEdit, setFlowStartNodeEdit, setJudgeDenyEdit,
   setJudgeModelEdit, setJudgePersonaEdit, setNodeResultEdit, setProgramFieldsEdit, setProgramParamEdit,
-  setProgramResultEdit, setRoleDenyEdit, setRoleModelEdit,
+  setProgramResultEdit, setRoleDenyEdit, setRoleFallbackModelEdit, setRoleModelEdit,
   setRolePersonaEdit, setRoleReuseEdit, setRoleCompactBeforeReuseEdit, SUPPORTED_CHECKER_IDS, undoEdit,
 } from './edits.js'
 
@@ -104,6 +104,15 @@ function modelInputOf(form) {
   }
 }
 
+/** #235：备用模型表单 → edits 输入（同一归一化语义，字段名独立以免与主模型串用）。 */
+function fallbackModelInputOf(form) {
+  return {
+    provider: form.fallbackProvider,
+    modelId: form.fallbackModelId,
+    reasoningEffort: form.fallbackEffort.trim() === '' ? undefined : form.fallbackEffort,
+  }
+}
+
 function workflowIdOf(yamlName) {
   return yamlName.endsWith('.yaml') ? yamlName.slice(0, -'.yaml'.length) : yamlName
 }
@@ -122,6 +131,10 @@ function roleFormOf(draft, sel) {
     provider: role?.model?.provider ?? '',
     modelId: role?.model?.modelId ?? '',
     effort: role?.model?.reasoningEffort ?? '',
+    // #235：备用模型（可选，整键省略 = 不配置，角色不引入故障切换链）。
+    fallbackProvider: role?.fallbackModel?.provider ?? '',
+    fallbackModelId: role?.fallbackModel?.modelId ?? '',
+    fallbackEffort: role?.fallbackModel?.reasoningEffort ?? '',
     reuse: role?.reuse ?? 'node',
     // #198：草稿缺席按开启解释（勾选默认勾上）。
     compactBeforeReuse: role?.compactBeforeReuse ?? true,
@@ -628,6 +641,22 @@ export function WorkflowConfigEditorPanel(props) {
   const clearRoleModel = useCallback(async () => {
     const sel = roleForm.sel
     await runEdit(setRoleModelEdit(state, sel, undefined), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm.sel, runEdit, syncRoleForm])
+
+  // #235：备用模型（可选）——与主模型同一套保存校验；清除即整键省略，
+  // 该角色回到「无故障切换链」的旧行为。
+  const applyRoleFallbackModel = useCallback(async () => {
+    const sel = roleForm.sel
+    await runEdit(setRoleFallbackModelEdit(state, sel, fallbackModelInputOf(roleForm)), (result) => {
+      syncRoleForm(result.state.draft, sel)
+    })
+  }, [state, roleForm, runEdit, syncRoleForm])
+
+  const clearRoleFallbackModel = useCallback(async () => {
+    const sel = roleForm.sel
+    await runEdit(setRoleFallbackModelEdit(state, sel, undefined), (result) => {
       syncRoleForm(result.state.draft, sel)
     })
   }, [state, roleForm.sel, runEdit, syncRoleForm])
@@ -1218,7 +1247,8 @@ export function WorkflowConfigEditorPanel(props) {
         draft, roleForm, setRoleForm, newRole, setNewRole, loadModels: props.loadModels,
         onAdd: addNewRole, onSelect: selectRole, onRename: renameSelectedRole,
         onPersona: applyRolePersona, onReuse: applyRoleReuse, onCompact: applyRoleCompactBeforeReuse, onModel: applyRoleModel,
-        onClearModel: clearRoleModel, onDeny: applyRoleDeny, onClearDeny: clearRoleDeny,
+        onClearModel: clearRoleModel, onFallbackModel: applyRoleFallbackModel, onClearFallbackModel: clearRoleFallbackModel,
+        onDeny: applyRoleDeny, onClearDeny: clearRoleDeny,
         onDelete: deleteSelectedRole, busy: state.busy,
       }),
       h(JudgeSection, {
@@ -1266,6 +1296,27 @@ export function WorkflowConfigEditorPanel(props) {
 function RoleSection(props) {
   const { draft, roleForm, setRoleForm, newRole, setNewRole } = props
   const setField = (field) => (event) => setRoleForm((prev) => ({ ...prev, [field]: event.target.value }))
+  // #235：备用模型复用同一个 ModelFields；把 fallback* 分量映射成控件认识的
+  // provider/modelId/effort，写回时只改 fallback* 前缀，绝不串到主模型。
+  const fallbackForm = {
+    provider: roleForm.fallbackProvider ?? '',
+    modelId: roleForm.fallbackModelId ?? '',
+    effort: roleForm.fallbackEffort ?? '',
+  }
+  const setFallbackForm = (update) => setRoleForm((prev) => {
+    const current = {
+      provider: prev.fallbackProvider ?? '',
+      modelId: prev.fallbackModelId ?? '',
+      effort: prev.fallbackEffort ?? '',
+    }
+    const next = typeof update === 'function' ? update(current) : update
+    return {
+      ...prev,
+      fallbackProvider: next.provider,
+      fallbackModelId: next.modelId,
+      fallbackEffort: next.effort,
+    }
+  })
   const roleIds = Object.keys(draft.roles ?? {})
   const selected = (draft.roles ?? {})[roleForm.sel]
   const refs = roleForm.sel === '' ? [] : findRoleRefs(draft, roleForm.sel)
@@ -1321,7 +1372,15 @@ function RoleSection(props) {
         ),
         h('p', { className: 'wf-hint' }, '默认开启；关闭后跨节点复用不再执行边界压缩。'),
       ) : null,
-      h(ModelFields, { form: roleForm, setForm: setRoleForm, loadModels: props.loadModels, busy: props.busy, onApply: props.onModel, onClear: props.onClearModel }),
+      h(ModelFields, { title: '主模型', form: roleForm, setForm: setRoleForm, loadModels: props.loadModels, busy: props.busy, onApply: props.onModel, onClear: props.onClearModel }),
+      h(ModelFields, {
+        title: '备用模型（可选）',
+        hint: '仅用于该角色主模型遇到明确瞬时故障（5xx / 429 / 网络 / 超时）并已安全收口时自动切换；宿主对瞬时失败默认自动重试，若 provider 配置为无限重试则收不到终止失败，本角色 fallback 不会被触发。清除后该角色不引入故障切换链。',
+        applyLabel: '应用备用模型',
+        clearLabel: '清除备用模型',
+        form: fallbackForm, setForm: setFallbackForm, loadModels: props.loadModels, busy: props.busy,
+        onApply: props.onFallbackModel, onClear: props.onClearFallbackModel,
+      }),
       h('div', null,
         h('label', null, 'tools.deny（逗号分隔；省略请用清除按钮）'),
         h('input', { value: roleForm.deny, onChange: setField('deny') }),

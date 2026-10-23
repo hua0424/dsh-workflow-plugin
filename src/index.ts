@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url'
 import { resolveInitSources, runInit, type InitOptions } from './init/install.ts'
 import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
 import { endedSessionUserMessageIds, endedTurnUserMessageIds } from './plugin/turnbind.ts'
-import { turnEndFailure, type TurnEndFact } from './plugin/turn-end.ts'
+import { turnEndFailure, turnEndFailureFacts, type TurnEndFact } from './plugin/turn-end.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
 import { checkCatalogProvidersWithModelListsAndEfforts, checkSingleProviderRoute, queryEffortInfo, queryModelLists, renderProviderCheckReport, renderStartProviderBlock } from './catalog/provider-check.ts'
 import { WorkflowEngine } from './engine/engine.ts'
@@ -477,7 +477,7 @@ export function apply(ctx: Context) {
   // 也不再触发一次全表 Store.list（#99 AC7）。判定与推进都不在 append 回调内发生。
   ctx.on('session/event', (session, event) => {
     if (stateAccess.maintenanceDiagnostic() || event.type !== 'turn/end') return
-    const capture = (): { caller: { sessionId: string; turnUserMessageIds: ReadonlySet<string>; sessionUserMessageIds: ReadonlySet<string> }; turnFailure: string | undefined } | undefined => {
+    const capture = (): { caller: { sessionId: string; turnUserMessageIds: ReadonlySet<string>; sessionUserMessageIds: ReadonlySet<string> }; turnFailure: string | undefined; turnFailureFacts: { code: string; status?: number } | undefined } | undefined => {
       const snapshot = session.snapshotEvents()
       const ids = endedTurnUserMessageIds(snapshot, event)
       if (ids === undefined) return undefined
@@ -485,9 +485,11 @@ export function apply(ctx: Context) {
       const lineage = endedSessionUserMessageIds(snapshot, event) ?? new Set<string>()
       // #29：同一次读取里取该 Turn 的失败事实（正常结束为 undefined）。诊断在这里
       // 定格，引擎只收到成品文本——它不需要理解 Host 的 TurnEndReason 形状。
+      // #235：同时定格结构化事实（code/status），故障切换资格按码判定，不解析文本。
       return {
         caller: { sessionId: session.id, turnUserMessageIds: ids, sessionUserMessageIds: lineage },
         turnFailure: turnEndFailure(snapshot as ReadonlyArray<TurnEndFact>, event as TurnEndFact),
+        turnFailureFacts: turnEndFailureFacts(event as TurnEndFact),
       }
     }
     const captured = participants.workspaceOf(session.id) === undefined ? undefined : capture()
@@ -498,7 +500,7 @@ export function apply(ctx: Context) {
         if (ws === undefined) return
         const settled = captured ?? capture()
         if (settled === undefined) return
-        await engine.handleTurnEnded(ws, settled.caller, settled.turnFailure)
+        await engine.handleTurnEnded(ws, settled.caller, settled.turnFailure, settled.turnFailureFacts)
       })().catch(error => ctx.logger.warn(`workflow turn settlement failed: ${String(error)}`))
     })
   })

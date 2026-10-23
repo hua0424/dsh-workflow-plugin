@@ -144,6 +144,26 @@ export function readRoleDefModel(
 }
 
 /**
+ * #235：catalog def 层 → 备用路由的共享单源。只对普通角色生效（Judge 备用
+ * 路由属 #236，schema 层仍拒绝 `judgeRole.fallbackModel`）。
+ */
+export function readRoleFallbackModel(
+  config: Pick<WorkflowConfig, 'roles' | 'judgeRole'>,
+  roleKey: 'judge' | string,
+): RoleModel | undefined {
+  return roleKey === 'judge' ? undefined : config.roles[roleKey]?.fallbackModel
+}
+
+/**
+ * #235：同一路由判定——“主备必须 provider+modelId 不同（effort 不参与）”。
+ * 任一分量缺席即无法证明冲突（未配置路由），返回 false。
+ */
+export function sameModelRoute(a: DelegationRoute, b: DelegationRoute): boolean {
+  return a.provider !== undefined && a.modelId !== undefined
+    && a.provider === b.provider && a.modelId === b.modelId
+}
+
+/**
  * A1 D3: the single trim-then-normalize rule for model routes, shared by the
  * catalog schema caps and `handleSetRoleModel`. Empty-after-trim or
  * over-limit components are rejected with the limit in the message; the
@@ -169,6 +189,14 @@ export function normalizeModelRoute(provider: string, modelId: string, reasoning
 export interface RoleDefinition {
   persona: string
   model?: RoleModel
+  /**
+   * #235：该角色唯一的备用模型路由（可选；无备用链、不含 Manager）。
+   * provider+modelId 必须与主路由不同（仅 effort 不同不构成备用——同一模型
+   * 再试一次不属于故障切换）；省略 `reasoningEffort` 即用备用模型的默认档位，
+   * 不继承主分辨率或 Manager 档位。`judgeRole.fallbackModel` 属 #236，schema
+   * 当前仍拒绝该键。
+   */
+  fallbackModel?: RoleModel
   tools?: { deny: string[] }
   /**
    * #60: 会话复用粒度。省略时归一化为 `node`。manager 不使用该字段
@@ -364,6 +392,24 @@ export interface ModelOverride {
   reasoningEffort?: string
 }
 
+/**
+ * #235：角色路由阶段（stage machine）。一次 Run 内每个角色最多一个备用路由：
+ * - `manual`：Manager 经 `workflow_set_role_model` 指定的人工路由 C（新一轮起点）。
+ * - `primary`：主路由 A（catalog `model`，缺省继承本 Run 冻结的 Manager 路由）。
+ * - `fallback`：备用路由 B（catalog `fallbackModel`）。
+ * 缺省（无该角色的阶段记录）= 旧行为：override > def > frozen。
+ */
+export type RoleRouteStage = 'primary' | 'fallback' | 'manual'
+
+/** #235：阶段 + 切换原因 + 本轮预算消耗（自动切换次数），随 Run row 持久化。 */
+export interface RoleRouteState {
+  stage: RoleRouteStage
+  /** 进入该阶段的原因（诊断脱敏：只记故障码/状态码与来源，不含凭据或请求载荷）。 */
+  reason?: string
+  /** 本轮自动切换次数（Manager 显式设置模型即开新一轮，归零）。 */
+  autoSwitches?: number
+}
+
 /** Run只管位置/控制/固定Snapshot/Role映射；节点材料属于NodeExecution。 */
 export interface RunState {
   runId: string
@@ -375,6 +421,12 @@ export interface RunState {
   callStack: CallFrame[]
   roleActors: Record<string, string>
   modelOverrides: Record<string, ModelOverride>
+  /**
+   * #235：各角色当前生效的路由阶段（缺省 = 旧行为）。持久化在 Run row 内，
+   * 因此关库重开/宿主重启后激活路由、切换原因与预算消耗全部保留；新 Run 从
+   * primary 起（旧快照/旧配置不受影响）。
+   */
+  roleRoutes?: Record<string, RoleRouteState>
   blockReason: string | null
   /** 当前 visit；completed 时仍指向终局工作单，最终交付从该工作单读取。 */
   currentExecutionId: string
@@ -452,6 +504,11 @@ export interface ExecutionResolution {
   skipCompact?: boolean
   /** 最近一次 Manager 恢复/重建决定，供事件解释，不作为新 criteria。 */
   decision?: string
+  /**
+   * #235：本次恢复由「Role Actor 模型故障自动切换」触发时，写给新 Actor 的
+   * 切换说明（旧路由/新路由/故障码/预算），派发正文独立成段。
+   */
+  failover?: string
   /** Judge 恢复沿普通 driver 续接持久 Session 或重新创建。 */
   judgeMode?: 'followup' | 'fresh'
   judgeSessionId?: string

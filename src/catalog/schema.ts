@@ -26,6 +26,12 @@ const roleDefinition = z
   .object({
     persona: nonEmptyTrimmed,
     model: roleModel.optional(),
+    // #235：备用模型路由（每角色最多一个，无备用链）。形状与 `model` 完全
+    // 相同（含可选档位，省略即用备用模型默认档位）；与主路由
+    // provider+modelId 的差异检查在 validateAndNormalize 里做（同层报错聚合）。
+    // `judgeRole.fallbackModel` 属 #236，本节点仍由 judgeRoleDefinition
+    // 的 strict 拒绝。
+    fallbackModel: roleModel.optional(),
     // #60: node | continuable；省略由 validateAndNormalize 归一化为 `node`。
     // 非法取值在这里被拒（strict + enum），只阻塞声明它的那个 catalog 文件。
     reuse: z.enum(ROLE_REUSE_MODES).optional(),

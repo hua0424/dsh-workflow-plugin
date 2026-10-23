@@ -363,6 +363,23 @@ export function setRolePersona(session: DraftSession, key: string, persona: stri
   return { ok: true }
 }
 
+/**
+ * #235：角色键序归一（catalog schema 声明序）。新增/删除 `fallbackModel` 会在
+ * 普通赋值下落到末尾，导致「保存 → 重载」后与 validateAndNormalize 的输出键序
+ * 分叉，`businessEqual` 判为不等价；这里按 schema 序重排，未知键稳定追加在末尾。
+ */
+const ROLE_KEY_ORDER = ['persona', 'model', 'fallbackModel', 'reuse', 'compactBeforeReuse', 'tools']
+
+function orderRoleKeys(role: Record<string, unknown>): void {
+  const rank = (key: string): number => {
+    const index = ROLE_KEY_ORDER.indexOf(key)
+    return index === -1 ? ROLE_KEY_ORDER.length : index
+  }
+  const entries = Object.entries(role).sort((a, b) => rank(a[0]) - rank(b[0]))
+  for (const key of Object.keys(role)) delete role[key]
+  for (const [key, value] of entries) role[key] = value
+}
+
 /** 设置/清除角色模型（undefined = 整键省略；三态区别保留）。 */
 export function setRoleModel(session: DraftSession, key: string, model: RoleModelInput | undefined): RoleEditResult {
   const role = session.draft.config.roles[key]
@@ -373,6 +390,27 @@ export function setRoleModel(session: DraftSession, key: string, model: RoleMode
   pushHistory(session)
   if (normalized.value === undefined) delete role.model
   else role.model = normalized.value
+  orderRoleKeys(role as unknown as Record<string, unknown>)
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/**
+ * #235：设置/清除角色备用模型（undefined = 整键省略；三态区别保留）。
+ * 与主模型共用同一套归一化（provider/modelId 成对非空、effort 空白拒绝）；
+ * 与主模型同 provider+modelId 的配置由保存前的 catalog 校验拒绝（仅 effort
+ * 不同不构成备用路由）。
+ */
+export function setRoleFallbackModel(session: DraftSession, key: string, model: RoleModelInput | undefined): RoleEditResult {
+  const role = session.draft.config.roles[key]
+  if (role === undefined) return { ok: false, reason: `角色 "${key}" 不存在` }
+  const normalized = normalizeModelInput(model)
+  if (!normalized.ok) return normalized
+  if (JSON.stringify(role.fallbackModel ?? null) === JSON.stringify(normalized.value ?? null)) return { ok: true }
+  pushHistory(session)
+  if (normalized.value === undefined) delete role.fallbackModel
+  else role.fallbackModel = normalized.value
+  orderRoleKeys(role as unknown as Record<string, unknown>)
   session.draft.dirtyBusiness = true
   return { ok: true }
 }

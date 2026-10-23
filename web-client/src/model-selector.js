@@ -29,7 +29,12 @@ export async function readModelCatalog(remote) {
   }
 }
 
-export function ModelFields({ form, setForm, loadModels, busy, onApply, onClear }) {
+/**
+ * 单条模型路由选择控件（provider/modelId/可选档位 + 应用/清除/刷新）。
+ * #235：`title`/`hint`/`applyLabel`/`clearLabel` 可选——同一控件复用给「主模型」与
+ * 「备用模型（可选）」，两处按钮文案必须可区分（备用实例传自己的文案）。
+ */
+export function ModelFields({ form, setForm, loadModels, busy, onApply, onClear, title, hint, applyLabel = '应用模型', clearLabel = '清除模型' }) {
   const [catalog, setCatalog] = useState({ groups: [], failures: [] })
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -49,12 +54,13 @@ export function ModelFields({ form, setForm, loadModels, busy, onApply, onClear 
   const { providers, models } = modelChoices(catalog.groups, form.provider, form.modelId)
   const field = (key) => (event) => setForm((previous) => ({ ...previous, [key]: event.target.value }))
   const select = (label, value, entries, onChange) => h('label', { className: 'wf-field' }, label,
-    h('select', { value, onChange, disabled: busy || loading, 'aria-label': label },
+    h('select', { value, onChange, disabled: busy || loading, 'aria-label': title === undefined ? label : `${title} ${label}` },
       h('option', { value: '' }, '请选择'),
       entries.map((item) => h('option', { key: item.id, value: item.id }, item.name)),
     ),
   )
   return h('div', { className: 'wf-model-fields' },
+    title === undefined ? null : h('h4', null, title),
     select('模型 provider', form.provider, providers, (event) => {
       const provider = event.target.value
       setForm((previous) => ({ ...previous, provider, modelId: '', effort: '' }))
@@ -66,11 +72,11 @@ export function ModelFields({ form, setForm, loadModels, busy, onApply, onClear 
     h('label', { className: 'wf-field' }, 'reasoningEffort（留空=未指定）',
       h('input', { value: form.effort, onChange: field('effort'), disabled: busy })),
     h('div', { className: 'wf-actions' },
-      h('button', { onClick: onApply, disabled: busy || !form.provider || !form.modelId }, '应用模型'),
-      h('button', { onClick: onClear, disabled: busy }, '清除模型'),
+      h('button', { onClick: onApply, disabled: busy || !form.provider || !form.modelId }, applyLabel),
+      h('button', { onClick: onClear, disabled: busy }, clearLabel),
       h('button', { onClick: () => setRevision((value) => value + 1), disabled: loading }, loading ? '加载模型…' : '刷新模型列表'),
     ),
-    h('small', null, '来自 DSH 会话模型列表；清除模型后使用工作流的继承规则。'),
+    h('small', null, hint ?? '来自 DSH 会话模型列表；清除模型后使用工作流的继承规则。'),
     error && h('p', { role: 'alert' }, error),
     catalog.failures.map((failure) => h('p', { key: failure.id, role: 'status' }, `${failure.name}：${failure.message}`)),
   )

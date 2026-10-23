@@ -84,6 +84,22 @@ export function turnEndFailure(events: ReadonlyArray<TurnEndFact>, end: TurnEndF
 }
 
 /**
+ * #235：`turn/end` 的结构化失败事实（只保留 `code` + `status`，不带 message）。
+ * 只有 `reason.kind === 'error'` 且 `error` 形状完整时才存在——正常结束、`aborted`、
+ * `max-tokens`、无结构化失败一律 undefined，交给 fail-closed 判定。
+ */
+export function turnEndFailureFacts(end: TurnEndFact): { code: string; status?: number } | undefined {
+  if (end.type !== 'turn/end') return undefined
+  const reason = dataOf(end)?.['reason']
+  if (typeof reason !== 'object' || reason === null) return undefined
+  const fields = reason as Record<string, unknown>
+  if (fields.kind !== 'error') return undefined
+  const fact = errorFact(fields.error)
+  if (fact === undefined) return undefined
+  return fact.status === undefined ? { code: fact.code } : { code: fact.code, status: fact.status }
+}
+
+/**
  * Issue #200：Judge 瞬时失败分类——只有明确的瞬时信号才值得自动重试 1 次。
  * - status >= 500 / code=SERVER → 瞬时（上游 5xx）。
  * - status 4xx / 4xx 家族码（INVALID_REQUEST / AUTH / QUOTA / RATE_LIMIT /

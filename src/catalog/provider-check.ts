@@ -28,7 +28,7 @@
  * - 某角色查询失败不掩盖其他角色确定误配；后者仍阻断 start。
  * - 跳过只表示允许尝试，不表示模型已验证或运行必然成功。
  */
-import { readRoleDefModel, type WorkflowConfig } from '../types.ts'
+import { readRoleDefModel, readRoleFallbackModel, type WorkflowConfig } from '../types.ts'
 
 /**
  * T2 modelId 本地列表检查结论（T3 消费：只有 `listed` 进入档位检查；
@@ -120,12 +120,21 @@ export function effortRouteKey(provider: string, modelId: string): string {
   return JSON.stringify([provider, modelId])
 }
 
-/** 收集 catalog 全部待查角色：roles 各键 + judgeRole（键名固定 `judge`）。def 层读取走共享单源。 */
+/**
+ * 收集 catalog 全部待查角色：roles 各键 + judgeRole（键名固定 `judge`）。def 层读取走共享单源。
+ * #235：配置了 `fallbackModel` 的角色额外产生一行备用路由（角色名带 `（备用模型）`
+ * 后缀）——主备执行同一套启动前静态校验，备用误配同样阻断启动。Judge 备用路由
+ * 属 #236，此处不收集。
+ */
 export function collectRoleRoutes(config: WorkflowConfig): Array<{ role: string; provider?: string; modelId?: string; effort?: string }> {
   const routes: Array<{ role: string; provider?: string; modelId?: string; effort?: string }> = []
   for (const roleKey of Object.keys(config.roles)) {
     const def = readRoleDefModel(config, roleKey)
     routes.push({ role: roleKey, provider: def?.provider, modelId: def?.modelId, effort: def?.reasoningEffort })
+    const fallback = readRoleFallbackModel(config, roleKey)
+    if (fallback !== undefined) {
+      routes.push({ role: `${roleKey}（备用模型）`, provider: fallback.provider, modelId: fallback.modelId, effort: fallback.reasoningEffort })
+    }
   }
   const judge = readRoleDefModel(config, 'judge')
   routes.push({ role: 'judge', provider: judge?.provider, modelId: judge?.modelId, effort: judge?.reasoningEffort })
