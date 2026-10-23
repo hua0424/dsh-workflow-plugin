@@ -1038,9 +1038,11 @@ export class WorkflowEngine {
       if (roleFallbackRoute(fresh.run, 'judge') !== undefined) {
         if (await this.tryJudgeFailover(ws, fresh, failureFacts)) return
         this.forgetDispatch(e.judge?.sessionId)
-        // 备用已用尽（B 之后再失败）与故障不合格/未配置路由分开报：前者明确告诉
-        // Manager 预算已消耗完，后者保持旧语义（含认证/额度等不换模的判定）。
+        // 备用已用尽（B 的合格故障）与故障不合格/未配置路由分开报：前者明确告诉
+        // Manager 预算已消耗完；后者保持旧语义（含认证/额度等不换模的判定），
+        // 即使当前声明阶段是 fallback，也不把「额度耗尽」误报成「备用路由用尽」。
         const exhausted = effectiveRoleRouteStage(fresh.run, 'judge') === 'fallback'
+          && classifyActorFailure(failureFacts).eligible
         await this.blockRow(ws, fresh, withTurnEndFailure(exhausted
           ? 'judge turn ended without judge_claim (备用模型已用尽，不再自动重试)'
           : 'judge turn ended without judge_claim', turnFailure))

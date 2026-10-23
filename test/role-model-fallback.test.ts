@@ -1146,6 +1146,73 @@ test('#237 Judge 人工 C 成功后跨节点继续用 C（判定成功不结束�
   } finally { h.close() }
 })
 
+test('#237 再次人工设置（即使值相同）重置轮次：C→A 后重设 C，再失败仍回 A 不直接 B', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'manual', 'manual-model', 'manager')).ok, true)
+    await h.toWorker()
+    await h.engine.handleTurnEnded('ws', await h.caller(), FAILOVER_503.text, FAILOVER_503.facts)
+    let row = await h.row()
+    assert.deepEqual(row.run.roleRoutes?.worker, { stage: 'primary', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+    assert.ok(!h.messages.some(message => message.includes('model override already applied')))
+
+    // 活动派发中的人工替换仍受既有安全约束：先 BLOCK 才能换模（本测试用不合格故障收口）。
+    const blocked = await h.engine.handleSetRoleModel('ws', 'worker', 'manual', 'manual-model', 'manager')
+    assert.equal(blocked.ok, false)
+    await h.engine.handleTurnEnded('ws', await h.caller(), QUOTA_402.text, QUOTA_402.facts)
+    assert.equal((await h.row()).run.status, 'blocked')
+
+    // 与上次完全相同的 C：已不在人工阶段，不得走 no-op——必须重新授权（预算归零）。
+    const again = await h.engine.handleSetRoleModel('ws', 'worker', 'manual', 'manual-model', 'manager')
+    assert.equal(again.ok, true)
+    assert.equal(again.message, 'model override saved for worker')
+    row = await h.row()
+    assert.deepEqual(row.run.roleRoutes?.worker, { stage: 'manual', reason: 'manager-set', autoSwitches: 0 })
+
+    assert.equal((await h.engine.handleResume('ws', row.execution.nodeToken, '同一模型再试一轮', 'manager', 'actor')).ok, true)
+    assert.equal(lastRoleSpawn(h.spawns).agentOptions?.provider, 'manual')
+    // 新轮次里 C 失败回到原始 A——而不是沿用上一轮已消耗的预算直接升 B。
+    await h.engine.handleTurnEnded('ws', await h.caller(), FAILOVER_503.text, FAILOVER_503.facts)
+    row = await h.row()
+    assert.deepEqual(row.run.roleRoutes?.worker, { stage: 'primary', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+    assert.equal(lastRoleSpawn(h.spawns).agentOptions?.provider, 'primary', '重设后的新一轮仍是 C→A，不是 C→B')
+    await h.engine.handleTurnEnded('ws', await h.caller(), FAILOVER_503.text, FAILOVER_503.facts)
+    row = await h.row()
+    assert.deepEqual(row.run.roleRoutes?.worker, { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 2 })
+  } finally { h.close() }
+})
+
+test('#237 Judge 备用阶段的 BLOCK 文案按故障成因区分：额度耗尽不报“备用模型已用尽”', async () => {
+  const h = harness(judgeConfig())
+  try {
+    await h.start()
+    // 先走到 B（A 的合格故障直接切 B），再让 B 遇到不合格故障（额度耗尽）。
+    await h.engine.handleTurnEnded('ws', await h.toChecking(), FAILOVER_503.text, FAILOVER_503.facts)
+    let row = await h.row()
+    assert.deepEqual(row.run.roleRoutes?.judge, { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+    await h.engine.handleTurnEnded('ws', await judgeCaller(h), QUOTA_402.text, QUOTA_402.facts)
+    row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    assert.match(row.execution.blockReason!, /judge turn ended without judge_claim(?!.*备用模型已用尽)/)
+    assert.match(row.execution.blockReason!, /code=QUOTA status=402/)
+    assert.deepEqual(row.run.roleRoutes?.judge, { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 }, '不合格故障不消耗预算')
+    assert.equal(h.messages.filter(message => message.includes('Workflow MODEL FALLBACK')).length, 1)
+  } finally { h.close() }
+})
+
+test('#237 备用路由进入启动前静态校验行：Judge 备用同样被误配阻断（#236 review A4）', () => {
+  const config = judgeConfig()
+  assert.deepEqual(collectRoleRoutes(config).map(route => route.role), ['worker', 'judge', 'judge（备用模型）'])
+  const missing = checkCatalogProviders('role-model-fallback', config, ['primary', 'jprimary'])
+  assert.equal(missing.ok, false)
+  const backup = missing.rows.find(row => row.role === 'judge（备用模型）')!
+  assert.equal(backup.ok, false)
+  assert.match(backup.reason, /jbackup.*未在当前 profile 注册/)
+  const accepted = checkCatalogProviders('role-model-fallback', config, ['primary', 'jprimary', 'jbackup'])
+  assert.equal(accepted.ok, true)
+})
+
 test('#236 GUI：Judge 面板独立提供主/备用模型两分区与恢复语义披露', () => {
   const bundle = bundleSources().panel
   // Judge 区自带备用控件（与 Role 区同一套 ModelFields，前缀隔离不串主模型）。
