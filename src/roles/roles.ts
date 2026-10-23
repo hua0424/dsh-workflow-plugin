@@ -11,7 +11,7 @@
  * The three enforcement layers (spawn filter here, spawn assertion in host.ts,
  * runtime gate in tools/authz.ts) all derive from this one source.
  */
-import { readRoleDefModel, type DelegationRoute, type RunState } from '../types.ts'
+import { readRoleDefModel, readRoleFallbackModel, type DelegationRoute, type RoleRouteStage, type RunState } from '../types.ts'
 import { ROLE_ACTOR_SUBMISSION_PROTOCOL } from '../engine/texts.ts'
 
 /**
@@ -83,13 +83,47 @@ export function judgeLabel(nodeId: string): string {
 }
 
 /**
- * Resolve a Role's effective model route: override > role def > frozen Manager
- * route. def 分支走共享单源。#118 D-91-1：三条分支全是领域事实（`modelId`），
- * 直接返回 `DelegationRoute`，交界处不再有逐字段的匿名形状转换。
+ * #235：角色当前生效的路由阶段。无阶段记录时按旧行为解释——
+ * 有 override 视为 `manual`（存量 Run 的 workflow_set_role_model 结果照常生效），
+ * 否则 `primary`。
+ */
+export function effectiveRoleRouteStage(run: RunState, roleKey: string): RoleRouteStage {
+  const declared = run.roleRoutes?.[roleKey]?.stage
+  if (declared !== undefined) return declared
+  return run.modelOverrides[roleKey] === undefined ? 'primary' : 'manual'
+}
+
+/** #235：角色配置的备用路由（未配置即 undefined——此时不引入任何人工恢复链）。 */
+export function roleFallbackRoute(run: RunState, roleKey: string): DelegationRoute | undefined {
+  return readRoleFallbackModel(run.definitionSnapshot, roleKey)
+}
+
+/**
+ * 主路由（忽略 override）：显式 catalog model，缺省回落到本 Run 冻结的默认路由。
+ * 启动期主备冲突检查与运行期「切到备用会不会是同一个模型」判定共用。
+ */
+export function rolePrimaryRoute(run: RunState, roleKey: string, frozen?: DelegationRoute): DelegationRoute {
+  return readRoleDefModel(run.definitionSnapshot, roleKey) ?? frozen ?? {}
+}
+
+/**
+ * Resolve a Role's effective model route: 阶段 > override > role def > frozen
+ * Manager route. def 分支走共享单源。#118 D-91-1：三条分支全是领域事实
+ * （`modelId`），直接返回 `DelegationRoute`，交界处不再有逐字段的匿名形状转换。
+ * #235：`fallback` 阶段用该角色的备用路由（未配置则回落旧链，fail-closed 不猜）。
  */
 export function resolveRoleModel(run: RunState, roleKey: 'judge' | string, frozen?: DelegationRoute): DelegationRoute {
-  const override = run.modelOverrides[roleKey]
-  if (override !== undefined) return override
+  const stage = effectiveRoleRouteStage(run, roleKey)
+  if (stage === 'fallback') {
+    const fallback = roleFallbackRoute(run, roleKey)
+    if (fallback !== undefined) return fallback
+  }
+  // `primary` 显式忽略 override（切回主模型后旧 override 不再生效）；其余阶段沿用
+  // override > def > frozen。
+  if (stage !== 'primary') {
+    const override = run.modelOverrides[roleKey]
+    if (override !== undefined) return override
+  }
   const def = readRoleDefModel(run.definitionSnapshot, roleKey)
   if (def !== undefined) return def
   return frozen ?? {} // inherit the Manager route at spawn time

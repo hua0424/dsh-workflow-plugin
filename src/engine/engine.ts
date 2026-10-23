@@ -1,13 +1,14 @@
 /** 唯一工作单 Runtime。SQLite CAS 保护短写；Host 调用始终在事务/锁之外。 */
 import type { WorkflowConfig, NodeClaim, NodeDef, Target, BuiltinProgramExecution, RunState, CallFrame, ClaimCaller, NodeContextBoundary, NodeExecution, ExecutionChange, NodeExecutionEvent, ExecutionDispatch, ExecutionJudge, ResumeTarget, ProgramResult } from '../types.ts'
-import { WorkflowError, LIMITS, compactBeforeReuse, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, type SpawnAgentOptions } from '../types.ts'
+import { WorkflowError, LIMITS, compactBeforeReuse, declaredResults, nodeChecker, nodeOnReturn, nodeResults, normalizeModelRoute, normalizeNodeClaim, roleReuseMode, agentOptionsToRoute, readRoleDefModel, readRoleFallbackModel, sameModelRoute, type SpawnAgentOptions } from '../types.ts'
 import { newNodeToken, topFrame } from '../state/invariants.ts'
-import { resolveRoleModel } from '../roles/roles.ts'
+import { effectiveRoleRouteStage, resolveRoleModel, roleFallbackRoute, rolePrimaryRoute } from '../roles/roles.ts'
 import { validateAndNormalize, computeDefinitionHash } from '../catalog/validate.ts'
 import { ACTOR_RECOVERY_INSTRUCTION, MANAGER_SUBMISSION_CONSTRAINT, runMaterialsSection } from './texts.ts'
 import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts.ts'
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { isTransientJudgeFailure, withTurnEndFailure } from '../plugin/turn-end.ts'
+import { classifyActorFailure, describeActorFailure, failoverNote, type ActorFailureFacts } from './failover.ts'
 import { describeActivationSettlement, shortRouteLabel, type ActivationEndInfo, type DispatchLifecycleTracker } from '../plugin/dispatch-lifecycle.ts'
 import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
@@ -281,6 +282,15 @@ export class WorkflowEngine {
       },
       blockReason: execution.blockReason ?? run.blockReason,
       handoffPreview,
+      // #235：已发生故障切换的角色——生效路由、来源阶段、切换原因与预算消耗。
+      // 未切换过的角色不在此列（保持状态输出精简，不新建监控面板）。
+      routes: Object.entries(run.roleRoutes ?? {}).map(([role, state]) => ({
+        role,
+        stage: state.stage,
+        route: shortRouteLabel(resolveRoleModel(run, role, run.delegationRoute)) ?? 'inherited',
+        reason: state.reason ?? null,
+        autoSwitches: state.autoSwitches ?? 0,
+      })),
       // v3：Run 生命周期（status）与业务终局分离；终局名与来源单源来自终局工作单。
       businessReturn: run.businessReturn ? { name: run.businessReturn.name, source: run.businessReturn.source } : null,
       finalHandoffPreview: run.status === 'completed' ? handoffPreview : null,
@@ -320,6 +330,12 @@ export class WorkflowEngine {
     if (frozen.provider !== undefined || frozen.model !== undefined || frozen.reasoningEffort !== undefined) {
       run.delegationRoute = agentOptionsToRoute(frozen)
     }
+    // #235：主备必须是不同模型。显式 `model` 的差异已由 catalog 校验拒绝；未配
+    // `model` 的角色继承本 Run 冻结的默认路由，只能在冻结之后判定——若备用与继承
+    // 主路由同 provider+modelId，第一次「切换」只是换个会话重试同一模型，直接拒绝
+    // 启动（fail-closed：不改 catalog，也不猜用户想要的备用模型）。
+    const fallbackClash = this.fallbackClash(run)
+    if (fallbackClash !== undefined) return rejected(fallbackClash)
     if (configPath) {
       const path = createRunLog(configPath, run.catalogWorkflowId, run.runId)
       if (path) run.traceLogPath = path
@@ -366,6 +382,21 @@ export class WorkflowEngine {
   private forgetDispatch(sessionId: string | undefined): void {
     if (sessionId === undefined) return
     this.subagents.dispatchLifecycle?.forget(sessionId)
+  }
+  /**
+   * #235：启动期主备冲突检查——配置了 `fallbackModel` 的角色，其生效主路由
+   * （显式 `model`，缺省为本 Run 冻结的默认路由）与备用路由的 provider+modelId
+   * 必须不同。返回拒绝原因或 undefined。
+   */
+  private fallbackClash(run: RunState): string | undefined {
+    for (const roleKey of Object.keys(run.definitionSnapshot.roles)) {
+      const fallback = readRoleFallbackModel(run.definitionSnapshot, roleKey)
+      if (fallback === undefined) continue
+      if (sameModelRoute(rolePrimaryRoute(run, roleKey, run.delegationRoute), fallback)) {
+        return `role "${roleKey}" fallbackModel duplicates its primary route (${fallback.provider}/${fallback.modelId})；备用模型必须与主模型 provider/modelId 不同`
+      }
+    }
+    return undefined
   }
   async drive(ws: string): Promise<void> {
     const row = await this.state.get(ws)
@@ -455,11 +486,14 @@ export class WorkflowEngine {
             : `\n\n[Manager 退回的旧 claim；无当前 Judge 反馈]\n[previous claim]\nresult: ${e.previousClaim.result}\nhandoff: ${e.previousClaim.handoff}`
           : ''
         const resolution = e.resolution?.context ? `\n\n[Manager 当前完整补充]\n${e.resolution.context}` : ''
+        // #235：自动切换的说明单列一段——旧/新路由与故障原因对新 Actor 可见，
+        // 避免它把「换了模型」误当作同一执行体的延续。
+        const failover = e.resolution?.failover ? `\n\n[模型故障切换]\n${e.resolution.failover}` : ''
         const recovery = e.resolution?.target === 'actor' ? ACTOR_RECOVERY_INSTRUCTION : ''
         const predecessor = await this.predecessorResultContext(ws, e)
         // Issue #226：Role 派发不再追加固定提交协议——协议已随派生 preset 进入
         // system persona（压缩/冷恢复后依然有效）；Manager 派发保留 manager 变体。
-        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${runMaterialsSection(ws, run.runId)}${role === 'manager' ? MANAGER_SUBMISSION_CONSTRAINT : ''}`
+        const text = `[handoff]\n${e.input}${predecessor}${this.exitContract(node)}${this.legalResults(node)}${correction}${resolution}${failover}${recovery}\n\n[instruction]\n${node.execution.instruction ?? ''}${runMaterialsSection(ws, run.runId)}${role === 'manager' ? MANAGER_SUBMISSION_CONSTRAINT : ''}`
         const sent = role === 'manager'
           ? { ...await this.targets.steerManager(run, text), childId: run.managerSessionId }
           : run.roleActors[role]
@@ -929,8 +963,10 @@ export class WorkflowEngine {
    * Host 必须退出append回调再调用；caller只带该turn/end对应Turn的消息ID。
    * `turnFailure` 是该 Turn 的非正常结束诊断（#29/#24 O1），作用于「回合无产出」的
    * 两条 BLOCK（Actor 与 Judge）：正常结束/无诊断时不追加任何文字，成功路径零噪音。
+   * `failureFacts` 是同一 Turn 的结构化失败事实（#235）：故障切换资格按 code/status
+   * 判定，不解析诊断文本。
    */
-  async handleTurnEnded(ws: string, caller: ClaimCaller, turnFailure?: string): Promise<EngineOutcome | undefined> {
+  async handleTurnEnded(ws: string, caller: ClaimCaller, turnFailure?: string, failureFacts?: ActorFailureFacts): Promise<EngineOutcome | undefined> {
     const row = await this.state.get(ws)
     if (!row || row.run.status !== 'running') return
     let e = row.execution
@@ -973,6 +1009,9 @@ export class WorkflowEngine {
       this.forgetDispatch(e.dispatch?.sessionId)
       await this.drive(ws)
     } else if (actor && e.phase === 'working') {
+      // #235：先尝试「单备用模型」安全恢复（旧执行已收口 + 无已接受 claim 才重派）；
+      // 不合格故障或已无可用路由时保持现行 BLOCK。
+      if (await this.tryFailover(ws, fresh, failureFacts)) return
       this.forgetDispatch(e.dispatch?.sessionId)
       await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
     } else if (judge && e.phase === 'checking') {
@@ -987,6 +1026,75 @@ export class WorkflowEngine {
         await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim', turnFailure))
       }
     }
+  }
+  /**
+   * #235：Role Actor 单备用模型的安全恢复（A→B→BLOCK；Manager 显式设置 C 后
+   * 开新一轮 C→A→B）。
+   *
+   * 前提由调用点保证：本 Turn 已结束且会话已安全收口（`unsafe`/`waiting` 在更早
+   * 分支 BLOCK/return），执行仍在 `working` 且没有已接受 claim。返回 `true` 表示
+   * 已完成切换并重新派发；`false` 交回 BLOCK 路径（含未配置备用路由的全部旧行为）。
+   *
+   * 预算：一次 Run 每个角色最多消耗「人工 C → 主 A → 备用 B」；`autoSwitches` 随
+   * roleRoutes 持久化，node_resume/Host 重启都不刷新，只有 Manager 再次显式设置
+   * 模型（`workflow_set_role_model`）才开新一轮。
+   */
+  private async tryFailover(ws: string, row: RuntimeRow, facts: ActorFailureFacts | undefined): Promise<boolean> {
+    const { run, execution: e } = row
+    const node = this.nodeAt(run, topFrame(run))
+    if (node?.execution.type !== 'actor-task') return false
+    const role = node.execution.role
+    // Manager 没有备用链；Judge 的备用路由属 #236（本节点不切换，保留同模型重试）。
+    if (role === 'manager') return false
+    const fallback = roleFallbackRoute(run, role)
+    // 未配置备用路由 = 不引入人工恢复链：完全保留现行 BLOCK 语义。
+    if (fallback === undefined) return false
+    // 已接受的 claim 是既成事实，换模型也不得撤销（迟到错误不回滚已提交结果）。
+    if (e.claim !== undefined) return false
+    const verdict = classifyActorFailure(facts)
+    if (facts === undefined || !verdict.eligible) return false
+    const stage = effectiveRoleRouteStage(run, role)
+    // 备用也用尽（B 之后再失败）：BLOCK，等 Manager 决定是否开新一轮。
+    if (stage === 'fallback') return false
+    const next = stage === 'manual' ? 'primary' : 'fallback'
+    const from = shortRouteLabel(resolveRoleModel(run, role, run.delegationRoute)) ?? 'unknown'
+    const target = next === 'primary' ? rolePrimaryRoute(run, role, run.delegationRoute) : fallback
+    // 主备同 provider+modelId（仅 effort 不同）：换过去等于同一模型再试一次，
+    // 不消耗预算也不谎报切换——交回 BLOCK。启动期已拒绝该配置，这里是纵深防御。
+    if (sameModelRoute(rolePrimaryRoute(run, role, run.delegationRoute), fallback)) return false
+    const to = shortRouteLabel(target) ?? 'unknown'
+    const autoSwitches = (run.roleRoutes?.[role]?.autoSwitches ?? 0) + 1
+    const reason = `${verdict.kind} ${describeActorFailure(facts)}`
+    const oldSessionId = e.dispatch?.sessionId
+    e.dispatch!.settled = true
+    // 离开人工路由即撤销该 override：回主模型后不得继续沿用 C。
+    if (stage === 'manual') delete run.modelOverrides[role]
+    run.roleRoutes = { ...(run.roleRoutes ?? {}), [role]: { stage: next, reason, autoSwitches } }
+    // 旧路由的会话退役：下一次派发走 ensureRoleActor 重新物化到新路由。
+    delete run.roleActors[role]
+    e.phase = 'ready'
+    // fresh replacement：没有跨节点上下文可压缩（等价于 handleResume 的 replaceRole）。
+    e.roleBoundaryPrepared = true
+    e.inputVersion += 1
+    e.resolution = {
+      target: 'actor',
+      // decision 是审计短标记（resolution 需要 context 或 decision 二者之一）；
+      // 面向 Actor 的人类说明走 failover 段，不占 Manager 的 context 位。
+      decision: `auto-failover ${verdict.kind} → ${next}`,
+      failover: failoverNote({ role, from, to, target: next, facts, kind: verdict.kind, autoSwitches, exhausted: next === 'fallback' }),
+      inputVersion: e.inputVersion,
+    }
+    await this.state.put(ws, run, row.version, [change(e, 'model-changed')])
+    this.forgetDispatch(oldSessionId)
+    this.trace(run, 'MODEL-FALLBACK', {
+      workflow: e.workflowId, node: e.nodeId, role,
+      from: jsonField(from, LIMITS.modelIdMax), to: jsonField(to, LIMITS.modelIdMax),
+      stage: next, switch: autoSwitches, reason: jsonField(reason, LIMITS.blockReasonMax),
+    })
+    // 成功切换主动通知 Manager（无需批准）；best-effort，绝不阻断重派。
+    await this.targets.steerManager(run, `${this.nodeEventText(run, e)}\nWorkflow MODEL FALLBACK: role=${role} ${from} → ${to}（${next}，本轮第 ${autoSwitches} 次自动切换，原因 ${reason}）\n该角色已用新路由重新派发，无需批准；再次合格故障将 BLOCK。`).catch(() => {})
+    await this.drive(ws)
+    return true
   }
   /**
    * Issue #221：派发受理后、无 turn/end 时的宿主生命周期终止信号收口。
@@ -1487,6 +1595,9 @@ export class WorkflowEngine {
     row.run.modelOverrides[role] = route
     if (mapped) delete row.run.roleActors[role]
     if (replacesCurrentRole) row.execution.roleBoundaryPrepared = true
+    // #235：显式设置模型即开新一轮（C → 主 → 备用），本轮自动切换预算归零；
+    // C 允许与主/备用相同（人工要求在该路由上再试一次）。Judge 无备用链，不写阶段表。
+    if (role !== 'judge') row.run.roleRoutes = { ...(row.run.roleRoutes ?? {}), [role]: { stage: 'manual', reason: 'manager-set', autoSwitches: 0 } }
     await this.state.put(ws, row.run, row.version, [change(row.execution, 'model-changed')])
     this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax), ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: jsonField(route.reasoningEffort, LIMITS.reasoningEffortMax) }) })
     return { ok: true, run: row.run, message: withNote(`model override saved for ${role}`) }

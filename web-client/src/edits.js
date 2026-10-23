@@ -223,6 +223,23 @@ export function setRolePersonaEdit(state, key, persona) {
 }
 
 /** 设置/清除角色模型。 */
+/**
+ * #235：角色键序归一（与服务端 draft.ts `orderRoleKeys` 同语义）——catalog schema
+ * 声明序，未知键稳定追加在末尾。普通赋值会把新键落到末尾，导致保存后重载的键序
+ * 与校验输出分叉。
+ */
+const ROLE_KEY_ORDER = ['persona', 'model', 'fallbackModel', 'reuse', 'compactBeforeReuse', 'tools']
+
+function orderRoleKeys(role) {
+  const rank = (key) => {
+    const index = ROLE_KEY_ORDER.indexOf(key)
+    return index === -1 ? ROLE_KEY_ORDER.length : index
+  }
+  const entries = Object.entries(role).sort((a, b) => rank(a[0]) - rank(b[0]))
+  for (const key of Object.keys(role)) delete role[key]
+  for (const [key, value] of entries) role[key] = value
+}
+
 export function setRoleModelEdit(state, key, model) {
   if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
   if (!hasRole(state.draft, key)) return { ok: false, reason: `角色 "${key}" 不存在` }
@@ -232,6 +249,25 @@ export function setRoleModelEdit(state, key, model) {
   const { withHistory, draft } = withRoleHistory(state)
   if (normalized.value === undefined) delete draft.roles[key].model
   else draft.roles[key].model = normalized.value
+  orderRoleKeys(draft.roles[key])
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/**
+ * #235：设置/清除角色备用模型（与主模型同一套归一化；`undefined` = 整键省略）。
+ * 主备同 provider+modelId 的非法组合由保存前的 catalog 校验统一拒绝，这里不
+ * 越权重复判定。
+ */
+export function setRoleFallbackModelEdit(state, key, model) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  if (!hasRole(state.draft, key)) return { ok: false, reason: `角色 "${key}" 不存在` }
+  const normalized = normalizeModelInput(model)
+  if (!normalized.ok) return normalized
+  if (sameJson(state.draft.roles[key].fallbackModel, normalized.value)) return { ok: true, noop: true, state }
+  const { withHistory, draft } = withRoleHistory(state)
+  if (normalized.value === undefined) delete draft.roles[key].fallbackModel
+  else draft.roles[key].fallbackModel = normalized.value
+  orderRoleKeys(draft.roles[key])
   return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
 }
 

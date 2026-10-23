@@ -10,7 +10,7 @@
  * the caller's own flow.
  */
 import { createHash } from 'node:crypto'
-import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, compactBeforeReuse, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
+import { ID_PATTERN, LIMITS, PROGRAM_RESULT_NAMES, RESERVED_ROLE_KEYS, compactBeforeReuse, nodeChecker, nodeOnReturn, nodeResults, roleReuseMode, sameModelRoute, type CheckerRef, type NodeDef, type Target, type WorkflowConfig, type WorkflowDef } from '../types.ts'
 // #100：固定 program id 名单从 Program 元数据单源派生，不在这里另维护一份。
 import { BUILTIN_PROGRAM_IDS } from '../programs/metadata.ts'
 
@@ -107,6 +107,18 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
       const trimmed = role.model.reasoningEffort.trim()
       if (trimmed === '') problems.push(`role "${roleKey}" reasoningEffort must be a non-empty string when provided`)
       else role.model.reasoningEffort = trimmed
+    }
+    // #235：备用路由沿用主路由同一套防御性 trim；省略档位即用备用模型默认档位
+    // （不继承主路由/Manager 档位，派发边界由 routeToAgentOptions 显式清除）。
+    if (role.fallbackModel !== undefined) {
+      const trimmed = role.fallbackModel.reasoningEffort?.trim()
+      if (trimmed === '') problems.push(`role "${roleKey}" fallbackModel reasoningEffort must be a non-empty string when provided`)
+      else if (trimmed !== undefined) role.fallbackModel.reasoningEffort = trimmed
+      // 主备必须是不同模型：provider+modelId 相同（仅 effort 不同）不构成备用，
+      // 在同一模型上再试一次不属于故障切换，静态拒绝以免运行期空转一轮预算。
+      if (role.model !== undefined && sameModelRoute(role.model, role.fallbackModel)) {
+        problems.push(`role "${roleKey}" fallbackModel must differ from model by provider/modelId (仅 reasoningEffort 不同不构成备用路由)`)
+      }
     }
     // #60: 缺省 reuse 在此归一化为 `node`，随 definitionSnapshot 一并冻结；
     // 之后修改 YAML 只影响新启动的 Run。
