@@ -198,8 +198,8 @@ export function checkStateInvariants(run: RunState, execution?: NodeExecution): 
   }
   for (const key of Object.keys(run.roleActors)) if (!(key in run.definitionSnapshot.roles)) problems.push(`unknown roleActors key: ${key}`)
   for (const key of Object.keys(run.modelOverrides)) if (key !== 'judge' && !(key in run.definitionSnapshot.roles)) problems.push(`unknown modelOverrides key: ${key}`)
-  // #235：阶段表只允许快照内普通角色（Judge 备用路由属 #236；Manager 无备用链）。
-  for (const key of Object.keys(run.roleRoutes ?? {})) if (!(key in run.definitionSnapshot.roles)) problems.push(`unknown roleRoutes key: ${key}`)
+  // #235/#236：阶段表只允许快照内普通角色与 `judge`（Manager 无备用链）。
+  for (const key of Object.keys(run.roleRoutes ?? {})) if (key !== 'judge' && !(key in run.definitionSnapshot.roles)) problems.push(`unknown roleRoutes key: ${key}`)
   if (execution) {
     problems.push(...checkExecutionInvariants(run, execution))
     if (run.status === 'blocked' && !(run.blockReason?.trim() || execution.blockReason?.trim())) problems.push('blocked run requires a control or execution reason')

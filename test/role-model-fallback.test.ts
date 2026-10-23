@@ -22,7 +22,7 @@ import { turnEndFailure, turnEndFailureFacts, type TurnEndFact } from '../src/pl
 import { judgeSpawnPlan, resolveRoleModel } from '../src/roles/roles.ts'
 import { StateStore } from '../src/state/store.ts'
 import { routeToAgentOptions, type RunState, type SpawnAgentOptions, type WorkflowConfig } from '../src/types.ts'
-import { businessEqual, loadDraft, previewDraft, setRoleFallbackModel, undo } from '../src/editor/draft.ts'
+import { businessEqual, loadDraft, previewDraft, redo, setJudgeFallbackModel, setJudgeModel, setRoleFallbackModel, undo } from '../src/editor/draft.ts'
 import { serializeLayout } from '../src/editor/layout.ts'
 import { buildClientBundle, bundleSources } from '../web-client/build.mjs'
 
@@ -90,19 +90,24 @@ test('#235 不同 provider 的同名 modelId 是合法备用路由', () => {
   assert.equal(config.roles.worker!.fallbackModel!.provider, 'p2')
 })
 
-test('#235 备用路由档位空白值防御性拒绝；judgeRole.fallbackModel 仍属 #236 被 schema 拒绝', () => {
+test('#235 备用路由档位空白值防御性拒绝（Judge 同规则，#236）', () => {
   const handBuilt = load(CATALOG(`  worker:
     persona: Worker persona.
     model: { provider: p1, modelId: m1 }`))
   handBuilt.roles.worker!.fallbackModel = { provider: 'p2', modelId: 'm2', reasoningEffort: '   ' }
   assert.throws(() => validateAndNormalize(handBuilt, { workflowId: 'w' }), CatalogValidationError, /fallbackModel reasoningEffort must be a non-empty string/)
 
-  assert.throws(() => parseCatalogConfig(`
+  handBuilt.judgeRole.fallbackModel = { provider: 'p2', modelId: 'm2', reasoningEffort: '   ' }
+  assert.throws(() => validateAndNormalize(handBuilt, { workflowId: 'w' }), CatalogValidationError, /judgeRole fallbackModel reasoningEffort must be a non-empty string/)
+
+  // #236：judgeRole.fallbackModel 已被 schema 接受，主备同路由由 catalog 校验拒绝。
+  const parsed = load(`
 schemaVersion: agent-workflow/v3
 roles:
   worker: { persona: W. }
 judgeRole:
   persona: Judge persona.
+  model: { provider: p1, modelId: m1 }
   fallbackModel: { provider: p2, modelId: m2 }
 workflow:
   startNode: plan
@@ -113,7 +118,15 @@ workflow:
       checker: { checkerId: judge.claim-correct, config: { criteria: PASS. } }
       results:
         succeeded: { criteria: Plan is complete., target: { return: done } }
-`), /fallbackModel|Unrecognized/)
+`)
+  assert.deepEqual(parsed.judgeRole.fallbackModel, { provider: 'p2', modelId: 'm2' })
+  assert.deepEqual(Object.keys(parsed.judgeRole), ['persona', 'model', 'fallbackModel'])
+
+  const clash = load(CATALOG(`  worker:
+    persona: Worker persona.`))
+  clash.judgeRole.model = { provider: 'p1', modelId: 'm1' }
+  clash.judgeRole.fallbackModel = { provider: 'p1', modelId: 'm1', reasoningEffort: 'high' }
+  assert.throws(() => validateAndNormalize(clash, { workflowId: 'w' }), CatalogValidationError, /judgeRole fallbackModel must differ from model by provider\/modelId/)
 })
 
 // ---- 故障资格判定：只按结构化事实分类，不解析 message ----
@@ -259,6 +272,17 @@ function harness(config: WorkflowConfig = CONFIG) {
     async caller() {
       const row = await h.row()
       return { sessionId: row.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
+    },
+    /** #236：推进到判定中（claim 已接受、Judge 已派发），返回 Judge 的派发 caller。 */
+    async toChecking() {
+      const plan = await h.row()
+      const planCaller = { sessionId: plan.execution.dispatch!.sessionId!, turnUserMessageIds: new Set([plan.execution.dispatch!.messageId!]) }
+      assert.equal((await engine.handleClaim('ws', { result: 'succeeded', handoff: 'plan handoff' }, planCaller)).ok, true)
+      await engine.handleTurnEnded('ws', planCaller)
+      const checking = await h.row()
+      assert.equal(checking.execution.phase, 'checking')
+      assert.ok(checking.execution.judge!.messageId, '判定已派发')
+      return { sessionId: checking.execution.judge!.sessionId!, turnUserMessageIds: new Set([checking.execution.judge!.messageId!]) }
     },
     /** 关库重开：同一 home 新建 Store/Engine（预算与激活路由必须来自持久化行）。 */
     reopen() {
@@ -499,7 +523,230 @@ test('#235 继承主路由时备用与之相同：启动即拒绝（冻结后才
   } finally { h.close() }
 })
 
-// ---- 编辑器与 GUI：备用模型的往返 ----
+// ---- #236：Judge 独立备用模型与安全判定恢复 ----
+
+/** Judge 主/备可分别声明（省略 = 继承 Run 冻结的 Manager 路由）。 */
+function judgeConfig(options: { primary?: boolean; fallback?: boolean } = {}): WorkflowConfig {
+  const config = load(CATALOG(`  worker:
+    persona: Worker persona.
+    model: { provider: primary, modelId: primary-model }`))
+  if (options.primary !== false) config.judgeRole.model = { provider: 'jprimary', modelId: 'jprimary-model' }
+  if (options.fallback !== false) config.judgeRole.fallbackModel = { provider: 'jbackup', modelId: 'jbackup-model' }
+  return config
+}
+
+function judgeSpawns(spawns: Spawn[], from: number): Spawn[] {
+  return spawns.slice(from).filter(entry => entry.label === 'judge')
+}
+
+test('#236 配置 Judge 备用：判定中 5xx 直接切 B 判同一 claim，不叠加同模型重试', async () => {
+  const h = harness(judgeConfig())
+  try {
+    await h.start()
+    const judging = await h.toChecking()
+    const before = await h.row()
+    const claimId = before.execution.claim!.id
+    const inputVersion = before.execution.inputVersion
+    const oldJudgeSession = before.execution.judge!.sessionId
+    const spawnsBefore = h.spawns.length
+
+    await h.engine.handleTurnEnded('ws', judging, FAILOVER_503.text, FAILOVER_503.facts)
+
+    const row = await h.row()
+    assert.equal(row.run.status, 'running', '合格故障 + 已安全收口 → 切 B，不是 BLOCK')
+    assert.equal(row.execution.phase, 'checking')
+    assert.equal(row.execution.blockReason, null)
+    assert.equal(row.execution.judgeAutoRetried, undefined, '不叠加 #200 的同模型重试预算')
+    assert.deepEqual(row.run.roleRoutes, { judge: { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 } })
+    // 同一 claim / 同一 inputVersion / 材料不变：新 Judge 判同一份材料，不补做 Actor 工作。
+    assert.equal(row.execution.claim!.id, claimId)
+    assert.equal(row.execution.inputVersion, inputVersion)
+    assert.equal(row.execution.input, before.execution.input)
+    assert.equal(row.execution.judge!.claimId, claimId)
+    assert.equal(row.execution.judge!.inputVersion, inputVersion)
+    assert.notEqual(row.execution.judge!.sessionId, oldJudgeSession, '旧会话仅撤权，新会话判同一 claim')
+    assert.deepEqual(row.execution.judge!.model, { provider: 'jbackup', modelId: 'jbackup-model' })
+
+    const respawn = judgeSpawns(h.spawns, spawnsBefore)
+    assert.equal(respawn.length, 1, '只切一次：不先同模型重试、不重复派发')
+    assert.equal(respawn[0]!.agentOptions?.provider, 'jbackup')
+    assert.equal(respawn[0]!.agentOptions?.model, 'jbackup-model')
+    assert.equal(respawn[0]!.agentOptions?.reasoningEffort, undefined, '省略档位 = 备用模型默认档位')
+
+    const notices = h.messages.filter(message => message.includes('Workflow MODEL FALLBACK'))
+    assert.equal(notices.length, 1, '切换主动通知 Manager 一次')
+    assert.match(notices[0]!, /role=judge jprimary\/jprimary-model → jbackup\/jbackup-model（fallback，本轮第 1 次自动切换，原因 server-5xx code=SERVER status=503）/)
+    assert.doesNotMatch(notices[0]!, /upstream exploded/, '诊断脱敏：不带错误正文')
+    assert.deepEqual((await h.store.events('ws', row.execution.executionId)).map(event => event.type).slice(-2), ['model-changed', 'judge-arranged'])
+
+    const status = (await h.engine.status('ws', 'manager')) as { status: { routes: Array<Record<string, unknown>> } }
+    assert.deepEqual(status.status.routes, [{
+      role: 'judge', stage: 'fallback', route: 'jbackup/jbackup-model', fallback: 'jbackup/jbackup-model',
+      reason: 'server-5xx code=SERVER status=503', autoSwitches: 1,
+    }])
+
+    // 旧 Judge 会话的迟到提交与重复 turn-end 都失权：不重复判定、不重复扣预算。
+    const staleJudge = { sessionId: oldJudgeSession, turnUserMessageIds: new Set(['stale-turn']) }
+    assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', 'stale verdict', staleJudge)).ok, false)
+    await h.engine.handleTurnEnded('ws', staleJudge, FAILOVER_503.text, FAILOVER_503.facts)
+    const after = await h.row()
+    assert.deepEqual(after.run.roleRoutes, row.run.roleRoutes, '迟到信号不消耗第二次预算')
+    assert.equal(after.execution.judge!.sessionId, row.execution.judge!.sessionId)
+    assert.equal(after.execution.phase, 'checking')
+
+    // 新 Judge ACCEPT 照常推进：已接受 judgment 不撤销、不重复判定。
+    const judgeCaller = { sessionId: after.execution.judge!.sessionId!, turnUserMessageIds: new Set([after.execution.judge!.messageId!]) }
+    assert.equal((await h.engine.handleJudgeClaim('ws', after.execution.nodeToken, 'ACCEPT', 'verified', judgeCaller)).ok, true)
+    await h.engine.drive('ws')
+    const advanced = await h.row()
+    assert.equal(advanced.execution.nodeId, 'work')
+    assert.equal(advanced.run.status, 'running')
+    assert.deepEqual((await h.store.events('ws', after.execution.executionId)).map(event => event.type).filter(type => type === 'judgment').length, 1)
+  } finally { h.close() }
+})
+
+test('#236 未配置 Judge 备用：保留 #200 的同模型重试一次，再失败 BLOCK', async () => {
+  const h = harness(judgeConfig({ fallback: false }))
+  try {
+    await h.start()
+    const judging = await h.toChecking()
+    const spawnsBefore = h.spawns.length
+    await h.engine.handleTurnEnded('ws', judging, FAILOVER_503.text, FAILOVER_503.facts)
+
+    let row = await h.row()
+    assert.equal(row.run.status, 'running')
+    assert.equal(row.execution.judgeAutoRetried, true, '旧行为：同模型 fresh 重试一次')
+    assert.equal(row.run.roleRoutes, undefined, '未配置备用 → 不引入人工恢复链')
+    const respawn = judgeSpawns(h.spawns, spawnsBefore)
+    assert.equal(respawn.length, 1)
+    assert.equal(respawn[0]!.agentOptions?.provider, 'jprimary', '重试仍在主模型')
+    assert.equal(h.messages.filter(message => message.includes('Workflow MODEL FALLBACK')).length, 0)
+
+    const retry = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    await h.engine.handleTurnEnded('ws', retry, FAILOVER_503.text, FAILOVER_503.facts)
+    row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    assert.match(row.execution.blockReason!, /judge turn ended without judge_claim \(已自动重试 1 次\)/)
+    assert.equal(row.run.roleRoutes, undefined)
+  } finally { h.close() }
+})
+
+test('#236 Judge 备用也失败 → BLOCK；node_resume 与关库重开都不刷新预算', async () => {
+  const h = harness(judgeConfig())
+  try {
+    await h.start()
+    await h.engine.handleTurnEnded('ws', await h.toChecking(), FAILOVER_503.text, FAILOVER_503.facts)
+    const switched = await h.row()
+    assert.equal(switched.execution.judge!.model?.provider, 'jbackup')
+    const onBackup = { sessionId: switched.execution.judge!.sessionId!, turnUserMessageIds: new Set([switched.execution.judge!.messageId!]) }
+    await h.engine.handleTurnEnded('ws', onBackup, FAILOVER_503.text, FAILOVER_503.facts)
+
+    let row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    assert.match(row.execution.blockReason!, /judge turn ended without judge_claim \(备用模型已用尽，不再自动重试\)/)
+    assert.match(row.execution.blockReason!, /code=SERVER status=503/)
+    assert.deepEqual(row.run.roleRoutes, { judge: { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 } })
+    const token = row.execution.nodeToken
+    const spawnsBefore = h.spawns.length
+
+    // 关库重开：激活路由/来源/预算来自持久化行，不刷新。
+    h.reopen()
+    row = await h.row()
+    assert.deepEqual(row.run.roleRoutes, { judge: { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 } })
+
+    assert.equal((await h.engine.handleResume('ws', token, '继续判定，先核验既有材料', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    assert.equal(resumed.run.status, 'running')
+    assert.equal(resumed.execution.phase, 'checking')
+    assert.equal(resumed.execution.claim!.id, row.execution.claim!.id, 'resume 判同一 claim')
+    assert.deepEqual(resumed.run.roleRoutes, { judge: { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 } }, 'resume 不刷新预算')
+    const judgeRespawns = judgeSpawns(h.spawns, spawnsBefore)
+    assert.ok(judgeRespawns.length >= 1)
+    assert.equal(judgeRespawns.at(-1)!.agentOptions?.provider, 'jbackup', 'resume 仍走备用，不自动回主模型')
+
+    // B 再次合格故障：预算耗尽，直接 BLOCK（不回到 A、不叠加插件级重试）。
+    const backOnBackup = { sessionId: resumed.execution.judge!.sessionId!, turnUserMessageIds: new Set([resumed.execution.judge!.messageId!]) }
+    await h.engine.handleTurnEnded('ws', backOnBackup, FAILOVER_503.text, FAILOVER_503.facts)
+    row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    assert.match(row.execution.blockReason!, /备用模型已用尽/)
+    assert.deepEqual(row.run.roleRoutes?.judge, { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+  } finally { h.close() }
+})
+
+test('#236 不合格故障不换 Judge：额度耗尽保留 BLOCK，不消耗路由预算', async () => {
+  const h = harness(judgeConfig())
+  try {
+    await h.start()
+    const judging = await h.toChecking()
+    const spawnsBefore = h.spawns.length
+    await h.engine.handleTurnEnded('ws', judging, QUOTA_402.text, QUOTA_402.facts)
+    const row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    assert.match(row.execution.blockReason!, /judge turn ended without judge_claim \| turn-end reason=error code=QUOTA status=402/)
+    assert.equal(row.run.roleRoutes, undefined)
+    assert.equal(row.execution.judgeAutoRetried, undefined, '不消耗同模型重试预算，也不换模')
+    assert.equal(h.spawns.length, spawnsBefore, '不额外派发')
+    assert.equal(h.messages.filter(message => message.includes('Workflow MODEL FALLBACK')).length, 0)
+  } finally { h.close() }
+})
+
+test('#236 Judge 继承主路由并单独配置备用：主备相同启动即拒绝，不同则生效', async () => {
+  // 继承路由 = Run 冻结的 Manager 路由；备用与之相同无法构成备用路由（冻结后才能判定）。
+  const clash = judgeConfig({ primary: false })
+  const h = harness(clash)
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'jbackup', model: 'jbackup-model' })
+    const run = h.engine.buildInitialRun('manager', 'role-model-fallback', clash, 'hash')
+    const outcome = await h.engine.startRun('ws', run, undefined, 'root request')
+    assert.equal(outcome.ok, false)
+    assert.match((outcome as { reason: string }).reason, /role "judge" fallbackModel duplicates its primary route \(jbackup\/jbackup-model\)/)
+  } finally { h.close() }
+
+  const inherited = judgeConfig({ primary: false })
+  const ok = harness(inherited)
+  try {
+    ok.engine.managerRoute = async () => ({ provider: 'frozen', model: 'frozen-model' })
+    const run = ok.engine.buildInitialRun('manager', 'role-model-fallback', inherited, 'hash')
+    assert.equal((await ok.engine.startRun('ws', run, undefined, 'root request')).ok, true)
+    // 配置了备用但尚未切换的 Judge 同样可见（stage=primary，route=继承的冻结路由）。
+    const status = (await ok.engine.status('ws', 'manager')) as { status: { routes: Array<Record<string, unknown>> } }
+    assert.deepEqual(status.status.routes, [{
+      role: 'judge', stage: 'primary', route: 'frozen/frozen-model', fallback: 'jbackup/jbackup-model',
+      reason: null, autoSwitches: 0,
+    }])
+  } finally { ok.close() }
+})
+
+test('#236 Judge 的 REJECT/NEED_CONTEXT 不是切换依据，也不消耗路由预算', async () => {
+  const h = harness(judgeConfig())
+  try {
+    await h.start()
+    const judging = await h.toChecking()
+    const before = await h.row()
+    // 材料不足 → 保留 BLOCK（NEED_CONTEXT 不是故障，不换模）。
+    assert.equal((await h.engine.handleJudgeClaim('ws', before.execution.nodeToken, 'NEED_CONTEXT', '需要更多证据', judging)).ok, true)
+    const needContext = await h.row()
+    assert.equal(needContext.run.status, 'blocked')
+    assert.match(needContext.execution.blockReason!, /Judge NEED_CONTEXT/)
+    assert.equal(needContext.run.roleRoutes, undefined)
+
+    // 补证恢复后 REJECT：进入修正轮，仍不换模、不消耗预算。
+    assert.equal((await h.engine.handleResume('ws', needContext.execution.nodeToken, '补齐证据后重判', 'manager', 'judge')).ok, true)
+    const resumed = await h.row()
+    const judgeCaller = { sessionId: resumed.execution.judge!.sessionId!, turnUserMessageIds: new Set([resumed.execution.judge!.messageId!]) }
+    assert.equal((await h.engine.handleJudgeClaim('ws', resumed.execution.nodeToken, 'REJECT', '不通过', judgeCaller)).ok, true)
+    await h.engine.drive('ws')
+    const rejected = await h.row()
+    // REJECT 后引擎把同一节点重新派给 Actor（修正轮），故 phase 回到 working。
+    assert.equal(rejected.execution.phase, 'working')
+    assert.equal(rejected.execution.judgment!.result, 'REJECT')
+    assert.equal(rejected.run.roleRoutes, undefined)
+    assert.equal(rejected.execution.judgeAutoRetried, undefined)
+    assert.equal(h.messages.filter(message => message.includes('Workflow MODEL FALLBACK')).length, 0)
+  } finally { h.close() }
+})
+
 
 const EDITOR_CONFIG = `
 schemaVersion: agent-workflow/v3
@@ -553,6 +800,48 @@ test('#235 GUI：Role 面板区分主/备用模型并披露无限重试限制', 
   assert.match(bundle, /应用备用模型/)
   assert.match(bundle, /清除备用模型/)
   assert.match(bundle, /无限重试则收不到终止失败，本角色 fallback 不会被触发/)
-  // 备用控件只加在 Role 面板；Judge 备用路由属 #236，本轮不得出现代理入口。
-  assert.doesNotMatch(bundle, /judgeFallback|备用模型.*judgeRole/)
+})
+
+test('#236 编辑器：Judge 备用模型设置/清除/撤销，保存-重载业务等价且键序稳定', () => {
+  const loaded = loadDraft('judge-fallback', EDITOR_CONFIG)
+  assert.equal(loaded.ok, true, JSON.stringify(loaded))
+  if (!loaded.ok) throw new Error('unreachable')
+  const session = loaded.session
+
+  assert.equal(setJudgeModel(session, { provider: 'p1', modelId: 'm1' }).ok, true)
+  assert.equal(setJudgeFallbackModel(session, { provider: 'p2', modelId: 'm2', reasoningEffort: 'high' }).ok, true)
+  assert.deepEqual(session.draft.config.judgeRole.fallbackModel, { provider: 'p2', modelId: 'm2', reasoningEffort: 'high' })
+  assert.deepEqual(Object.keys(session.draft.config.judgeRole), ['persona', 'model', 'fallbackModel'])
+  assert.equal(undo(session), true)
+  assert.equal(session.draft.config.judgeRole.fallbackModel, undefined)
+  assert.equal(redo(session), true)
+  assert.deepEqual(session.draft.config.judgeRole.fallbackModel, { provider: 'p2', modelId: 'm2', reasoningEffort: 'high' })
+
+  const preview = previewDraft(session)
+  assert.deepEqual(preview.problems, [])
+  assert.match(preview.yaml, /judgeRole:\n\s+persona: Judge it\.\n\s+model:\n\s+provider: p1\n\s+modelId: m1\n\s+fallbackModel:\n\s+provider: p2\n\s+modelId: m2\n\s+reasoningEffort: high/)
+  const reloaded = loadDraft('judge-fallback', preview.yaml, serializeLayout(session.draft.config, session.draft.layout))
+  assert.equal(reloaded.ok, true, JSON.stringify(reloaded))
+  if (!reloaded.ok) throw new Error('unreachable')
+  assert.ok(businessEqual(session.draft.config, reloaded.session.draft.config))
+
+  // 清除 = 整键省略：Judge 回到「同模型重试一次」的旧行为。
+  assert.equal(setJudgeFallbackModel(session, undefined).ok, true)
+  assert.equal(session.draft.config.judgeRole.fallbackModel, undefined)
+  assert.equal(setJudgeFallbackModel(session, { provider: 'p2', modelId: '' }).ok, false)
+  assert.equal(previewDraft(session).problems.length, 0)
+})
+
+test('#236 GUI：Judge 面板独立提供主/备用模型两分区与恢复语义披露', () => {
+  const bundle = bundleSources().panel
+  // Judge 区自带备用控件（与 Role 区同一套 ModelFields，前缀隔离不串主模型）。
+  assert.match(bundle, /function JudgeSection\(props\)/)
+  assert.match(bundle, /onFallbackModel: applyJudgeFallbackModel/)
+  assert.match(bundle, /onClearFallbackModel: clearJudgeFallbackModel/)
+  assert.match(bundle, /仅用于 Judge 判定遇到明确瞬时故障/)
+  assert.match(bundle, /不再先用主模型重试一次/)
+  assert.match(bundle, /清除后 Judge 保留原有行为：瞬时失败同模型重试一次/)
+  assert.match(bundle, /fallbackProvider: judge\.fallbackModel\?\.provider/)
+  // 编辑器镜像与 server 同语义（保存/回读 effort 不丢失）。
+  assert.match(bundleSources().edits, /function setJudgeFallbackModelEdit\(state, model\)/)
 })

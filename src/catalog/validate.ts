@@ -145,6 +145,16 @@ function checkPersonaProtocol(label: string, persona: string, warnings: string[]
     if (trimmed === '') problems.push('judgeRole reasoningEffort must be a non-empty string when provided')
     else config.judgeRole.model.reasoningEffort = trimmed
   }
+  // #236：Judge 备用路由与普通角色同一套防御性 trim + 主备差异检查（显式 model
+  // 时在此判定；省略 model 继承冻结路由的情形在 startRun 冻结后判定）。
+  if (config.judgeRole.fallbackModel !== undefined) {
+    const trimmed = config.judgeRole.fallbackModel.reasoningEffort?.trim()
+    if (trimmed === '') problems.push('judgeRole fallbackModel reasoningEffort must be a non-empty string when provided')
+    else if (trimmed !== undefined) config.judgeRole.fallbackModel.reasoningEffort = trimmed
+    if (config.judgeRole.model !== undefined && sameModelRoute(config.judgeRole.model, config.judgeRole.fallbackModel)) {
+      problems.push('judgeRole fallbackModel must differ from model by provider/modelId (仅 reasoningEffort 不同不构成备用路由)')
+    }
+  }
   checkPersonaProtocol('judgeRole', config.judgeRole.persona, warnings)
 
   // workflows (root + children)

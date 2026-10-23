@@ -369,11 +369,13 @@ export function setRolePersona(session: DraftSession, key: string, persona: stri
  * 分叉，`businessEqual` 判为不等价；这里按 schema 序重排，未知键稳定追加在末尾。
  */
 const ROLE_KEY_ORDER = ['persona', 'model', 'fallbackModel', 'reuse', 'compactBeforeReuse', 'tools']
+/** #236：Judge 的 schema 序（persona → model → fallbackModel → tools）。 */
+const JUDGE_KEY_ORDER = ['persona', 'model', 'fallbackModel', 'tools']
 
-function orderRoleKeys(role: Record<string, unknown>): void {
+function orderRoleKeys(role: Record<string, unknown>, order: string[] = ROLE_KEY_ORDER): void {
   const rank = (key: string): number => {
-    const index = ROLE_KEY_ORDER.indexOf(key)
-    return index === -1 ? ROLE_KEY_ORDER.length : index
+    const index = order.indexOf(key)
+    return index === -1 ? order.length : index
   }
   const entries = Object.entries(role).sort((a, b) => rank(a[0]) - rank(b[0]))
   for (const key of Object.keys(role)) delete role[key]
@@ -517,6 +519,25 @@ export function setJudgeModel(session: DraftSession, model: RoleModelInput | und
   pushHistory(session)
   if (normalized.value === undefined) delete session.draft.config.judgeRole.model
   else session.draft.config.judgeRole.model = normalized.value
+  orderRoleKeys(session.draft.config.judgeRole as unknown as Record<string, unknown>, JUDGE_KEY_ORDER)
+  session.draft.dirtyBusiness = true
+  return { ok: true }
+}
+
+/**
+ * #236：设置/清除 Judge 备用模型（undefined = 整键省略；三态区别保留）。
+ * 与主模型共用同一套归一化；主备同 provider+modelId 由保存前校验（显式 model 时）
+ * 或启动期 fallbackClash（继承冻结路由时）拒绝。
+ */
+export function setJudgeFallbackModel(session: DraftSession, model: RoleModelInput | undefined): RoleEditResult {
+  const normalized = normalizeModelInput(model)
+  if (!normalized.ok) return normalized
+  const current = session.draft.config.judgeRole.fallbackModel ?? null
+  if (JSON.stringify(current) === JSON.stringify(normalized.value ?? null)) return { ok: true }
+  pushHistory(session)
+  if (normalized.value === undefined) delete session.draft.config.judgeRole.fallbackModel
+  else session.draft.config.judgeRole.fallbackModel = normalized.value
+  orderRoleKeys(session.draft.config.judgeRole as unknown as Record<string, unknown>, JUDGE_KEY_ORDER)
   session.draft.dirtyBusiness = true
   return { ok: true }
 }

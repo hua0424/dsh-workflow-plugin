@@ -29,8 +29,7 @@ const roleDefinition = z
     // #235：备用模型路由（每角色最多一个，无备用链）。形状与 `model` 完全
     // 相同（含可选档位，省略即用备用模型默认档位）；与主路由
     // provider+modelId 的差异检查在 validateAndNormalize 里做（同层报错聚合）。
-    // `judgeRole.fallbackModel` 属 #236，本节点仍由 judgeRoleDefinition
-    // 的 strict 拒绝。
+    // #236：Judge 用同一键同一形状（`judgeRole.fallbackModel`）。
     fallbackModel: roleModel.optional(),
     // #60: node | continuable；省略由 validateAndNormalize 归一化为 `node`。
     // 非法取值在这里被拒（strict + enum），只阻塞声明它的那个 catalog 文件。
@@ -50,6 +49,9 @@ const judgeRoleDefinition = z
   .object({
     persona: nonEmptyTrimmed,
     model: roleModel.optional(),
+    // #236：Judge 备用路由；主路由省略时是启动时冻结的继承路由，主备差异由
+    // startRun 的 fallbackClash 在冻结后判定（此处只管形状与档位归一）。
+    fallbackModel: roleModel.optional(),
     // Issue #25: the Judge inherits the full tool catalog; `deny` narrows it on
     // top of the plugin default deny list. Protected tools stay undeniably
     // present (denying `judge_claim` or the delegation machinery deadlocks the

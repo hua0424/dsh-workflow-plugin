@@ -229,11 +229,13 @@ export function setRolePersonaEdit(state, key, persona) {
  * 与校验输出分叉。
  */
 const ROLE_KEY_ORDER = ['persona', 'model', 'fallbackModel', 'reuse', 'compactBeforeReuse', 'tools']
+/** #236：Judge 的 schema 序（persona → model → fallbackModel → tools）。 */
+const JUDGE_KEY_ORDER = ['persona', 'model', 'fallbackModel', 'tools']
 
-function orderRoleKeys(role) {
+function orderRoleKeys(role, order = ROLE_KEY_ORDER) {
   const rank = (key) => {
-    const index = ROLE_KEY_ORDER.indexOf(key)
-    return index === -1 ? ROLE_KEY_ORDER.length : index
+    const index = order.indexOf(key)
+    return index === -1 ? order.length : index
   }
   const entries = Object.entries(role).sort((a, b) => rank(a[0]) - rank(b[0]))
   for (const key of Object.keys(role)) delete role[key]
@@ -383,6 +385,23 @@ export function setJudgeModelEdit(state, model) {
   const { withHistory, draft } = withRoleHistory(state)
   if (normalized.value === undefined) delete draft.judgeRole.model
   else draft.judgeRole.model = normalized.value
+  orderRoleKeys(draft.judgeRole, JUDGE_KEY_ORDER)
+  return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
+}
+
+/**
+ * #236：设置/清除 Judge 备用模型（与主模型同一套归一化；`undefined` = 整键省略）。
+ * 主备同 provider+modelId 的非法组合由保存前/启动期的 catalog 校验统一拒绝。
+ */
+export function setJudgeFallbackModelEdit(state, model) {
+  if (state.draft === null) return { ok: false, reason: '尚未加载配置' }
+  const normalized = normalizeModelInput(model)
+  if (!normalized.ok) return normalized
+  if (sameJson(state.draft.judgeRole.fallbackModel, normalized.value)) return { ok: true, noop: true, state }
+  const { withHistory, draft } = withRoleHistory(state)
+  if (normalized.value === undefined) delete draft.judgeRole.fallbackModel
+  else draft.judgeRole.fallbackModel = normalized.value
+  orderRoleKeys(draft.judgeRole, JUDGE_KEY_ORDER)
   return { ok: true, state: { ...withHistory, draft, dirtyBusiness: true, saveResult: null } }
 }
 

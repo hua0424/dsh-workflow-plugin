@@ -22,7 +22,7 @@ import {
   checkNewFilename, deleteFlowReturnEdit, deleteNodeEdit, deleteNodeResultEdit, deleteRoleEdit, deleteSubflowEdit, findNodeRefsEdit,
   findRoleRefs, findSubflowCallersEdit, ID_PATTERN, isDirty, layoutFilenameFor, minimalConfigOf, moveNodeEdit,
   parseNewFilenameEdit, redoEdit, renameFlowReturnEdit, renameNodeEdit, renameNodeResultEdit, renameSubflowEdit,
-  renameRoleEdit, savePlanOf, setActorFieldsEdit, setChildReturnTargetEdit, setChildWorkflowIdEdit, setFlowStartNodeEdit, setJudgeDenyEdit,
+  renameRoleEdit, savePlanOf, setActorFieldsEdit, setChildReturnTargetEdit, setChildWorkflowIdEdit, setFlowStartNodeEdit, setJudgeDenyEdit, setJudgeFallbackModelEdit,
   setJudgeModelEdit, setJudgePersonaEdit, setNodeResultEdit, setProgramFieldsEdit, setProgramParamEdit,
   setProgramResultEdit, setRoleDenyEdit, setRoleFallbackModelEdit, setRoleModelEdit,
   setRolePersonaEdit, setRoleReuseEdit, setRoleCompactBeforeReuseEdit, SUPPORTED_CHECKER_IDS, undoEdit,
@@ -149,6 +149,10 @@ function judgeFormOf(draft) {
     provider: judge.model?.provider ?? '',
     modelId: judge.model?.modelId ?? '',
     effort: judge.model?.reasoningEffort ?? '',
+    // #236：Judge 备用模型（与普通角色同形状；整键省略 = 保留同模型重试一次）。
+    fallbackProvider: judge.fallbackModel?.provider ?? '',
+    fallbackModelId: judge.fallbackModel?.modelId ?? '',
+    fallbackEffort: judge.fallbackModel?.reasoningEffort ?? '',
     deny: denyTextOf(judge.tools?.deny),
   }
 }
@@ -330,7 +334,7 @@ export function WorkflowConfigEditorPanel(props) {
   // T2 表单缓冲（纯输入态，非业务模型；业务唯一来源仍是 state.draft，经 edits.js 变更）。
   const [newRole, setNewRole] = useState({ id: '', persona: '' })
   const [roleForm, setRoleForm] = useState({ sel: '', rename: '', persona: '', provider: '', modelId: '', effort: '', reuse: 'node', compactBeforeReuse: true, deny: '' })
-  const [judgeForm, setJudgeForm] = useState({ persona: '', provider: '', modelId: '', effort: '', deny: '' })
+  const [judgeForm, setJudgeForm] = useState({ persona: '', provider: '', modelId: '', effort: '', fallbackProvider: '', fallbackModelId: '', fallbackEffort: '', deny: '' })
   // T3 表单缓冲与选择态（同上：纯输入态；边身份 = 源节点 + 结果名）。
   const [newFileName, setNewFileName] = useState('')
   const [nodeSel, setNodeSel] = useState(null)
@@ -701,6 +705,20 @@ export function WorkflowConfigEditorPanel(props) {
 
   const clearJudgeModel = useCallback(async () => {
     await runEdit(setJudgeModelEdit(state, undefined), (result) => {
+      setJudgeForm(judgeFormOf(result.state.draft))
+    })
+  }, [state, runEdit])
+
+  // #236：Judge 备用模型（可选）——同一套归一化与保存校验；清除即整键省略，
+  // Judge 回到「无备用路由」的旧行为（瞬时失败同模型重试一次）。
+  const applyJudgeFallbackModel = useCallback(async () => {
+    await runEdit(setJudgeFallbackModelEdit(state, fallbackModelInputOf(judgeForm)), (result) => {
+      setJudgeForm(judgeFormOf(result.state.draft))
+    })
+  }, [state, judgeForm, runEdit])
+
+  const clearJudgeFallbackModel = useCallback(async () => {
+    await runEdit(setJudgeFallbackModelEdit(state, undefined), (result) => {
       setJudgeForm(judgeFormOf(result.state.draft))
     })
   }, [state, runEdit])
@@ -1254,6 +1272,7 @@ export function WorkflowConfigEditorPanel(props) {
       h(JudgeSection, {
         draft, judgeForm, setJudgeForm, loadModels: props.loadModels,
         onPersona: applyJudgePersona, onModel: applyJudgeModel, onClearModel: clearJudgeModel,
+        onFallbackModel: applyJudgeFallbackModel, onClearFallbackModel: clearJudgeFallbackModel,
         onDeny: applyJudgeDeny, onClearDeny: clearJudgeDeny, busy: state.busy,
       }),
           ),
@@ -1392,10 +1411,25 @@ function RoleSection(props) {
   )
 }
 
-/** T2 Judge 区：persona/可选模型/tools.deny，不提供 reuse。 */
+/** T2 Judge 区：persona/可选主备模型/tools.deny，不提供 reuse。 */
 function JudgeSection(props) {
   const { judgeForm, setJudgeForm } = props
   const setField = (field) => (event) => setJudgeForm((prev) => ({ ...prev, [field]: event.target.value }))
+  // #236：与 RoleSection 同一套 fallback* 前缀映射（绝不串到主模型）。
+  const fallbackForm = {
+    provider: judgeForm.fallbackProvider ?? '',
+    modelId: judgeForm.fallbackModelId ?? '',
+    effort: judgeForm.fallbackEffort ?? '',
+  }
+  const setFallbackForm = (update) => setJudgeForm((prev) => {
+    const current = {
+      provider: prev.fallbackProvider ?? '',
+      modelId: prev.fallbackModelId ?? '',
+      effort: prev.fallbackEffort ?? '',
+    }
+    const next = typeof update === 'function' ? update(current) : update
+    return { ...prev, fallbackProvider: next.provider, fallbackModelId: next.modelId, fallbackEffort: next.effort }
+  })
   return h('div', { className: 'wf-judge' },
     h('h3', null, 'Judge · 验收角色'),
     h('div', null,
@@ -1403,7 +1437,15 @@ function JudgeSection(props) {
       h(LongTextField, { title: 'Judge persona', value: judgeForm.persona, onChange: setField('persona') }),
       h('button', { onClick: props.onPersona, disabled: props.busy }, '应用'),
     ),
-    h(ModelFields, { form: judgeForm, setForm: setJudgeForm, loadModels: props.loadModels, busy: props.busy, onApply: props.onModel, onClear: props.onClearModel }),
+    h(ModelFields, { title: '主模型', form: judgeForm, setForm: setJudgeForm, loadModels: props.loadModels, busy: props.busy, onApply: props.onModel, onClear: props.onClearModel }),
+    h(ModelFields, {
+      title: '备用模型（可选）',
+      hint: '仅用于 Judge 判定遇到明确瞬时故障（5xx / 429 / 网络 / 超时）并已安全收口时自动切换到该路由判定同一 claim（不再先用主模型重试一次）；备用模型也失败则 BLOCK，不追加插件级重试。宿主对瞬时失败默认自动重试，若 provider 配置为无限重试则收不到终止失败，本备用不会被触发。清除后 Judge 保留原有行为：瞬时失败同模型重试一次。',
+      applyLabel: '应用备用模型',
+      clearLabel: '清除备用模型',
+      form: fallbackForm, setForm: setFallbackForm, loadModels: props.loadModels, busy: props.busy,
+      onApply: props.onFallbackModel, onClear: props.onClearFallbackModel,
+    }),
     h('div', null,
       h('label', null, 'tools.deny（逗号分隔；省略请用清除按钮）'),
       h('input', { value: judgeForm.deny, onChange: setField('deny') }),
