@@ -89,7 +89,7 @@ Role（含 judgeRole）的模型路由由 provider、modelId 与可选思考强�
 
 本地模型列表（Local Model Catalog）是当前 profile 实际声明的模型集合：适配器内置目录与 settings/config 显式声明合并而成，与供应商接口的动态发现无关。modelId 本地列表校验与档位支持矩阵按 #149 执行（含明确的 fail-open 跳过维度与 start 前置阻断，由 T2/T3 交付）；基线空列表按不可用处理，unlisted 阻断为有意严格策略。
 
-## 已确认的 Fallback 领域术语（设计中，尚未实施）
+## 已确认的 Fallback 领域术语（#235–#237 已落地 Runtime）
 
 **Primary Model Route（主模型路由）**：Role Actor 或 Judge 在尚未发生故障切换时使用的模型路由。Manager 主会话不属于本次自动切换范围。
 
@@ -97,9 +97,9 @@ Role（含 judgeRole）的模型路由由 provider、modelId 与可选思考强�
 
 **Automatic Model Failover（自动模型故障切换）**：用户通过显式配置备用路由，预先授权在确认模型调用故障且满足安全恢复条件时改用该路由。未配置备用路由不构成自动选模授权；业务结果不符合验收条件不等于模型调用故障。
 
-**Model Recovery Cycle（模型恢复轮次）**：一次获授权的有限模型故障恢复过程，授权来自 Run 的显式备用配置或 Manager 的再次人工设置。自动切换、普通恢复与进程重启不构成新一轮授权。
+**Model Recovery Cycle（模型恢复轮次）**：一次获授权的有限模型故障恢复过程，授权来自 Run 的显式备用配置或 Manager 的再次人工设置。自动切换、普通恢复与进程重启不构成新一轮授权。「再次人工设置」对 Role Actor 与 Judge 同规则（#237）：C 与 A/B 相同也开新一轮，只有当前已在人工阶段（stage=manual、预算 0）且路由三元件相同时才算无需变更。人工阶段的激活路由、来源与预算记在 `run.roleRoutes`（持久化，node_resume/重启不刷新）。
 
-以上为设计访谈中已确认的概念，不表示现行 Runtime 已支持。备用配置仅随新 Run 的 Definition Snapshot 生效，不通过编辑配置追改在途 Run。已确认的行为边界见[单备用模型故障切换规格](docs/specs/role-model-fallback.md)，授权与安全取舍见 [ADR-0004](docs/adr/0004-role-model-fallback-authorization.md)。
+以上概念已在 #235（Actor 备用链）、#236（Judge 备用链）与 #237（人工换模新轮次）落地；备用配置仅随新 Run 的 Definition Snapshot 生效，不通过编辑配置追改在途 Run。已确认的行为边界见[单备用模型故障切换规格](docs/specs/role-model-fallback.md)，授权与安全取舍见 [ADR-0004](docs/adr/0004-role-model-fallback-authorization.md)。
 
 ## Judge Role / Judge Agent
 

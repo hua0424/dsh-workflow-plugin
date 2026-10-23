@@ -291,9 +291,11 @@ export class WorkflowEngine {
     } }
   }
   /**
-   * #235：`workflow_status.routes` 视图。列出「发生过切换的角色」与「配置了备用
-   * 路由但尚未切换的角色」（stage 缺省即 primary），让 Manager 不必猜某个角色是否
-   * 参与故障切换链；无备用路由的普通角色不列入（保持状态输出精简，不新建监控面板）。
+   * #235：`workflow_status.routes` 视图。列出「发生过切换/人工授权的角色」与「配置了
+   * 备用路由但尚未切换的角色」（stage 缺省即 primary），让 Manager 不必猜某个角色
+   * 是否参与故障切换链。无备用路由、也没有人工授权的普通角色不列入（保持状态输出
+   * 精简，不新建监控面板）；#237 起人工设置（stage=manual）本身也是一条可见事实，
+   * 即使该角色没有配置备用路由也列出。
    */
   private roleRoutesView(run: RunState): Array<{ role: string; stage: string; route: string; fallback: string | null; reason: string | null; autoSwitches: number }> {
     const roles = new Set(Object.keys(run.roleRoutes ?? {}))
@@ -1036,9 +1038,11 @@ export class WorkflowEngine {
       if (roleFallbackRoute(fresh.run, 'judge') !== undefined) {
         if (await this.tryJudgeFailover(ws, fresh, failureFacts)) return
         this.forgetDispatch(e.judge?.sessionId)
-        // 备用已用尽（B 之后再失败）与故障不合格/未配置路由分开报：前者明确告诉
-        // Manager 预算已消耗完，后者保持旧语义（含认证/额度等不换模的判定）。
+        // 备用已用尽（B 的合格故障）与故障不合格/未配置路由分开报：前者明确告诉
+        // Manager 预算已消耗完；后者保持旧语义（含认证/额度等不换模的判定），
+        // 即使当前声明阶段是 fallback，也不把「额度耗尽」误报成「备用路由用尽」。
         const exhausted = effectiveRoleRouteStage(fresh.run, 'judge') === 'fallback'
+          && classifyActorFailure(failureFacts).eligible
         await this.blockRow(ws, fresh, withTurnEndFailure(exhausted
           ? 'judge turn ended without judge_claim (备用模型已用尽，不再自动重试)'
           : 'judge turn ended without judge_claim', turnFailure))
@@ -1679,8 +1683,12 @@ export class WorkflowEngine {
     // override 带 effort 时走正常替换生命周期（探针 + 删映射 + 重存 override，
     // 后续派发经显式 undefined 回落模型默认，或携带显式档位）；Judge 恒无映射（Judge 会话复用由
     // resume 的三元件比较决定，#22/T1），无映射且 override 三元件全等时才可 no-op。
+    // #237：no-op 还要求当前已处于人工轮（stage=manual、预算 0）。否则同样的
+    // override 值也必须重新授权——「C 等于 A/B 或与上次相同」不能静默吞掉新轮次，
+    // 因为轮次阶段（primary/fallback 的已消耗预算）只有显式设置才能重置。
     if (existing?.provider === route.provider && existing.modelId === route.modelId
-      && existing.reasoningEffort === route.reasoningEffort && mapped === undefined) return { ok: true, run: row.run, message: withNote('model override already applied') }
+      && existing.reasoningEffort === route.reasoningEffort && mapped === undefined
+      && row.run.roleRoutes?.[role]?.stage === 'manual') return { ok: true, run: row.run, message: withNote('model override already applied') }
     const currentNode = this.nodeAt(row.run, topFrame(row.run))
     const replacesCurrentRole = mapped && currentNode?.execution.type === 'actor-task' && currentNode.execution.role === role
     if (replacesCurrentRole && row.run.status === 'running' && row.execution.phase === 'working') return rejected('current active Role must node_block before model replacement')
@@ -1693,11 +1701,13 @@ export class WorkflowEngine {
     row.run.modelOverrides[role] = route
     if (mapped) delete row.run.roleActors[role]
     if (replacesCurrentRole) row.execution.roleBoundaryPrepared = true
-    // #235：显式设置模型即开新一轮（C → 主 → 备用），本轮自动切换预算归零；
-    // C 允许与主/备用相同（人工要求在该路由上再试一次）。#236：Judge 已有人工
-    // 路由（override 即 manual），但「人工设置 C 后的全新恢复轮次」属 #237，本节点
-    // 不改写 Judge 的阶段表/预算（避免提前交付下一票语义）。
-    if (role !== 'judge') row.run.roleRoutes = { ...(row.run.roleRoutes ?? {}), [role]: { stage: 'manual', reason: 'manager-set', autoSwitches: 0 } }
+    // #235/#237：显式设置模型即开一轮新的有限恢复轮次（C → 主 A → 备用 B），
+    // 本轮自动切换预算归零；C 允许与主/备用相同（人工要求在该路由上再试一次）。
+    // Judge 与普通角色同规则（#237 起）：阶段表/预算显式持久化，因此
+    // `workflow_status.routes` 能显示 judge stage=manual，且后备 B 用尽后再次
+    // 人工设置能把阶段从 fallback 拉回人工轮（否则 resolveRoleModel 会继续用 B，
+    // 静默丢掉这次授权）。
+    row.run.roleRoutes = { ...(row.run.roleRoutes ?? {}), [role]: { stage: 'manual', reason: 'manager-set', autoSwitches: 0 } }
     await this.state.put(ws, row.run, row.version, [change(row.execution, 'model-changed')])
     this.trace(row.run, 'MODEL', { workflow: row.execution.workflowId, role, provider: jsonField(route.provider, LIMITS.providerMax), model: jsonField(route.modelId, LIMITS.modelIdMax), ...(route.reasoningEffort === undefined ? {} : { reasoningEffort: jsonField(route.reasoningEffort, LIMITS.reasoningEffortMax) }) })
     return { ok: true, run: row.run, message: withNote(`model override saved for ${role}`) }
