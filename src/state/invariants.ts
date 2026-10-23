@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { workflowConfigSchema } from '../catalog/schema.ts'
 import { computeDefinitionHash } from '../catalog/validate.ts'
-import { LIMITS, ID_PATTERN, declaredResults, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
+import { LIMITS, ID_PATTERN, declaredResults, roleKeysWithJudge, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
 
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
@@ -197,9 +197,10 @@ export function checkStateInvariants(run: RunState, execution?: NodeExecution): 
     }
   }
   for (const key of Object.keys(run.roleActors)) if (!(key in run.definitionSnapshot.roles)) problems.push(`unknown roleActors key: ${key}`)
-  for (const key of Object.keys(run.modelOverrides)) if (key !== 'judge' && !(key in run.definitionSnapshot.roles)) problems.push(`unknown modelOverrides key: ${key}`)
-  // #235/#236：阶段表只允许快照内普通角色与 `judge`（Manager 无备用链）。
-  for (const key of Object.keys(run.roleRoutes ?? {})) if (key !== 'judge' && !(key in run.definitionSnapshot.roles)) problems.push(`unknown roleRoutes key: ${key}`)
+  // #243 D1：路由相关的键域 = types.roleKeysWithJudge（普通角色 ∪ judge）；Manager 无备用链。
+  const routeKeys = new Set(roleKeysWithJudge(run.definitionSnapshot))
+  for (const key of Object.keys(run.modelOverrides)) if (!routeKeys.has(key)) problems.push(`unknown modelOverrides key: ${key}`)
+  for (const key of Object.keys(run.roleRoutes ?? {})) if (!routeKeys.has(key)) problems.push(`unknown roleRoutes key: ${key}`)
   if (execution) {
     problems.push(...checkExecutionInvariants(run, execution))
     if (run.status === 'blocked' && !(run.blockReason?.trim() || execution.blockReason?.trim())) problems.push('blocked run requires a control or execution reason')

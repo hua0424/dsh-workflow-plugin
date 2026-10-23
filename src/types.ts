@@ -154,6 +154,15 @@ export function readRoleFallbackModel(
 }
 
 /**
+ * #243 D1：「可持有路由阶段」的角色键集合（快照内普通角色 + `judge`）的唯一枚举点。
+ * 路由阶段表（roleRoutes）、override 表与 routes 视图都用它；`roleActors` 不适用
+ * （Judge 的会话映射独立于普通角色）。
+ */
+export function roleKeysWithJudge(config: Pick<WorkflowConfig, 'roles'>): string[] {
+  return [...Object.keys(config.roles), 'judge']
+}
+
+/**
  * #235：同一路由判定——“主备必须 provider+modelId 不同（effort 不参与）”。
  * 任一分量缺席即无法证明冲突（未配置路由），返回 false。
  */
