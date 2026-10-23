@@ -282,19 +282,35 @@ export class WorkflowEngine {
       },
       blockReason: execution.blockReason ?? run.blockReason,
       handoffPreview,
-      // #235：已发生故障切换的角色——生效路由、来源阶段、切换原因与预算消耗。
-      // 未切换过的角色不在此列（保持状态输出精简，不新建监控面板）。
-      routes: Object.entries(run.roleRoutes ?? {}).map(([role, state]) => ({
-        role,
-        stage: state.stage,
-        route: shortRouteLabel(resolveRoleModel(run, role, run.delegationRoute)) ?? 'inherited',
-        reason: state.reason ?? null,
-        autoSwitches: state.autoSwitches ?? 0,
-      })),
+      // #235：角色路由可观察性——已切换过的角色 + 配置了备用路由但尚未切换的角色。
+      // 只列与故障切换有关的角色（无备用、未切换的普通角色不出现在这里）。
+      routes: this.roleRoutesView(run),
       // v3：Run 生命周期（status）与业务终局分离；终局名与来源单源来自终局工作单。
       businessReturn: run.businessReturn ? { name: run.businessReturn.name, source: run.businessReturn.source } : null,
       finalHandoffPreview: run.status === 'completed' ? handoffPreview : null,
     } }
+  }
+  /**
+   * #235：`workflow_status.routes` 视图。列出「发生过切换的角色」与「配置了备用
+   * 路由但尚未切换的角色」（stage 缺省即 primary），让 Manager 不必猜某个角色是否
+   * 参与故障切换链；无备用路由的普通角色不列入（保持状态输出精简，不新建监控面板）。
+   */
+  private roleRoutesView(run: RunState): Array<{ role: string; stage: string; route: string; fallback: string | null; reason: string | null; autoSwitches: number }> {
+    const roles = new Set(Object.keys(run.roleRoutes ?? {}))
+    for (const role of Object.keys(run.definitionSnapshot.roles)) {
+      if (readRoleFallbackModel(run.definitionSnapshot, role) !== undefined) roles.add(role)
+    }
+    return [...roles].sort().map((role) => {
+      const state = run.roleRoutes?.[role]
+      return {
+        role,
+        stage: state?.stage ?? 'primary',
+        route: shortRouteLabel(resolveRoleModel(run, role, run.delegationRoute)) ?? 'inherited',
+        fallback: shortRouteLabel(roleFallbackRoute(run, role)) ?? null,
+        reason: state?.reason ?? null,
+        autoSwitches: state?.autoSwitches ?? 0,
+      }
+    })
   }
   async startRun(ws: string, run: RunState, configPath?: string, extraText = ''): Promise<EngineOutcome> {
     if (extraText.length > LIMITS.handoffMax) return rejected(`root input exceeds ${LIMITS.handoffMax} characters`)

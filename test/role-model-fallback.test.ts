@@ -314,7 +314,42 @@ test('#235 5xx 且已安全收口：自动切备用并重派，Manager 收到通
     const status = await h.engine.status('ws', 'manager')
     assert.equal(status.ok, true)
     const routes = (status as { status: { routes: Array<Record<string, unknown>> } }).status.routes
-    assert.deepEqual(routes, [{ role: 'worker', stage: 'fallback', route: 'backup/backup-model', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 }])
+    assert.deepEqual(routes, [{ role: 'worker', stage: 'fallback', route: 'backup/backup-model', fallback: 'backup/backup-model', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 }])
+  } finally { h.close() }
+})
+
+test('#235 已执行外部写后故障：材料保留事实，新执行先核验再续作（不盲目重复）', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const worker = await h.toWorker()
+    // 上一执行（主路由）已经做过外部写（推送分支、合并 PR、改文件）——这些副作用
+    // 不随 turn/end 失败回滚，切换后必须让新执行先核验，而不是从材料里“看不出就重做”。
+    const before = await h.row()
+    const materials = before.execution.input
+
+    // F-2：配置了备用但尚未切换的角色也可见（stage=primary），不必猜是否参与切换链。
+    const beforeStatus = (await h.engine.status('ws', 'manager')) as { status: { routes: Array<Record<string, unknown>> } }
+    assert.deepEqual(beforeStatus.status.routes, [{ role: 'worker', stage: 'primary', route: 'primary/primary-model', fallback: 'backup/backup-model', reason: null, autoSwitches: 0 }])
+
+    const spawnsBefore = h.spawns.length
+    await h.engine.handleTurnEnded('ws', worker, FAILOVER_503.text, FAILOVER_503.facts)
+
+    const row = await h.row()
+    assert.equal(row.run.status, 'running', '合格故障 + 安全收口 → 切换而不是 BLOCK')
+    const dispatch = h.spawns.slice(spawnsBefore).at(-1)!
+    assert.equal(dispatch.label, 'role:worker')
+    const text = dispatch.text!
+    // 恢复材料保留事实：节点原始材料仍在派发正文里。
+    assert.ok(text.includes(materials), '节点材料原样保留')
+    assert.equal(row.execution.input, materials, '切换不改写节点材料')
+    assert.equal(row.execution.inputVersion, before.execution.inputVersion + 1)
+    // 新执行先核验既有外部操作结果，而不是盲目重复。
+    assert.match(text, /\[模型故障切换\]/)
+    assert.match(text, /先用工具核验已执行外部操作的真实结果/)
+    assert.match(text, /已完成的不要重复执行/)
+    assert.match(text, /无法核验或存在不确定副作用时保持 BLOCK/)
+    assert.match(text, /\[中断恢复\]/)
   } finally { h.close() }
 })
 

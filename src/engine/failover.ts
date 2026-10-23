@@ -77,6 +77,11 @@ export function classifyActorFailure(facts: ActorFailureFacts | undefined): Acto
 /**
  * 切换说明文本（写进 `workflow_set_role_model`/切换事件的同款有界诊断，
  * 同时作为新 Actor 派发正文的 `[模型故障切换]` 段）。不含凭据与请求载荷。
+ *
+ * 必带外部写核验指示（规格验收「已执行外部写操作后故障：恢复材料保留事实，
+ * 新执行先核验结果而非盲目重复」）：切换必定发生在「旧执行已安全收口」之后，
+ * 但收口不等于副作用没发生——上一执行可能已经推送分支、合并 PR、改过文件，
+ * 新执行必须先用工具核验真实状态再决定是否重复。
  */
 export function failoverNote(input: {
   role: string
@@ -92,5 +97,6 @@ export function failoverNote(input: {
   const tail = input.exhausted
     ? '本 Run 该角色已无可用备用路由，再次合格故障将直接 BLOCK（详见下方要求）。'
     : '本 Run 该角色此后保持该路由，不自动回切；如仍需换模型，由 Manager 显式设置后开新一轮（C → 主 → 备用）。'
-  return `${head}${tail}`.slice(0, LIMITS.blockReasonMax)
+  const recovery = '上一执行的 [handoff] 与节点材料原样保留，不代表其外部操作一定回滚：续作前先用工具核验已执行外部操作的真实结果（如 PR/分支是否已合并或推送、文件与远端状态是否已改、下游任务是否已跑），已完成的不要重复执行；无法核验或存在不确定副作用时保持 BLOCK 并说明，不要盲目重试。'
+  return `${head}${tail}\n\n${recovery}`.slice(0, LIMITS.blockReasonMax)
 }
