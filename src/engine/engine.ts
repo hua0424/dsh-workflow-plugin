@@ -9,7 +9,7 @@ import { DISPATCH_TIMEOUTS, DispatchTimeoutError, withTimeout } from './timeouts
 import { BUILTIN_PROGRAMS } from '../programs/catalog.ts'
 import { isTransientJudgeFailure, withTurnEndFailure } from '../plugin/turn-end.ts'
 import { classifyActorFailure, describeActorFailure, failoverNote, type ActorFailureFacts } from './failover.ts'
-import { describeActivationSettlement, shortRouteLabel, type ActivationEndInfo, type DispatchLifecycleTracker } from '../plugin/dispatch-lifecycle.ts'
+import { describeActivationSettlement, shortRouteLabel, type DispatchLifecycle, type DispatchObservationRef } from '../plugin/dispatch-lifecycle.ts'
 import { createRunLog, appendLine, traceEvent, jsonField, shortId } from './tracelog.ts'
 
 export interface DispatchTargets {
@@ -73,10 +73,10 @@ export interface SubagentHost {
   /** 必须覆盖普通工具 tail、已知后台写任务及未收口后代；unknown 一律 `unsafe`。 */
   safeToInspect(sessionId: string): Promise<SafeInspection>
   /**
-   * Issue #221：派发生命周期终止信号的待对账观察（Host Adapter 持有并装配，
-   * 引擎只在发布/结算点读写）。缺席 = 旧装配/测试替身，引擎退化为既有行为。
+   * Issue #247：派发生命周期观察模块（Host Adapter 持有并装配，引擎只在发布
+   * 与结算点报告事实/消费候选）。缺席 = 旧装配/测试替身，引擎退化为既有行为。
    */
-  dispatchLifecycle?: DispatchLifecycleTracker
+  dispatchLifecycle?: DispatchLifecycle
 }
 export interface ProgramHost {
   run(run: RunState, programId: string, parameters: Record<string, unknown>, cwd: string): Promise<ProgramResult>
@@ -386,34 +386,32 @@ export class WorkflowEngine {
 
   /** 一次触发只登记当前需要的一个安排。并发触发由数据库 CAS 仲裁，非整Promise锁。 */
   /**
-   * Issue #221：登记一次已发布派发的待对账条目（受理不等于执行完成）。
-   * 只登记真实子代理 Activation 路径（manager steer 不是 activation 路径，
-   * 不跟踪）。条目绑定不可变 Run/执行/派发身份与真实会话身份；发布窗口内
-   * 先到达的终态由 tracker 对账后立即经 handleActivationSettled 处理。
+   * Issue #247：发布一次已受理派发（受理不等于执行完成），由观察模块决定
+   * 是否已有可结算的终止事实。只登记真实子代理 Activation 路径（manager
+   * steer 不是 activation 路径，不跟踪）；发布窗口内先到达的终态由模块
+   * 归因，能归属本登记时立即结算（矩阵 B）。
    */
   private async trackDispatch(ws: string, run: RunState, e: NodeExecution, kind: 'actor' | 'judge', roleKey: string): Promise<void> {
-    const tracker = this.subagents.dispatchLifecycle
-    if (tracker === undefined) return
+    const lifecycle = this.subagents.dispatchLifecycle
+    if (lifecycle === undefined) return
     const dispatch = kind === 'actor' ? e.dispatch : e.judge
     if (!dispatch?.sessionId || !dispatch.messageId) return
     if (kind === 'judge' && !e.claim) return
     const route = kind === 'judge'
       ? shortRouteLabel((dispatch as ExecutionJudge).model)
       : shortRouteLabel(resolveRoleModel(run, roleKey, run.delegationRoute))
-    const buffered = tracker.track({
+    const ref = lifecycle.publish({
       workspaceKey: ws, runId: run.runId, executionId: e.executionId, nodeToken: e.nodeToken,
       dispatchId: dispatch.id, kind, roleKey,
       ...(route === undefined ? {} : { route }),
       sessionId: dispatch.sessionId, messageId: dispatch.messageId,
-      epochRunId: tracker.epochOf(dispatch.sessionId),
       ...(kind === 'judge' ? { claimId: e.claim!.id, inputVersion: e.inputVersion } : {}),
-      outcome: 'unknown',
     })
-    if (buffered !== undefined) await this.handleActivationSettled(ws, dispatch.sessionId, buffered)
+    if (ref !== undefined) await this.settleActivation(ref)
   }
-  private forgetDispatch(sessionId: string | undefined): void {
+  private forgetDispatch(sessionId: string | undefined, dispatchId?: string): void {
     if (sessionId === undefined) return
-    this.subagents.dispatchLifecycle?.forget(sessionId)
+    this.subagents.dispatchLifecycle?.invalidate(sessionId, dispatchId)
   }
   /**
    * #235/#236：启动期主备冲突检查——配置了 `fallbackModel` 的角色（含 Judge），
@@ -704,6 +702,9 @@ export class WorkflowEngine {
     await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
     this.trace(run, 'JUDGE-RETRY', { workflow: e.workflowId, node: e.nodeId, reason: jsonField(turnFailure ?? 'transient judge failure', LIMITS.blockReasonMax) })
     await this.subagents.retireJudge(run, oldSessionId).catch(() => {})
+    // Issue #247：旧 Judge 会话的登记随退役按会话失效（其迟到终态只进观察模块的
+    // 有界暂存，不再进入结算）。
+    this.forgetDispatch(oldSessionId)
     try {
       const cwd = await this.cwdResolver(run)
       if (!await this.stillCurrent(ws, e, version + 1)) { await this.subagents.retireJudge(run, e.judge.sessionId).catch(() => {}); return }
@@ -1015,7 +1016,7 @@ export class WorkflowEngine {
       if (!fresh || fresh.version !== row.version || fresh.execution.executionId !== e.executionId) return
       transfer.judge.settled = true
       await this.state.put(ws, fresh.run, fresh.version, [change(transfer.owner)])
-      this.forgetDispatch(caller.sessionId)
+      this.forgetDispatch(caller.sessionId, transfer.judge.id)
       await this.drive(ws)
       return
     }
@@ -1038,13 +1039,13 @@ export class WorkflowEngine {
     if (actor && e.phase === 'checking') {
       e.dispatch!.settled = true
       await this.state.put(ws, fresh.run, fresh.version, [change(e)])
-      this.forgetDispatch(e.dispatch?.sessionId)
+      this.forgetDispatch(e.dispatch?.sessionId, e.dispatch?.id)
       await this.drive(ws)
     } else if (actor && e.phase === 'working') {
       // #235：先尝试「单备用模型」安全恢复（旧执行已收口 + 无已接受 claim 才重派）；
       // 不合格故障或已无可用路由时保持现行 BLOCK。
       if (await this.tryFailover(ws, fresh, failureFacts) === 'switched') return
-      this.forgetDispatch(e.dispatch?.sessionId)
+      this.forgetDispatch(e.dispatch?.sessionId, e.dispatch?.id)
       await this.blockRow(ws, fresh, withTurnEndFailure('actor-turn-ended-without-result', turnFailure))
     } else if (judge && e.phase === 'checking') {
       // #236：配置了 Judge 备用路由时，合格故障且已安全收口就直接切 B——不再叠加
@@ -1052,7 +1053,7 @@ export class WorkflowEngine {
       if (roleFallbackRoute(fresh.run, 'judge') !== undefined) {
         const verdict = await this.tryJudgeFailover(ws, fresh, failureFacts)
         if (verdict === 'switched') return
-        this.forgetDispatch(e.judge?.sessionId)
+        this.forgetDispatch(e.judge?.sessionId, e.judge?.id)
         // #243 D2：切换尝试已判定过「有没有备用 / 故障是否合格 / 预算是否用尽」，收口
         // 文案直接取它的结论；不再从阶段与故障资格重推（额度等不合格故障即使当前阶段
         // 是 fallback，也不能误报成「备用路由用尽」）。
@@ -1065,10 +1066,10 @@ export class WorkflowEngine {
       // （4xx 等）直接 BLOCK。fail-closed/只读不变量不变。
       if (isTransientJudgeFailure(turnFailure) && !e.judgeAutoRetried) await this.retryJudgeOnce(ws, fresh, turnFailure)
       else if (e.judgeAutoRetried) {
-        this.forgetDispatch(e.judge?.sessionId)
+        this.forgetDispatch(e.judge?.sessionId, e.judge?.id)
         await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim (已自动重试 1 次)', turnFailure))
       } else {
-        this.forgetDispatch(e.judge?.sessionId)
+        this.forgetDispatch(e.judge?.sessionId, e.judge?.id)
         await this.blockRow(ws, fresh, withTurnEndFailure('judge turn ended without judge_claim', turnFailure))
       }
     }
@@ -1121,6 +1122,7 @@ export class WorkflowEngine {
     const autoSwitches = (run.roleRoutes?.[role]?.autoSwitches ?? 0) + 1
     const reason = `${verdict.kind} ${describeActorFailure(facts)}`
     const oldSessionId = e.dispatch?.sessionId
+    const oldDispatchId = e.dispatch?.id
     e.dispatch!.settled = true
     // 离开人工路由即撤销该 override：回主模型后不得继续沿用 C。
     if (stage === 'manual') delete run.modelOverrides[role]
@@ -1140,7 +1142,7 @@ export class WorkflowEngine {
       inputVersion: e.inputVersion,
     }
     await this.state.put(ws, run, row.version, [change(e, 'model-changed')])
-    this.forgetDispatch(oldSessionId)
+    this.forgetDispatch(oldSessionId, oldDispatchId)
     this.trace(run, 'MODEL-FALLBACK', {
       workflow: e.workflowId, node: e.nodeId, role,
       from: jsonField(from, LIMITS.modelIdMax), to: jsonField(to, LIMITS.modelIdMax),
@@ -1193,6 +1195,7 @@ export class WorkflowEngine {
     const autoSwitches = (run.roleRoutes?.judge?.autoSwitches ?? 0) + 1
     const reason = `${verdict.kind} ${describeActorFailure(facts)}`
     const previousSessionId = e.judge.sessionId
+    const previousJudgeId = e.judge.id
     // 离开人工路由即撤销该 override（与 Actor 同义）；切 B 后用 B，新 Run 才回 A。
     if (stage === 'manual') delete run.modelOverrides.judge
     run.roleRoutes = { ...(run.roleRoutes ?? {}), judge: { stage: next, reason, autoSwitches } }
@@ -1200,7 +1203,7 @@ export class WorkflowEngine {
     // 因 e.judge 身份失配被丢弃（预算不会被扣第二次）。判定中不刷新同模型重试预算。
     e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: target }
     await this.state.put(ws, run, version, [change(e, 'model-changed', 'judge-arranged')])
-    this.forgetDispatch(previousSessionId)
+    this.forgetDispatch(previousSessionId, previousJudgeId)
     await this.subagents.retireJudge(run, previousSessionId).catch(() => {})
     this.trace(run, 'MODEL-FALLBACK', {
       workflow: e.workflowId, node: e.nodeId, role: 'judge',
@@ -1230,72 +1233,50 @@ export class WorkflowEngine {
     }
   }
   /**
-   * Issue #221：派发受理后、无 turn/end 时的宿主生命周期终止信号收口。
-   * 由 `subagent/end` 监听经 setImmediate 转交（Host append 回调之外），以及
-   * 身份发布前到达的缓存终态对账时调用。与 turn/end 结算互斥去重：
-   * - 条目缺席 → 缓存终态，等身份发布时对账（矩阵 B）；
-   * - 世代失配 → 陈旧世代的迟到信号忽略；新世代的信号缓存等新条目（矩阵 C）；
-   * - 工作单已推进/替换/BLOCK/终止，或派发身份已不符 → 条目作废，不影响当前状态；
-   * - 已接受的 claim / 已提交的业务交接永不撤销（矩阵 E 的执行完成情形只清条目）；
+   * Issue #247：消费一次已归属的派发终止观察（由 `subagent/end` 经 setImmediate
+   * 转交，以及发布对账时由 trackDispatch 直接调用）。归属、世代匹配、发布窗口
+   * 暂存与去重都由观察模块完成；本方法只判断候选是否仍指向当前工作单，并决定
+   * 是否 fail-closed BLOCK：
+   * - 工作单已推进/替换/BLOCK/终止，或派发身份已不符 → 候选作废，不影响当前状态；
+   * - 已接受的 claim / 已提交的业务交接永不撤销（矩阵 E 的执行完成情形只清登记）；
    * - 明确失败且无可用 turn/end → 技术故障 BLOCK，保留 execution/claim/handoff（矩阵 A）；
    * - 正常 completed 不是失败；不因空消息/idle/耗时推断失败（矩阵 D）；
    * - Judge 不做第二次自动重试：无 turn/end 兜底直接 BLOCK（矩阵 F）。
    */
-  async handleActivationSettled(ws: string, sessionId: string, end: ActivationEndInfo): Promise<void> {
-    const tracker = this.subagents.dispatchLifecycle
-    if (tracker === undefined) return
-    const entry = tracker.peek(sessionId)
-    if (entry === undefined) {
-      tracker.bufferEnd(sessionId, end)
-      return
-    }
-    if (entry.epochRunId !== undefined && entry.epochRunId !== end.runId) {
-      if (end.runId === tracker.epochOf(sessionId)) {
-        // 结束属于更新的世代：旧条目作废，缓存该信号等新身份发布时对账。
-        tracker.forget(sessionId)
-        tracker.bufferEnd(sessionId, end)
+  async settleActivation(observation: DispatchObservationRef): Promise<void> {
+    const lifecycle = this.subagents.dispatchLifecycle
+    if (lifecycle === undefined) return
+    const candidate = await lifecycle.consume(observation)
+    if (candidate === undefined) return
+    try {
+      const ws = candidate.workspaceKey
+      const row = await this.state.get(ws)
+      if (!row || row.run.status !== 'running' || row.execution.executionId !== candidate.executionId
+        || row.execution.nodeToken !== candidate.nodeToken) return
+      const e = row.execution
+      const sessionId = candidate.sessionId
+      if (candidate.kind === 'actor') {
+        const dispatch = e.dispatch
+        if (!dispatch || dispatch.id !== candidate.dispatchId || dispatch.sessionId !== sessionId || dispatch.settled
+          || e.claim?.dispatchId === candidate.dispatchId || e.phase !== 'working') return
+      } else {
+        const judge = e.judge
+        if (!judge || judge.id !== candidate.dispatchId || judge.sessionId !== sessionId || judge.settled
+          || judge.claimId !== candidate.claimId || judge.inputVersion !== candidate.inputVersion || e.phase !== 'checking') return
       }
-      // 陈旧世代的迟到信号：忽略，保留当前条目。
-      return
-    }
-    const row = await this.state.get(ws)
-    if (!row || row.run.status !== 'running' || row.execution.executionId !== entry.executionId
-      || row.execution.nodeToken !== entry.nodeToken) {
-      tracker.forget(sessionId)
-      return
-    }
-    const e = row.execution
-    if (entry.kind === 'actor') {
-      const dispatch = e.dispatch
-      if (!dispatch || dispatch.id !== entry.dispatchId || dispatch.sessionId !== sessionId || dispatch.settled
-        || e.claim?.dispatchId === entry.dispatchId || e.phase !== 'working') {
-        tracker.forget(sessionId)
-        return
+      // 明确的执行失败证据（activation.result 终态）优先于终态边。
+      if (candidate.outcome !== 'failed') {
+        // 矩阵 D：正常 completed 不是失败；不因空消息、idle 或耗时推断失败。
+        if (candidate.end.stopReason === 'completed') return
+        // 矩阵 E：执行已完成、仅清理失败 → 不是"Actor 无结果失败"，只清登记，
+        // 不 BLOCK、不撤销 claim/交接。
+        if (candidate.outcome === 'completed') return
       }
-    } else {
-      const judge = e.judge
-      if (!judge || judge.id !== entry.dispatchId || judge.sessionId !== sessionId || judge.settled
-        || judge.claimId !== entry.claimId || judge.inputVersion !== entry.inputVersion || e.phase !== 'checking') {
-        tracker.forget(sessionId)
-        return
-      }
+      await this.blockRow(ws, row, describeActivationSettlement(candidate))
+    } finally {
+      // 异步处理结束后精确失效原登记：替换后的新登记不受影响。
+      lifecycle.release(observation)
     }
-    // 明确的执行失败证据（activation.result 终态）优先于终态边。
-    if (entry.outcome !== 'failed') {
-      // 矩阵 D：正常 completed 不是失败；不因空消息、idle 或耗时推断失败。
-      if (end.stopReason === 'completed') {
-        tracker.forget(sessionId)
-        return
-      }
-      // 矩阵 E：执行已完成、仅清理失败 → 不是"Actor 无结果失败"，只清条目，
-      // 不 BLOCK、不撤销 claim/交接。
-      if (entry.outcome === 'completed') {
-        tracker.forget(sessionId)
-        return
-      }
-    }
-    await this.blockRow(ws, row, describeActivationSettlement(entry, end))
-    tracker.forget(sessionId)
   }
   async handleBlock(ws: string, token: string | undefined, reason: string, caller: ClaimCaller): Promise<EngineOutcome> {
     const row = await this.state.get(ws)
@@ -1354,7 +1335,7 @@ export class WorkflowEngine {
           && owner.judgment.judgeDispatchId === owner.judge?.id
         if (!e.restartPending || !terminalAccepted) return rejected('predecessor Judge is not safely settled; keep BLOCK until its activity is resolved')
         owner.judge!.settled = true
-        this.forgetDispatch(owner.judge?.sessionId)
+        this.forgetDispatch(owner.judge?.sessionId, owner.judge?.id)
         recoveredPredecessor = owner
       }
     }
@@ -1403,7 +1384,7 @@ export class WorkflowEngine {
       // auto never takes this branch while unsettled; explicit target=judge is the Manager's takeover decision.
       if (!e.dispatch.settled) {
         e.dispatch.settled = true
-        this.forgetDispatch(e.dispatch.sessionId)
+        this.forgetDispatch(e.dispatch.sessionId, e.dispatch.id)
       }
       const sameJudgeNeedContext = oldJudge !== undefined && e.judgment?.result === 'NEED_CONTEXT'
         && e.judgment.claimId === e.claim.id && e.judgment.inputVersion === e.inputVersion
