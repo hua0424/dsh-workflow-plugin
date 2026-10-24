@@ -408,6 +408,157 @@ workflow:
   }
 })
 
+// #247 真实宿主契约：受理后无 turn/end 的失败必须经过真实插件接线（index.ts 的
+// `subagent/end` 观察 → Dispatch Lifecycle → Engine 工作单核验 → SQLite）落成技术
+// BLOCK，而不是停在 running 或等下一次 turn 才失败。这里刻意让 Role 的模型流挂起
+// （不产出任何 chunk，因此不会有 turn/end），再用宿主同款 `subagent/end` 事件注入
+// 终态；事件可能在派发登记发布前到达，正好覆盖发布窗口对账。
+class A3LifecycleAdapter extends LlmAdapter {
+  readonly roleGate = Promise.withResolvers<void>()
+  readonly roleTurnStarted = Promise.withResolvers<void>()
+  roleSessionId: string | undefined
+  private managerClaimed = false
+  private call = 0
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 100_000 } })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const tools = new Set((options.tools ?? []).map(tool => tool.name))
+    const text = messageText(options)
+    const sessionId = String(options.sessionId ?? '')
+    if (tools.has('judge_claim') && !tools.has('node_claim')) {
+      const token = text.match(/"nodeToken": "([^"]+)"/)?.[1]
+      if (!token) throw new Error('Judge packet omitted nodeToken')
+      yield* toolChunks(`a3-call-${++this.call}`, 'judge_claim', {
+        nodeToken: token,
+        result: 'ACCEPT',
+        reason: 'Scripted read-only Judge accepts the kickoff handoff.',
+      })
+      return
+    }
+    if (sessionId === 'a3-manager') {
+      if (!this.managerClaimed && text.includes('Kickoff the isolated A3 lifecycle scenario.')) {
+        this.managerClaimed = true
+        yield* toolChunks(`a3-call-${++this.call}`, 'node_claim', { result: 'succeeded', handoff: 'kickoff accepted' })
+        return
+      }
+      yield* textChunks('Manager observed a Host lifecycle notice; no workflow mutation is needed.')
+      return
+    }
+    if (tools.has('node_claim')) {
+      if (this.roleSessionId === undefined) {
+        this.roleSessionId = sessionId
+        this.roleTurnStarted.resolve()
+      }
+      // 受理后的模型流挂起（不产出 chunk、不结束 turn），终态由测试注入的宿主事件给出。
+      await this.roleGate.promise
+      yield* textChunks('Late Role turn after the injected Host terminal event.')
+      return
+    }
+    yield* textChunks('No workflow action required.')
+  }
+}
+
+test('A3 real DSH Host: accepted Role dispatch without turn/end fails into a technical BLOCK through plugin wiring', { timeout: 30_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-a3-host-'))
+  const workspace = join(home, 'workspace')
+  const sessions = join(home, 'sessions')
+  mkdirSync(join(home, 'workflows'), { recursive: true })
+  mkdirSync(workspace, { recursive: true })
+  writeFileSync(join(home, 'workflows', 'a3.yaml'), `schemaVersion: agent-workflow/v3
+roles:
+  worker:
+    persona: Complete only the current workflow work order and use its control tools.
+judgeRole:
+  persona: Read-only verification of the isolated workspace.
+workflow:
+  startNode: kickoff
+  returns: [done]
+  nodes:
+    kickoff:
+      execution: { type: actor-task, role: manager, instruction: Kickoff the isolated A3 lifecycle scenario. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: Accept the scripted kickoff handoff. } }
+      results:
+        succeeded: { criteria: The kickoff handoff is accepted., target: { node: work } }
+    work:
+      execution: { type: actor-task, role: worker, instruction: Wait for a Host terminal event without finishing a turn. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: Accept the worker handoff. } }
+      results:
+        succeeded: { criteria: The worker handoff is accepted., target: { return: done } }
+`, 'utf8')
+
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const ctx = new Context()
+  const adapter = new A3LifecycleAdapter()
+  const signal = new AbortController().signal
+  const lifecycleStarts = new Map<string, { id: string; runId: string }>()
+
+  try {
+    await mountAgentLoopTestDependencies(ctx)
+    ctx.provide('workingDirectory', {
+      defaultDirectory: workspace,
+      get: (session: { header: { cwd?: string } }) => session.header.cwd ?? workspace,
+      ensure: (agent: { session: { header: { cwd?: string } } }) =>
+        Promise.resolve(agent.session.header.cwd ?? workspace),
+      set: () => Promise.resolve(),
+    })
+    await ctx.plugin(CordisLoader.Loader)
+    await ctx.plugin(AgentPresetRegistry, { default: 'a3-base' })
+    await ctx.get('agentPresets').register({ id: 'a3-base', plugins: [] })
+    await ctx.plugin(JsonlSessionPersistence, { root: sessions, compression: 'none', packChunks: false })
+    await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
+    await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(TokenMeter)
+    await ctx.plugin(BasicCompactionEngine, { auto: false })
+    await ctx.plugin(LocalJobRegistry, {})
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
+    await ctx.plugin(CommandRuntime)
+    for (const name of ['read', 'glob', 'grep', 'read_image'] as const) ctx.tools.register(readOnlyFixtureTool(name))
+    ctx.llm.registerAdapter([MODEL], adapter)
+
+    ctx.on('subagent/start', info => {
+      lifecycleStarts.set(String(info.id), { id: String(info.id), runId: String(info.runId) })
+    })
+
+    const WorkflowPlugin = await import('../src/index.ts')
+    await ctx.plugin(WorkflowPlugin)
+    const manager = await ctx.agentLoop.create(SessionId('a3-manager'), { provider: MODEL, model: MODEL }, { cwd: workspace })
+    const start = await ctx.commands.execute(manager, '/dsh-flow start a3 isolated-host-input', [], signal)
+    assert.ok(start)
+    assert.equal(start.result.kind, 'success', start.result.kind === 'error' ? start.result.text : undefined)
+
+    // 受理 = Role turn 已开始（模型请求已到达）。此后注入宿主终态：没有 turn/end 可以
+    // 解释这次结束，只能由观察模块转交 Engine 落成技术 BLOCK。
+    await adapter.roleTurnStarted.promise
+    const roleSessionId = adapter.roleSessionId
+    assert.ok(roleSessionId)
+    const startInfo = lifecycleStarts.get(roleSessionId)
+    assert.ok(startInfo, `missing subagent/start for the Role session: ${JSON.stringify([...lifecycleStarts])}`)
+    ctx.emit('subagent/end', { id: startInfo.id, runId: startInfo.runId, stopReason: 'error' } as never)
+
+    const blocked = await waitFor(async () => {
+      const status = commandJson(await ctx.commands.execute(manager, '/dsh-flow status', [], signal))
+      return status.status === 'blocked' ? status : undefined
+    }, 10_000).catch(error => {
+      throw new Error(`${String(error)}; lifecycle starts: ${JSON.stringify([...lifecycleStarts])}`)
+    })
+    assert.equal(blocked.execution.nodeId, 'work')
+    assert.equal(blocked.execution.hasClaim, false)
+    assert.match(blocked.execution.blockReason ?? '', /^activation settled without turn\/end: actor role=worker/,
+      `blockReason should carry the lifecycle settlement: ${blocked.execution.blockReason}`)
+  } finally {
+    adapter.roleGate.resolve()
+    await ctx.fiber.dispose()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
 // #246 A0 的真实宿主契约：宿主只在 setup 返回值 resolve 之后才 publication
 // （agent-loop `setupAndPublish`：`await raceAbort(setup(...))` → publish）。
 // 冷维护 setup 等待角色 preset 挂载正是靠这条时序才成立，所以这里在真实 Host 上

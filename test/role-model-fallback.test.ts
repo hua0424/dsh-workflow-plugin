@@ -18,6 +18,7 @@ import { checkCatalogProviders, collectRoleRoutes } from '../src/catalog/provide
 import { classifyActorFailure, describeActorFailure } from '../src/engine/failover.ts'
 import { WorkflowEngine, type JudgeSpawnInput, type SubagentHost } from '../src/engine/engine.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
+import { makeDispatchLifecycle, type DispatchLifecycle } from '../src/plugin/dispatch-lifecycle.ts'
 import { turnEndFailure, turnEndFailureFacts, type TurnEndFact } from '../src/plugin/turn-end.ts'
 import { judgeSpawnPlan, resolveRoleModel } from '../src/roles/roles.ts'
 import { StateStore } from '../src/state/store.ts'
@@ -206,7 +207,7 @@ function endOf(reason: unknown): { text: string | undefined; facts: { code: stri
 const FAILOVER_503 = endOf({ kind: 'error', error: { message: 'upstream exploded', code: 'SERVER', status: 503 } })
 const QUOTA_402 = endOf({ kind: 'error', error: { message: 'insufficient balance', code: 'QUOTA', status: 402 } })
 
-function harness(config: WorkflowConfig = CONFIG, traceDir?: string) {
+function harness(config: WorkflowConfig = CONFIG, traceDir?: string, lifecycle?: DispatchLifecycle) {
   const home = mkdtempSync(join(tmpdir(), 'workflow-role-fallback-'))
   const spawns: Spawn[] = []
   const messages: string[] = []
@@ -217,7 +218,9 @@ function harness(config: WorkflowConfig = CONFIG, traceDir?: string) {
     const subagents: SubagentHost = {
       async ensureRoleActor(run, roleKey, initialText) {
         spawns.push({ label: `role:${roleKey}`, agentOptions: routeToAgentOptions(resolveRoleModel(run, roleKey, run.delegationRoute)), text: initialText })
-        return { childId: `child-${++serial}`, messageId: `message-${serial}` }
+        const childId = `child-${++serial}`
+        lifecycle?.noteStart(childId, `epoch-${childId}`)
+        return { childId, messageId: `message-${serial}` }
       },
       async startJudge(run: RunState, input: JudgeSpawnInput) {
         spawns.push({ label: 'judge', agentOptions: routeToAgentOptions(judgeSpawnPlan(run, run.delegationRoute).agentOptions) })
@@ -231,6 +234,7 @@ function harness(config: WorkflowConfig = CONFIG, traceDir?: string) {
       async drainRoleActor() {},
       async compactRoleActor() { throw new Error('no cross-node boundary in this fixture') },
       async safeToInspect() { return 'safe' as const },
+      ...(lifecycle === undefined ? {} : { dispatchLifecycle: lifecycle }),
     }
     const engine = new WorkflowEngine({
       async steerManager(_run, text) { messages.push(text); return { messageId: 'manager-message' } },
@@ -346,6 +350,55 @@ test('#235 5xx 且已安全收口：自动切备用并重派，Manager 收到通
     assert.equal(status.ok, true)
     const routes = (status as { status: { routes: Array<Record<string, unknown>> } }).status.routes
     assert.deepEqual(routes, [{ role: 'worker', stage: 'fallback', route: 'backup/backup-model', fallback: 'backup/backup-model', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 }])
+  } finally { h.close() }
+})
+
+test('#247 同装 lifecycle + fallback：生命周期信号与安全收口正反交错，不双扣预算、不凭 lifecycle-only 授路由', async () => {
+  const lifecycle = makeDispatchLifecycle()
+  const h = harness(CONFIG, undefined, lifecycle)
+  try {
+    await h.start()
+    const worker = await h.toWorker()
+    const before = await h.row()
+    const primarySession = before.execution.dispatch!.sessionId!
+    const spawnsBefore = h.spawns.length
+    // 反序一：终态先被观察，宿主 turn/end 随后到达并安全收口到备用路由。
+    const early = lifecycle.noteEnd(primarySession, { runId: `epoch-${primarySession}`, stopReason: 'error', provider: 'primary' })
+    assert.notEqual(early, undefined)
+    await h.engine.handleTurnEnded('ws', worker, FAILOVER_503.text, FAILOVER_503.facts)
+    let row = await h.row()
+    assert.equal(row.run.status, 'running', '安全收口成功，不因早到终态 BLOCK')
+    assert.deepEqual(row.run.roleRoutes.worker, { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+    const switched = h.spawns.slice(spawnsBefore)
+    assert.equal(switched.length, 1, '只重派一次')
+    assert.equal(switched[0]!.agentOptions?.provider, 'backup')
+    // 延后转交的旧终态：旧派发登记已精确失效，迟到的结算不得二次扣预算或改工作单。
+    await h.engine.settleActivation(early!)
+    row = await h.row()
+    assert.equal(row.run.status, 'running')
+    assert.equal(row.run.roleRoutes.worker!.autoSwitches, 1, '不双扣预算')
+    assert.equal(h.spawns.length, spawnsBefore + 1, '不因旧信号再派发')
+    const newSession = row.execution.dispatch!.sessionId!
+    assert.notEqual(newSession, primarySession)
+    assert.equal((await h.store.events('ws', row.execution.executionId)).filter(event => event.type === 'blocked').length, 0)
+    // 正序：新派发受理后先接受 claim，再收到生命周期终态；阶段已离开 working，
+    // 终态不得撤 claim、不得改派、不得把安全收口变成技术 BLOCK。
+    const claimCaller = { sessionId: newSession, turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: '保留的现场' }, claimCaller)).ok, true)
+    const claimed = await h.row()
+    assert.equal(claimed.execution.phase, 'checking')
+    assert.equal(claimed.execution.claim?.result, 'succeeded')
+    const ref = lifecycle.noteEnd(newSession, { runId: `epoch-${newSession}`, stopReason: 'error' })
+    assert.notEqual(ref, undefined)
+    await h.engine.settleActivation(ref!)
+    const after = await h.row()
+    assert.equal(after.run.status, 'running', '判定中迟到的生命周期终态不越权 BLOCK')
+    assert.equal(after.execution.claim?.result, 'succeeded', 'claim 不被撤')
+    assert.equal(after.execution.claim?.handoff, '保留的现场')
+    assert.deepEqual(after.run.roleRoutes.worker, { stage: 'fallback', reason: 'server-5xx code=SERVER status=503', autoSwitches: 1 })
+    assert.equal(h.spawns.length, spawnsBefore + 1, '不额外派发')
+    assert.equal(h.messages.filter(message => message.includes('Workflow MODEL FALLBACK')).length, 1)
+    assert.equal((await h.store.events('ws', after.execution.executionId)).filter(event => event.type === 'blocked').length, 0)
   } finally { h.close() }
 })
 
