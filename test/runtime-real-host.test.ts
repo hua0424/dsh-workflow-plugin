@@ -12,7 +12,7 @@ import SqliteSessionQueryEngine from '@deepseek-ai/dsh-session-query-sqlite'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
-import SubagentRuntime from '@deepseek-ai/dsh-subagent'
+import SubagentRuntime, { SubagentRunId } from '@deepseek-ai/dsh-subagent'
 import * as SubagentSpawn from '@deepseek-ai/dsh-subagent-spawn-in-process'
 import CommandRuntime from '@deepseek-ai/dsh-commands'
 import * as CordisLoader from '@deepseek-ai/cordis-plugin-loader'
@@ -20,7 +20,9 @@ import AgentPresetRegistry from '@deepseek-ai/dsh-agent-preset-registry'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { LlmAdapter, ToolCallId, type GenerateOptions, type LlmResolvedModelInfo, type StreamChunk } from '@deepseek-ai/dsh-llm'
+import { queueHostSubagentPrompt } from '@deepseek-ai/dsh-subagent/internal'
 import { scanCatalog } from '../src/catalog/loader.ts'
+import { WORKFLOW_DISPATCH_SOURCE } from '../src/message-sources.ts'
 
 const MODEL = 'scripted-a30'
 const SUMMARY = 'A30 COMPACT CHECKPOINT: first Role visit completed and its accepted handoff is authoritative.'
@@ -210,6 +212,71 @@ function commandJson(execution: Awaited<ReturnType<CommandRuntime['execute']>>):
   return JSON.parse(execution.result.text)
 }
 
+/** #247 真实宿主契约测试的最小组合：只挂子代理生命周期需要的宿主服务。 */
+async function mountSubagentContractHost(ctx: Context, options: {
+  workspace: string
+  sessions: string
+  presetId: string
+  adapter: LlmAdapter
+}): Promise<void> {
+  await mountAgentLoopTestDependencies(ctx)
+  ctx.provide('workingDirectory', {
+    defaultDirectory: options.workspace,
+    get: (session: { header: { cwd?: string } }) => session.header.cwd ?? options.workspace,
+    ensure: (agent: { session: { header: { cwd?: string } } }) =>
+      Promise.resolve(agent.session.header.cwd ?? options.workspace),
+    set: () => Promise.resolve(),
+  })
+  await ctx.plugin(CordisLoader.Loader)
+  await ctx.plugin(AgentPresetRegistry, { default: options.presetId })
+  await ctx.get('agentPresets').register({ id: options.presetId, plugins: [] })
+  await ctx.plugin(JsonlSessionPersistence, { root: options.sessions, compression: 'none', packChunks: false })
+  await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
+  await ctx.plugin(AgentLoop, { agents: [] })
+  await ctx.plugin(TokenMeter)
+  await ctx.plugin(BasicCompactionEngine, { auto: false })
+  await ctx.plugin(LocalJobRegistry, {})
+  await ctx.plugin(SubagentRuntime)
+  await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
+  ctx.llm.registerAdapter([MODEL], options.adapter)
+}
+
+/** #247 A4：首 turn 可控挂起，用于在运行中再次受理同一 child。 */
+class A4WarmDispatchAdapter extends LlmAdapter {
+  calls = 0
+  readonly firstTurnStarted = Promise.withResolvers<void>()
+  readonly gate = Promise.withResolvers<void>()
+  readonly turnTexts: string[] = []
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 100_000 } })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.calls += 1
+    this.turnTexts.push(messageText(options))
+    if (this.calls === 1) {
+      this.firstTurnStarted.resolve()
+      await this.gate.promise
+    }
+    yield* textChunks(`A4 reply ${this.calls}`)
+  }
+}
+
+/** #247 A5：只产出文本、不涉及工作流工具。 */
+class A5ReplyAdapter extends LlmAdapter {
+  calls = 0
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 100_000 } })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.calls += 1
+    yield* textChunks(`A5 reply ${this.calls}: ${messageText(options).slice(-40)}`)
+  }
+}
+
 test('A30 real DSH Host composes cold Role continuation, Basic compaction, Host interrupt, and same-execution resume', { timeout: 30_000 }, async () => {
   const home = mkdtempSync(join(tmpdir(), 'workflow-a30-host-'))
   const workspace = join(home, 'workspace')
@@ -255,6 +322,7 @@ workflow:
   const ctx = new Context()
   const adapter = new A30Adapter()
   const lifecycleStarts = new Map<string, { runId: string; id: string }>()
+  const lifecycleOrder: string[] = []
   const roleEnds: Array<{ runId: string; released: boolean }> = []
   const observedCompactionEvents: SessionEvent[] = []
   const signal = new AbortController().signal
@@ -288,8 +356,10 @@ workflow:
 
     ctx.on('subagent/start', info => {
       lifecycleStarts.set(String(info.runId), { runId: String(info.runId), id: String(info.id) })
+      lifecycleOrder.push(`start:${String(info.runId)}`)
     })
     ctx.on('subagent/end', info => {
+      lifecycleOrder.push(`end:${String(info.runId)}`)
       if (String(info.id) !== adapter.roleSessionId) return
       roleEnds.push({ runId: String(info.runId), released: ctx.agents.get(info.id) === undefined })
       if (roleEnds.length === 1) adapter.firstRoleReleased.resolve()
@@ -381,8 +451,26 @@ workflow:
     assert.match(resumedText, /A30 COMPACT CHECKPOINT/)
     assert.doesNotMatch(resumedText, /OLD_ROLE_SURFACE/)
 
-    assert.ok(roleEnds.length >= 2)
-    assert.ok(roleEnds.every(end => lifecycleStarts.get(end.runId)?.id === roleSessionId))
+    // MF-4：真实宿主的 residency epoch 契约——暖多派共享一个 epoch，
+    // 冷续接只在旧 epoch 结算/释放后开新 epoch，每个 start 恰好配对一次 end。
+    const roleStarts = [...lifecycleStarts.values()].filter(start => start.id === roleSessionId)
+    assert.ok(roleStarts.length >= 2, `expected at least two Role residency epochs: ${JSON.stringify(roleStarts)}`)
+    assert.equal(roleEnds.length, roleStarts.length, 'every Role residency epoch must publish exactly one terminal edge')
+    assert.equal(new Set(roleStarts.map(start => start.runId)).size, roleStarts.length,
+      'cold continuation must open a new residency epoch id')
+    for (const start of roleStarts) {
+      const startedAt = lifecycleOrder.indexOf(`start:${start.runId}`)
+      const endedAt = lifecycleOrder.indexOf(`end:${start.runId}`)
+      assert.ok(startedAt >= 0, `missing subagent/start ordering for ${start.runId}`)
+      assert.ok(endedAt > startedAt, `subagent/end must follow its own start for ${start.runId}`)
+    }
+    for (const end of roleEnds) {
+      assert.ok(roleStarts.some(start => start.runId === end.runId), `end ${end.runId} has no matching Role epoch`)
+    }
+    const firstRoleStart = roleStarts[0]!
+    const secondRoleStart = roleStarts[1]!
+    assert.ok(lifecycleOrder.indexOf(`end:${firstRoleStart.runId}`) < lifecycleOrder.indexOf(`start:${secondRoleStart.runId}`),
+      'cold continuation must start only after the previous residency epoch ended')
     assert.equal(roleEnds[0]!.released, true, 'first Role Activation must be released before cold continuation')
 
     // #216 断言一：preset 组装下 Judge deny 实际收敛工具面——
@@ -407,6 +495,323 @@ workflow:
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
 })
+
+// #247 真实宿主契约：受理后无 turn/end 的失败必须经过真实插件接线（index.ts 的
+// `subagent/end` 观察 → Dispatch Lifecycle → Engine 工作单核验 → SQLite）落成技术
+// BLOCK，而不是停在 running 或等下一次 turn 才失败。这里刻意让 Role 的模型流挂起
+// （不产出任何 chunk，因此不会有 turn/end），再用宿主同款 `subagent/end` 事件注入
+// 终态；事件可能在派发登记发布前到达，正好覆盖发布窗口对账。
+class A3LifecycleAdapter extends LlmAdapter {
+  readonly roleGate = Promise.withResolvers<void>()
+  readonly roleTurnStarted = Promise.withResolvers<void>()
+  roleSessionId: string | undefined
+  private managerClaimed = false
+  private call = 0
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({ provider, id: model, name: model, context: { contextWindow: 100_000 } })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    const tools = new Set((options.tools ?? []).map(tool => tool.name))
+    const text = messageText(options)
+    const sessionId = String(options.sessionId ?? '')
+    if (tools.has('judge_claim') && !tools.has('node_claim')) {
+      const token = text.match(/"nodeToken": "([^"]+)"/)?.[1]
+      if (!token) throw new Error('Judge packet omitted nodeToken')
+      yield* toolChunks(`a3-call-${++this.call}`, 'judge_claim', {
+        nodeToken: token,
+        result: 'ACCEPT',
+        reason: 'Scripted read-only Judge accepts the kickoff handoff.',
+      })
+      return
+    }
+    if (sessionId === 'a3-manager') {
+      if (!this.managerClaimed && text.includes('Kickoff the isolated A3 lifecycle scenario.')) {
+        this.managerClaimed = true
+        yield* toolChunks(`a3-call-${++this.call}`, 'node_claim', { result: 'succeeded', handoff: 'kickoff accepted' })
+        return
+      }
+      yield* textChunks('Manager observed a Host lifecycle notice; no workflow mutation is needed.')
+      return
+    }
+    if (tools.has('node_claim')) {
+      if (this.roleSessionId === undefined) {
+        this.roleSessionId = sessionId
+        this.roleTurnStarted.resolve()
+      }
+      // 受理后的模型流挂起（不产出 chunk、不结束 turn），终态由测试注入的宿主事件给出。
+      await this.roleGate.promise
+      yield* textChunks('Late Role turn after the injected Host terminal event.')
+      return
+    }
+    yield* textChunks('No workflow action required.')
+  }
+}
+
+test('A3 real DSH Host: accepted Role dispatch without turn/end fails into a technical BLOCK through plugin wiring', { timeout: 30_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-a3-host-'))
+  const workspace = join(home, 'workspace')
+  const sessions = join(home, 'sessions')
+  mkdirSync(join(home, 'workflows'), { recursive: true })
+  mkdirSync(workspace, { recursive: true })
+  writeFileSync(join(home, 'workflows', 'a3.yaml'), `schemaVersion: agent-workflow/v3
+roles:
+  worker:
+    persona: Complete only the current workflow work order and use its control tools.
+judgeRole:
+  persona: Read-only verification of the isolated workspace.
+workflow:
+  startNode: kickoff
+  returns: [done]
+  nodes:
+    kickoff:
+      execution: { type: actor-task, role: manager, instruction: Kickoff the isolated A3 lifecycle scenario. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: Accept the scripted kickoff handoff. } }
+      results:
+        succeeded: { criteria: The kickoff handoff is accepted., target: { node: work } }
+    work:
+      execution: { type: actor-task, role: worker, instruction: Wait for a Host terminal event without finishing a turn. }
+      checker: { checkerId: judge.claim-correct, config: { criteria: Accept the worker handoff. } }
+      results:
+        succeeded: { criteria: The worker handoff is accepted., target: { return: done } }
+`, 'utf8')
+
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const ctx = new Context()
+  const adapter = new A3LifecycleAdapter()
+  const signal = new AbortController().signal
+  const lifecycleStarts = new Map<string, { id: string; runId: string }>()
+
+  try {
+    await mountAgentLoopTestDependencies(ctx)
+    ctx.provide('workingDirectory', {
+      defaultDirectory: workspace,
+      get: (session: { header: { cwd?: string } }) => session.header.cwd ?? workspace,
+      ensure: (agent: { session: { header: { cwd?: string } } }) =>
+        Promise.resolve(agent.session.header.cwd ?? workspace),
+      set: () => Promise.resolve(),
+    })
+    await ctx.plugin(CordisLoader.Loader)
+    await ctx.plugin(AgentPresetRegistry, { default: 'a3-base' })
+    await ctx.get('agentPresets').register({ id: 'a3-base', plugins: [] })
+    await ctx.plugin(JsonlSessionPersistence, { root: sessions, compression: 'none', packChunks: false })
+    await ctx.plugin(SqliteSessionQueryEngine, { path: ':memory:', openAt: 'never' })
+    await ctx.plugin(AgentLoop, { agents: [] })
+    await ctx.plugin(TokenMeter)
+    await ctx.plugin(BasicCompactionEngine, { auto: false })
+    await ctx.plugin(LocalJobRegistry, {})
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(SubagentSpawn, { providerName: 'spawn' })
+    await ctx.plugin(CommandRuntime)
+    for (const name of ['read', 'glob', 'grep', 'read_image'] as const) ctx.tools.register(readOnlyFixtureTool(name))
+    ctx.llm.registerAdapter([MODEL], adapter)
+
+    ctx.on('subagent/start', info => {
+      lifecycleStarts.set(String(info.id), { id: String(info.id), runId: String(info.runId) })
+    })
+
+    const WorkflowPlugin = await import('../src/index.ts')
+    await ctx.plugin(WorkflowPlugin)
+    const manager = await ctx.agentLoop.create(SessionId('a3-manager'), { provider: MODEL, model: MODEL }, { cwd: workspace })
+    const start = await ctx.commands.execute(manager, '/dsh-flow start a3 isolated-host-input', [], signal)
+    assert.ok(start)
+    assert.equal(start.result.kind, 'success', start.result.kind === 'error' ? start.result.text : undefined)
+
+    // 受理 = Role turn 已开始（模型请求已到达）。此后注入宿主终态：没有 turn/end 可以
+    // 解释这次结束，只能由观察模块转交 Engine 落成技术 BLOCK。
+    await adapter.roleTurnStarted.promise
+    const roleSessionId = adapter.roleSessionId
+    assert.ok(roleSessionId)
+    const startInfo = lifecycleStarts.get(roleSessionId)
+    assert.ok(startInfo, `missing subagent/start for the Role session: ${JSON.stringify([...lifecycleStarts])}`)
+    ctx.emit('subagent/end', {
+      id: SessionId(startInfo.id),
+      runId: SubagentRunId(startInfo.runId),
+      provider: 'spawn',
+      local: true,
+      stopReason: 'error',
+    })
+
+    const blocked = await waitFor(async () => {
+      const status = commandJson(await ctx.commands.execute(manager, '/dsh-flow status', [], signal))
+      return status.status === 'blocked' ? status : undefined
+    }, 10_000).catch(error => {
+      throw new Error(`${String(error)}; lifecycle starts: ${JSON.stringify([...lifecycleStarts])}`)
+    })
+    assert.equal(blocked.execution.nodeId, 'work')
+    assert.equal(blocked.execution.hasClaim, false)
+    assert.match(blocked.execution.blockReason ?? '', /^activation settled without turn\/end: actor role=worker/,
+      `blockReason should carry the lifecycle settlement: ${blocked.execution.blockReason}`)
+  } finally {
+    adapter.roleGate.resolve()
+    await ctx.fiber.dispose()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
+// MF-4（#247）：真实宿主的 residency epoch 契约。暖多派（同一 activation 内先后受理
+// 两条 prompt）只发一次 subagent/start、一次 subagent/end；结算后的冷续接必须开新的
+// activation/runId，旧 end 不会串到新 epoch。受控测试只能模拟这些时序，因此这条契约
+// 必须在真实 Host 上单独固定。
+test('A4 real DSH Host: warm dispatches share one residency epoch and cold continuation opens a new one', { timeout: 20_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-a4-lifecycle-'))
+  const workspace = join(home, 'workspace')
+  const sessions = join(home, 'sessions')
+  mkdirSync(workspace, { recursive: true })
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const ctx = new Context()
+  const adapter = new A4WarmDispatchAdapter()
+  const childId = SessionId('a4-child')
+  const signal = new AbortController().signal
+  const starts: string[] = []
+  const ends: Array<{ runId: string; stopReason: string }> = []
+  const sequence: string[] = []
+
+  try {
+    await mountSubagentContractHost(ctx, { workspace, sessions, presetId: 'a4-base', adapter })
+    ctx.on('subagent/start', info => {
+      if (String(info.id) !== String(childId)) return
+      starts.push(String(info.runId))
+      sequence.push(`start:${String(info.runId)}`)
+    })
+    ctx.on('subagent/end', info => {
+      if (String(info.id) !== String(childId)) return
+      ends.push({ runId: String(info.runId), stopReason: info.stopReason })
+      sequence.push(`end:${String(info.runId)}`)
+    })
+
+    const parent = await ctx.agentLoop.create(SessionId('a4-parent'), { provider: MODEL, model: MODEL }, { cwd: workspace })
+    const started = await ctx.subagents.startActivation({
+      provider: 'spawn',
+      label: 'a4-contract',
+      childId,
+      request: { prompt: [{ type: 'text', text: 'A4 FIRST_PROMPT' }], parent, signal },
+      signal,
+      delivery: 'parent',
+    })
+
+    await adapter.firstTurnStarted.promise
+    await queueHostSubagentPrompt(
+      ctx.subagents,
+      parent,
+      childId,
+      [{ type: 'text', text: 'A4 SECOND_PROMPT' }],
+      WORKFLOW_DISPATCH_SOURCE,
+      signal,
+    )
+    adapter.gate.resolve()
+    const result = await started.result
+    sequence.push('result')
+
+    assert.equal(result.stopReason, 'completed')
+    assert.equal(starts.length, 1, 'warm dispatches must not open a second residency epoch')
+    assert.equal(ends.length, 1, 'one residency epoch publishes exactly one terminal edge')
+    assert.equal(ends[0]!.runId, starts[0])
+    assert.equal(sequence.indexOf(`end:${ends[0]!.runId}`), sequence.indexOf('result') - 1,
+      'the host publishes subagent/end before the result resolves')
+    assert.ok(adapter.turnTexts.some(text => text.includes('A4 SECOND_PROMPT')),
+      'the second prompt must be delivered inside the warm activation')
+
+    // 结算后再次投递：宿主冷续接，必须开新 activation/runId。
+    await queueHostSubagentPrompt(
+      ctx.subagents,
+      parent,
+      childId,
+      [{ type: 'text', text: 'A4 THIRD_PROMPT' }],
+      WORKFLOW_DISPATCH_SOURCE,
+      new AbortController().signal,
+    )
+    await waitFor(async () => ends.length === 2 ? true : undefined, 10_000).catch(error => {
+      throw new Error(`${String(error)}; starts=${JSON.stringify(starts)}; ends=${JSON.stringify(ends)}`)
+    })
+    assert.equal(starts.length, 2, 'cold continuation must start a new residency epoch')
+    assert.notEqual(starts[1], starts[0], 'cold continuation must not reuse the settled epoch id')
+    assert.equal(ends[1]!.runId, starts[1])
+    assert.equal(ends[1]!.stopReason, 'completed')
+  } finally {
+    adapter.gate.resolve()
+    await ctx.fiber.dispose()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
+// MF-4（#247）：真实宿主的 completed+cleanup-error 表达。宿主在会话干净收尾时捕获
+// completed 结果，但把拆卸失败折进终态边：subagent/end 为 error、随后 result 仍为
+// completed。观察模块必须消费「结果 completed + end error」而不把已完成的工作误判成
+// 技术失败。这里通过真实 AgentHandle 的 dispose 注入一次性清理故障来固定该表达。
+test('A5 real DSH Host: a completed turn with a cleanup failure ends with an error edge and a completed result', { timeout: 20_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-a5-cleanup-'))
+  const workspace = join(home, 'workspace')
+  const sessions = join(home, 'sessions')
+  mkdirSync(workspace, { recursive: true })
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const ctx = new Context()
+  const adapter = new A5ReplyAdapter()
+  const childId = SessionId('a5-child')
+  const signal = new AbortController().signal
+  const sequence: string[] = []
+  const stops: string[] = []
+  let cleanupCalls = 0
+  let injected = false
+
+  try {
+    await mountSubagentContractHost(ctx, { workspace, sessions, presetId: 'a5-base', adapter })
+    type AgentHandle = Awaited<ReturnType<typeof ctx.agents.create>>
+    const agents = ctx.agents as unknown as {
+      create: (options: Parameters<typeof ctx.agents.create>[0]) => Promise<AgentHandle>
+    }
+    const originalCreate = agents.create.bind(ctx.agents)
+    agents.create = async options => {
+      const handle = await originalCreate(options)
+      if (String(options.sessionId) !== String(childId) || injected) return handle
+      injected = true
+      const originalDispose = handle.dispose.bind(handle)
+      handle.dispose = async () => {
+        await originalDispose()
+        cleanupCalls += 1
+        throw new Error('A5 injected cleanup failure')
+      }
+      return handle
+    }
+    ctx.on('subagent/end', info => {
+      if (String(info.id) !== String(childId)) return
+      sequence.push('end')
+      stops.push(String(info.stopReason))
+    })
+
+    const parent = await ctx.agentLoop.create(SessionId('a5-parent'), { provider: MODEL, model: MODEL }, { cwd: workspace })
+    const started = await ctx.subagents.startActivation({
+      provider: 'spawn',
+      label: 'a5-contract',
+      childId,
+      request: { prompt: [{ type: 'text', text: 'A5 PROMPT' }], parent, signal },
+      signal,
+      delivery: 'parent',
+    })
+    const result = await started.result
+    sequence.push('result')
+
+    assert.equal(injected, true, 'the cleanup fault must be injected on the child AgentHandle')
+    assert.equal(cleanupCalls, 1)
+    assert.deepEqual(sequence, ['end', 'result'], 'the terminal edge is published before the result resolves')
+    assert.deepEqual(stops, ['error'], 'cleanup failure is folded into the terminal edge')
+    assert.equal(result.stopReason, 'completed', 'the captured business result stays completed')
+  } finally {
+    await ctx.fiber.dispose()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})
+
 
 // #246 A0 的真实宿主契约：宿主只在 setup 返回值 resolve 之后才 publication
 // （agent-loop `setupAndPublish`：`await raceAbort(setup(...))` → publish）。
