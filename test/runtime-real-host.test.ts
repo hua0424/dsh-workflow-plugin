@@ -407,3 +407,95 @@ workflow:
     rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
   }
 })
+
+// #246 A0 的真实宿主契约：宿主只在 setup 返回值 resolve 之后才 publication
+// （agent-loop `setupAndPublish`：`await raceAbort(setup(...))` → publish）。
+// 冷维护 setup 等待角色 preset 挂载正是靠这条时序才成立，所以这里在真实 Host 上
+// 固定它：不等待的 setup 立刻发布（旧形态的失效机制）；等待中的 setup 在其
+// resolve 前不发布；取消挂起中的 setup 不留迟到 live Agent，同一 Session id
+// 之后仍可再次 resume。不断言取消能回滚底层 mount / preset 绑定。
+test('A0 real DSH Host publishes a cold resume only after its awaited setup resolves (#246)', { timeout: 20_000 }, async () => {
+  const home = mkdtempSync(join(tmpdir(), 'workflow-a0-setup-'))
+  const workspace = join(home, 'workspace')
+  const sessions = join(home, 'sessions')
+  mkdirSync(workspace, { recursive: true })
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = home
+  const ctx = new Context()
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+  try {
+    await mountAgentLoopTestDependencies(ctx)
+    await ctx.plugin(JsonlSessionPersistence, { root: sessions, compression: 'none', packChunks: false })
+    await ctx.plugin(AgentLoop, { agents: [] })
+    ctx.llm.registerAdapter([MODEL], new A30Adapter())
+
+    const id = SessionId('a0-setup-contract')
+    const seed = await ctx.agents.create({ sessionId: id, agentOptions: { provider: MODEL, model: MODEL }, meta: { cwd: workspace } })
+    seed.agent.session.append('turn/start', { turn: 1 })
+    seed.agent.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    await seed.dispose()
+    assert.equal(ctx.agents.get(id), undefined, '冷基线：持久化会话存在但没有 live agent')
+
+    // 1) 旧插件形态：setup 里把 mount 的 Promise 丢掉，宿主立刻 publication。
+    const backgroundMount = Promise.withResolvers<void>()
+    const detached = await ctx.agentLoop.resume(ctx, {
+      resumeSessionId: id,
+      setup: () => { void backgroundMount.promise },
+    })
+    assert.notEqual(ctx.agents.get(id), undefined,
+      '不等待的 setup 在其同步返回后就被当成完成——这正是 #246 的失效机制（挂载仍在进行却已发布）')
+    await detached.dispose()
+    assert.equal(ctx.agents.get(id), undefined)
+    backgroundMount.resolve()
+
+    // 2) 修复形态：setup await 挂载，挂载完成前不得 publication。
+    const mountStarted = Promise.withResolvers<void>()
+    const mountGate = Promise.withResolvers<void>()
+    const trace: string[] = []
+    const pending = ctx.agentLoop.resume(ctx, {
+      resumeSessionId: id,
+      setup: async () => {
+        trace.push('setup-start')
+        mountStarted.resolve()
+        await mountGate.promise
+        trace.push('setup-done')
+      },
+    })
+    await mountStarted.promise
+    await sleep(50)
+    assert.equal(ctx.agents.get(id), undefined, 'setup/挂载挂起期间不得 publication（否则后续解析会跑在没挂上的 isolate 上）')
+    mountGate.resolve()
+    const mountedHandle = await pending
+    assert.deepEqual(trace, ['setup-start', 'setup-done'])
+    assert.notEqual(ctx.agents.get(id), undefined, '挂载完成后才 publication')
+    await mountedHandle.dispose()
+
+    // 3) 挂起中取消：不留迟到 live Agent；同一 Session id 仍可再次 resume。
+    const controller = new AbortController()
+    const cancellingStart = Promise.withResolvers<void>()
+    const cancelGate = Promise.withResolvers<void>()
+    const cancelled = ctx.agentLoop.resume(ctx, {
+      resumeSessionId: id,
+      signal: controller.signal,
+      setup: async () => {
+        cancellingStart.resolve()
+        await cancelGate.promise
+      },
+    })
+    await cancellingStart.promise
+    controller.abort()
+    await assert.rejects(cancelled)
+    cancelGate.resolve()
+    await sleep(50)
+    assert.equal(ctx.agents.get(id), undefined, '取消后的迟到 setup 不得发布 live Agent')
+
+    const recovered = await ctx.agentLoop.resume(ctx, { resumeSessionId: id, setup: () => {} })
+    assert.notEqual(ctx.agents.get(id), undefined, '同一 Session id 仍可冷 resume（取消不回滚可复用性）')
+    await recovered.dispose()
+  } finally {
+    await ctx.fiber.dispose()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })
+  }
+})

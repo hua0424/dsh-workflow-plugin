@@ -184,7 +184,14 @@ function makeHost(options: {
   disposeError?: Error
   disposeHangs?: boolean
   persistence?: { open: (id: unknown, access: unknown, options?: { signal?: AbortSignal }) => Promise<unknown> }
-  presets?: { serviceFor: (agent: Agent, name: string) => unknown; composeFrom?: (agentCtx: unknown, parentCtx: unknown) => void }
+  presets?: {
+    serviceFor: (agent: Agent, name: string) => unknown
+    composeFrom?: (agentCtx: unknown, parentCtx: unknown) => void
+    composedPreset?: (ctx: unknown) => string | undefined
+    readDocument?: (id: string) => Promise<{ agentPreset: string; content: string }>
+    register?: (definition: { id: string }) => Promise<() => Promise<void>>
+    mount?: (agentCtx: unknown, id: string) => Promise<unknown>
+  }
   noHostCompaction?: boolean
   events: string[]
   resumes: ResumeCall[]
@@ -481,6 +488,136 @@ test('cold maintenance resume carries no setup when the manager is not live', as
   // 同 #93 改造方法第 4 条：没有 preset-join setup 的冷维护同样不得携带 prompt。
   assert.equal('prompt' in f.resumes[0]!, false, 'cold maintenance resume must not carry a prompt')
   assert.equal(f.resumes[0]!.signal?.aborted, false, '没有 setup 也必须带 signal：取消覆盖整个 load/setup 窗口')
+})
+
+// #246 A0：宿主只在 setup 返回值 resolve 之后才 publication（agent-loop
+// `setupAndPublish`：`await raceAbort(setup(...))` → publish）。因此冷维护的 setup
+// 必须**等**角色 preset 挂载完，才能让随后的 compaction 解析看到挂上的 isolate；
+// 丢弃 mount 的 Promise 会让宿主把 setup 当成已完成——旧代码的挂载窗口因此可以
+// 整个跑在压缩之外（误用宿主平面 backend，或按"没有 backend"整段跳过）。
+test('cold maintenance setup waits for the role preset mount before resolving the backend (#246)', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const manager = { id: 'manager', ctx: { tag: 'manager-ctx' } } as unknown as Agent
+  const run = makeRun('sess-dev')
+  const presetId = rolePresetId(run.runId, 'developer')
+  const mountStarted = Promise.withResolvers<void>()
+  const gate = Promise.withResolvers<void>()
+  let mounted = false
+  const presetBackend = {
+    compactNow: async () => {
+      f.events.push('preset-compact')
+      return { shadowedSeqs: [1, 2], shadowedTokenCount: 20 }
+    },
+  }
+  const { host, materialized } = makeHost({
+    ...f, manager, compactResult: { shadowedSeqs: [9], shadowedTokenCount: 90 },
+    presets: {
+      composedPreset: () => undefined,
+      async register() { return async () => {} },
+      async mount(_agentCtx: unknown, id: string) {
+        f.events.push(`mount-start:${id}`)
+        mountStarted.resolve()
+        await gate.promise
+        mounted = true
+        f.events.push('mount-done')
+      },
+      serviceFor: (agent: Agent, name: string) => {
+        if (name !== 'compaction') return undefined
+        f.events.push('backend-lookup')
+        return mounted && agent === materialized ? presetBackend : undefined
+      },
+    },
+  })
+  const pending = host.compactRoleActor(run, 'developer')
+  await mountStarted.promise
+  await delay(20)
+  assert.deepEqual(f.events, ['resume', `mount-start:${presetId}`],
+    '挂载未完成前不得解析 backend、不得 compact、不得提前释放物化会话')
+  gate.resolve()
+  assert.deepEqual(await pending, { ok: true, detail: 'cold compacted 2 items (~20 tokens)' },
+    '挂载完成后再压缩，用的是角色 preset 的 backend，而不是同时存在的宿主平面 backend')
+  assert.deepEqual(f.events, ['resume', `mount-start:${presetId}`, 'mount-done', 'backend-lookup', 'preset-compact', 'dispose'],
+    '成功路径顺序：先挂载 → 再用角色 preset 解析 backend → 释放冷 handle')
+  assert.deepEqual(f.compacts, [], '宿主平面 backend 一次都不该被调用')
+  assert.deepEqual(f.warns, [], '正常挂载不产生告警')
+})
+
+test('cold maintenance mount rejection keeps the existing warning and degrades instead of failing resume (#246)', async () => {
+  const presetsRejecting = {
+    composedPreset: () => undefined,
+    async register() { return async () => {} },
+    async mount() { throw new Error('preset mount exploded') },
+    serviceFor: () => undefined,
+  }
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const manager = { id: 'manager', ctx: { tag: 'manager-ctx' } } as unknown as Agent
+  const { host } = makeHost({ ...f, manager, compactResult: { shadowedSeqs: [4], shadowedTokenCount: 40 }, presets: presetsRejecting })
+  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'cold compacted 1 items (~40 tokens)' },
+    '挂载拒绝不把 resume 升级成失败：沿用既有宿主平面回退')
+  assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
+  assert.deepEqual(f.warns, ['workflow maintenance preset mount skipped: preset mount exploded'],
+    '既有告警措辞不变，且没有未处理的 rejection')
+
+  const g = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const { host: skipping } = makeHost({ ...g, manager, noHostCompaction: true, presets: presetsRejecting })
+  assert.deepEqual(await skipping.compactRoleActor(makeRun('sess-dev'), 'developer'),
+    { ok: true, detail: 'no compaction backend; boundary compact skipped' }, '无 backend 时仍是既有 benign skip')
+  assert.deepEqual(g.events, ['resume', 'dispose'], '物化照样释放，不留下泄漏的 agent')
+  assert.equal(g.warns.length, 2)
+  assert.match(g.warns[1]!, /workflow boundary compact skipped/)
+})
+
+test('cold maintenance: a mount that never settles exhausts the existing coldMaterialize budget (#246)', async () => {
+  await withShortTimeouts({ coldMaterialize: 20 }, async () => {
+    const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+    const manager = { id: 'manager', ctx: { tag: 'manager-ctx' } } as unknown as Agent
+    const gate = Promise.withResolvers<void>()
+    const { host } = makeHost({
+      ...f, manager, compactResult: { shadowedSeqs: [1], shadowedTokenCount: 10 },
+      presets: {
+        composedPreset: () => undefined,
+        async register() { return async () => {} },
+        async mount() { f.events.push('mount-start'); await gate.promise; f.events.push('mount-done') },
+        serviceFor: (_agent: Agent, name: string) => { if (name === 'compaction') f.events.push('backend-lookup'); return undefined },
+      },
+    })
+    assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'),
+      { ok: false, detail: 'cold materialize failed: timeout after 20ms at stage "coldMaterialize"' },
+      '挂载永不返回时由既有预算收口为失败，不能伪装成成功跳过')
+    assert.deepEqual(f.events, ['resume', 'mount-start'], '超时前不解析 backend、不 compact')
+    assert.equal(f.resumes[0]!.signal?.aborted, true, '预算是真实中断源：signal 已 abort')
+    gate.resolve()
+    await delay(60)
+    assert.deepEqual(f.events, ['resume', 'mount-start', 'mount-done', 'dispose'],
+      '忽略 signal 的宿主迟到发布 handle 仍走既有有界 dispose，且不迟到解析 backend / compact')
+    assert.deepEqual(f.compacts, [])
+  })
+})
+
+test('cold maintenance keeps the composeFrom and preset-service-absent fallbacks (#246)', async () => {
+  const f = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const manager = { id: 'manager', ctx: { tag: 'manager-ctx' } } as unknown as Agent
+  const composed: Array<{ agentCtx: unknown; parentCtx: unknown }> = []
+  const { host } = makeHost({
+    ...f, manager, compactResult: null,
+    presets: {
+      composedPreset: () => undefined,
+      async register() { throw new Error('registry closed') },
+      async mount() { throw new Error('must not mount without a derived preset') },
+      composeFrom: (agentCtx: unknown, parentCtx: unknown) => { composed.push({ agentCtx, parentCtx }) },
+      serviceFor: () => undefined,
+    },
+  })
+  assert.deepEqual(await host.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'cold: no compactable range' })
+  assert.equal(composed.length, 1, '未获得派生 preset 时回退 Manager 的组合 preset')
+  assert.equal(composed[0]!.parentCtx, manager.ctx, 'composeFrom 的父上下文仍是 Manager，不是角色自己')
+  assert.deepEqual(f.events, ['resume', 'compact', 'dispose'])
+
+  const g = { events: [] as string[], resumes: [] as ResumeCall[], compacts: [] as CompactCall[], warns: [] as string[] }
+  const { host: noService } = makeHost({ ...g, manager, compactResult: null })
+  assert.deepEqual(await noService.compactRoleActor(makeRun('sess-dev'), 'developer'), { ok: true, detail: 'cold: no compactable range' })
+  assert.deepEqual(g.events, ['resume', 'compact', 'dispose'])
+  assert.match(g.warns[0]!, /workflow preset degraded for developer/, 'preset 服务缺席仍是既有降级告警')
 })
 
 // #21 F1 故障注入：派发/恢复链上 seam 挂起时必须超时降级为携带阶段名的结果，
