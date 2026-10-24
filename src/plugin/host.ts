@@ -635,11 +635,20 @@ async function compactOnce(
       // preset——两者都无则不 join。Join 失败降级为宿主平面回退 / 跳过，
       // 因此记日志而不是让 resume 失败。
       ...(manager === undefined ? {} : {
-        setup: ((agentCtx: Context) => {
+        // #246：setup 必须**等**角色 preset 挂载完成。宿主只在 setup 返回值 resolve
+        // 之后才 publication（agent-loop `setupAndPublish`：`await raceAbort(setup(...))`
+        // → publish），丢弃 mount 的 Promise 会让宿主把 setup 当成已完成，后续
+        // compaction 解析就可能跑在还没挂上的 isolate 上——误用宿主平面配置或按
+        // "没有 backend"整段跳过 compact。等待复用既有 coldMaterialize 预算与 resume
+        // signal：`withTimeout(resuming, …)` 到期即停止等待并 abort，不另设计时器，
+        // 也不承诺取消能终止底层 mount。
+        setup: (async (agentCtx: Context) => {
           const presets = agentCtx.get('agentPresets')
           if (presets === undefined) return
           try {
-            if (agentPreset !== undefined) void presets.mount(agentCtx, agentPreset).catch(error => {
+            // 挂载拒绝/同步抛错都只记既有告警并降级（宿主平面回退 / 无 backend 跳过），
+            // 不把一次 preset 组装失败升级成 resume 失败。
+            if (agentPreset !== undefined) await presets.mount(agentCtx, agentPreset).catch(error => {
               agentCtx.logger.warn(`workflow maintenance preset mount skipped: ${errorDetail(error)}`)
             })
             else presets.composeFrom(agentCtx, manager.ctx)
