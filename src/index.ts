@@ -322,30 +322,24 @@ export function apply(ctx: Context) {
     })()
   })
 
-  // Issue #221：宿主生命周期终止信号收口。终态只做待对账观察：条目缺席则
-  // 缓存（等身份发布时对账），条目在位则转交引擎在 append 回调之外结算。
-  // 绝不解析父会话的自然语言通知判断终态。
+  // Issue #247：宿主生命周期终止边只做报告。世代记录、发布窗口暂存、归属
+  // 匹配与去重都在观察模块内完成；入口只在 Host append 回调之外把可消费的
+  // 引用转交引擎结算（回调内不改变工作单）。绝不解析父会话的自然语言通知
+  // 判断终态。
   ctx.on('subagent/end', (info) => {
     if (stateAccess.maintenanceDiagnostic()) return
-    const tracker = subagentHost.dispatchLifecycle
-    if (tracker === undefined) return
-    const sessionId = String(info.id)
-    const end = {
+    const lifecycle = subagentHost.dispatchLifecycle
+    if (lifecycle === undefined) return
+    const ref = lifecycle.noteEnd(String(info.id), {
       runId: String(info.runId),
       stopReason: String(info.stopReason),
       ...(typeof info.provider === 'string' ? { provider: info.provider } : {}),
-    }
+    })
+    if (ref === undefined) return
     setImmediate(() => {
-      void (async () => {
-        try {
-          const tracked = tracker.peek(sessionId)
-          const ws = tracked?.workspaceKey ?? await workspaceOfSession(sessionId)
-          if (ws === undefined) return
-          await engine.handleActivationSettled(ws, sessionId, end)
-        } catch (error) {
-          ctx.logger.warn(`workflow activation settlement failed: ${String(error)}`)
-        }
-      })()
+      void engine.settleActivation(ref).catch((error: unknown) => {
+        ctx.logger.warn(`workflow activation settlement failed: ${String(error)}`)
+      })
     })
   })
 
@@ -510,7 +504,7 @@ export function apply(ctx: Context) {
     for (const dispose of disposeTools) dispose()
     for (const dispose of disposeEditorRpcFns.splice(0)) dispose()
     // Issue #221：插件卸载清理待对账观察资源。
-    subagentHost.dispatchLifecycle?.clear()
+    subagentHost.dispatchLifecycle?.dispose()
     // #216：插件卸载注销全部动态 preset（best-effort）。
     void presetBook.releaseAll(ctx).catch(() => {})
   })
