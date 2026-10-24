@@ -27,6 +27,14 @@ Catalog 位于 `${DSH_HOME:-$HOME/.dsh}/workflows/<workflow-id>.yaml`。schema �
 
 Run 启动校验、规范化并固定完整 Definition Snapshot 与 hash。运行中不读取新 YAML 改图。Root startNode 必须是 `actor-task role:manager`。Graph 用命名结果 + 统一 Target + 流程 returns：每个结果有自己的必填 criteria 与互斥 Target（本流程节点或 `{ return }`），流程经 `{ return }` 结束（Root 的返回即 Run 的业务终局）；没有裸 END、`onPass`/`onFail`、默认路由或通配映射，v2/v1 配置不再接受。
 
+## 配置图 / 运行图
+
+**配置图（Config Graph）**：配置编辑器画布渲染的可编辑静态图。数据源是 catalog YAML 草稿与 `<id>.layout.json` 坐标。
+
+**运行图（Run Graph）**：运行监控页渲染的只读图。数据源是某个 Run 的 Definition Snapshot 与工作单状态投影；坐标复用同一 layout 文件（缺失走网格兜底）。与配置图共享画布组件，但数据源不同。
+
+_Avoid_: 把运行图当作「当前配置的执行」——运行图是启动时冻结的快照，启动后改 YAML 不改变它。
+
 ## Run
 
 `runs` 保存 Run identity、workspace、固定 Manager/Snapshot、status、`currentExecutionId`、callStack、Role mappings、modelOverrides、row CAS version 及时间。节点材料不镜像在 Run。
