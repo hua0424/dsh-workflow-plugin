@@ -9,7 +9,7 @@ import { EDITOR_STYLES } from '../web-client/src/styles.js'
 function renderRole(reuse?: string, compactBeforeReuse = false, busy = false) {
   const { RoleSection } = runInNewContext(`${bundleSources().panel}\n({ RoleSection })`, {
     require: () => ({ createElement: (type, props, ...children) => ({ type, props, children }) }),
-    __rpc: {}, __edits: { findRoleRefs }, __styles: {}, __modelSelector: {},
+    __rpc: {}, __edits: { findRoleRefs }, __styles: {}, __modelSelector: {}, __graphCanvas: { NodeCanvas: () => null },
   })
   const changes: boolean[] = []
   const tree = RoleSection({

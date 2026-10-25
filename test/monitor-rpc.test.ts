@@ -11,6 +11,7 @@ import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { createMonitorRpcHandler, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
+import type { EditorLayout } from '../src/editor/layout.ts'
 
 const config: WorkflowConfig = {
   schemaVersion: 'agent-workflow/v3', roles: { reviewer: { persona: 'Review', model: { provider: 'prov', modelId: 'm-review' } } }, judgeRole: { persona: 'Read only' },
@@ -51,11 +52,12 @@ function harness() {
 }
 
 /** 显式传 workspace key 形状的 cwd：服务端只按请求上行解析，不再回退 process.cwd。 */
-function handlerOf(h: ReturnType<typeof harness>) {
+function handlerOf(h: ReturnType<typeof harness>, layout?: EditorLayout) {
   return createMonitorRpcHandler({
     maintenance: () => undefined,
     status: async cwd => h.store.get(cwd ?? 'ws'),
     executions: async cwd => h.store.runExecutions(cwd ?? 'ws'),
+    layout: async () => layout,
   })
 }
 
@@ -122,6 +124,25 @@ test('#251 status：活跃 Run → 完整只读投影（节点/角色模型/图/
   } finally { h.cleanup() }
 })
 
+test('#252 status：布局坐标随 payload 返回（缺失补网格）且不改写输入', async () => {
+  const h = harness()
+  try {
+    await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')
+    const layout: EditorLayout = { version: 1, main: { plan: { x: 10, y: 20 } }, children: {} }
+    const before = JSON.parse(JSON.stringify(layout)) as EditorLayout
+    const result = await handlerOf(h, layout)('status', { cwd: 'ws' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
+    assert.deepEqual(payload.run!.layout.main.plan, { x: 10, y: 20 })
+    // 缺失的 review 按网格第 2 位补位（fillMissingPositions 只改副本）。
+    assert.deepEqual(payload.run!.layout.main.review, { x: 260, y: 40 })
+    assert.deepEqual(layout, before, '输入布局对象不被原地补位改写')
+    // 结果端口随图返回，供只读画布绘制结果端口与连线。
+    const plan = payload.run!.flows.test.nodes.find(node => node.id === 'plan')!
+    assert.deepEqual(plan.results, { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } })
+  } finally { h.cleanup() }
+})
+
 test('#251 status：BLOCK 原因透出（run 级 + 节点级）', async () => {
   const h = harness()
   try {
@@ -173,6 +194,7 @@ test('#251 status：cwd 原样透传，缺省不猜宿主 process.cwd（F4）', 
     maintenance: () => undefined,
     status: async cwd => { seen.push(cwd); return undefined },
     executions: async cwd => { seen.push(cwd); return [] },
+    layout: async () => undefined,
   })
   assert.deepEqual(await handler('status', {}), { ok: true, value: { mode: 'empty' } })
   assert.deepEqual(await handler('status', { cwd: 'D:/ws' }), { ok: true, value: { mode: 'empty' } })
@@ -185,6 +207,7 @@ test('#251 status：维护诊断短路，不触碰状态库', async () => {
     maintenance: () => ({ kind: 'incompatible', path: '/tmp/state.sqlite3', userVersion: 1, tables: ['runs'], reason: 'incompatible state format (user_version=1); original data retained' }),
     status: async () => { touched.push('status'); return undefined },
     executions: async () => { touched.push('executions'); return [] },
+    layout: async () => { touched.push('layout'); return undefined },
   })
   const result = await handler('status', {})
   assert.equal(result.ok, true)
