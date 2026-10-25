@@ -70,6 +70,7 @@ Runtime deps are only `yaml` + `zod`. All `@deepseek-ai/dsh-*` host API packages
 - `src/judge/` — Node-local transcript projection + `judge.claim-correct` Judgment Packet 与 `judge_claim` 协议.
 - `src/tools/` — workflow 控制工具 + inspection wrappers；所有调用经 `authz.ts` 校验调用者身份.
 - `src/commands/` — `/dsh-flow list|start|status|reset`.
+- `src/monitor/` — 只读运行监控 status RPC 投影（`/workflow-run-monitor`，Run 冻结快照 + 工作单/BLOCK/启动 prompt，ADR-0005）.
 - `src/programs/` — git/gh runner + builtin programs.
 - `src/plugin/host.ts` — 把真实 DSH 服务接入 engine 的适配层（测试 seam）.
 

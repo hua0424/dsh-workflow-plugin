@@ -1,6 +1,6 @@
 # 运行监控页：better-sidebar Tab + 宿主只读 RPC + Run 冻结快照
 
-状态：设计已确认（尚未实施；实施与验收记录见后续 issue）。
+状态：v1 已实施（#251：宿主只读 status RPC + better-sidebar tab）；后续增量（真实宿主冒烟 #253、切换器/下钻等）见 milestone `run-monitor-sidebar`。
 
 向用户展示当前 Run 推进到哪个节点、各角色生效模型。载体是已安装的 DSH-better-sidebar 的扩展点 `ctx.betterSidebar.registerTab`（右侧栏 tab，`id: dsh-workflow:monitor`），不做独立浮窗、不占用原生主面板。本插件浏览器 bundle 用**动态注入**注册（不进静态 `inject` 导出）：未装 better-sidebar 时 tab 静默缺席，配置编辑器照常加载；这优于把三方宿主变成硬依赖。每个 tab 组件收到 `scope.cwd`（会话工作目录），经 canonical workspace 定位「一 workspace 一活跃 Run」。
 

@@ -9,7 +9,7 @@
  *
  * 用法：node web-client/build.mjs [--out <目录>]
  * 约束：源文件经正则做最小拼合（顺序 rpc → edits → styles → model-selector →
- * start-submit/start-modal → panel → index，
+ * start-submit/start-modal → monitor-view/monitor → panel → index，
  * 无重名顶层绑定，react 经 require('react') 取宿主共享实例）。React Flow 引入后必须切换到正式
  * bundler，本脚本即退役（见 README）。
  */
@@ -56,13 +56,17 @@ export function bundleSources() {
   const startModal = rewriteImports(read('start-modal.js'), 'react', "require('react')")
     .replace(/^import\s*\{[^}]*\}\s*from\s*['"]\.\/start-submit\.js['"];?/gm, '')
     .replace(/^export\s+/gm, '')
+  const monitorView = read('monitor-view.js').replace(/^export\s+/gm, '')
+  const graphCanvas = rewriteImports(read('graph-canvas.js'), 'react', "require('react')").replace(/^export\s+/gm, '')
+  const monitor = rewriteImports(rewriteImports(rewriteImports(rewriteImports(read('monitor.js'), 'react', "require('react')"), './monitor-view.js', '__monitorView'), './graph-canvas.js', '__graphCanvas'), './styles.js', '__styles')
+    .replace(/^export\s+/gm, '')
   const panel = rewriteImports(read('panel.js'), 'react', "require('react')")
-  const panelLinked = rewriteImports(rewriteImports(rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits'), './styles.js', '__styles'), './model-selector.js', '__modelSelector')
-  const index = rewriteImports(rewriteImports(rewriteImports(
-    rewriteImports(read('index.js'), './panel.js', '__panel'),
-    './rpc.js',
-    '__rpc',
-  ), './model-selector.js', '__modelSelector'), './start-modal.js', '__startModal')
+  const panelLinked = rewriteImports(rewriteImports(rewriteImports(rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits'), './styles.js', '__styles'), './model-selector.js', '__modelSelector'), './graph-canvas.js', '__graphCanvas')
+  const index = rewriteImports(rewriteImports(rewriteImports(rewriteImports(
+    rewriteImports(rewriteImports(read('index.js'), './panel.js', '__panel'),
+      './rpc.js',
+      '__rpc',
+    ), './model-selector.js', '__modelSelector'), './start-modal.js', '__startModal'), './monitor.js', '__monitor'), './monitor-view.js', '__monitorView')
   return {
     rpc,
     edits,
@@ -70,18 +74,21 @@ export function bundleSources() {
     modelSelector,
     startSubmit,
     startModal,
+    monitorView,
+    graphCanvas,
+    monitor,
     panel: panelLinked.replace(/^export\s+/gm, ''),
     index: index.replace(/^export\s+/gm, ''),
   }
 }
 
 export function buildClientBundle({ outDir } = {}) {
-  const { rpc, edits, styles, modelSelector, startSubmit, startModal, panel, index } = bundleSources()
+  const { rpc, edits, styles, modelSelector, startSubmit, startModal, monitorView, graphCanvas, monitor, panel, index } = bundleSources()
   const bundle = `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {
 var module = { exports: {} }; var exports = module.exports;
 var __rpc = (function () {
 ${rpc}
-return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage, readWorkflowCatalog };
+return { EDITOR_RPC_CHANNEL, callChannel, callEditor, rpcErrorMessage, readWorkflowCatalog };
 })();
 var __edits = (function () {
 ${edits}
@@ -95,6 +102,10 @@ var __modelSelector = (function () {
 ${modelSelector}
 return { ModelFields, modelChoices, readModelCatalog };
 })();
+var __graphCanvas = (function () {
+${graphCanvas}
+return { NodeCanvas, nodeSummary, portsOf, targetLabel };
+})();
 var __panel = (function () {
 ${panel}
 return { WorkflowConfigEditorPanel, WorkflowConfigEditorIcon };
@@ -103,6 +114,14 @@ var __startModal = (function () {
 ${startSubmit}
 ${startModal}
 return { START_PROMPT_MAX_CHARS, START_MODAL_STYLES, normalizeStartPrompt, startCommandLineOf, canStartWorkflow, executeStartWorkflow, StartWorkflowButton };
+})();
+var __monitorView = (function () {
+${monitorView}
+return { PHASE_LABELS, RUN_STATUS_LABELS, monitorViewModel, monitorErrorState, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow };
+})();
+var __monitor = (function () {
+${monitor}
+return { MONITOR_STYLES, useMonitorPolling, WorkflowMonitorTab };
 })();
 ${index}
 return { PANEL_KEY, inject, apply }; } });\n`

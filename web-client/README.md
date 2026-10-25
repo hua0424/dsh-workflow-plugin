@@ -23,8 +23,10 @@
 - `src/rpc.js`：同源 RPC、超时与取消。
 - `src/start-submit.js`：启动命令组装/可用性闸门/结果分类纯函数（无 React 依赖，可单测）。
 - `src/start-modal.js`：会话归属原生 dialog 启动弹窗（有效/警告可选、无效禁用、上下文提示、提交闸门）。
+- `src/monitor-view.js`：#251 运行监控视图模型纯函数（payload → 信息条/节点行；可单测）。
+- `src/monitor.js`：#251 运行监控右侧栏 tab 组件（可见时 2s 轮询、失败横幅保留旧数据、只读展示）。
 
-使用 `node web-client/build.mjs [--out <目录>]` 生成宿主模块加载器 factory 格式产物。构建脚本只拼合本目录固定模块（含 `index`/`panel`/`styles`/`edits`/`rpc`/`start-submit`/`start-modal`），浏览器只 require 宿主 React，不打包第二份 React，不引入画图库依赖。源码属于纯 JS，不在根 tsconfig 编译范围内。
+使用 `node web-client/build.mjs [--out <目录>]` 生成宿主模块加载器 factory 格式产物。构建脚本只拼合本目录固定模块（含 `index`/`panel`/`styles`/`edits`/`rpc`/`start-submit`/`start-modal`/`monitor-view`/`monitor`），浏览器只 require 宿主 React，不打包第二份 React，不引入画图库依赖。源码属于纯 JS，不在根 tsconfig 编译范围内。
 
 `node scripts/deploy-web.mjs --out <临时目录>` 可验证完整插件产物；部署真实 profile 仍需显式授权。服务端变更前先运行 `pnpm run build`。
 

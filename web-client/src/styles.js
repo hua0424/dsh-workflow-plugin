@@ -99,6 +99,26 @@ export const EDITOR_STYLES = `
 }
 .wf-editor .wf-node-title:active { cursor: grabbing; }
 .wf-editor .wf-node-type { height: 28px; padding: 5px 12px; font-size: 11px; font-weight: 650; color: var(--wf-accent); background: var(--wf-accent-soft); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* #252 运行态叠加（监控只读画布；配置编辑器不传 decorations 时不出现）。 */
+.wf-editor .wf-node-state { height: 20px; padding: 1px 12px; font-size: 11px; font-weight: 650; color: var(--wf-muted); background: var(--wf-soft); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wf-editor .wf-node-detail { max-height: 18px; padding: 0 12px 2px; font-size: 10px; line-height: 16px; color: var(--wf-muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wf-editor .wf-node.wf-node-current { box-shadow: 0 0 0 2px #3b82f6, 0 6px 16px #3b82f622; }
+.wf-editor .wf-node.wf-node-blocked { box-shadow: 0 0 0 2px #dc2626, 0 6px 16px #dc262622; }
+.wf-editor .wf-node.wf-node-completed { opacity: .92; }
+.wf-editor .wf-node.wf-node-current .wf-node-state { color: #1d4ed8; background: #e8efff; }
+.wf-editor .wf-node.wf-node-blocked .wf-node-state { color: #b42336; background: #fff0f1; }
+.wf-editor .wf-node.wf-node-completed .wf-node-state { color: #0f766e; background: var(--wf-accent-soft); }
+.wf-editor .wf-node.wf-node-working .wf-node-state { color: #8a580f; background: #fff7e6; }
+.wf-editor .wf-node.wf-node-checking .wf-node-state { color: #1d4ed8; background: #e8efff; }
+.wf-editor .wf-node.wf-node-settling .wf-node-state { color: #6d28d9; background: #f3e8ff; }
+.wf-editor .wf-node.wf-node-ready .wf-node-state { opacity: .8; }
+/* #253 重做 visit：最新一次为第 N(>1) 次执行时用虚线边框 + 「第 N 次执行」详情区分首次。 */
+.wf-editor .wf-node.wf-node-redo { border-style: dashed; }
+.wf-editor .wf-node.wf-node-redo .wf-node-state { font-style: italic; }
+/* 只读画布：保留可读性，不显示禁用态的灰化与编辑光标。 */
+.wf-editor .wf-readonly .wf-node-title:disabled, .wf-editor .wf-readonly .wf-port:disabled, .wf-editor .wf-readonly .wf-return-marker:disabled { opacity: 1; cursor: default; }
+.wf-editor .wf-readonly .wf-node-title { cursor: default; }
+.wf-editor .wf-readonly .wf-port { cursor: default; }
 .wf-editor .wf-port-label { display: inline-block; margin-right: 6px; font-size: 10px; color: var(--wf-muted); font-weight: 400; }
 .wf-editor .wf-port {
   display: block; width: 100%; height: 32px; min-height: 32px; border: 0; border-radius: 0;

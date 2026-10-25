@@ -283,33 +283,35 @@ export function registerEditorRpc(ctx: { connection?: ConnectionService },
 ):
   | { status: 'registered'; dispose: () => Promise<void> }
   | { status: 'skipped-no-connection' } {
+  return registerConnectionRpc(ctx, EDITOR_RPC_CHANNEL, createEditorRpcHandler(deps))
+}
+
+/** 旧宿主回退路径的内部注册（通道/处理器由挂载主干提供，不对外暴露）。 */
+function registerConnectionRpc(ctx: { connection?: ConnectionService }, channel: string, handler: EditorRpcHandler):
+  | { status: 'registered'; dispose: () => Promise<void> }
+  | { status: 'skipped-no-connection' } {
   const connection = ctx.connection
   if (connection === undefined || typeof connection.rpc?.handle !== 'function') return { status: 'skipped-no-connection' }
-  const dispose = connection.rpc.handle(EDITOR_RPC_CHANNEL, createEditorRpcHandler(deps))
+  const dispose = connection.rpc.handle(channel, handler)
   return { status: 'registered', dispose }
 }
 
 /**
- * dsh v0.1.5-alpha.1+ 的正式安装路径：client-connection 的 inject 收缩为 ['credentials']，
- * `connection.rpc.handle()` 内部访问 owner.webServer 必抛 "cannot get property without
- * inject"（实测 2026-09-24，dsh-pocket lib/web-rpc.js 记录了同一坑）。因此优先把通道
- * 路由直接挂到**本插件自己 inject 的 webServer** 上，鉴权以方法形式调用
- * `connection.requestRejection(req)`（401/403 均由它判定，丢失 this 会 TypeError →
- * fail-closed 403）；wire 协议（client-request → handler → server-response）与
- * Connection /api 通道逐字段一致，浏览器客户端无需改动。
- * 旧版宿主（无 webServer 服务，如 headless）回退 `connection.rpc.handle`。
+ * 通道挂载主干（#251 起与编辑器共享）：优先把路由挂到本插件 inject 的 webServer
+ * （鉴权 requestRejection + httpBridge），旧宿主回退 `connection.rpc.handle`。
+ * installEditorRpc 即本函数以编辑器通道与 deps 的特化。
  */
-export function installEditorRpc(ctx: EditorWebCtx, deps: { listCatalog?: CatalogListSource } = {}):
+export function mountRpcChannel(ctx: EditorWebCtx, channel: string, handler: EditorRpcHandler):
   | { status: 'mounted'; dispose: () => void }
   | { status: 'fallback'; dispose: () => Promise<void> }
   | { status: 'skipped' } {
   const connection = ctx.connection
   const webServer = ctx.webServer
   if (connection !== undefined && webServer !== undefined && typeof webServer.register === 'function') {
-    const fetchHandler = editorFetchHandler(EDITOR_RPC_CHANNEL, createEditorRpcHandler(deps))
+    const fetchHandler = editorFetchHandler(channel, handler)
     const route: WebRoute = {
       kind: 'prefix',
-      path: EDITOR_RPC_CHANNEL,
+      path: channel,
       handler: async (req, res) => {
         let rejection: number | undefined = 403
         if (typeof connection.requestRejection === 'function') {
@@ -342,9 +344,26 @@ export function installEditorRpc(ctx: EditorWebCtx, deps: { listCatalog?: Catalo
         : () => {}
     return { status: 'mounted', dispose: cleanup }
   }
-  const fallback = registerEditorRpc(ctx, deps)
+  const fallback = registerConnectionRpc(ctx, channel, handler)
   if (fallback.status === 'registered') return { status: 'fallback', dispose: fallback.dispose }
   return { status: 'skipped' }
+}
+
+/**
+ * dsh v0.1.5-alpha.1+ 的正式安装路径：client-connection 的 inject 收缩为 ['credentials']，
+ * `connection.rpc.handle()` 内部访问 owner.webServer 必抛 "cannot get property without
+ * inject"（实测 2026-09-24，dsh-pocket lib/web-rpc.js 记录了同一坑）。因此优先把通道
+ * 路由直接挂到**本插件自己 inject 的 webServer** 上，鉴权以方法形式调用
+ * `connection.requestRejection(req)`（401/403 均由它判定，丢失 this 会 TypeError →
+ * fail-closed 403）；wire 协议（client-request → handler → server-response）与
+ * Connection /api 通道逐字段一致，浏览器客户端无需改动。
+ * 旧版宿主（无 webServer 服务，如 headless）回退 `connection.rpc.handle`。
+ */
+export function installEditorRpc(ctx: EditorWebCtx, deps: { listCatalog?: CatalogListSource } = {}):
+  | { status: 'mounted'; dispose: () => void }
+  | { status: 'fallback'; dispose: () => Promise<void> }
+  | { status: 'skipped' } {
+  return mountRpcChannel(ctx, EDITOR_RPC_CHANNEL, createEditorRpcHandler(deps))
 }
 
 /** 单请求体上限：业务文本上限 512KB，信封开销留余量。 */
