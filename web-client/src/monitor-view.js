@@ -118,7 +118,12 @@ function graphOf(run) {
       if (node.childWorkflowId !== undefined) execution.workflowId = node.childWorkflowId
       nodes[node.id] = { execution, results: node.results, onReturn: node.onReturn }
       const state = monitorNodeState(latest.get(`${id}/${node.id}`))
-      if (state !== null) decorations[node.id] = state
+      // #262：Actor 卡直接展示服务端算出的「当前生效模型」（只呈现，不重算 primary/manual/fallback）；
+      // 未执行节点同样有值，Program/Child 不伪造模型，缺字段由 modelTextOf 降级为空。
+      const modelText = node.kind === 'actor-task' ? modelTextOf(node.model) : ''
+      if (state !== null || modelText !== '') {
+        decorations[node.id] = modelText === '' ? state : { ...(state ?? {}), summary: modelText }
+      }
     }
     const positions = id === run.workflowId ? layout.main ?? {} : layout.children?.[id] ?? {}
     return {
