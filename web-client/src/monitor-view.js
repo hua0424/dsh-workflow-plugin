@@ -17,6 +17,60 @@ export const PHASE_LABELS = {
   exited: ['已完成', 'phase-exited'],
 }
 
+/**
+ * 单个工作单 → 画布节点叠加态（#252）：BLOCK 原因优先（引擎可能停在任一时相），
+ * 其次是当前焦点、终态完成、其余按 phase。无工作单返回 null（节点未运行）。
+ */
+export function monitorNodeState(execution) {
+  if (execution === null || execution === undefined) return null
+  const [phaseLabel, phaseClass] = phaseOf(execution.phase)
+  const blocked = typeof execution.blockReason === 'string' && execution.blockReason !== ''
+  if (blocked) return { className: 'wf-node-blocked', badge: 'BLOCK', detail: execution.blockReason, phaseClass }
+  if (execution.current === true) return { className: 'wf-node-current', badge: '当前', detail: '', phaseClass }
+  if (execution.phase === 'exited') return { className: 'wf-node-completed', badge: phaseLabel, detail: '', phaseClass }
+  return { className: `wf-node-${execution.phase}`, badge: phaseLabel, detail: '', phaseClass }
+}
+
+const EMPTY_LAYOUT = { version: 1, main: {}, children: {} }
+
+/**
+ * run 投影 → 画布模型（#252）：每个流程一份 def（nodes 为对象，NodeCanvas 形状）
+ * + 坐标（服务端布局；缺失由画布按网格补位）+ 每节点最新 visit 的叠加态。
+ * 当前焦点所在流程作为默认显示流程。
+ */
+function graphOf(run) {
+  const latest = new Map()
+  for (const node of run.nodes ?? []) {
+    const key = `${node.workflowId}/${node.nodeId}`
+    const previous = latest.get(key)
+    if (previous === undefined || node.visit > previous.visit) latest.set(key, node)
+  }
+  const layout = run.layout ?? EMPTY_LAYOUT
+  const flows = Object.entries(run.flows ?? {}).map(([id, flow]) => {
+    const nodes = {}
+    const decorations = {}
+    for (const node of flow.nodes ?? []) {
+      const execution = { type: node.kind }
+      if (node.role !== undefined) execution.role = node.role
+      if (node.programId !== undefined) execution.programId = node.programId
+      if (node.childWorkflowId !== undefined) execution.workflowId = node.childWorkflowId
+      nodes[node.id] = { execution, results: node.results, onReturn: node.onReturn }
+      const state = monitorNodeState(latest.get(`${id}/${node.id}`))
+      if (state !== null) decorations[node.id] = state
+    }
+    const positions = id === run.workflowId ? layout.main ?? {} : layout.children?.[id] ?? {}
+    return {
+      id,
+      label: id === run.workflowId ? '主流程' : `子流程 ${id}`,
+      def: { startNode: flow.startNode, returns: flow.returns ?? [], nodes },
+      positions,
+      decorations,
+    }
+  })
+  const currentFlowId = (run.nodes ?? []).find(node => node.current === true)?.workflowId ?? run.workflowId
+  return { layout, flows, currentFlowId }
+}
+
 /** status → 中文标签。 */
 export const RUN_STATUS_LABELS = {
   running: '运行中',
@@ -92,6 +146,7 @@ export function monitorViewModel(payload, options = {}) {
       businessReturn: run.businessReturn ? `${run.businessReturn.name}` : null,
       launchPrompt: run.launchPrompt ?? '',
       roles,
+      graph: graphOf(run),
     },
     nodes: nodes.map(node => {
       const [phaseLabel, phaseClass] = phaseOf(node.phase)

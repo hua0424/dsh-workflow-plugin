@@ -57,10 +57,11 @@ export function bundleSources() {
     .replace(/^import\s*\{[^}]*\}\s*from\s*['"]\.\/start-submit\.js['"];?/gm, '')
     .replace(/^export\s+/gm, '')
   const monitorView = read('monitor-view.js').replace(/^export\s+/gm, '')
-  const monitor = rewriteImports(rewriteImports(read('monitor.js'), 'react', "require('react')"), './monitor-view.js', '__monitorView')
+  const graphCanvas = rewriteImports(read('graph-canvas.js'), 'react', "require('react')").replace(/^export\s+/gm, '')
+  const monitor = rewriteImports(rewriteImports(rewriteImports(rewriteImports(read('monitor.js'), 'react', "require('react')"), './monitor-view.js', '__monitorView'), './graph-canvas.js', '__graphCanvas'), './styles.js', '__styles')
     .replace(/^export\s+/gm, '')
   const panel = rewriteImports(read('panel.js'), 'react', "require('react')")
-  const panelLinked = rewriteImports(rewriteImports(rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits'), './styles.js', '__styles'), './model-selector.js', '__modelSelector')
+  const panelLinked = rewriteImports(rewriteImports(rewriteImports(rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits'), './styles.js', '__styles'), './model-selector.js', '__modelSelector'), './graph-canvas.js', '__graphCanvas')
   const index = rewriteImports(rewriteImports(rewriteImports(rewriteImports(
     rewriteImports(rewriteImports(read('index.js'), './panel.js', '__panel'),
       './rpc.js',
@@ -74,6 +75,7 @@ export function bundleSources() {
     startSubmit,
     startModal,
     monitorView,
+    graphCanvas,
     monitor,
     panel: panelLinked.replace(/^export\s+/gm, ''),
     index: index.replace(/^export\s+/gm, ''),
@@ -81,7 +83,7 @@ export function bundleSources() {
 }
 
 export function buildClientBundle({ outDir } = {}) {
-  const { rpc, edits, styles, modelSelector, startSubmit, startModal, monitorView, monitor, panel, index } = bundleSources()
+  const { rpc, edits, styles, modelSelector, startSubmit, startModal, monitorView, graphCanvas, monitor, panel, index } = bundleSources()
   const bundle = `window.__ModuleLoader__.load({ id: ${JSON.stringify(PLUGIN_ID)}, factory: (require) => {
 var module = { exports: {} }; var exports = module.exports;
 var __rpc = (function () {
@@ -99,6 +101,10 @@ return { EDITOR_STYLES };
 var __modelSelector = (function () {
 ${modelSelector}
 return { ModelFields, modelChoices, readModelCatalog };
+})();
+var __graphCanvas = (function () {
+${graphCanvas}
+return { NodeCanvas, nodeSummary, portsOf, targetLabel };
 })();
 var __panel = (function () {
 ${panel}

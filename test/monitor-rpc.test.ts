@@ -3,7 +3,7 @@
 // 视图模型纯函数与 bundle 注册断言在 test/monitor-view.test.ts。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ClaimCaller, WorkflowConfig } from '../src/types.ts'
@@ -11,6 +11,8 @@ import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { createMonitorRpcHandler, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
+import { readRunLayout } from '../src/monitor/layout.ts'
+import type { EditorLayout } from '../src/editor/layout.ts'
 
 const config: WorkflowConfig = {
   schemaVersion: 'agent-workflow/v3', roles: { reviewer: { persona: 'Review', model: { provider: 'prov', modelId: 'm-review' } } }, judgeRole: { persona: 'Read only' },
@@ -51,11 +53,12 @@ function harness() {
 }
 
 /** 显式传 workspace key 形状的 cwd：服务端只按请求上行解析，不再回退 process.cwd。 */
-function handlerOf(h: ReturnType<typeof harness>) {
+function handlerOf(h: ReturnType<typeof harness>, layout?: EditorLayout) {
   return createMonitorRpcHandler({
     maintenance: () => undefined,
     status: async cwd => h.store.get(cwd ?? 'ws'),
     executions: async cwd => h.store.runExecutions(cwd ?? 'ws'),
+    layout: async () => layout,
   })
 }
 
@@ -122,6 +125,66 @@ test('#251 status：活跃 Run → 完整只读投影（节点/角色模型/图/
   } finally { h.cleanup() }
 })
 
+test('#252 status：布局坐标随 payload 返回（缺失补网格）且不改写输入', async () => {
+  const h = harness()
+  try {
+    await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')
+    const layout: EditorLayout = { version: 1, main: { plan: { x: 10, y: 20 } }, children: {} }
+    const before = JSON.parse(JSON.stringify(layout)) as EditorLayout
+    const result = await handlerOf(h, layout)('status', { cwd: 'ws' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
+    assert.deepEqual(payload.run!.layout.main.plan, { x: 10, y: 20 })
+    // 缺失的 review 按网格第 2 位补位（fillMissingPositions 只改副本）。
+    assert.deepEqual(payload.run!.layout.main.review, { x: 260, y: 40 })
+    assert.deepEqual(layout, before, '输入布局对象不被原地补位改写')
+    // 结果端口随图返回，供只读画布绘制结果端口与连线。
+    const plan = payload.run!.flows.test.nodes.find(node => node.id === 'plan')!
+    assert.deepEqual(plan.results, { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } })
+  } finally { h.cleanup() }
+})
+
+test('#252 status：平铺布局经真实读取进入 payload（与编辑器同路径）', async () => {
+  const h = harness()
+  try {
+    await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')
+    mkdirSync(join(h.home, 'workflows'), { recursive: true })
+    writeFileSync(join(h.home, 'workflows', 'test.layout.json'), JSON.stringify({ version: 1, main: { plan: { x: 7, y: 8 } }, children: {} }))
+    const handler = createMonitorRpcHandler({
+      maintenance: () => undefined,
+      status: async cwd => h.store.get(cwd ?? 'ws'),
+      executions: async cwd => h.store.runExecutions(cwd ?? 'ws'),
+      layout: async workflowId => readRunLayout(h.home, workflowId),
+    })
+    const result = await handler('status', { cwd: 'ws' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
+    assert.deepEqual(payload.run!.layout.main.plan, { x: 7, y: 8 }, '平铺布局被 status 读到')
+  } finally { h.cleanup() }
+})
+
+test('#252 status：启动后变更配置对象/磁盘 YAML，冻结图不变（AC4）', async () => {
+  const h = harness()
+  try {
+    const launched = structuredClone(config)
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', launched, 'hash'), undefined, '受控启动请求')).ok, true)
+    const first = await handlerOf(h)('status', { cwd: 'ws' })
+    const payload = first.value as Extract<typeof first.value, { mode: 'run' }>
+    const frozenFlows = structuredClone(payload.run!.flows)
+    // 启动后深改内存配置：结果目标、角色模型、节点清单都应只影响后续启动的 Run。
+    launched.workflow.nodes.plan.results.succeeded.target = { return: 'done' }
+    launched.roles.reviewer.model!.modelId = 'm-mutated'
+    launched.workflow.nodes.extra = { execution: { type: 'actor-task', role: 'reviewer', instruction: 'x' }, checker: { checkerId: 'judge.claim-correct', config: { criteria: 'x' } }, results: { succeeded: { criteria: 'x', target: { return: 'done' } } } }
+    // 启动后改写磁盘 YAML：status 只读 Run 的冻结快照，不重新加载 catalog。
+    mkdirSync(join(h.home, 'workflows'), { recursive: true })
+    writeFileSync(join(h.home, 'workflows', 'test.yaml'), 'schemaVersion: agent-workflow/v3\nworkflow:\n  startNode: extra\n')
+    const second = await handlerOf(h)('status', { cwd: 'ws' })
+    const after = second.value as Extract<typeof second.value, { mode: 'run' }>
+    assert.deepEqual(after.run!.flows, frozenFlows, 'flows 与启动时冻结快照一致')
+    assert.equal(after.run!.roles.find(role => role.role === 'reviewer')!.model.modelId, 'm-review')
+  } finally { h.cleanup() }
+})
+
 test('#251 status：BLOCK 原因透出（run 级 + 节点级）', async () => {
   const h = harness()
   try {
@@ -173,6 +236,7 @@ test('#251 status：cwd 原样透传，缺省不猜宿主 process.cwd（F4）', 
     maintenance: () => undefined,
     status: async cwd => { seen.push(cwd); return undefined },
     executions: async cwd => { seen.push(cwd); return [] },
+    layout: async () => undefined,
   })
   assert.deepEqual(await handler('status', {}), { ok: true, value: { mode: 'empty' } })
   assert.deepEqual(await handler('status', { cwd: 'D:/ws' }), { ok: true, value: { mode: 'empty' } })
@@ -185,6 +249,7 @@ test('#251 status：维护诊断短路，不触碰状态库', async () => {
     maintenance: () => ({ kind: 'incompatible', path: '/tmp/state.sqlite3', userVersion: 1, tables: ['runs'], reason: 'incompatible state format (user_version=1); original data retained' }),
     status: async () => { touched.push('status'); return undefined },
     executions: async () => { touched.push('executions'); return [] },
+    layout: async () => { touched.push('layout'); return undefined },
   })
   const result = await handler('status', {})
   assert.equal(result.ok, true)

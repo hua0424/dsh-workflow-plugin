@@ -13,12 +13,20 @@ const RUN_PAYLOAD = {
     runId: 'r1', workflowId: 'test', status: 'running', blockReason: null,
     businessReturn: null, launchPrompt: '启动原文',
     roles: [{ role: 'reviewer', model: { provider: 'prov', modelId: 'm-review' } }],
-    flows: { test: { startNode: 'plan', returns: ['done'], nodes: [
-      { id: 'plan', kind: 'actor-task', role: 'manager', model: { provider: 'prov', modelId: 'm-plan' } },
-      { id: 'review', kind: 'actor-task', role: 'reviewer', model: { provider: 'prov', modelId: 'm-review' } },
-      { id: 'report', kind: 'builtin-program', programId: 'write-report' },
-      { id: 'child', kind: 'child-workflow', childWorkflowId: 'sub' },
-    ] } },
+    flows: {
+      test: { startNode: 'plan', returns: ['done'], nodes: [
+        { id: 'plan', kind: 'actor-task', role: 'manager', model: { provider: 'prov', modelId: 'm-plan' }, results: { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } } },
+        { id: 'review', kind: 'actor-task', role: 'reviewer', model: { provider: 'prov', modelId: 'm-review' } },
+        { id: 'report', kind: 'builtin-program', programId: 'write-report' },
+        { id: 'child', kind: 'child-workflow', childWorkflowId: 'sub', onReturn: { out: { return: 'done' } } },
+      ] },
+      sub: { startNode: 's1', returns: ['out'], nodes: [{ id: 's1', kind: 'actor-task', role: 'reviewer' }] },
+    },
+    layout: {
+      version: 1,
+      main: { plan: { x: 40, y: 40 }, review: { x: 260, y: 40 }, report: { x: 480, y: 40 }, child: { x: 700, y: 40 } },
+      children: { sub: { s1: { x: 40, y: 40 } } },
+    },
     nodes: [
       { workflowId: 'test', nodeId: 'plan', executionId: 'e1', visit: 1, revision: 3, phase: 'exited', blockReason: null, enteredAt: STARTED_AT, exitedAt: '2026-10-25T04:01:00.000Z', current: false },
       { workflowId: 'test', nodeId: 'review', executionId: 'e2', visit: 2, revision: 1, phase: 'working', blockReason: '等待授权', enteredAt: '2026-10-25T04:01:00.000Z', exitedAt: null, current: true },
@@ -48,6 +56,26 @@ test('#251 monitorViewModel：run 投影（信息条/角色模型/节点行/焦�
   assert.equal(view.nodes[1].blockReason, '等待授权')
   // F3：引擎 BLOCK 不改 phase，checking 相上的原因同样可见。
   assert.equal(view.nodes[2].blockReason, '审查超时')
+})
+
+test('#252 monitorViewModel：运行图模型（节点 decoration/布局/子流程/焦点流程）', () => {
+  const graph = monitorViewModel(RUN_PAYLOAD).run.graph
+  assert.equal(graph.currentFlowId, 'test')
+  assert.deepEqual(graph.flows.map(flow => flow.id), ['test', 'sub'])
+  const main = graph.flows[0]
+  // 冻结布局坐标随图下发；节点定义保留结果端口/Child 映射。
+  assert.deepEqual(main.positions.plan, { x: 40, y: 40 })
+  assert.deepEqual(main.def.nodes.plan.results, { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } })
+  assert.deepEqual(main.def.nodes.child.onReturn, { out: { return: 'done' } })
+  // 历史 visit 只装饰最新一次执行；phase + BLOCK 原因 + 焦点合成只读样式。
+  assert.equal(main.decorations.plan.badge, PHASE_LABELS.exited[0])
+  assert.equal(main.decorations.review.badge, 'BLOCK')
+  assert.equal(main.decorations.review.className, 'wf-node-blocked')
+  assert.equal(main.decorations.review.detail, '等待授权')
+  // 子流程单独成图，坐标来自 children 表，无执行时无装饰。
+  const sub = graph.flows[1]
+  assert.deepEqual(sub.positions.s1, { x: 40, y: 40 })
+  assert.deepEqual(sub.decorations, {})
 })
 
 test('#251 monitorViewModel：empty / maintenance / 加载中 / blocked 状态', () => {
@@ -124,4 +152,10 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   assert.match(bundle, /scope\?\.cwd/)
   // 保留编辑器通道静态注册（未装 better-sidebar 时配置编辑器照常）。
   assert.match(bundle, /PANEL_KEY/)
+  // #252 画布复用：NodeCanvas 与编辑器样式打进同一个 bundle（监控不重复实现画布）。
+  assert.match(bundle, /__graphCanvas/)
+  assert.match(bundle, /function NodeCanvas/)
+  assert.match(bundle, /wf-node-blocked/)
+  // 宿主 client bundle 不做 JSX 转译：产物必须是可直接解析的纯 JS（#252 发现 #251 JSX 隐患）。
+  assert.doesNotThrow(() => new Function(bundle), 'bundle 必须是可解析的纯 JS')
 })

@@ -24,6 +24,7 @@ import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
 import { installEditorRpc, mountRpcChannel } from './editor/rpc.ts'
 import { MONITOR_RPC_CHANNEL, createMonitorRpcHandler } from './monitor/rpc.ts'
+import { readRunLayout } from './monitor/layout.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, managerRouteOf, programHost, type HostAdapters } from './plugin/host.ts'
 import { RolePresetBook } from './plugin/presets.ts'
@@ -473,6 +474,8 @@ export function apply(ctx: Context) {
           const ws = await monitorWorkspace(cwd)
           return ws === undefined ? [] : store().runExecutions(ws)
         },
+        // #252：坐标与配置同目录，只读；缺失/损坏回退网格补位，不影响 status。
+        layout: workflowId => readRunLayout(home, workflowId),
       }))
       if (monitor.status !== 'skipped') disposeEditorRpcFns.push(monitor.dispose)
     })
