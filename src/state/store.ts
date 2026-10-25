@@ -213,6 +213,22 @@ export class StateStore {
     return this.enqueue(() => (this.db.prepare('SELECT * FROM runs WHERE sequence IN (SELECT MAX(sequence) FROM runs GROUP BY workspace_key) ORDER BY sequence').all() as unknown as RunRow[]).map(row => this.decode(row)))
   }
 
+  /** #251 只读：最新 Run 的全部工作单快照（含历史 visit），按 visit 升序。 */
+  runExecutions(workspaceKey: string): Promise<NodeExecution[]> {
+    return this.enqueue(() => {
+      const row = this.latest(workspaceKey)
+      if (!row) return []
+      const run = this.decodeRun(row)
+      const rows = this.db.prepare('SELECT execution_id, run_id, visit, revision, snapshot_json FROM node_executions WHERE run_id = ? ORDER BY visit').all(row.run_id) as unknown as ExecutionRow[]
+      return rows.map(r => {
+        const execution = parse<NodeExecution>(r.snapshot_json)
+        assertValid(checkExecutionInvariants(run, execution))
+        if (execution.executionId !== r.execution_id || execution.runId !== r.run_id || execution.visit !== r.visit || execution.revision !== r.revision) throw new Error('corrupt execution columns/snapshot mismatch')
+        return execution
+      })
+    })
+  }
+
   execution(workspaceKey: string, executionId: string): Promise<NodeExecution | undefined> {
     return this.enqueue(() => {
       const row = this.runRowForExecution(workspaceKey, executionId)

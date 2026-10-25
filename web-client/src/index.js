@@ -14,10 +14,15 @@
  */
 import { WorkflowConfigEditorIcon, WorkflowConfigEditorPanel } from './panel.js'
 import { StartWorkflowButton } from './start-modal.js'
-import { callEditor, readWorkflowCatalog } from './rpc.js'
+import { WorkflowMonitorTab, MONITOR_STYLES } from './monitor.js'
+import { callChannel, callEditor, readWorkflowCatalog } from './rpc.js'
 import { readModelCatalog } from './model-selector.js'
 
 export const PANEL_KEY = 'workflow-config-editor'
+
+/** #251 运行监控 tab：通道与 tab id（独立于编辑器通道，ADR-0005）。 */
+export const MONITOR_RPC_CHANNEL = '/workflow-run-monitor'
+export const MONITOR_TAB_ID = 'dsh-workflow:monitor'
 
 /** 对话输入工具区启动按钮注册（session-scoped list，不替换 composer）。 */
 export const START_BUTTON_ID = 'dsh-workflow-start'
@@ -60,4 +65,18 @@ export function apply(ctx) {
       WorkflowConfigEditorIcon,
     ),
   )
+
+  // #251 运行监控 tab：动态注入——等待 better-sidebar 服务出现后注册；未安装
+  // better-sidebar 的环境注入永不触发，tab 静默缺席，编辑器面板照常加载。
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['better-sidebar'], (sidebarCtx) => {
+      const sidebar = sidebarCtx?.betterSidebar ?? sidebarCtx?.['better-sidebar']
+      if (typeof sidebar?.registerTab !== 'function') return
+      const fetchStatus = () => callChannel(ctx.connection, MONITOR_RPC_CHANNEL, 'status', {})
+      sidebar.registerTab(
+        { id: MONITOR_TAB_ID, label: '工作流监控', styles: MONITOR_STYLES },
+        (props) => WorkflowMonitorTab({ ...props, fetchStatus }),
+      )
+    })
+  }
 }
