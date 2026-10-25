@@ -1,10 +1,12 @@
 /**
  * #251 运行监控右侧栏 tab 组件：可见时每 2s 轮询 status，不可见暂停；
  * RPC 失败显示横幅并保留上一次成功数据，恢复后自动清横幅继续轮询。
+ * #261：轮询上下文 = (scope.cwd, 选定 runId)，切目录/切 Run/重新可见都重建周期，
+ * 旧上下文的在途响应一律丢弃；终态 Run 停周期，另给只读「刷新状态」入口。
  * 只读展示：run 信息条 + 启动 prompt 展开 + 节点列表；无任何控制入口（ADR-0005）。
  */
 import { createElement as h, useState, useEffect, useRef } from 'react'
-import { monitorViewModel, monitorErrorState, initialFollowState, monitorFollowView, selectFlow, resumeFollow } from './monitor-view.js'
+import { monitorViewModel, monitorErrorState, monitorPollingContinues, initialFollowState, monitorFollowView, selectFlow, resumeFollow } from './monitor-view.js'
 import { NodeCanvas } from './graph-canvas.js'
 import { EDITOR_STYLES } from './styles.js'
 
@@ -47,61 +49,125 @@ export const MONITOR_STYLES = `
 .wf-monitor-guidance { background: rgba(128,128,128,0.12); border-radius: 6px; padding: 8px; white-space: pre-wrap; }
 .wf-monitor-terminal-note { color: #9fc8ff; font-size: 12px; }
 .wf-monitor-maintenance { white-space: pre-wrap; }
+/* #261 只读刷新入口：终态停周期后由用户决定何时重新读取。 */
+.wf-monitor-toolbar { display: flex; justify-content: flex-end; }
+.wf-monitor-refresh { padding: 2px 8px; font-size: 12px; }
 `
 
-/** 轮询驱动（抽出便于测试）：visible=false 或页面隐藏时暂停；runId 变化重置数据并重启周期。 */
-export function useMonitorPolling(fetchStatus, enabled, runId = null, shouldContinue = () => true) {
-  const [data, setData] = useState(null)
-  const [banner, setBanner] = useState('')
-  // 轮询不离散：scope.cwd 变化时更新闭包，但不重启 2s 周期（R1 F4）。
-  const fetchRef = useRef(fetchStatus)
-  const continueRef = useRef(shouldContinue)
-  const lastRunId = useRef(runId)
-  useEffect(() => { fetchRef.current = fetchStatus }, [fetchStatus])
-  useEffect(() => { continueRef.current = shouldContinue })
-  useEffect(() => {
-    if (!enabled) return undefined
-    // 切换 Run：清掉旧 Run 的数据/横幅，首轮结果回来前显示加载态（不串台）。
-    if (lastRunId.current !== runId) { lastRunId.current = runId; setData(null); setBanner('') }
-    let disposed = false
-    let timer
-    const tick = async () => {
-      if (document.visibilityState === 'visible') {
-        try {
-          const result = await fetchRef.current(runId)
-          if (disposed) return
-          if (result?.ok) {
-            setData(result.value)
-            setBanner('')
-            // 终态/维护态：本轮后停止轮询；空态继续轮询，外部启动新 Run 后自动出现（R1 F2）。
-            if (!continueRef.current(result.value)) return
-          } else { setBanner(prev => monitorErrorState(prev, result?.error?.message ?? String(result?.error?.code ?? 'monitor failed'))) }
-        } catch (error) {
-          if (!disposed) setBanner(prev => monitorErrorState(prev, String(error)))
-        }
-      }
-      if (!disposed) timer = setTimeout(tick, POLL_INTERVAL_MS)
-    }
-    tick()
-    return () => { disposed = true; clearTimeout(timer) }
-  }, [enabled, runId])
-  return { data, banner }
+/** 轮询上下文键：cwd + 选定 runId 决定一个独立读取周期；用值而非函数身份，重渲染不重启周期（#261）。 */
+function pollContextKey(cwd, runId) {
+  return `${cwd ?? ''}\u0000${runId ?? ''}`
 }
 
-export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
-  const [selectedRunId, setSelectedRunId] = useState(null)
+const IDLE_POLL_STATE = { key: null, data: null, banner: '', refreshing: false }
+
+/**
+ * 轮询驱动（抽出便于测试），上下文 = (scope.cwd, 选定 runId)：
+ * - 可见时每 2s 读取；document 隐藏期间不发请求；终态停周期，运行中/BLOCK/空态/维护态继续。
+ * - 上下文变化、tab 隐藏或卸载时旧在途响应一律丢弃：不写数据/横幅，也不启停别人的定时器。
+ * - refresh()：只读手动刷新，同上下文在途请求合并；返回活跃/空态/维护态后恢复周期。
+ * - 数据与横幅带上下文键：切目录/切 Run 的当次渲染就读不到旧目录数据（不等 effect 擦除）。
+ */
+export function useMonitorPolling(fetchStatus, options = {}) {
+  const enabled = options.enabled !== false
+  const cwd = typeof options.cwd === 'string' ? options.cwd : null
+  const runId = typeof options.runId === 'string' ? options.runId : null
+  const key = pollContextKey(cwd, runId)
+  const [state, setState] = useState({ ...IDLE_POLL_STATE, key })
+  const fetchRef = useRef(fetchStatus)
+  const refreshRef = useRef(null)
+  // 每次渲染新建的闭包只更新引用，不参与周期依赖（R1 F4：函数身份不重启轮询）。
+  useEffect(() => { fetchRef.current = fetchStatus }, [fetchStatus])
+  useEffect(() => {
+    if (!enabled) { refreshRef.current = null; return undefined }
+    let disposed = false
+    let timer
+    let busy = false
+    const hidden = () => typeof document !== 'undefined' && document.visibilityState === 'hidden'
+    const stop = () => { if (timer !== undefined) { clearTimeout(timer); timer = undefined } }
+    const schedule = () => { stop(); if (!disposed) timer = setTimeout(tick, POLL_INTERVAL_MS) }
+    const read = async (manual) => {
+      if (disposed) return
+      // 同上下文在途刷新合并成一次，不叠加请求；手动点击在结果回来前给按钮即时反馈。
+      if (manual) setState(prev => (prev.key === key ? { ...prev, refreshing: true } : prev))
+      if (busy) return
+      stop()
+      busy = true
+      let payload
+      let errorText = ''
+      try {
+        const result = await fetchRef.current(runId)
+        if (result?.ok) payload = result.value
+        else errorText = String(result?.error?.message ?? result?.error?.code ?? 'monitor failed')
+      } catch (error) {
+        errorText = String(error)
+      }
+      // 卸载或上下文已切换（本周期被 dispose）：旧响应静默丢弃。
+      if (disposed) return
+      busy = false
+      if (payload !== undefined) {
+        setState({ key, data: payload, banner: '', refreshing: false })
+        // 终态停周期；其余模式继续（维护态恢复、空态等新 Run 都靠它自愈，见 monitorPollingContinues）。
+        if (!monitorPollingContinues(payload)) return
+      } else {
+        // 失败：只保留同一上下文最后成功数据，横幅提示，下一轮自动重试。
+        setState(prev => ({
+          key,
+          data: prev.key === key ? prev.data : null,
+          banner: monitorErrorState(prev.key === key ? prev.banner : '', errorText),
+          refreshing: false,
+        }))
+      }
+      schedule()
+    }
+    const tick = () => {
+      if (disposed) return
+      // 页面隐藏：不发请求，保留周期让回到可见后自愈（visibilitychange 另外立即读一次）。
+      if (hidden()) { schedule(); return }
+      void read(false)
+    }
+    // 重新可见读一次：隐藏期或在途时不叠加；终态上下文的这次读取只是复用同一周期规则。
+    const wake = () => { if (disposed || busy || hidden()) return; void read(false) }
+    refreshRef.current = () => { if (!disposed) void read(true) }
+    if (typeof document !== 'undefined') document.addEventListener('visibilitychange', wake)
+    void read(false)
+    return () => {
+      disposed = true
+      refreshRef.current = null
+      stop()
+      if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', wake)
+    }
+  }, [enabled, key])
+  const current = state.key === key ? state : IDLE_POLL_STATE
+  return {
+    data: current.data,
+    banner: current.banner,
+    refreshing: current.refreshing,
+    refresh: () => { const invoke = refreshRef.current; if (invoke !== null) invoke() },
+  }
+}
+
+export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
+  // 目录只来自 tab scope.cwd；缺席/空串不回退宿主 process.cwd（R1 F4）。
+  const cwd = typeof scope?.cwd === 'string' && scope.cwd !== '' ? scope.cwd : null
+  // 选择与目录绑在一起：cwd 变化即回到「当前目录（默认）」，不等 effect 事后纠正（#261）。
+  const [selection, setSelection] = useState({ cwd, runId: null })
+  const selectedRunId = selection.cwd === cwd ? selection.runId : null
   const [promptOpen, setPromptOpen] = useState(false)
   const [follow, setFollow] = useState(initialFollowState)
-  // 终态/空态/维护态返回后不再排下一轮（#254：终态 Run 停止轮询）。
-  const { data, banner } = useMonitorPolling(runId => fetchStatus(runId), visible !== false, selectedRunId,
-    payload => payload?.mode !== 'maintenance' && payload?.run?.terminal !== true)
-  const view = monitorViewModel(data, { banner, selectedRunId })
-  // 切换 Run：跟随状态回到默认跟随（手动流程选择不跨 Run 复用）。
-  useEffect(() => { setFollow(initialFollowState()) }, [selectedRunId])
-  // 选中的 Run 失效/回退到 cwd 默认：清掉选择，避免切换器值悬空。
-  useEffect(() => {
-    if (selectedRunId !== null && data?.run && data.run.runId !== selectedRunId && !(data.runs ?? []).some(ref => ref.runId === selectedRunId)) setSelectedRunId(null)
-  }, [data, selectedRunId])
+  // 维护态继续探测、终态停周期、只读手动刷新都在 hook 里（#261）。
+  const { data, banner, refreshing, refresh } = useMonitorPolling(
+    runId => fetchStatus(runId),
+    { enabled: visible !== false, cwd, runId: selectedRunId },
+  )
+  const view = monitorViewModel(data, { banner })
+  const returnedRunId = view.mode === 'run' || view.mode === 'terminal' ? view.run.runId : null
+  // 实际返回的 Run 变化（新 Run / 切目录 / 刷新到别的 Run）：跟随与手动流程选择回到默认。
+  useEffect(() => { setFollow(initialFollowState()) }, [returnedRunId, cwd])
+  // 选中的 Run 失效/回退到 cwd 默认：清掉选择，避免切换器值悬空（loading/维护态下保留选择）。
+  const selectionLost = selectedRunId !== null && view.mode !== 'loading' && view.mode !== 'maintenance'
+    && !view.runs.some(ref => ref.runId === selectedRunId)
+  useEffect(() => { if (selectionLost) setSelection({ cwd, runId: null }) }, [selectionLost, cwd])
   // 横幅在全部模式（loading/maintenance/empty/run）都渲染：首轮失败必须可见（R1 F5）。
   const bannerEl = view.banner !== ''
     ? h('div', { className: 'wf-monitor-banner' }, `状态刷新失败（保留上次数据）：${view.banner}`)
@@ -109,13 +175,23 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   // 宿主 client bundle 不做 JSX 转译：统一 createElement（与 panel.js 同约定）。
   // better-sidebar 的 descriptor 不支持 styles 字段，样式随组件内联注入。
   const styleEl = h('style', null, MONITOR_STYLES)
-  const frame = (...children) => h('div', { className: 'wf-monitor' }, styleEl, bannerEl, ...children)
+  // 只读「刷新状态」：每个模式都可用；终态停周期后这是发现同目录新 Run 的唯一入口（#261）。
+  const refreshEl = h('div', { className: 'wf-monitor-toolbar' },
+    h('button', {
+      type: 'button',
+      className: 'wf-monitor-refresh',
+      disabled: refreshing,
+      'aria-busy': refreshing ? 'true' : 'false',
+      title: '只读刷新：重新读取当前目录的运行状态，不启动也不停止 Run',
+      onClick: () => refresh(),
+    }, refreshing ? '正在刷新…' : '刷新状态'))
+  const frame = (...children) => h('div', { className: 'wf-monitor' }, styleEl, bannerEl, refreshEl, ...children)
   // #254 切换器：默认「当前目录」，另列全部活跃 Run（跨 workspace）；选中项变化即重置轮询/跟随。
   const switcher = view.runs.length === 0 ? null : h('label', { className: 'wf-monitor-switcher' },
     '运行：',
     h('select', {
       value: selectedRunId ?? '',
-      onChange: event => setSelectedRunId(event.target.value === '' ? null : event.target.value),
+      onChange: event => setSelection({ cwd, runId: event.target.value === '' ? null : event.target.value }),
       'aria-label': '切换运行',
     },
     h('option', { value: '' }, '当前目录（默认）'),
@@ -130,7 +206,6 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
     return frame(
       switcher,
       h('div', { className: 'wf-monitor-guidance' }, view.guidance ?? '当前目录没有工作流运行记录。'),
-      view.recent === null ? null : h('div', { className: 'wf-monitor-muted' }, `当前目录最近一次终态 Run：${view.recent.label} · ${view.recent.statusLabel}`),
     )
   }
   const run = view.run
@@ -144,13 +219,15 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   return h('div', { className: 'wf-monitor' },
     styleEl,
     bannerEl,
+    refreshEl,
     switcher,
     h('div', null,
       h('span', { className: `wf-monitor-status ${run.statusClass}` }, run.statusLabel),
       run.blockReason ? h('span', { className: 'wf-node-block' }, ` — ${run.blockReason}`) : null,
       run.businessReturn ? h('span', { className: 'wf-monitor-muted' }, ` · 返回：${run.businessReturn}`) : null,
     ),
-    run.terminalNote ? h('div', { className: 'wf-monitor-muted' }, run.terminalNote) : null,
+    // 终态提示在视图模型顶层（view.terminalNote），历史上误读 run.terminalNote 导致从不渲染（#261 修正）。
+    view.terminalNote ? h('div', { className: 'wf-monitor-muted' }, view.terminalNote) : null,
     h('div', { className: 'wf-monitor-muted' },
       h('div', null, `工作流：${run.workflowId} · Run：${run.runId}`),
       h('div', null, `开始：${run.startedAtText ?? '—'} · ${run.durationLabel}：${run.durationText ?? '—'}`),

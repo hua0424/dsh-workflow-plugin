@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildClientBundle } from '../web-client/build.mjs'
-import { monitorViewModel, monitorErrorState, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, PHASE_LABELS } from '../web-client/src/monitor-view.js'
+import { monitorViewModel, monitorErrorState, monitorPollingContinues, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, PHASE_LABELS } from '../web-client/src/monitor-view.js'
 
 const STARTED_AT = '2026-10-25T04:00:00.000Z'
 
@@ -81,6 +81,41 @@ test('#252 monitorViewModel：运行图模型（节点 decoration/布局/子流�
   assert.deepEqual(sub.decorations, {})
 })
 
+test('#262 图卡生效模型：主/子流程、未执行节点同一规则，Program/Child 不伪造', () => {
+  const graph = monitorViewModel(RUN_PAYLOAD).run.graph
+  const [main, sub] = graph.flows
+  // 已执行与未执行节点都取冻结图的「当前生效模型」（不冒充历史实际调用模型）。
+  assert.deepEqual(main.def.nodes.plan.execution, { type: 'actor-task', role: 'manager' })
+  assert.equal(main.decorations.plan.summary, 'prov/m-plan')
+  assert.equal(main.decorations.review.summary, 'prov/m-review')
+  // Program/Child 只保留程序/子流程目标，不追加 Actor 模型。
+  assert.equal(main.decorations.report?.summary, undefined)
+  assert.equal(main.decorations.child?.summary, undefined)
+  assert.deepEqual(main.def.nodes.report.execution, { type: 'builtin-program', programId: 'write-report' })
+  assert.deepEqual(main.def.nodes.child.execution, { type: 'child-workflow', workflowId: 'sub' })
+  // 子流程同一规则；actor 缺 model（旧 payload/harness）时不制造未知 provider，也不臆造状态徽标。
+  assert.equal(sub.decorations.s1, undefined)
+
+  const withSubModel = structuredClone(RUN_PAYLOAD)
+  withSubModel.run.flows.sub.nodes[0].model = { provider: 'prov', modelId: 'm-sub' }
+  const subDecor = monitorViewModel(withSubModel).run.graph.flows[1].decorations.s1
+  assert.equal(subDecor.summary, 'prov/m-sub')
+  assert.equal(subDecor.badge, undefined)
+
+  // 服务端 override/fallback 的新 payload 到达即替换旧文本；客户端只呈现，不自行推导优先级。
+  const overridden = structuredClone(RUN_PAYLOAD)
+  overridden.run.flows.test.nodes[1].model = { provider: 'prov2', modelId: 'm-review-b', reasoningEffort: 'high' }
+  assert.equal(monitorViewModel(overridden).run.graph.flows[0].decorations.review.summary, 'prov2/m-review-b')
+
+  // provider/modelId 部分缺席：只渲染存在的段，不补假值。
+  const partial = structuredClone(RUN_PAYLOAD)
+  partial.run.flows.test.nodes[0].model = { modelId: 'm-only' }
+  partial.run.flows.test.nodes[1].model = {}
+  const partialMain = monitorViewModel(partial).run.graph.flows[0]
+  assert.equal(partialMain.decorations.plan.summary, 'm-only')
+  assert.equal(partialMain.decorations.review.summary, undefined)
+})
+
 test('#253 monitorCallPath：多层调用栈投影为可点击路径，递归同名流程按帧保留', () => {
   const payload = {
     ...RUN_PAYLOAD,
@@ -135,44 +170,64 @@ test('#253 重做 visit：第二次及以上标记 redo 并展示「第 N 次执
   assert.equal(redo.phaseClass, 'phase-working')
 })
 
-test('#254 monitorViewModel：活跃 Run 切换器 + cwd 最近终态', () => {
+test('#254 monitorViewModel：活跃 Run 切换器（#263 已删除 recent 摘要链）', () => {
   const refA = { runId: 'r1', workspaceKey: 'D:/ws/alpha', workflowId: 'test', status: 'running' }
   const refB = { runId: 'r2', workspaceKey: 'D:\\ws\\beta', workflowId: 'other', status: 'blocked' }
-  const view = monitorViewModel({ ...RUN_PAYLOAD, runs: [refA, refB], recent: { runId: 'r0', workspaceKey: 'D:/ws/alpha', workflowId: 'test', status: 'completed' } })
+  const view = monitorViewModel({ ...RUN_PAYLOAD, runs: [refA, refB] })
   assert.equal(view.mode, 'run')
   assert.equal(view.polling, true)
-  assert.deepEqual(view.runs.map(ref => [ref.runId, ref.workspaceLabel, ref.label, ref.statusLabel, ref.selected]), [
-    ['r1', 'alpha', 'alpha · test', '运行中', true],
-    ['r2', 'beta', 'beta · other', '已阻塞', false],
+  assert.deepEqual(view.runs.map(ref => [ref.runId, ref.label, ref.statusLabel]), [
+    ['r1', 'alpha · test', '运行中'],
+    ['r2', 'beta · other', '已阻塞'],
   ])
-  assert.equal(view.recent.runId, 'r0')
-  assert.equal(view.recent.statusLabel, '已完成')
-  // 切换器显式选中其他 Run：selected 标记跟随；未在活跃清单里的当前 Run 补一项避免值悬空。
-  const picked = monitorViewModel({ ...RUN_PAYLOAD, runs: [refB], recent: null }, { selectedRunId: 'r2' })
-  assert.deepEqual(picked.runs.map(ref => [ref.runId, ref.selected]), [['r2', true], ['r1', false]])
-  assert.equal(picked.selectedRunId, 'r2')
+  // #263：selected/workspaceKey/workspaceLabel 没有消费者（选中态由组件受控），视图不再输出；recent 摘要整链已删。
+  for (const ref of view.runs) {
+    assert.deepEqual(Object.keys(ref).sort(), ['label', 'runId', 'status', 'statusLabel', 'workflowId'])
+  }
+  assert.equal('recent' in view, false)
+  // 当前 Run 不在活跃清单时补一项，避免切换器值悬空（选中态仍由组件决定）。
+  const picked = monitorViewModel({ ...RUN_PAYLOAD, runs: [refB] })
+  assert.deepEqual(picked.runs.map(ref => ref.runId), ['r2', 'r1'])
+  assert.equal('recent' in picked, false)
 })
 
 test('#254 monitorViewModel：终态 Run 停止轮询并展示终态图', () => {
-  const done = monitorViewModel({ ...RUN_PAYLOAD, runs: [], recent: { runId: 'r1', workspaceKey: 'D:/ws', workflowId: 'test', status: 'completed' }, run: { ...RUN_PAYLOAD.run, status: 'completed' } })
+  const done = monitorViewModel({ ...RUN_PAYLOAD, runs: [], run: { ...RUN_PAYLOAD.run, status: 'completed' } })
   assert.equal(done.mode, 'terminal')
   assert.equal(done.polling, false)
-  assert.match(done.terminalNote, /停止轮询/)
+  // #261：终态文案明确「停止自动轮询 + 可手动刷新」，与只读刷新入口一致。
+  assert.match(done.terminalNote, /停止自动轮询/)
+  assert.match(done.terminalNote, /刷新状态/)
   assert.equal(done.run.graph.flows.length, 2)
-  assert.equal(done.recent.runId, 'r1')
+  // #254：终态 Run 不在活跃清单，作为当前 Run 补进切换器选项（#263：不再有 recent 字段）。
+  assert.deepEqual(done.runs.map(ref => [ref.runId, ref.statusLabel]), [['r1', '已完成']])
+})
+
+test('#261 monitorPollingContinues：只有终态 Run 停周期，空态/维护态/活跃 Run 继续', () => {
+  assert.equal(monitorPollingContinues(undefined), true)
+  assert.equal(monitorPollingContinues({ mode: 'empty', runs: [] }), true)
+  assert.equal(monitorPollingContinues({ mode: 'maintenance', maintenance: { kind: 'corrupt', reason: 'x' } }), true)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'running' } }), true)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'blocked' } }), true)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'completed' } }), false)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'terminated' } }), false)
+  // 视图模型的 polling 与该判定同源（不出现两套规则）。
+  const blocked = monitorViewModel({ ...RUN_PAYLOAD, run: { ...RUN_PAYLOAD.run, status: 'blocked' } })
+  assert.equal(blocked.polling, true)
 })
 
 test('#254 monitorViewModel：空态三形态（无 Run 引导 / 维护态 / 加载中）', () => {
-  const empty = monitorViewModel({ mode: 'empty', runs: [], recent: null })
+  const empty = monitorViewModel({ mode: 'empty', runs: [] })
   assert.equal(empty.mode, 'empty')
-  // R1 F2：空态继续轮询（外部启动新 Run 后自动出现）；只有终态/维护态停轮询。
+  // R1 F2：空态继续轮询（外部启动新 Run 后自动出现）。
   assert.equal(empty.polling, true)
   assert.match(empty.guidance, /dsh-flow start/)
   assert.deepEqual(empty.runs, [])
-  assert.equal(empty.recent, null)
-  const maintenance = monitorViewModel({ mode: 'maintenance', maintenance: { kind: 'incompatible', reason: '版本不兼容' }, runs: [], recent: null })
+  assert.equal('recent' in empty, false)
+  const maintenance = monitorViewModel({ mode: 'maintenance', maintenance: { kind: 'incompatible', reason: '版本不兼容' }, runs: [] })
   assert.equal(maintenance.mode, 'maintenance')
-  assert.equal(maintenance.polling, false)
+  // #261：维护态继续探测，运维恢复状态库后自动回到正常视图（此前完全停请求，只能重挂载自愈）。
+  assert.equal(maintenance.polling, true)
   assert.match(maintenance.reason, /版本不兼容/)
   assert.equal(monitorViewModel(undefined).mode, 'loading')
 })
@@ -281,8 +336,21 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   assert.match(bundle, /该 Run 已结束/)
   assert.match(bundle, /dsh-flow start/)
   assert.match(bundle, /fetchStatus = \(scope, runId\)/)
-  // R1 F2：停轮询只收窄到终态/维护态，空态继续轮询以发现新 Run。
-  assert.match(bundle, /payload\?\.mode !== 'maintenance' && payload\?\.run\?\.terminal !== true/)
+  // #261 刷新恢复与目录隔离：统一停轮询判定、只读刷新入口、可见性监听、上下文键隔离打进 bundle。
+  assert.match(bundle, /monitorPollingContinues/)
+  assert.doesNotMatch(bundle, /payload\?\.mode !== 'maintenance' && payload\?\.run\?\.terminal !== true/)
+  assert.match(bundle, /刷新状态/)
+  assert.match(bundle, /正在刷新/)
+  assert.match(bundle, /visibilitychange/)
+  assert.match(bundle, /pollContextKey/)
+  assert.match(bundle, /useMonitorPolling\(\s*runId => fetchStatus\(runId\)/)
+  // #262 图卡生效模型：装饰文本接在现有类型摘要行后，完整值走 title（行高/几何不变）。
+  assert.match(bundle, /decoration\?\.summary/)
+  assert.match(bundle, /className: 'wf-node-type', title: typeText/)
+  // #263：recent 摘要链（视图输出 + 空态渲染）与画布 displayPoint 等价别名已删，不留在产物里。
+  assert.doesNotMatch(bundle, /recent/)
+  assert.doesNotMatch(bundle, /displayPoint/)
+  assert.match(bundle, /point\(/)
   // 宿主 client bundle 不做 JSX 转译：产物必须是可直接解析的纯 JS（#252 发现 #251 JSX 隐患）。
   assert.doesNotThrow(() => new Function(bundle), 'bundle 必须是可解析的纯 JS')
 })

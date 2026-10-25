@@ -118,7 +118,12 @@ function graphOf(run) {
       if (node.childWorkflowId !== undefined) execution.workflowId = node.childWorkflowId
       nodes[node.id] = { execution, results: node.results, onReturn: node.onReturn }
       const state = monitorNodeState(latest.get(`${id}/${node.id}`))
-      if (state !== null) decorations[node.id] = state
+      // #262：Actor 卡直接展示服务端算出的「当前生效模型」（只呈现，不重算 primary/manual/fallback）；
+      // 未执行节点同样有值，Program/Child 不伪造模型，缺字段由 modelTextOf 降级为空。
+      const modelText = node.kind === 'actor-task' ? modelTextOf(node.model) : ''
+      if (state !== null || modelText !== '') {
+        decorations[node.id] = modelText === '' ? state : { ...(state ?? {}), summary: modelText }
+      }
     }
     const positions = id === run.workflowId ? layout.main ?? {} : layout.children?.[id] ?? {}
     return {
@@ -151,19 +156,20 @@ export function workspaceLabel(workspaceKey) {
   return parts.at(-1) ?? workspaceKey
 }
 
-/** Run 引用 → 切换器选项（workspace 标识 + 流程 + 状态）。 */
-function runRefView(ref, selectedRunId) {
+/**
+ * Run 引用 → 切换器选项（workspace 短标签 + 流程 + 状态）。只保留实际渲染的
+ * 字段：#263 删除了无人消费的 selected/workspaceKey 输出（选中态由组件受控
+ * selectedRunId 决定，workspaceKey 只作为 workspaceLabel 的输入）。
+ */
+function runRefView(ref) {
   const workspace = workspaceLabel(ref?.workspaceKey)
   const workflowId = typeof ref?.workflowId === 'string' ? ref.workflowId : '—'
   return {
     runId: ref?.runId ?? '',
-    workspaceKey: ref?.workspaceKey ?? '',
-    workspaceLabel: workspace,
     workflowId,
     status: ref?.status ?? '',
     statusLabel: RUN_STATUS_LABELS[ref?.status] ?? String(ref?.status ?? ''),
     label: `${workspace} · ${workflowId}`,
-    selected: ref?.runId === selectedRunId,
   }
 }
 
@@ -194,27 +200,38 @@ function elapsedText(ms) {
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'terminated'])
 
 /**
+ * 该 payload 是否还要继续自动轮询（#261 统一口径，组件与 Hook 共用一份判断）。
+ * 只有终态 Run 停周期：运行中/BLOCK/空态/维护态都在可见时按 2s 继续探测——
+ * 维护态是运维临时状态，继续探测才能在状态库恢复后自动回到正常视图；
+ * 终态 Run 由「刷新状态」手动读取（不引入自动发现）。
+ */
+export function monitorPollingContinues(payload) {
+  const run = payload?.run
+  if (run === undefined || run === null) return true
+  return run.terminal !== true && !TERMINAL_RUN_STATUSES.has(run.status)
+}
+
+/**
  * payload（服务端 MonitorRunStatus）→ 视图模型（#254 起区分 run/terminal/empty）。
  * payload 为 null/undefined（尚无数据）时返回 { mode: 'loading' }。
- * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅；
- * options.selectedRunId 是切换器选中的 Run（缺省 = 当前 cwd 默认 Run）。
- * polling=false 的模式（terminal/maintenance）由组件停止轮询；empty 继续轮询以发现新 Run（#254 R1 F2）。
+ * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅。
+ * polling=false 只剩终态 Run 一种（#261）：维护态同样继续探测，状态库恢复后自愈；
+ * 终态由只读「刷新状态」手动读取。是否继续的判定见 monitorPollingContinues。
  */
 export function monitorViewModel(payload, options = {}) {
   const banner = typeof options.banner === 'string' ? options.banner : ''
-  if (payload === null || payload === undefined || typeof payload !== 'object') return { mode: 'loading', banner, polling: true, runs: [], recent: null }
+  if (payload === null || payload === undefined || typeof payload !== 'object') return { mode: 'loading', banner, polling: true, runs: [] }
   if (payload.mode === 'maintenance') {
-    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner, polling: false, runs: [], recent: null }
+    // 维护态继续按可见性探测（#261）：否则运维恢复状态库后面板永远停在维护视图。
+    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner, polling: true, runs: [] }
   }
   const payloadRuns = Array.isArray(payload.runs) ? payload.runs : []
-  const recent = payload.recent === null || payload.recent === undefined ? null : runRefView(payload.recent, null)
-  const selectedRunId = typeof options.selectedRunId === 'string' ? options.selectedRunId : payload.run?.runId ?? null
-  const runs = payloadRuns.map(ref => runRefView(ref, selectedRunId))
+  const runs = payloadRuns.map(ref => runRefView(ref))
   // 选中的 Run 可能已离开活跃清单（终态）：补一个选项，避免切换器值悬空。
   if (payload.run !== undefined && payload.run !== null && !runs.some(ref => ref.runId === payload.run.runId)) {
-    runs.push(runRefView({ ...payload.run, workspaceKey: payload.run.workspaceKey }, selectedRunId))
+    runs.push(runRefView(payload.run))
   }
-  const base = { banner, runs, recent, selectedRunId }
+  const base = { banner, runs }
   if (payload.run === undefined || payload.run === null) {
     return { ...base, mode: 'empty', polling: true, guidance: EMPTY_GUIDANCE }
   }
@@ -228,7 +245,7 @@ export function monitorViewModel(payload, options = {}) {
   // 开始时间取首个工作单的进入时刻（不新增持久化字段）；终态用最后工作单的退出时刻。
   const startedAt = typeof nodes[0]?.enteredAt === 'string' ? nodes[0].enteredAt : null
   const startedMs = startedAt === null ? Number.NaN : Date.parse(startedAt)
-  const terminal = run.terminal === true || TERMINAL_RUN_STATUSES.has(run.status)
+  const terminal = !monitorPollingContinues(payload)
   const lastExitedAt = nodes[nodes.length - 1]?.exitedAt
   const endMs = terminal && typeof lastExitedAt === 'string' ? Date.parse(lastExitedAt) : now
   const durationText = Number.isFinite(startedMs) ? elapsedText((Number.isFinite(endMs) ? endMs : now) - startedMs) : null
@@ -236,7 +253,7 @@ export function monitorViewModel(payload, options = {}) {
     ...base,
     mode: terminal ? 'terminal' : 'run',
     polling: !terminal,
-    terminalNote: terminal ? '该 Run 已结束，已停止轮询（展示冻结终态图）。' : null,
+    terminalNote: terminal ? '该 Run 已结束，已停止自动轮询；点击「刷新状态」可查看最新状态。' : null,
     run: {
       workflowId: run.workflowId ?? '—',
       runId: run.runId ?? '—',

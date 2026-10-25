@@ -11,6 +11,7 @@ import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { createMonitorRpcHandler, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
+import { monitorViewModel } from '../web-client/src/monitor-view.js'
 import { readRunLayout } from '../src/monitor/layout.ts'
 import type { EditorLayout } from '../src/editor/layout.ts'
 
@@ -59,7 +60,6 @@ function handlerOf(h: ReturnType<typeof harness>, layout?: EditorLayout) {
     resolveWorkspace: async cwd => cwd ?? 'ws',
     latest: async workspaceKey => h.store.get(workspaceKey),
     active: async () => h.store.activeRuns(),
-    recentCompleted: async workspaceKey => h.store.latestCompleted(workspaceKey),
     byRunId: async runId => h.store.getByRunId(runId),
     executions: async runId => h.store.runExecutionsByRunId(runId),
     layout: async () => layout,
@@ -77,12 +77,13 @@ async function judgeAccept(h: ReturnType<typeof harness>, caller: ClaimCaller): 
   await h.engine.handleTurnEnded('ws', caller)
 }
 
-test('#254 status：零 Run → empty 模式（含空活跃清单/无终态）', async () => {
+// #263：empty 只表示「当前 cwd 无 Run」，不是全库无 Run（其他 workspace 仍可能有活跃 Run）。
+test('#254 status：当前 cwd 零 Run → empty 模式（含空活跃清单）', async () => {
   const h = harness()
   try {
     const result = await handlerOf(h)('status', { cwd: 'ws' })
     assert.equal(result.ok, true)
-    assert.deepEqual(result.value, { mode: 'empty', runs: [], recent: null })
+    assert.deepEqual(result.value, { mode: 'empty', runs: [] })
   } finally { h.cleanup() }
 })
 
@@ -98,9 +99,8 @@ test('#251 status：活跃 Run → 完整只读投影（节点/角色模型/图/
     assert.equal(payload.run!.status, 'running')
     assert.equal(payload.run!.workflowId, 'test')
     assert.equal(payload.run!.launchPrompt, '受控启动请求')
-    // #254：活跃清单带 workspace 标识（当前 Run 也在其中，默认选中）；无终态历史。
+    // #254：活跃清单带 workspace 标识（当前 Run 也在其中，默认选中）。
     assert.deepEqual(payload.runs, [{ runId: payload.run!.runId, workspaceKey: 'ws', workflowId: 'test', status: 'running' }])
-    assert.equal(payload.recent, null)
     // 节点按 visit 升序；首个工作单 working、当前焦点在 plan。
     assert.equal(payload.run!.nodes.length, 1)
     assert.deepEqual([payload.run!.nodes[0].nodeId, payload.run!.nodes[0].phase, payload.run!.nodes[0].current], ['plan', 'working', true])
@@ -154,6 +154,24 @@ test('#252 status：布局坐标随 payload 返回（缺失补网格）且不改
   } finally { h.cleanup() }
 })
 
+test('#262 status→视图投影：图卡生效模型来自服务端投影，缺路由不虚构', async () => {
+  const h = harness()
+  try {
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const result = await handlerOf(h)('status', { cwd: 'ws' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
+    const main = monitorViewModel(payload).run!.graph.flows.find(flow => flow.id === 'test')!
+    // reviewer 显式声明模型：画布装饰文本直接用服务端算出的 provider/modelId。
+    assert.equal(main.decorations.review.summary, 'prov/m-review')
+    // manager 继承默认路由：本 harness 无冻结路由 → 服务端投影为空对象，
+    // 客户端安全降级（不制造 unknown/假 provider），已执行节点的状态徽标照常。
+    assert.deepEqual(payload.run!.flows.test.nodes.find(node => node.id === 'plan')!.model, {})
+    assert.equal(main.decorations.plan.summary, undefined)
+    assert.equal(typeof main.decorations.plan.badge, 'string')
+  } finally { h.cleanup() }
+})
+
 test('#252 status：平铺布局经真实读取进入 payload（与编辑器同路径）', async () => {
   const h = harness()
   try {
@@ -165,7 +183,6 @@ test('#252 status：平铺布局经真实读取进入 payload（与编辑器同�
       resolveWorkspace: async cwd => cwd ?? 'ws',
       latest: async workspaceKey => h.store.get(workspaceKey),
       active: async () => h.store.activeRuns(),
-      recentCompleted: async workspaceKey => h.store.latestCompleted(workspaceKey),
       byRunId: async runId => h.store.getByRunId(runId),
       executions: async runId => h.store.runExecutionsByRunId(runId),
       layout: async workflowId => readRunLayout(h.home, workflowId),
@@ -240,12 +257,72 @@ test('#251 status：终态 Run → completed + 业务返回', async () => {
     const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
     assert.equal(payload.run!.status, 'completed')
     assert.equal(payload.run!.terminal, true)
-    // #254：终态 Run 不在活跃清单；作为 cwd 最近完成 Run 返回（客户端展示终态图并停轮询）。
+    // #254：终态 Run 不在活跃清单；投影仍返回完整终态图（客户端展示并停轮询）。
     assert.deepEqual(payload.runs, [])
-    assert.deepEqual(payload.recent, { runId: payload.run!.runId, workspaceKey: 'ws', workflowId: 'test', status: 'completed' })
     assert.deepEqual(payload.run!.businessReturn, { name: 'done', source: row.execution.executionId })
     assert.deepEqual(payload.run!.nodes.map(node => [node.visit, node.phase]), [[1, 'exited'], [2, 'exited']])
     assert.deepEqual(payload.run!.callStack, [], '终态 Run 调用栈为空')
+  } finally { h.cleanup() }
+})
+
+test('#263 status：同 cwd 旧终态→新 Run —— 默认读新 Run，显式旧 runId 仍复盘完整终态（completed/terminated）', async () => {
+  const h = harness()
+  type RunView = {
+    run: {
+      runId: string
+      status: string
+      terminal: boolean
+      businessReturn: { name: string } | null
+      nodes: Array<{ phase: string }>
+      callStack: unknown[]
+    }
+  }
+  try {
+    const handler = handlerOf(h)
+    const view = async (payload: Record<string, unknown>) => (await handler('status', payload)).value as RunView
+    const start = async (label: string) => assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, label)).ok, true)
+
+    // completed 结局：走完 plan/review 两个节点。
+    await start('old completed')
+    await claim(h, { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }, 'succeeded', 'plan artifact')
+    let row = (await h.store.get('ws'))!
+    await judgeAccept(h, { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) })
+    row = (await h.store.get('ws'))!
+    await claim(h, { sessionId: 'role-reviewer', turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }, 'succeeded', 'review artifact')
+    row = (await h.store.get('ws'))!
+    await judgeAccept(h, { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) })
+    const completedId = (await h.store.get('ws'))!.run.runId
+
+    // 同 cwd 起新 Run：latest 语义不变（任意状态的最新 Run），默认读新 Run。
+    await start('new after completed')
+    const currentId = (await h.store.get('ws'))!.run.runId
+    assert.notEqual(currentId, completedId, '同 cwd 已有新 Run')
+    const fallback = await view({ cwd: 'ws' })
+    assert.equal(fallback.run.runId, currentId, '默认读新 Run，不回退历史')
+    assert.equal(fallback.run.terminal, false)
+    // 显式旧 runId：不依赖 recent 摘要也返回完整终态（terminal/业务返回/节点/调用栈）。
+    const oldCompleted = await view({ cwd: 'ws', runId: completedId })
+    assert.equal(oldCompleted.run.runId, completedId)
+    assert.equal(oldCompleted.run.status, 'completed')
+    assert.equal(oldCompleted.run.terminal, true)
+    assert.equal(oldCompleted.run.businessReturn!.name, 'done')
+    assert.deepEqual(oldCompleted.run.nodes.map(node => node.phase), ['exited', 'exited'])
+    assert.deepEqual(oldCompleted.run.callStack, [])
+
+    // terminated 结局：reset 终止当前 Run，同 cwd 再起新 Run，旧 Run 仍可经 runId 复盘（无业务返回）。
+    assert.equal((await h.engine.handleReset('ws', true)).ok, true)
+    const terminatedRow = (await h.store.get('ws'))!
+    assert.equal(terminatedRow.run.status, 'terminated')
+    await start('new after terminated')
+    const newestId = (await h.store.get('ws'))!.run.runId
+    const newest = await view({ cwd: 'ws' })
+    assert.equal(newest.run.runId, newestId, '终止后默认仍读新 Run')
+    const oldTerminated = await view({ cwd: 'ws', runId: terminatedRow.run.runId })
+    assert.equal(oldTerminated.run.runId, terminatedRow.run.runId)
+    assert.equal(oldTerminated.run.status, 'terminated')
+    assert.equal(oldTerminated.run.terminal, true)
+    assert.equal(oldTerminated.run.businessReturn, null)
+    assert.equal(oldTerminated.run.nodes.length, 1)
   } finally { h.cleanup() }
 })
 
@@ -256,15 +333,14 @@ test('#251 status：cwd 原样透传，缺省不猜宿主 process.cwd（F4）', 
     resolveWorkspace: async cwd => { seen.push(cwd); return cwd },
     latest: async key => { seen.push(key); return undefined },
     active: async () => [],
-    recentCompleted: async key => { seen.push(key); return undefined },
     byRunId: async runId => { seen.push(runId); return undefined },
     executions: async runId => { seen.push(runId); return [] },
     layout: async () => undefined,
   })
-  assert.deepEqual(await handler('status', {}), { ok: true, value: { mode: 'empty', runs: [], recent: null } })
-  assert.deepEqual(await handler('status', { cwd: 'D:/ws' }), { ok: true, value: { mode: 'empty', runs: [], recent: null } })
-  // 缺省 cwd 只解析为 undefined，不回退 process.cwd；显式 cwd 依次用于解析/最近终态/默认 Run。
-  assert.deepEqual(seen, [undefined, 'D:/ws', 'D:/ws', 'D:/ws'])
+  assert.deepEqual(await handler('status', {}), { ok: true, value: { mode: 'empty', runs: [] } })
+  assert.deepEqual(await handler('status', { cwd: 'D:/ws' }), { ok: true, value: { mode: 'empty', runs: [] } })
+  // 缺省 cwd 只解析为 undefined，不回退 process.cwd；显式 cwd 用于解析与默认 Run（#263 已无 recent 额外读）。
+  assert.deepEqual(seen, [undefined, 'D:/ws', 'D:/ws'])
 })
 
 test('#254 status：活跃清单跨 workspace + runId 切换 + 失效回退', async () => {
@@ -295,7 +371,6 @@ test('#251 status：维护诊断短路，不触碰状态库', async () => {
     resolveWorkspace: async () => { touched.push('resolve'); return undefined },
     latest: async () => { touched.push('latest'); return undefined },
     active: async () => { touched.push('active'); return [] },
-    recentCompleted: async () => { touched.push('recent'); return undefined },
     byRunId: async () => { touched.push('byRunId'); return undefined },
     executions: async () => { touched.push('executions'); return [] },
     layout: async () => { touched.push('layout'); return undefined },

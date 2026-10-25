@@ -77,8 +77,6 @@ export interface MonitorRunStatus {
   maintenance?: { kind: StateMaintenanceDiagnostic['kind']; reason: string }
   /** 全部活跃 Run（running/blocked），带 workspace 标识；维护态为空。 */
   runs: MonitorRunRef[]
-  /** 当前 cwd 最近一次终态 Run（completed/terminated）；无则 null。 */
-  recent: MonitorRunRef | null
   run?: {
     runId: string
     workspaceKey: string
@@ -144,14 +142,15 @@ function runRefOf(row: StateRow): MonitorRunRef {
 }
 
 /**
- * 纯投影：StateRow + 全部工作单快照 + 可选布局 + 活跃清单/cwd 最近终态
+ * 纯投影：StateRow + 全部工作单快照 + 可选布局 + 活跃清单
  * → 监控 payload（校验副本，不改写输入）。维护态短路且不读任何状态。
  */
-export function projectRunStatus(row: StateRow | undefined, executions: readonly NodeExecution[] | undefined, maintenance: StateMaintenanceDiagnostic | undefined, layout?: EditorLayout, runs: readonly StateRow[] = [], recent?: StateRow): MonitorRunStatus {
-  if (maintenance) return { mode: 'maintenance', maintenance: { kind: maintenance.kind, reason: maintenanceText(maintenance) }, runs: [], recent: null }
+export function projectRunStatus(row: StateRow | undefined, executions: readonly NodeExecution[] | undefined, maintenance: StateMaintenanceDiagnostic | undefined, layout?: EditorLayout, runs: readonly StateRow[] = []): MonitorRunStatus {
+  if (maintenance) return { mode: 'maintenance', maintenance: { kind: maintenance.kind, reason: maintenanceText(maintenance) }, runs: [] }
   const refs = runs.map(runRefOf)
-  const recentRef = recent === undefined ? null : runRefOf(recent)
-  if (row === undefined) return { mode: 'empty', runs: refs, recent: recentRef }
+  // empty 只表示「当前 cwd 没有可投影的 Run」：其他 workspace 仍可能有活跃 Run（见 runs），
+  // 终态历史也仍在状态库中、经 runId 可复盘（#263 删除 recent 摘要链后语义不变）。
+  if (row === undefined) return { mode: 'empty', runs: refs }
   const run = row.run
   const snapshot = run.definitionSnapshot
   const ordered = [...(executions ?? [])].sort((a, b) => a.visit - b.visit)
@@ -166,7 +165,6 @@ export function projectRunStatus(row: StateRow | undefined, executions: readonly
   return {
     mode: 'run',
     runs: refs,
-    recent: recentRef,
     run: {
       runId: run.runId,
       workspaceKey: row.workspaceKey,
@@ -205,8 +203,6 @@ export interface MonitorRpcDeps {
   latest: (workspaceKey: string) => Promise<StateRow | undefined>
   /** 全部活跃 Run（running/blocked）。 */
   active: () => Promise<StateRow[]>
-  /** workspace 最近一次终态 Run（completed/terminated）。 */
-  recentCompleted: (workspaceKey: string) => Promise<StateRow | undefined>
   /** runId → Run 行（切换器跨 workspace）。 */
   byRunId: (runId: string) => Promise<StateRow | undefined>
   /** runId → 全部工作单快照（visit 升序；无 Run 空数组）。 */
@@ -237,13 +233,12 @@ export function createMonitorRpcHandler(deps: MonitorRpcDeps) {
     if (maintenance) return { ok: true as const, value: projectRunStatus(undefined, undefined, maintenance) }
     try {
       const [active, workspaceKey] = await Promise.all([deps.active(), deps.resolveWorkspace(cwd)])
-      const recent = workspaceKey === undefined ? undefined : await deps.recentCompleted(workspaceKey)
       // 显式 runId 优先（切换器跨 workspace）；失效/缺失时回退当前 cwd 默认。
       let row = runId === undefined ? undefined : await deps.byRunId(runId)
       if (row === undefined && workspaceKey !== undefined) row = await deps.latest(workspaceKey)
       const executions = row === undefined ? [] : await deps.executions(row.run.runId)
       const layout = row === undefined ? undefined : await deps.layout(row.run.catalogWorkflowId).catch(() => undefined)
-      return { ok: true as const, value: projectRunStatus(row, executions, undefined, layout, active, recent) }
+      return { ok: true as const, value: projectRunStatus(row, executions, undefined, layout, active) }
     } catch (error) {
       return { ok: false as const, error: { code: 'monitor/status-failed', message: `运行状态读取失败：${error instanceof Error ? error.message : String(error)}`, details: {} } }
     }
