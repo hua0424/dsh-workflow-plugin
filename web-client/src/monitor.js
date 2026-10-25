@@ -41,25 +41,41 @@ export const MONITOR_STYLES = `
 .wf-monitor-breadcrumb button.is-current { border-color: #3b82f6; color: #1d4ed8; background: #e8efff; }
 .wf-monitor-sep { opacity: 0.6; }
 .wf-monitor-return { align-self: flex-start; padding: 3px 8px; font-size: 12px; border-color: #3b82f6; color: #1d4ed8; }
+/* #254 多 Run 切换器 / 空态 / 终态提示。 */
+.wf-monitor-switcher { display: flex; align-items: center; gap: 6px; font-size: 12px; }
+.wf-monitor-switcher select { max-width: 100%; padding: 2px 4px; font-size: 12px; }
+.wf-monitor-guidance { background: rgba(128,128,128,0.12); border-radius: 6px; padding: 8px; white-space: pre-wrap; }
+.wf-monitor-terminal-note { color: #9fc8ff; font-size: 12px; }
+.wf-monitor-maintenance { white-space: pre-wrap; }
 `
 
-/** 轮询驱动（抽出便于测试）：visible=false 或页面隐藏时暂停。 */
-export function useMonitorPolling(fetchStatus, enabled) {
+/** 轮询驱动（抽出便于测试）：visible=false 或页面隐藏时暂停；runId 变化重置数据并重启周期。 */
+export function useMonitorPolling(fetchStatus, enabled, runId = null, shouldContinue = () => true) {
   const [data, setData] = useState(null)
   const [banner, setBanner] = useState('')
   // 轮询不离散：scope.cwd 变化时更新闭包，但不重启 2s 周期（R1 F4）。
   const fetchRef = useRef(fetchStatus)
+  const continueRef = useRef(shouldContinue)
+  const lastRunId = useRef(runId)
   useEffect(() => { fetchRef.current = fetchStatus }, [fetchStatus])
+  useEffect(() => { continueRef.current = shouldContinue })
   useEffect(() => {
     if (!enabled) return undefined
+    // 切换 Run：清掉旧 Run 的数据/横幅，首轮结果回来前显示加载态（不串台）。
+    if (lastRunId.current !== runId) { lastRunId.current = runId; setData(null); setBanner('') }
     let disposed = false
     let timer
     const tick = async () => {
       if (document.visibilityState === 'visible') {
         try {
-          const result = await fetchRef.current()
+          const result = await fetchRef.current(runId)
           if (disposed) return
-          if (result?.ok) { setData(result.value); setBanner('') } else { setBanner(prev => monitorErrorState(prev, result?.error?.message ?? String(result?.error?.code ?? 'monitor failed'))) }
+          if (result?.ok) {
+            setData(result.value)
+            setBanner('')
+            // 终态/维护态：本轮后停止轮询；空态继续轮询，外部启动新 Run 后自动出现（R1 F2）。
+            if (!continueRef.current(result.value)) return
+          } else { setBanner(prev => monitorErrorState(prev, result?.error?.message ?? String(result?.error?.code ?? 'monitor failed'))) }
         } catch (error) {
           if (!disposed) setBanner(prev => monitorErrorState(prev, String(error)))
         }
@@ -68,15 +84,24 @@ export function useMonitorPolling(fetchStatus, enabled) {
     }
     tick()
     return () => { disposed = true; clearTimeout(timer) }
-  }, [enabled])
+  }, [enabled, runId])
   return { data, banner }
 }
 
 export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
-  const { data, banner } = useMonitorPolling(fetchStatus, visible !== false)
+  const [selectedRunId, setSelectedRunId] = useState(null)
   const [promptOpen, setPromptOpen] = useState(false)
   const [follow, setFollow] = useState(initialFollowState)
-  const view = monitorViewModel(data, { banner })
+  // 终态/空态/维护态返回后不再排下一轮（#254：终态 Run 停止轮询）。
+  const { data, banner } = useMonitorPolling(runId => fetchStatus(runId), visible !== false, selectedRunId,
+    payload => payload?.mode !== 'maintenance' && payload?.run?.terminal !== true)
+  const view = monitorViewModel(data, { banner, selectedRunId })
+  // 切换 Run：跟随状态回到默认跟随（手动流程选择不跨 Run 复用）。
+  useEffect(() => { setFollow(initialFollowState()) }, [selectedRunId])
+  // 选中的 Run 失效/回退到 cwd 默认：清掉选择，避免切换器值悬空。
+  useEffect(() => {
+    if (selectedRunId !== null && data?.run && data.run.runId !== selectedRunId && !(data.runs ?? []).some(ref => ref.runId === selectedRunId)) setSelectedRunId(null)
+  }, [data, selectedRunId])
   // 横幅在全部模式（loading/maintenance/empty/run）都渲染：首轮失败必须可见（R1 F5）。
   const bannerEl = view.banner !== ''
     ? h('div', { className: 'wf-monitor-banner' }, `状态刷新失败（保留上次数据）：${view.banner}`)
@@ -85,14 +110,28 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   // better-sidebar 的 descriptor 不支持 styles 字段，样式随组件内联注入。
   const styleEl = h('style', null, MONITOR_STYLES)
   const frame = (...children) => h('div', { className: 'wf-monitor' }, styleEl, bannerEl, ...children)
+  // #254 切换器：默认「当前目录」，另列全部活跃 Run（跨 workspace）；选中项变化即重置轮询/跟随。
+  const switcher = view.runs.length === 0 ? null : h('label', { className: 'wf-monitor-switcher' },
+    '运行：',
+    h('select', {
+      value: selectedRunId ?? '',
+      onChange: event => setSelectedRunId(event.target.value === '' ? null : event.target.value),
+      'aria-label': '切换运行',
+    },
+    h('option', { value: '' }, '当前目录（默认）'),
+    ...view.runs.map(ref => h('option', { key: ref.runId, value: ref.runId }, `${ref.label} · ${ref.statusLabel}`))))
   if (view.mode === 'loading') {
     return frame(h('div', { className: 'wf-monitor-muted' }, '正在加载运行状态…'))
   }
   if (view.mode === 'maintenance') {
-    return frame(h('div', { className: 'wf-monitor-banner' }, `状态库维护模式：${view.reason}`))
+    return frame(h('div', { className: 'wf-monitor-banner wf-monitor-maintenance' }, `状态库维护模式：\n${view.reason}`))
   }
   if (view.mode === 'empty') {
-    return frame(h('div', { className: 'wf-monitor-muted' }, '当前 workspace 没有工作流运行记录。'))
+    return frame(
+      switcher,
+      h('div', { className: 'wf-monitor-guidance' }, view.guidance ?? '当前目录没有工作流运行记录。'),
+      view.recent === null ? null : h('div', { className: 'wf-monitor-muted' }, `当前目录最近一次终态 Run：${view.recent.label} · ${view.recent.statusLabel}`),
+    )
   }
   const run = view.run
   const graph = run.graph ?? null
@@ -105,11 +144,13 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   return h('div', { className: 'wf-monitor' },
     styleEl,
     bannerEl,
+    switcher,
     h('div', null,
       h('span', { className: `wf-monitor-status ${run.statusClass}` }, run.statusLabel),
       run.blockReason ? h('span', { className: 'wf-node-block' }, ` — ${run.blockReason}`) : null,
       run.businessReturn ? h('span', { className: 'wf-monitor-muted' }, ` · 返回：${run.businessReturn}`) : null,
     ),
+    run.terminalNote ? h('div', { className: 'wf-monitor-muted' }, run.terminalNote) : null,
     h('div', { className: 'wf-monitor-muted' },
       h('div', null, `工作流：${run.workflowId} · Run：${run.runId}`),
       h('div', null, `开始：${run.startedAtText ?? '—'} · ${run.durationLabel}：${run.durationText ?? '—'}`),

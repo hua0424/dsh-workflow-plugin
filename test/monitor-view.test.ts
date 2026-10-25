@@ -135,6 +135,55 @@ test('#253 重做 visit：第二次及以上标记 redo 并展示「第 N 次执
   assert.equal(redo.phaseClass, 'phase-working')
 })
 
+test('#254 monitorViewModel：活跃 Run 切换器 + cwd 最近终态', () => {
+  const refA = { runId: 'r1', workspaceKey: 'D:/ws/alpha', workflowId: 'test', status: 'running' }
+  const refB = { runId: 'r2', workspaceKey: 'D:\\ws\\beta', workflowId: 'other', status: 'blocked' }
+  const view = monitorViewModel({ ...RUN_PAYLOAD, runs: [refA, refB], recent: { runId: 'r0', workspaceKey: 'D:/ws/alpha', workflowId: 'test', status: 'completed' } })
+  assert.equal(view.mode, 'run')
+  assert.equal(view.polling, true)
+  assert.deepEqual(view.runs.map(ref => [ref.runId, ref.workspaceLabel, ref.label, ref.statusLabel, ref.selected]), [
+    ['r1', 'alpha', 'alpha · test', '运行中', true],
+    ['r2', 'beta', 'beta · other', '已阻塞', false],
+  ])
+  assert.equal(view.recent.runId, 'r0')
+  assert.equal(view.recent.statusLabel, '已完成')
+  // 切换器显式选中其他 Run：selected 标记跟随；未在活跃清单里的当前 Run 补一项避免值悬空。
+  const picked = monitorViewModel({ ...RUN_PAYLOAD, runs: [refB], recent: null }, { selectedRunId: 'r2' })
+  assert.deepEqual(picked.runs.map(ref => [ref.runId, ref.selected]), [['r2', true], ['r1', false]])
+  assert.equal(picked.selectedRunId, 'r2')
+})
+
+test('#254 monitorViewModel：终态 Run 停止轮询并展示终态图', () => {
+  const done = monitorViewModel({ ...RUN_PAYLOAD, runs: [], recent: { runId: 'r1', workspaceKey: 'D:/ws', workflowId: 'test', status: 'completed' }, run: { ...RUN_PAYLOAD.run, status: 'completed' } })
+  assert.equal(done.mode, 'terminal')
+  assert.equal(done.polling, false)
+  assert.match(done.terminalNote, /停止轮询/)
+  assert.equal(done.run.graph.flows.length, 2)
+  assert.equal(done.recent.runId, 'r1')
+})
+
+test('#254 monitorViewModel：空态三形态（无 Run 引导 / 维护态 / 加载中）', () => {
+  const empty = monitorViewModel({ mode: 'empty', runs: [], recent: null })
+  assert.equal(empty.mode, 'empty')
+  // R1 F2：空态继续轮询（外部启动新 Run 后自动出现）；只有终态/维护态停轮询。
+  assert.equal(empty.polling, true)
+  assert.match(empty.guidance, /dsh-flow start/)
+  assert.deepEqual(empty.runs, [])
+  assert.equal(empty.recent, null)
+  const maintenance = monitorViewModel({ mode: 'maintenance', maintenance: { kind: 'incompatible', reason: '版本不兼容' }, runs: [], recent: null })
+  assert.equal(maintenance.mode, 'maintenance')
+  assert.equal(maintenance.polling, false)
+  assert.match(maintenance.reason, /版本不兼容/)
+  assert.equal(monitorViewModel(undefined).mode, 'loading')
+})
+
+test('#254 monitorStatusPayload：切换器 runId 随 cwd 上行，空串/非字符串不上行', () => {
+  assert.deepEqual(monitorStatusPayload({ cwd: 'D:/ws' }, 'r2'), { cwd: 'D:/ws', runId: 'r2' })
+  assert.deepEqual(monitorStatusPayload(undefined, 'r2'), { runId: 'r2' })
+  assert.deepEqual(monitorStatusPayload({ cwd: 'D:/ws' }, ''), { cwd: 'D:/ws' })
+  assert.deepEqual(monitorStatusPayload({ cwd: 'D:/ws' }, 42), { cwd: 'D:/ws' })
+})
+
 test('#251 monitorViewModel：empty / maintenance / 加载中 / blocked 状态', () => {
   assert.equal(monitorViewModel(undefined).mode, 'loading')
   assert.equal(monitorViewModel({ mode: 'empty' }).mode, 'empty')
@@ -227,6 +276,13 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   assert.match(bundle, /selectFlow/)
   assert.match(bundle, /回到当前节点/)
   assert.match(bundle, /wf-node-redo/)
+  // #254 切换器/空态：Run 切换选项、终态停轮询文案、空态引导打进 bundle。
+  assert.match(bundle, /当前目录（默认）/)
+  assert.match(bundle, /该 Run 已结束/)
+  assert.match(bundle, /dsh-flow start/)
+  assert.match(bundle, /fetchStatus = \(scope, runId\)/)
+  // R1 F2：停轮询只收窄到终态/维护态，空态继续轮询以发现新 Run。
+  assert.match(bundle, /payload\?\.mode !== 'maintenance' && payload\?\.run\?\.terminal !== true/)
   // 宿主 client bundle 不做 JSX 转译：产物必须是可直接解析的纯 JS（#252 发现 #251 JSX 隐患）。
   assert.doesNotThrow(() => new Function(bundle), 'bundle 必须是可解析的纯 JS')
 })

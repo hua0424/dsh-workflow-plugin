@@ -12,7 +12,8 @@ import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { resolveInitSources, runInit, type InitOptions } from './init/install.ts'
-import { StateAccess, workspaceKeyOf, StateConflictError, type StateMaintenanceDiagnostic } from './state/store.ts'
+import { StateAccess, workspaceKeyOf, StateConflictError } from './state/store.ts'
+import { maintenanceText } from './state/maintenance.ts'
 import { endedSessionUserMessageIds, endedTurnUserMessageIds } from './plugin/turnbind.ts'
 import { turnEndFailure, turnEndFailureFacts, type TurnEndFact } from './plugin/turn-end.ts'
 import { scanCatalog, loadCatalogEntry } from './catalog/loader.ts'
@@ -57,15 +58,6 @@ export function apply(ctx: Context) {
   const stateAccess = new StateAccess(home)
   const store = () => stateAccess.current()
   ctx.effect(() => () => stateAccess.close())
-  const maintenanceText = (diagnostic: StateMaintenanceDiagnostic): string => [
-    'Workflow State Store is in maintenance mode; ordinary list/start/tools are disabled.',
-    `path: ${diagnostic.path}`,
-    `user_version: ${diagnostic.userVersion ?? 'unreadable'}`,
-    `reason: ${diagnostic.reason}`,
-    'No data was migrated or replaced. Plain /dsh-flow reset cannot cut over an incompatible store.',
-    'A root user may back up and replace the ENTIRE workflow State Store with: /dsh-flow reset --incompatible-store',
-    'This does not cancel old external effects; inspect them before starting new work.',
-  ].join('\n')
 
   /**
    * #99：参与者路由、重启修复与观察引用寿命全部收在同一个深 Module
@@ -466,14 +458,12 @@ export function apply(ctx: Context) {
       if (installed.status !== 'skipped') disposeEditorRpcFns.push(installed.dispose)
       const monitor = mountRpcChannel(webCtx as Parameters<typeof mountRpcChannel>[0], MONITOR_RPC_CHANNEL, createMonitorRpcHandler({
         maintenance: () => stateAccess.maintenanceDiagnostic(),
-        status: async cwd => {
-          const ws = await monitorWorkspace(cwd)
-          return ws === undefined ? undefined : store().get(ws)
-        },
-        executions: async cwd => {
-          const ws = await monitorWorkspace(cwd)
-          return ws === undefined ? [] : store().runExecutions(ws)
-        },
+        resolveWorkspace: cwd => monitorWorkspace(cwd),
+        latest: workspaceKey => store().get(workspaceKey),
+        active: () => store().activeRuns(),
+        recentCompleted: workspaceKey => store().latestCompleted(workspaceKey),
+        byRunId: runId => store().getByRunId(runId),
+        executions: runId => store().runExecutionsByRunId(runId),
         // #252：坐标与配置同目录，只读；缺失/损坏回退网格补位，不影响 status。
         layout: workflowId => readRunLayout(home, workflowId),
       }))

@@ -174,7 +174,7 @@ export class StateStore {
     return this.db.prepare('SELECT r.* FROM runs r JOIN node_executions e ON e.run_id = r.run_id WHERE r.workspace_key = ? AND e.execution_id = ?').get(workspaceKey, executionId) as RunRow | undefined
   }
 
-  /** 执行行解码 + 列/快照一致性校验（readExecution 与 runExecutions 共用）。 */
+  /** 执行行解码 + 列/快照一致性校验（readExecution 与 executionsOf 共用）。 */
   private decodeExecution(run: RunState, row: ExecutionRow, validate = true): NodeExecution {
     const execution = parse<NodeExecution>(row.snapshot_json)
     if (validate) assertValid(checkExecutionInvariants(run, execution))
@@ -218,14 +218,38 @@ export class StateStore {
     return this.enqueue(() => (this.db.prepare('SELECT * FROM runs WHERE sequence IN (SELECT MAX(sequence) FROM runs GROUP BY workspace_key) ORDER BY sequence').all() as unknown as RunRow[]).map(row => this.decode(row)))
   }
 
-  /** #251 只读：最新 Run 的全部工作单快照（含历史 visit），按 visit 升序。 */
-  runExecutions(workspaceKey: string): Promise<NodeExecution[]> {
+  /** #254 只读：按 runId 取工作单快照（切换器可查看非最新 Run）。 */
+  runExecutionsByRunId(runId: string): Promise<NodeExecution[]> {
     return this.enqueue(() => {
-      const row = this.latest(workspaceKey)
-      if (!row) return []
-      const run = this.decodeRun(row)
-      const rows = this.db.prepare('SELECT execution_id, run_id, visit, revision, snapshot_json FROM node_executions WHERE run_id = ? ORDER BY visit').all(row.run_id) as unknown as ExecutionRow[]
-      return rows.map(r => this.decodeExecution(run, r))
+      const row = this.db.prepare('SELECT * FROM runs WHERE run_id = ?').get(runId) as RunRow | undefined
+      return row ? this.executionsOf(row) : []
+    })
+  }
+
+  private executionsOf(row: RunRow): NodeExecution[] {
+    const run = this.decodeRun(row)
+    const rows = this.db.prepare('SELECT execution_id, run_id, visit, revision, snapshot_json FROM node_executions WHERE run_id = ? ORDER BY visit').all(row.run_id) as unknown as ExecutionRow[]
+    return rows.map(r => this.decodeExecution(run, r))
+  }
+
+  /** #254 只读：全部 workspace 的活跃 Run（running/blocked；每 workspace 至多一个）。 */
+  activeRuns(): Promise<StateRow[]> {
+    return this.enqueue(() => (this.db.prepare("SELECT * FROM runs WHERE status IN ('running', 'blocked') ORDER BY sequence DESC").all() as unknown as RunRow[]).map(row => this.decode(row)))
+  }
+
+  /** #254 只读：workspace 最近一次终态 Run（completed/terminated）。 */
+  latestCompleted(workspaceKey: string): Promise<StateRow | undefined> {
+    return this.enqueue(() => {
+      const row = this.db.prepare("SELECT * FROM runs WHERE workspace_key = ? AND status IN ('completed', 'terminated') ORDER BY sequence DESC LIMIT 1").get(workspaceKey) as RunRow | undefined
+      return row ? this.decode(row) : undefined
+    })
+  }
+
+  /** #254 只读：按 runId 定位 Run（跨 workspace 切换）。 */
+  getByRunId(runId: string): Promise<StateRow | undefined> {
+    return this.enqueue(() => {
+      const row = this.db.prepare('SELECT * FROM runs WHERE run_id = ?').get(runId) as RunRow | undefined
+      return row ? this.decode(row) : undefined
     })
   }
 
