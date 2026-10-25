@@ -11,6 +11,7 @@ import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { createMonitorRpcHandler, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
+import { readRunLayout } from '../src/monitor/layout.ts'
 import type { EditorLayout } from '../src/editor/layout.ts'
 
 const config: WorkflowConfig = {
@@ -140,6 +141,25 @@ test('#252 status：布局坐标随 payload 返回（缺失补网格）且不改
     // 结果端口随图返回，供只读画布绘制结果端口与连线。
     const plan = payload.run!.flows.test.nodes.find(node => node.id === 'plan')!
     assert.deepEqual(plan.results, { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } })
+  } finally { h.cleanup() }
+})
+
+test('#252 status：平铺布局经真实读取进入 payload（与编辑器同路径）', async () => {
+  const h = harness()
+  try {
+    await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')
+    mkdirSync(join(h.home, 'workflows'), { recursive: true })
+    writeFileSync(join(h.home, 'workflows', 'test.layout.json'), JSON.stringify({ version: 1, main: { plan: { x: 7, y: 8 } }, children: {} }))
+    const handler = createMonitorRpcHandler({
+      maintenance: () => undefined,
+      status: async cwd => h.store.get(cwd ?? 'ws'),
+      executions: async cwd => h.store.runExecutions(cwd ?? 'ws'),
+      layout: async workflowId => readRunLayout(h.home, workflowId),
+    })
+    const result = await handler('status', { cwd: 'ws' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
+    assert.deepEqual(payload.run!.layout.main.plan, { x: 7, y: 8 }, '平铺布局被 status 读到')
   } finally { h.cleanup() }
 })
 
