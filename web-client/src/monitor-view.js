@@ -156,19 +156,20 @@ export function workspaceLabel(workspaceKey) {
   return parts.at(-1) ?? workspaceKey
 }
 
-/** Run 引用 → 切换器选项（workspace 标识 + 流程 + 状态）。 */
-function runRefView(ref, selectedRunId) {
+/**
+ * Run 引用 → 切换器选项（workspace 短标签 + 流程 + 状态）。只保留实际渲染的
+ * 字段：#263 删除了无人消费的 selected/workspaceKey 输出（选中态由组件受控
+ * selectedRunId 决定，workspaceKey 只作为 workspaceLabel 的输入）。
+ */
+function runRefView(ref) {
   const workspace = workspaceLabel(ref?.workspaceKey)
   const workflowId = typeof ref?.workflowId === 'string' ? ref.workflowId : '—'
   return {
     runId: ref?.runId ?? '',
-    workspaceKey: ref?.workspaceKey ?? '',
-    workspaceLabel: workspace,
     workflowId,
     status: ref?.status ?? '',
     statusLabel: RUN_STATUS_LABELS[ref?.status] ?? String(ref?.status ?? ''),
     label: `${workspace} · ${workflowId}`,
-    selected: ref?.runId === selectedRunId,
   }
 }
 
@@ -213,27 +214,24 @@ export function monitorPollingContinues(payload) {
 /**
  * payload（服务端 MonitorRunStatus）→ 视图模型（#254 起区分 run/terminal/empty）。
  * payload 为 null/undefined（尚无数据）时返回 { mode: 'loading' }。
- * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅；
- * options.selectedRunId 是切换器选中的 Run（缺省 = 当前 cwd 默认 Run）。
+ * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅。
  * polling=false 只剩终态 Run 一种（#261）：维护态同样继续探测，状态库恢复后自愈；
  * 终态由只读「刷新状态」手动读取。是否继续的判定见 monitorPollingContinues。
  */
 export function monitorViewModel(payload, options = {}) {
   const banner = typeof options.banner === 'string' ? options.banner : ''
-  if (payload === null || payload === undefined || typeof payload !== 'object') return { mode: 'loading', banner, polling: true, runs: [], recent: null }
+  if (payload === null || payload === undefined || typeof payload !== 'object') return { mode: 'loading', banner, polling: true, runs: [] }
   if (payload.mode === 'maintenance') {
     // 维护态继续按可见性探测（#261）：否则运维恢复状态库后面板永远停在维护视图。
-    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner, polling: true, runs: [], recent: null }
+    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner, polling: true, runs: [] }
   }
   const payloadRuns = Array.isArray(payload.runs) ? payload.runs : []
-  const recent = payload.recent === null || payload.recent === undefined ? null : runRefView(payload.recent, null)
-  const selectedRunId = typeof options.selectedRunId === 'string' ? options.selectedRunId : payload.run?.runId ?? null
-  const runs = payloadRuns.map(ref => runRefView(ref, selectedRunId))
+  const runs = payloadRuns.map(ref => runRefView(ref))
   // 选中的 Run 可能已离开活跃清单（终态）：补一个选项，避免切换器值悬空。
   if (payload.run !== undefined && payload.run !== null && !runs.some(ref => ref.runId === payload.run.runId)) {
-    runs.push(runRefView({ ...payload.run, workspaceKey: payload.run.workspaceKey }, selectedRunId))
+    runs.push(runRefView(payload.run))
   }
-  const base = { banner, runs, recent, selectedRunId }
+  const base = { banner, runs }
   if (payload.run === undefined || payload.run === null) {
     return { ...base, mode: 'empty', polling: true, guidance: EMPTY_GUIDANCE }
   }

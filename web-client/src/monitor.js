@@ -160,7 +160,7 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
     runId => fetchStatus(runId),
     { enabled: visible !== false, cwd, runId: selectedRunId },
   )
-  const view = monitorViewModel(data, { banner, selectedRunId })
+  const view = monitorViewModel(data, { banner })
   const returnedRunId = view.mode === 'run' || view.mode === 'terminal' ? view.run.runId : null
   // 实际返回的 Run 变化（新 Run / 切目录 / 刷新到别的 Run）：跟随与手动流程选择回到默认。
   useEffect(() => { setFollow(initialFollowState()) }, [returnedRunId, cwd])
@@ -206,7 +206,6 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
     return frame(
       switcher,
       h('div', { className: 'wf-monitor-guidance' }, view.guidance ?? '当前目录没有工作流运行记录。'),
-      view.recent === null ? null : h('div', { className: 'wf-monitor-muted' }, `当前目录最近一次终态 Run：${view.recent.label} · ${view.recent.statusLabel}`),
     )
   }
   const run = view.run

@@ -60,15 +60,14 @@ export function NodeCanvas(props) {
   const point = (id) => dragPosition?.id === id ? dragPosition.pos : positions[id] ?? (id.startsWith('return:') ? { x: returnX, y: 40 + returns.indexOf(id.slice(7)) * 64 } : nodePoint(id))
   const itemIds = [...nodes.map(([id]) => id), ...returns.map((ret) => `return:${ret}`)]
   // 视口平移与节点的世界坐标分离，空白区域没有滚动边界。
-  const displayPoint = point
   // 运行态徽标/原因行会撑高节点；连线路由与画布高度按同样增量下移（#252）。
   const decorationExtra = (id) => {
     const decoration = decorations[id]
     if (decoration === undefined) return 0
     return (decoration.badge ? 20 : 0) + (decoration.detail ? 18 : 0)
   }
-  const width = Math.max(570, ...itemIds.map((id) => displayPoint(id).x + 240))
-  const height = Math.max(420, ...returns.map((ret) => displayPoint(`return:${ret}`).y + 80), ...nodes.map(([id, node]) => displayPoint(id).y + 100 + decorationExtra(id) + portsOf(node).length * 32))
+  const width = Math.max(570, ...itemIds.map((id) => point(id).x + 240))
+  const height = Math.max(420, ...returns.map((ret) => point(`return:${ret}`).y + 80), ...nodes.map(([id, node]) => point(id).y + 100 + decorationExtra(id) + portsOf(node).length * 32))
   const onPointerDown = (event, nodeId) => {
     if (busy || readOnly || wire !== null || event.button !== 0) return
     const start = point(nodeId)
@@ -205,11 +204,11 @@ export function NodeCanvas(props) {
           h('svg', { className: 'wf-edges', width, height, 'aria-label': '节点连线' },
             ...nodes.flatMap(([id, node]) => portsOf(node).map((port, index) => {
               const target = node.results?.[port.key]?.target ?? node.onReturn?.[port.key]
-              const source = displayPoint(id)
+              const source = point(id)
               const targetIndex = returns.indexOf(target?.return)
               const destination = target?.node !== undefined && def.nodes[target.node] !== undefined
-                ? { x: displayPoint(target.node).x, y: displayPoint(target.node).y + 22 }
-                : targetIndex >= 0 ? { x: displayPoint(`return:${target.return}`).x, y: displayPoint(`return:${target.return}`).y + 16 } : null
+                ? { x: point(target.node).x, y: point(target.node).y + 22 }
+                : targetIndex >= 0 ? { x: point(`return:${target.return}`).x, y: point(`return:${target.return}`).y + 16 } : null
               if (destination === null) return null
               const x = source.x + 196, y = source.y + 88 + decorationExtra(id) + index * 32
               const key = `edge:${id}:${port.key}`
@@ -251,7 +250,7 @@ export function NodeCanvas(props) {
             })),
           ),
           ...nodes.map(([nodeId, node]) => {
-            const pos = displayPoint(nodeId)
+            const pos = point(nodeId)
             const decoration = decorations[nodeId]
             // #262：监控可选的 decoration.summary（当前生效模型）接在现有类型摘要行后，完整文本走 title；
             // 行高固定、overflow 省略，不改变节点尺寸与连线端点（编辑器不传 decoration 时原样）。
@@ -283,7 +282,7 @@ export function NodeCanvas(props) {
             )
           }),
           ...returns.map((ret) => h('button', {
-            key: ret, className: 'wf-return-marker', style: { position: 'absolute', left: `${displayPoint(`return:${ret}`).x}px`, top: `${displayPoint(`return:${ret}`).y}px`, touchAction: 'none', cursor: wire === null ? 'grab' : 'pointer' },
+            key: ret, className: 'wf-return-marker', style: { position: 'absolute', left: `${point(`return:${ret}`).x}px`, top: `${point(`return:${ret}`).y}px`, touchAction: 'none', cursor: wire === null ? 'grab' : 'pointer' },
             onPointerDown: (event) => onPointerDown(event, `return:${ret}`),
             onPointerMove: (event) => onPointerMove(event, `return:${ret}`),
             onPointerUp: () => endDrag(false), onPointerCancel: () => endDrag(true),

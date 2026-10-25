@@ -237,14 +237,6 @@ export class StateStore {
     return this.enqueue(() => (this.db.prepare("SELECT * FROM runs WHERE status IN ('running', 'blocked') ORDER BY sequence DESC").all() as unknown as RunRow[]).map(row => this.decode(row)))
   }
 
-  /** #254 只读：workspace 最近一次终态 Run（completed/terminated）。 */
-  latestCompleted(workspaceKey: string): Promise<StateRow | undefined> {
-    return this.enqueue(() => {
-      const row = this.db.prepare("SELECT * FROM runs WHERE workspace_key = ? AND status IN ('completed', 'terminated') ORDER BY sequence DESC LIMIT 1").get(workspaceKey) as RunRow | undefined
-      return row ? this.decode(row) : undefined
-    })
-  }
-
   /** #254 只读：按 runId 定位 Run（跨 workspace 切换）。 */
   getByRunId(runId: string): Promise<StateRow | undefined> {
     return this.enqueue(() => {
