@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildClientBundle } from '../web-client/build.mjs'
-import { monitorViewModel, monitorErrorState, monitorStatusPayload, PHASE_LABELS } from '../web-client/src/monitor-view.js'
+import { monitorViewModel, monitorErrorState, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, PHASE_LABELS } from '../web-client/src/monitor-view.js'
 
 const STARTED_AT = '2026-10-25T04:00:00.000Z'
 
@@ -33,6 +33,7 @@ const RUN_PAYLOAD = {
       { workflowId: 'test', nodeId: 'report', executionId: 'e3', visit: 3, revision: 1, phase: 'checking', blockReason: '审查超时', enteredAt: '2026-10-25T04:02:00.000Z', exitedAt: null, current: false },
       { workflowId: 'test', nodeId: 'child', executionId: 'e4', visit: 4, revision: 1, phase: 'ready', blockReason: null, enteredAt: '2026-10-25T04:03:00.000Z', exitedAt: null, current: false },
     ],
+    callStack: [{ workflowId: 'test', nodeId: 'review', executionId: 'e2' }],
   },
 }
 
@@ -71,11 +72,67 @@ test('#252 monitorViewModel：运行图模型（节点 decoration/布局/子流�
   assert.equal(main.decorations.plan.badge, PHASE_LABELS.exited[0])
   assert.equal(main.decorations.review.badge, 'BLOCK')
   assert.equal(main.decorations.review.className, 'wf-node-blocked')
-  assert.equal(main.decorations.review.detail, '等待授权')
+  assert.equal(main.decorations.review.detail, '等待授权 · 第 2 次执行')
+  assert.equal(main.decorations.review.redo, true)
+  assert.equal(main.decorations.plan.redo, false)
   // 子流程单独成图，坐标来自 children 表，无执行时无装饰。
   const sub = graph.flows[1]
   assert.deepEqual(sub.positions.s1, { x: 40, y: 40 })
   assert.deepEqual(sub.decorations, {})
+})
+
+test('#253 monitorCallPath：多层调用栈投影为可点击路径，递归同名流程按帧保留', () => {
+  const payload = {
+    ...RUN_PAYLOAD,
+    run: {
+      ...RUN_PAYLOAD.run,
+      workflowId: 'root',
+      flows: {
+        root: { startNode: 'manager', returns: ['out'], nodes: [{ id: 'manager', kind: 'actor-task', role: 'manager' }, { id: 'call', kind: 'child-workflow', childWorkflowId: 'sub' }] },
+        sub: { startNode: 'worker', returns: ['out'], nodes: [{ id: 'worker', kind: 'actor-task', role: 'worker' }, { id: 'call2', kind: 'child-workflow', childWorkflowId: 'sub' }] },
+      },
+      callStack: [
+        { workflowId: 'root', nodeId: 'call', executionId: 'c1' },
+        { workflowId: 'sub', nodeId: 'call2', executionId: 'c2' },
+        { workflowId: 'sub', nodeId: 'worker', executionId: 'c3' },
+      ],
+    },
+  }
+  const path = monitorCallPath(payload.run)
+  assert.deepEqual(path.frames.map(frame => frame.workflowId), ['root', 'sub', 'sub'])
+  assert.deepEqual(path.frames.map(frame => frame.label), ['主流程', '子流程 sub', '子流程 sub'])
+  assert.deepEqual(path.frames.map(frame => frame.nodeLabel), ['call', 'call2', 'worker（worker）'])
+  assert.equal(path.currentWorkflowId, 'sub')
+  assert.deepEqual(path.frames.map(frame => frame.executionId), ['c1', 'c2', 'c3'])
+  // 空调用栈（终态/旧数据）回退到 run.workflowId 单帧。
+  const fallback = monitorCallPath({ ...payload.run, callStack: [] })
+  assert.deepEqual(fallback.frames, [])
+  assert.equal(fallback.currentWorkflowId, 'root')
+})
+
+test('#253 自动跟随状态机：默认跟随当前流程，手动切换暂停并可恢复', () => {
+  const initial = initialFollowState()
+  assert.deepEqual(initial, { mode: 'following', manualFlowId: null })
+  assert.deepEqual(monitorFollowView(initial, 'sub'), { mode: 'following', activeFlowId: 'sub', showReturn: false })
+  const paused = selectFlow(initial, 'root', 'sub')
+  assert.deepEqual(paused, { mode: 'paused', manualFlowId: 'root' })
+  assert.deepEqual(monitorFollowView(paused, 'sub'), { mode: 'paused', activeFlowId: 'root', showReturn: true })
+  // 手动停留的流程再次成为当前流程：跟随当前，不再显示返回入口。
+  assert.deepEqual(monitorFollowView(paused, 'root'), { mode: 'paused', activeFlowId: 'root', showReturn: false })
+  // 点选当前流程 = 恢复跟随；恢复后继续跟随新当前流程。
+  assert.deepEqual(selectFlow(paused, 'root', 'root'), initial)
+  assert.deepEqual(monitorFollowView(resumeFollow(), 'grand'), { mode: 'following', activeFlowId: 'grand', showReturn: false })
+})
+
+test('#253 重做 visit：第二次及以上标记 redo 并展示「第 N 次执行」', () => {
+  const first = monitorNodeState({ workflowId: 'test', nodeId: 'plan', executionId: 'e1', visit: 1, revision: 1, phase: 'exited', blockReason: null, enteredAt: STARTED_AT, exitedAt: null, current: false })
+  assert.equal(first.redo, false)
+  assert.equal(first.detail, '')
+  const redo = monitorNodeState({ workflowId: 'test', nodeId: 'review', executionId: 'e2', visit: 3, revision: 1, phase: 'working', blockReason: null, enteredAt: STARTED_AT, exitedAt: null, current: true })
+  assert.equal(redo.redo, true)
+  assert.equal(redo.detail, '第 3 次执行')
+  assert.equal(redo.className, 'wf-node-current')
+  assert.equal(redo.phaseClass, 'phase-working')
 })
 
 test('#251 monitorViewModel：empty / maintenance / 加载中 / blocked 状态', () => {
@@ -142,20 +199,33 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   const outFile = buildClientBundle()
   const { readFileSync } = await import('node:fs')
   const bundle = readFileSync(outFile, 'utf8')
-  // 动态注入：等待 better-sidebar 服务后注册监控 tab；静态 inject 数组不含 better-sidebar。
-  assert.match(bundle, /inject\(\['better-sidebar'\]/)
+  // 动态注入：等待 betterSidebar 服务后注册监控 tab；静态 inject 数组不含该服务。
+  assert.match(bundle, /inject\(\['betterSidebar'\]/)
   assert.match(bundle, /dsh-workflow:monitor/)
   assert.match(bundle, /workflow-run-monitor/)
   assert.match(bundle, /registerTab/)
+  // AC3 实证：better-sidebar 0.28 只认单 descriptor，title/component 必填（旧双参写法 tab 不出现）。
+  assert.match(bundle, /title: '工作流监控'/)
+  assert.match(bundle, /component: \(props\) => WorkflowMonitorTab/)
   // scope.cwd 经 monitorStatusPayload 上行，服务端不再猜 process.cwd。
   assert.match(bundle, /monitorStatusPayload/)
+  // #253 下钻/跟随的纯函数必须进入 __monitorView 模块表，否则运行时 "is not a function"。
+  assert.match(bundle, /monitorFollowView, selectFlow, resumeFollow/)
   assert.match(bundle, /scope\?\.cwd/)
+  // #253 AC3 实证：__rpc 模块表必须导出 callChannel（漏导出时监控请求全失败）。
+  assert.match(bundle, /return \{ EDITOR_RPC_CHANNEL, callChannel, callEditor/)
   // 保留编辑器通道静态注册（未装 better-sidebar 时配置编辑器照常）。
   assert.match(bundle, /PANEL_KEY/)
   // #252 画布复用：NodeCanvas 与编辑器样式打进同一个 bundle（监控不重复实现画布）。
   assert.match(bundle, /__graphCanvas/)
   assert.match(bundle, /function NodeCanvas/)
   assert.match(bundle, /wf-node-blocked/)
+  // #253 子流程下钻：调用栈路径 + 跟随状态机 + 回到当前节点入口打进 bundle。
+  assert.match(bundle, /monitorCallPath/)
+  assert.match(bundle, /monitorFollowView/)
+  assert.match(bundle, /selectFlow/)
+  assert.match(bundle, /回到当前节点/)
+  assert.match(bundle, /wf-node-redo/)
   // 宿主 client bundle 不做 JSX 转译：产物必须是可直接解析的纯 JS（#252 发现 #251 JSX 隐患）。
   assert.doesNotThrow(() => new Function(bundle), 'bundle 必须是可解析的纯 JS')
 })

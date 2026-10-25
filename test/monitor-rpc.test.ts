@@ -97,6 +97,9 @@ test('#251 status：活跃 Run → 完整只读投影（节点/角色模型/图/
     // 节点按 visit 升序；首个工作单 working、当前焦点在 plan。
     assert.equal(payload.run!.nodes.length, 1)
     assert.deepEqual([payload.run!.nodes[0].nodeId, payload.run!.nodes[0].phase, payload.run!.nodes[0].current], ['plan', 'working', true])
+    // #253 调用栈投影：根流程单帧，供客户端面包屑/自动跟随定位（不含 nodeToken）。
+    const launched = (await h.store.get('ws'))!
+    assert.deepEqual(payload.run!.callStack, [{ workflowId: 'test', nodeId: 'plan', executionId: launched.execution.executionId }])
     // 冻结图结构：根流程两节点 + 生效模型（manager 继承路由，reviewer 显式声明）。
     const flow = payload.run!.flows['test']
     assert.deepEqual(flow.nodes.map(node => [node.id, node.kind, node.role]), [['plan', 'actor-task', 'manager'], ['review', 'actor-task', 'reviewer']])
@@ -227,6 +230,7 @@ test('#251 status：终态 Run → completed + 业务返回', async () => {
     assert.equal(payload.run!.status, 'completed')
     assert.deepEqual(payload.run!.businessReturn, { name: 'done', source: row.execution.executionId })
     assert.deepEqual(payload.run!.nodes.map(node => [node.visit, node.phase]), [[1, 'exited'], [2, 'exited']])
+    assert.deepEqual(payload.run!.callStack, [], '终态 Run 调用栈为空')
   } finally { h.cleanup() }
 })
 

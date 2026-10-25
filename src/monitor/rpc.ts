@@ -42,6 +42,13 @@ export interface MonitorFlowDef {
   nodes: MonitorNodeDef[]
 }
 
+/** 调用栈帧投影（#253）：只暴露路径定位所需字段，不含 nodeToken。 */
+export interface MonitorCallFrame {
+  workflowId: string
+  nodeId: string
+  executionId: string
+}
+
 export interface MonitorNodeExecution {
   workflowId: string
   nodeId: string
@@ -74,6 +81,8 @@ export interface MonitorRunStatus {
     layout: EditorLayout
     /** 全部工作单（含历史 visit），按 visit 升序。 */
     nodes: MonitorNodeExecution[]
+    /** 调用栈（栈底根流程 → 栈顶当前节点），供子流程下钻/自动跟随/面包屑（#253）。 */
+    callStack: MonitorCallFrame[]
   }
 }
 
@@ -153,6 +162,7 @@ export function projectRunStatus(row: StateRow | undefined, executions: readonly
         exitedAt: execution.exitedAt ?? null,
         current: top !== undefined && top.workflowId === execution.workflowId && top.nodeId === execution.nodeId && top.executionId === execution.executionId,
       })),
+      callStack: run.callStack.map(frame => ({ workflowId: frame.workflowId, nodeId: frame.nodeId, executionId: frame.executionId })),
     },
   }
 }
