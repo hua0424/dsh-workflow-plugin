@@ -14,7 +14,7 @@
  */
 import { WorkflowConfigEditorIcon, WorkflowConfigEditorPanel } from './panel.js'
 import { StartWorkflowButton } from './start-modal.js'
-import { WorkflowMonitorTab, MONITOR_STYLES } from './monitor.js'
+import { WorkflowMonitorTab } from './monitor.js'
 import { monitorStatusPayload } from './monitor-view.js'
 import { callChannel, callEditor, readWorkflowCatalog } from './rpc.js'
 import { readModelCatalog } from './model-selector.js'
@@ -69,17 +69,23 @@ export function apply(ctx) {
 
   // #251 运行监控 tab：动态注入——等待 better-sidebar 服务出现后注册；未安装
   // better-sidebar 的环境注入永不触发，tab 静默缺席，编辑器面板照常加载。
+  // 服务名是 ctx.betterSidebar（ADR-0005 / better-sidebar service.d.ts），
+  // 不是包名 'better-sidebar'——写错注入名回调永不触发，tab 不出现（#253 AC3 实证）。
   if (typeof ctx.inject === 'function') {
-    ctx.inject(['better-sidebar'], (sidebarCtx) => {
-      const sidebar = sidebarCtx?.betterSidebar ?? sidebarCtx?.['better-sidebar']
+    ctx.inject(['betterSidebar'], (sidebarCtx) => {
+      const sidebar = sidebarCtx?.betterSidebar
       if (typeof sidebar?.registerTab !== 'function') return
       // 每次请求带上 tab 收到的 scope.cwd：宿主按会话工作目录解析 workspace，
       // 服务端不再回退 process.cwd（R1 F4）。
       const fetchStatus = (scope) => callChannel(ctx.connection, MONITOR_RPC_CHANNEL, 'status', monitorStatusPayload(scope))
-      sidebar.registerTab(
-        { id: MONITOR_TAB_ID, label: '工作流监控', styles: MONITOR_STYLES },
-        (props) => WorkflowMonitorTab({ ...props, fetchStatus: () => fetchStatus(props?.scope) }),
-      )
+      // better-sidebar 0.28 descriptor 契约：title/component 必填；描述字段名是
+      // description（`desc` 是死字段，宿主不会渲染——R1 F1）。
+      sidebar.registerTab({
+        id: MONITOR_TAB_ID,
+        title: '工作流监控',
+        description: '运行状态、节点进度与子流程下钻',
+        component: (props) => WorkflowMonitorTab({ ...props, fetchStatus: () => fetchStatus(props?.scope) }),
+      })
     })
   }
 }

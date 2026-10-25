@@ -4,7 +4,7 @@
  * 只读展示：run 信息条 + 启动 prompt 展开 + 节点列表；无任何控制入口（ADR-0005）。
  */
 import { createElement as h, useState, useEffect, useRef } from 'react'
-import { monitorViewModel, monitorErrorState } from './monitor-view.js'
+import { monitorViewModel, monitorErrorState, initialFollowState, monitorFollowView, selectFlow, resumeFollow } from './monitor-view.js'
 import { NodeCanvas } from './graph-canvas.js'
 import { EDITOR_STYLES } from './styles.js'
 
@@ -35,6 +35,12 @@ export const MONITOR_STYLES = `
 .wf-monitor-flowtabs { display: flex; gap: 4px; flex-wrap: wrap; }
 .wf-monitor-flowtabs button { padding: 3px 8px; font-size: 12px; }
 .wf-monitor-flowtabs button[aria-selected="true"] { border-color: #3b82f6; color: #1d4ed8; background: #e8efff; }
+/* #253 子流程下钻：面包屑导航 + 暂停跟随后的「回到当前节点」入口。 */
+.wf-monitor-breadcrumb { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; font-size: 12px; }
+.wf-monitor-breadcrumb button { padding: 2px 6px; font-size: 12px; border: 1px solid transparent; background: transparent; color: inherit; }
+.wf-monitor-breadcrumb button.is-current { border-color: #3b82f6; color: #1d4ed8; background: #e8efff; }
+.wf-monitor-sep { opacity: 0.6; }
+.wf-monitor-return { align-self: flex-start; padding: 3px 8px; font-size: 12px; border-color: #3b82f6; color: #1d4ed8; }
 `
 
 /** 轮询驱动（抽出便于测试）：visible=false 或页面隐藏时暂停。 */
@@ -69,14 +75,16 @@ export function useMonitorPolling(fetchStatus, enabled) {
 export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   const { data, banner } = useMonitorPolling(fetchStatus, visible !== false)
   const [promptOpen, setPromptOpen] = useState(false)
-  const [activeFlow, setActiveFlow] = useState(null)
+  const [follow, setFollow] = useState(initialFollowState)
   const view = monitorViewModel(data, { banner })
   // 横幅在全部模式（loading/maintenance/empty/run）都渲染：首轮失败必须可见（R1 F5）。
   const bannerEl = view.banner !== ''
     ? h('div', { className: 'wf-monitor-banner' }, `状态刷新失败（保留上次数据）：${view.banner}`)
     : null
   // 宿主 client bundle 不做 JSX 转译：统一 createElement（与 panel.js 同约定）。
-  const frame = (...children) => h('div', { className: 'wf-monitor' }, bannerEl, ...children)
+  // better-sidebar 的 descriptor 不支持 styles 字段，样式随组件内联注入。
+  const styleEl = h('style', null, MONITOR_STYLES)
+  const frame = (...children) => h('div', { className: 'wf-monitor' }, styleEl, bannerEl, ...children)
   if (view.mode === 'loading') {
     return frame(h('div', { className: 'wf-monitor-muted' }, '正在加载运行状态…'))
   }
@@ -88,10 +96,14 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   }
   const run = view.run
   const graph = run.graph ?? null
+  const currentFlowId = graph?.currentFlowId ?? run.workflowId
+  const followView = monitorFollowView(follow, currentFlowId)
+  const callPath = graph?.callPath ?? { frames: [] }
   const flow = graph === null
     ? null
-    : graph.flows.find(item => item.id === activeFlow) ?? graph.flows.find(item => item.id === graph.currentFlowId) ?? graph.flows[0] ?? null
+    : graph.flows.find(item => item.id === followView.activeFlowId) ?? graph.flows.find(item => item.id === currentFlowId) ?? graph.flows[0] ?? null
   return h('div', { className: 'wf-monitor' },
+    styleEl,
     bannerEl,
     h('div', null,
       h('span', { className: `wf-monitor-status ${run.statusClass}` }, run.statusLabel),
@@ -105,10 +117,22 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
     run.roles !== '' ? h('div', { className: 'wf-monitor-muted' }, `角色模型：${run.roles}`) : null,
     graph !== null && flow !== null ? h('div', { className: 'wf-monitor-graph' },
       h('style', null, EDITOR_STYLES),
+      callPath.frames.length > 1 ? h('div', { className: 'wf-monitor-breadcrumb', role: 'navigation', 'aria-label': '流程路径' },
+        ...callPath.frames.flatMap((frame, index) => [
+          index > 0 ? h('span', { key: `sep-${index}`, className: 'wf-monitor-sep', 'aria-hidden': 'true' }, '›') : null,
+          h('button', {
+            key: `crumb-${index}`,
+            type: 'button',
+            className: frame.workflowId === flow.id ? 'is-current' : '',
+            title: `调用节点 ${frame.nodeLabel}`,
+            onClick: () => setFollow(selectFlow(follow, frame.workflowId, currentFlowId)),
+          }, frame.label),
+        ])) : null,
       graph.flows.length > 1 ? h('div', { className: 'wf-monitor-flowtabs', role: 'tablist', 'aria-label': '流程切换' },
         ...graph.flows.map(item => h('button', {
-          key: item.id, type: 'button', role: 'tab', 'aria-selected': item.id === flow.id, onClick: () => setActiveFlow(item.id),
+          key: item.id, type: 'button', role: 'tab', 'aria-selected': item.id === flow.id, onClick: () => setFollow(selectFlow(follow, item.id, currentFlowId)),
         }, item.label))) : null,
+      followView.showReturn ? h('button', { type: 'button', className: 'wf-monitor-return', onClick: () => setFollow(resumeFollow()) }, '回到当前节点') : null,
       h('div', { className: 'wf-editor wf-monitor-canvas' },
         h(NodeCanvas, {
           key: `${run.runId}:${flow.id}`,
@@ -119,6 +143,13 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
           startNode: flow.def.startNode,
           returns: flow.def.returns,
           decorations: flow.decorations,
+          // AC1：点击子流程节点直接下钻；普通节点点击不改变跟随状态。
+          onSelectNode: (nodeId) => {
+            // 画布 NodeDef 的子流程目标在 execution.workflowId（graphOf 归一化），不是 childWorkflowId。
+            const execution = flow.def.nodes?.[nodeId]?.execution
+            const child = execution?.type === 'child-workflow' ? execution.workflowId : undefined
+            if (child && graph.flows.some(item => item.id === child)) setFollow(selectFlow(follow, child, currentFlowId))
+          },
         })),
     ) : null,
     h('div', null,
@@ -133,6 +164,7 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
           : null,
         node.targetText !== null ? h('span', { className: 'wf-monitor-muted' }, node.targetText) : null,
         h('span', { className: `wf-node-phase ${node.phaseClass}` }, node.phaseLabel),
+        node.visit > 1 ? h('span', { className: 'wf-monitor-muted' }, `第${node.visit}次`) : null,
         node.blocked ? h('span', { className: 'wf-node-block' }, `BLOCK：${node.blockReason}`) : null,
       ))),
   )

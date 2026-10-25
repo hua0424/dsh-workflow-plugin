@@ -2,9 +2,9 @@
  * #252 共享流程画布：从配置编辑器 panel.js 抽出的节点/连线画布（渲染 + 拖拽/
  * 缩放/平移），配置编辑器与运行监控共用，避免第二套画布实现漂移。
  *
- * 监控只读用法：`readOnly` 关闭全部编辑交互（节点/连线/端口点击与拖动），
- * `decorations[nodeId]` 叠加运行态徽标（className/badge/detail），不改图数据；
- * 平移/缩放/适应画布仍可用。配置编辑器用法与抽取前完全一致（未传 readOnly）。
+ * 监控只读用法：`readOnly` 关闭编辑交互（拖动/连线/端口点击），节点点击仍回调
+ * `onSelectNode`（监控用于下钻子流程）；`decorations[nodeId]` 叠加运行态徽标
+ * （className/badge/detail），不改图数据；平移/缩放/适应画布仍可用。
  */
 import { createElement as h, useEffect, useRef, useState } from 'react'
 
@@ -94,7 +94,9 @@ export function NodeCanvas(props) {
     if (!cancelled && drag !== null && suppressClick.current) onMove(flowId, drag.nodeId, drag.pos)
   }
   const selectNode = (nodeId) => {
-    if (busy || readOnly || suppressClick.current) { suppressClick.current = false; return }
+    if (busy || suppressClick.current) { suppressClick.current = false; return }
+    // 只读运行图仍允许 onSelectNode 回调（监控用它下钻子流程），但不进入编辑选择/连线。
+    if (readOnly) { onSelectNode(nodeId); return }
     if (wire !== null) onWireNode(nodeId)
     else onSelectNode(nodeId)
   }
@@ -252,7 +254,7 @@ export function NodeCanvas(props) {
             const pos = displayPoint(nodeId)
             const decoration = decorations[nodeId]
             return h('div', {
-              key: nodeId, className: `wf-node${nodeId === selectedNode ? ' wf-selected' : ''}${decoration?.className ? ` ${decoration.className}` : ''}`,
+              key: nodeId, className: `wf-node${nodeId === selectedNode ? ' wf-selected' : ''}${decoration?.className ? ` ${decoration.className}` : ''}${decoration?.redo ? ' wf-node-redo' : ''}`,
               style: { left: `${pos.x}px`, top: `${pos.y}px` },
               onClick: () => selectNode(nodeId),
             },

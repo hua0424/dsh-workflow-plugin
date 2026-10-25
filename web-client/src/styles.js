@@ -112,6 +112,9 @@ export const EDITOR_STYLES = `
 .wf-editor .wf-node.wf-node-checking .wf-node-state { color: #1d4ed8; background: #e8efff; }
 .wf-editor .wf-node.wf-node-settling .wf-node-state { color: #6d28d9; background: #f3e8ff; }
 .wf-editor .wf-node.wf-node-ready .wf-node-state { opacity: .8; }
+/* #253 重做 visit：最新一次为第 N(>1) 次执行时用虚线边框 + 「第 N 次执行」详情区分首次。 */
+.wf-editor .wf-node.wf-node-redo { border-style: dashed; }
+.wf-editor .wf-node.wf-node-redo .wf-node-state { font-style: italic; }
 /* 只读画布：保留可读性，不显示禁用态的灰化与编辑光标。 */
 .wf-editor .wf-readonly .wf-node-title:disabled, .wf-editor .wf-readonly .wf-port:disabled, .wf-editor .wf-readonly .wf-return-marker:disabled { opacity: 1; cursor: default; }
 .wf-editor .wf-readonly .wf-node-title { cursor: default; }

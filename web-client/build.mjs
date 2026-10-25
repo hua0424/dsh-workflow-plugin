@@ -88,7 +88,7 @@ export function buildClientBundle({ outDir } = {}) {
 var module = { exports: {} }; var exports = module.exports;
 var __rpc = (function () {
 ${rpc}
-return { EDITOR_RPC_CHANNEL, callEditor, rpcErrorMessage, readWorkflowCatalog };
+return { EDITOR_RPC_CHANNEL, callChannel, callEditor, rpcErrorMessage, readWorkflowCatalog };
 })();
 var __edits = (function () {
 ${edits}
@@ -117,7 +117,7 @@ return { START_PROMPT_MAX_CHARS, START_MODAL_STYLES, normalizeStartPrompt, start
 })();
 var __monitorView = (function () {
 ${monitorView}
-return { PHASE_LABELS, RUN_STATUS_LABELS, monitorViewModel, monitorErrorState, monitorStatusPayload };
+return { PHASE_LABELS, RUN_STATUS_LABELS, monitorViewModel, monitorErrorState, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow };
 })();
 var __monitor = (function () {
 ${monitor}

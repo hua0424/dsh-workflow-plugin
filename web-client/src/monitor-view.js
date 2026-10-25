@@ -24,11 +24,72 @@ export const PHASE_LABELS = {
 export function monitorNodeState(execution) {
   if (execution === null || execution === undefined) return null
   const [phaseLabel, phaseClass] = phaseOf(execution.phase)
+  const visit = typeof execution.visit === 'number' ? execution.visit : 1
+  const redo = visit > 1
+  const redoDetail = redo ? `第 ${visit} 次执行` : ''
   const blocked = typeof execution.blockReason === 'string' && execution.blockReason !== ''
-  if (blocked) return { className: 'wf-node-blocked', badge: 'BLOCK', detail: execution.blockReason, phaseClass }
-  if (execution.current === true) return { className: 'wf-node-current', badge: '当前', detail: '', phaseClass }
-  if (execution.phase === 'exited') return { className: 'wf-node-completed', badge: phaseLabel, detail: '', phaseClass }
-  return { className: `wf-node-${execution.phase}`, badge: phaseLabel, detail: '', phaseClass }
+  if (blocked) return { className: 'wf-node-blocked', badge: 'BLOCK', detail: [execution.blockReason, redoDetail].filter(Boolean).join(' · '), phaseClass, visit, redo }
+  if (execution.current === true) return { className: 'wf-node-current', badge: '当前', detail: redoDetail, phaseClass, visit, redo }
+  if (execution.phase === 'exited') return { className: 'wf-node-completed', badge: phaseLabel, detail: redoDetail, phaseClass, visit, redo }
+  return { className: `wf-node-${execution.phase}`, badge: phaseLabel, detail: redoDetail, phaseClass, visit, redo }
+}
+
+/**
+ * callStack → 当前路径 + 多层 breadcrumb（#253）：栈底为根流程、栈顶为当前节点。
+ * 每帧给出流程标签与调用节点标签；递归调用同一 workflowId 时按帧序保留层级，
+ * 不靠 workflowId 去重（同名子流程可多层）。
+ */
+export function monitorCallPath(run) {
+  const rootWorkflowId = run?.workflowId
+  const flows = run?.flows ?? {}
+  const frames = Array.isArray(run?.callStack) ? run.callStack : []
+  const path = frames.map(frame => {
+    const flow = flows[frame.workflowId]
+    const node = flow?.nodes?.find(candidate => candidate.id === frame.nodeId)
+    return {
+      workflowId: frame.workflowId,
+      nodeId: frame.nodeId,
+      executionId: frame.executionId,
+      label: frame.workflowId === rootWorkflowId ? '主流程' : `子流程 ${frame.workflowId}`,
+      nodeLabel: node?.role === undefined ? frame.nodeId : `${frame.nodeId}（${node.role}）`,
+    }
+  })
+  return {
+    frames: path,
+    currentWorkflowId: path.at(-1)?.workflowId ?? rootWorkflowId ?? null,
+    currentFrame: path.at(-1) ?? null,
+  }
+}
+
+/**
+ * 自动跟随状态机（#253）纯函数：following 始终显示当前节点所在流程；用户手动
+ * 切换 flow 后 paused 并记住 manualFlowId（「回到当前节点」可见）；恢复后回到
+ * following。组件只保存 state，activeFlowId 每次由当前节点派生。
+ */
+export function initialFollowState() {
+  return { mode: 'following', manualFlowId: null }
+}
+
+/** 派生当前应显示的流程与「回到当前节点」入口；paused 时手动流程优先。 */
+export function monitorFollowView(state, currentFlowId) {
+  const paused = state?.mode === 'paused' && typeof state.manualFlowId === 'string'
+  const activeFlowId = paused ? state.manualFlowId : currentFlowId
+  return {
+    mode: paused ? 'paused' : 'following',
+    activeFlowId,
+    showReturn: paused && activeFlowId !== currentFlowId,
+  }
+}
+
+/** 用户点选流程：选中当前流程视为继续跟随，选其他流程则暂停跟随。 */
+export function selectFlow(state, flowId, currentFlowId) {
+  if (flowId === currentFlowId) return initialFollowState()
+  return { mode: 'paused', manualFlowId: flowId }
+}
+
+/** 「回到当前节点」：恢复自动跟随。 */
+export function resumeFollow() {
+  return initialFollowState()
 }
 
 const EMPTY_LAYOUT = { version: 1, main: {}, children: {} }
@@ -45,6 +106,7 @@ function graphOf(run) {
     const previous = latest.get(key)
     if (previous === undefined || node.visit > previous.visit) latest.set(key, node)
   }
+  const callPath = monitorCallPath(run)
   const layout = run.layout ?? EMPTY_LAYOUT
   const flows = Object.entries(run.flows ?? {}).map(([id, flow]) => {
     const nodes = {}
@@ -67,8 +129,8 @@ function graphOf(run) {
       decorations,
     }
   })
-  const currentFlowId = (run.nodes ?? []).find(node => node.current === true)?.workflowId ?? run.workflowId
-  return { layout, flows, currentFlowId }
+  const currentFlowId = callPath.currentWorkflowId ?? (run.nodes ?? []).find(node => node.current === true)?.workflowId ?? run.workflowId
+  return { layout, flows, currentFlowId, callPath }
 }
 
 /** status → 中文标签。 */
