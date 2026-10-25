@@ -73,7 +73,7 @@ export function useMonitorPolling(fetchStatus, enabled, runId = null, shouldCont
           if (result?.ok) {
             setData(result.value)
             setBanner('')
-            // 终态/空态/维护态：本轮后停止轮询（切 Run 或重新可见时再启动）。
+            // 终态/维护态：本轮后停止轮询；空态继续轮询，外部启动新 Run 后自动出现（R1 F2）。
             if (!continueRef.current(result.value)) return
           } else { setBanner(prev => monitorErrorState(prev, result?.error?.message ?? String(result?.error?.code ?? 'monitor failed'))) }
         } catch (error) {
@@ -94,7 +94,7 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   const [follow, setFollow] = useState(initialFollowState)
   // 终态/空态/维护态返回后不再排下一轮（#254：终态 Run 停止轮询）。
   const { data, banner } = useMonitorPolling(runId => fetchStatus(runId), visible !== false, selectedRunId,
-    payload => payload?.mode === 'run' && payload.run?.terminal !== true)
+    payload => payload?.mode !== 'maintenance' && payload?.run?.terminal !== true)
   const view = monitorViewModel(data, { banner, selectedRunId })
   // 切换 Run：跟随状态回到默认跟随（手动流程选择不跨 Run 复用）。
   useEffect(() => { setFollow(initialFollowState()) }, [selectedRunId])

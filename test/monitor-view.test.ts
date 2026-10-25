@@ -165,7 +165,8 @@ test('#254 monitorViewModel：终态 Run 停止轮询并展示终态图', () => 
 test('#254 monitorViewModel：空态三形态（无 Run 引导 / 维护态 / 加载中）', () => {
   const empty = monitorViewModel({ mode: 'empty', runs: [], recent: null })
   assert.equal(empty.mode, 'empty')
-  assert.equal(empty.polling, false)
+  // R1 F2：空态继续轮询（外部启动新 Run 后自动出现）；只有终态/维护态停轮询。
+  assert.equal(empty.polling, true)
   assert.match(empty.guidance, /dsh-flow start/)
   assert.deepEqual(empty.runs, [])
   assert.equal(empty.recent, null)
@@ -280,6 +281,8 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   assert.match(bundle, /该 Run 已结束/)
   assert.match(bundle, /dsh-flow start/)
   assert.match(bundle, /fetchStatus = \(scope, runId\)/)
+  // R1 F2：停轮询只收窄到终态/维护态，空态继续轮询以发现新 Run。
+  assert.match(bundle, /payload\?\.mode !== 'maintenance' && payload\?\.run\?\.terminal !== true/)
   // 宿主 client bundle 不做 JSX 转译：产物必须是可直接解析的纯 JS（#252 发现 #251 JSX 隐患）。
   assert.doesNotThrow(() => new Function(bundle), 'bundle 必须是可解析的纯 JS')
 })

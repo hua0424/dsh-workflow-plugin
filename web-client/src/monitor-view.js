@@ -198,7 +198,7 @@ const TERMINAL_RUN_STATUSES = new Set(['completed', 'terminated'])
  * payload 为 null/undefined（尚无数据）时返回 { mode: 'loading' }。
  * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅；
  * options.selectedRunId 是切换器选中的 Run（缺省 = 当前 cwd 默认 Run）。
- * polling=false 的模式（terminal/empty/maintenance）由组件停止轮询。
+ * polling=false 的模式（terminal/maintenance）由组件停止轮询；empty 继续轮询以发现新 Run（#254 R1 F2）。
  */
 export function monitorViewModel(payload, options = {}) {
   const banner = typeof options.banner === 'string' ? options.banner : ''
@@ -216,7 +216,7 @@ export function monitorViewModel(payload, options = {}) {
   }
   const base = { banner, runs, recent, selectedRunId }
   if (payload.run === undefined || payload.run === null) {
-    return { ...base, mode: 'empty', polling: false, guidance: EMPTY_GUIDANCE }
+    return { ...base, mode: 'empty', polling: true, guidance: EMPTY_GUIDANCE }
   }
   const run = payload.run
   const now = Number.isFinite(options.now) ? options.now : Date.now()

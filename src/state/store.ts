@@ -174,7 +174,7 @@ export class StateStore {
     return this.db.prepare('SELECT r.* FROM runs r JOIN node_executions e ON e.run_id = r.run_id WHERE r.workspace_key = ? AND e.execution_id = ?').get(workspaceKey, executionId) as RunRow | undefined
   }
 
-  /** 执行行解码 + 列/快照一致性校验（readExecution 与 runExecutions 共用）。 */
+  /** 执行行解码 + 列/快照一致性校验（readExecution 与 executionsOf 共用）。 */
   private decodeExecution(run: RunState, row: ExecutionRow, validate = true): NodeExecution {
     const execution = parse<NodeExecution>(row.snapshot_json)
     if (validate) assertValid(checkExecutionInvariants(run, execution))
@@ -216,14 +216,6 @@ export class StateStore {
   /** Each workspace's newest Run; completed history remains in runs. */
   list(): Promise<StateRow[]> {
     return this.enqueue(() => (this.db.prepare('SELECT * FROM runs WHERE sequence IN (SELECT MAX(sequence) FROM runs GROUP BY workspace_key) ORDER BY sequence').all() as unknown as RunRow[]).map(row => this.decode(row)))
-  }
-
-  /** #251 只读：最新 Run 的全部工作单快照（含历史 visit），按 visit 升序。 */
-  runExecutions(workspaceKey: string): Promise<NodeExecution[]> {
-    return this.enqueue(() => {
-      const row = this.latest(workspaceKey)
-      return row ? this.executionsOf(row) : []
-    })
   }
 
   /** #254 只读：按 runId 取工作单快照（切换器可查看非最新 Run）。 */
