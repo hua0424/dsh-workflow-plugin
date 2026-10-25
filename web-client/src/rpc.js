@@ -15,12 +15,13 @@ function normalizeResult(result) {
 
 /**
  * @param connection 宿主浏览器端的 ctx.connection（结构：{ rpc: { call } }）。
- * @param {string} endpoint parse | validate | preview | layout | metadata | catalog
+ * @param {string} channel Connection 单段绝对路径通道（编辑器 = EDITOR_RPC_CHANNEL）。
+ * @param {string} endpoint parse | validate | preview | layout | metadata | catalog | status
  */
-export async function callEditor(connection, endpoint, payload, signal) {
+export async function callChannel(connection, channel, endpoint, payload, signal) {
   const call = connection?.rpc?.call
   if (typeof call !== 'function') {
-    return { ok: false, error: { code: 'editor/no-channel', message: '当前页面没有可用的编辑器 RPC 通道', details: {} } }
+    return { ok: false, error: { code: 'editor/no-channel', message: '当前页面没有可用的 RPC 通道', details: {} } }
   }
   const controller = new AbortController()
   let timedOut = false
@@ -41,7 +42,7 @@ export async function callEditor(connection, endpoint, payload, signal) {
   try {
     // 同时终止传输与等待：宿主通道即使没有响应 abort，也不能一直锁住编辑器。
     return normalizeResult(await Promise.race([
-      call.call(connection.rpc, EDITOR_RPC_CHANNEL, endpoint, payload, controller.signal),
+      call.call(connection.rpc, channel, endpoint, payload, controller.signal),
       cancelled,
     ]))
   } catch (error) {
@@ -58,6 +59,11 @@ export function rpcErrorMessage(result) {
   if (result.ok) return ''
   const error = result.error ?? {}
   return typeof error.message === 'string' && error.message !== '' ? error.message : String(error.code ?? 'unknown')
+}
+
+/** 编辑器通道 = callChannel 的特化（保留旧签名）。 */
+export function callEditor(connection, endpoint, payload, signal) {
+  return callChannel(connection, EDITOR_RPC_CHANNEL, endpoint, payload, signal)
 }
 
 /**

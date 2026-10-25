@@ -22,7 +22,8 @@ import { WorkflowError } from './types.ts'
 import type { RunState, NodeExecution } from './types.ts'
 import { makeWorkflowTools, type ToolHost } from './tools/tools.ts'
 import { authorizeToolCall } from './tools/authz.ts'
-import { installEditorRpc } from './editor/rpc.ts'
+import { installEditorRpc, mountRpcChannel } from './editor/rpc.ts'
+import { MONITOR_RPC_CHANNEL, createMonitorRpcHandler } from './monitor/rpc.ts'
 import { isRootCommandAgent, makeBlankSessionActivator, makeDshFlowCommand, type CommandHost } from './commands/dsh-flow.ts'
 import { makeStateHost, makeDispatchTargets, makeSubagentHost, managerRouteOf, programHost, type HostAdapters } from './plugin/host.ts'
 import { RolePresetBook } from './plugin/presets.ts'
@@ -454,10 +455,26 @@ export function apply(ctx: Context) {
   const disposeEditorRpcFns: Array<() => void> = []
   // #178 catalog 端点复用命令层 list（fresh 扫描 + 维护判定），与 /dsh-flow list 同源。
   const catalogDeps = { listCatalog: () => commandHost.list() }
+  // #251 运行监控只读 RPC：maintenance 短路诊断，不触碰状态库；workspace 只按
+  // 浏览器上行的 scope.cwd 解析（缺省 → empty，绝不回退 process.cwd：宿主进程
+  // 目录不等于会话目录，R1 F4）。
+  const monitorWorkspace = (cwd?: string) => workspaceKeyOf(cwd)
   if (typeof ctx.inject === 'function') {
     ctx.inject(['connection', 'webServer'], (webCtx: unknown) => {
       const installed = installEditorRpc(webCtx as Parameters<typeof installEditorRpc>[0], catalogDeps)
       if (installed.status !== 'skipped') disposeEditorRpcFns.push(installed.dispose)
+      const monitor = mountRpcChannel(webCtx as Parameters<typeof mountRpcChannel>[0], MONITOR_RPC_CHANNEL, createMonitorRpcHandler({
+        maintenance: () => stateAccess.maintenanceDiagnostic(),
+        status: async cwd => {
+          const ws = await monitorWorkspace(cwd)
+          return ws === undefined ? undefined : store().get(ws)
+        },
+        executions: async cwd => {
+          const ws = await monitorWorkspace(cwd)
+          return ws === undefined ? [] : store().runExecutions(ws)
+        },
+      }))
+      if (monitor.status !== 'skipped') disposeEditorRpcFns.push(monitor.dispose)
     })
   } else {
     const installed = installEditorRpc(ctx as Parameters<typeof installEditorRpc>[0], catalogDeps)
