@@ -56,8 +56,12 @@ function harness() {
 function handlerOf(h: ReturnType<typeof harness>, layout?: EditorLayout) {
   return createMonitorRpcHandler({
     maintenance: () => undefined,
-    status: async cwd => h.store.get(cwd ?? 'ws'),
-    executions: async cwd => h.store.runExecutions(cwd ?? 'ws'),
+    resolveWorkspace: async cwd => cwd ?? 'ws',
+    latest: async workspaceKey => h.store.get(workspaceKey),
+    active: async () => h.store.activeRuns(),
+    recentCompleted: async workspaceKey => h.store.latestCompleted(workspaceKey),
+    byRunId: async runId => h.store.getByRunId(runId),
+    executions: async runId => h.store.runExecutionsByRunId(runId),
     layout: async () => layout,
   })
 }
@@ -73,12 +77,12 @@ async function judgeAccept(h: ReturnType<typeof harness>, caller: ClaimCaller): 
   await h.engine.handleTurnEnded('ws', caller)
 }
 
-test('#251 status：无 Run → empty 模式', async () => {
+test('#254 status：零 Run → empty 模式（含空活跃清单/无终态）', async () => {
   const h = harness()
   try {
     const result = await handlerOf(h)('status', { cwd: 'ws' })
     assert.equal(result.ok, true)
-    assert.deepEqual(result.value, { mode: 'empty' })
+    assert.deepEqual(result.value, { mode: 'empty', runs: [], recent: null })
   } finally { h.cleanup() }
 })
 
@@ -94,6 +98,9 @@ test('#251 status：活跃 Run → 完整只读投影（节点/角色模型/图/
     assert.equal(payload.run!.status, 'running')
     assert.equal(payload.run!.workflowId, 'test')
     assert.equal(payload.run!.launchPrompt, '受控启动请求')
+    // #254：活跃清单带 workspace 标识（当前 Run 也在其中，默认选中）；无终态历史。
+    assert.deepEqual(payload.runs, [{ runId: payload.run!.runId, workspaceKey: 'ws', workflowId: 'test', status: 'running' }])
+    assert.equal(payload.recent, null)
     // 节点按 visit 升序；首个工作单 working、当前焦点在 plan。
     assert.equal(payload.run!.nodes.length, 1)
     assert.deepEqual([payload.run!.nodes[0].nodeId, payload.run!.nodes[0].phase, payload.run!.nodes[0].current], ['plan', 'working', true])
@@ -155,8 +162,12 @@ test('#252 status：平铺布局经真实读取进入 payload（与编辑器同�
     writeFileSync(join(h.home, 'workflows', 'test.layout.json'), JSON.stringify({ version: 1, main: { plan: { x: 7, y: 8 } }, children: {} }))
     const handler = createMonitorRpcHandler({
       maintenance: () => undefined,
-      status: async cwd => h.store.get(cwd ?? 'ws'),
-      executions: async cwd => h.store.runExecutions(cwd ?? 'ws'),
+      resolveWorkspace: async cwd => cwd ?? 'ws',
+      latest: async workspaceKey => h.store.get(workspaceKey),
+      active: async () => h.store.activeRuns(),
+      recentCompleted: async workspaceKey => h.store.latestCompleted(workspaceKey),
+      byRunId: async runId => h.store.getByRunId(runId),
+      executions: async runId => h.store.runExecutionsByRunId(runId),
       layout: async workflowId => readRunLayout(h.home, workflowId),
     })
     const result = await handler('status', { cwd: 'ws' })
@@ -228,6 +239,10 @@ test('#251 status：终态 Run → completed + 业务返回', async () => {
     assert.equal(result.ok, true)
     const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
     assert.equal(payload.run!.status, 'completed')
+    assert.equal(payload.run!.terminal, true)
+    // #254：终态 Run 不在活跃清单；作为 cwd 最近完成 Run 返回（客户端展示终态图并停轮询）。
+    assert.deepEqual(payload.runs, [])
+    assert.deepEqual(payload.recent, { runId: payload.run!.runId, workspaceKey: 'ws', workflowId: 'test', status: 'completed' })
     assert.deepEqual(payload.run!.businessReturn, { name: 'done', source: row.execution.executionId })
     assert.deepEqual(payload.run!.nodes.map(node => [node.visit, node.phase]), [[1, 'exited'], [2, 'exited']])
     assert.deepEqual(payload.run!.callStack, [], '终态 Run 调用栈为空')
@@ -238,20 +253,50 @@ test('#251 status：cwd 原样透传，缺省不猜宿主 process.cwd（F4）', 
   const seen: Array<string | undefined> = []
   const handler = createMonitorRpcHandler({
     maintenance: () => undefined,
-    status: async cwd => { seen.push(cwd); return undefined },
-    executions: async cwd => { seen.push(cwd); return [] },
+    resolveWorkspace: async cwd => { seen.push(cwd); return cwd },
+    latest: async key => { seen.push(key); return undefined },
+    active: async () => [],
+    recentCompleted: async key => { seen.push(key); return undefined },
+    byRunId: async runId => { seen.push(runId); return undefined },
+    executions: async runId => { seen.push(runId); return [] },
     layout: async () => undefined,
   })
-  assert.deepEqual(await handler('status', {}), { ok: true, value: { mode: 'empty' } })
-  assert.deepEqual(await handler('status', { cwd: 'D:/ws' }), { ok: true, value: { mode: 'empty' } })
-  assert.deepEqual(seen, [undefined, undefined, 'D:/ws', 'D:/ws'])
+  assert.deepEqual(await handler('status', {}), { ok: true, value: { mode: 'empty', runs: [], recent: null } })
+  assert.deepEqual(await handler('status', { cwd: 'D:/ws' }), { ok: true, value: { mode: 'empty', runs: [], recent: null } })
+  // 缺省 cwd 只解析为 undefined，不回退 process.cwd；显式 cwd 依次用于解析/最近终态/默认 Run。
+  assert.deepEqual(seen, [undefined, 'D:/ws', 'D:/ws', 'D:/ws'])
+})
+
+test('#254 status：活跃清单跨 workspace + runId 切换 + 失效回退', async () => {
+  const h = harness()
+  try {
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, 'A')).ok, true)
+    assert.equal((await h.engine.startRun('ws2', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, 'B')).ok, true)
+    const rowA = (await h.store.get('ws'))!
+    const rowB = (await h.store.get('ws2'))!
+    const handler = handlerOf(h)
+    const first = await handler('status', { cwd: 'ws' })
+    const payload = first.value as Extract<typeof first.value, { mode: 'run' }>
+    assert.equal(payload.run!.runId, rowA.run.runId, '默认选中当前 cwd 的 Run')
+    assert.deepEqual(payload.runs.map(ref => ref.runId).sort(), [rowA.run.runId, rowB.run.runId].sort())
+    assert.ok(payload.runs.every(ref => typeof ref.workspaceKey === 'string' && ref.workspaceKey !== ''), '每条活跃 Run 带 workspace 标识')
+    const picked = (await handler('status', { cwd: 'ws', runId: rowB.run.runId })).value as Extract<typeof first.value, { mode: 'run' }>
+    assert.equal(picked.run!.runId, rowB.run.runId, 'runId 可跨 workspace 选择')
+    assert.equal(picked.run!.workspaceKey, 'ws2')
+    const fallback = (await handler('status', { cwd: 'ws', runId: 'missing' })).value as Extract<typeof first.value, { mode: 'run' }>
+    assert.equal(fallback.run!.runId, rowA.run.runId, '失效 runId 回退 cwd 默认 Run')
+  } finally { h.cleanup() }
 })
 
 test('#251 status：维护诊断短路，不触碰状态库', async () => {
   const touched: string[] = []
   const handler = createMonitorRpcHandler({
     maintenance: () => ({ kind: 'incompatible', path: '/tmp/state.sqlite3', userVersion: 1, tables: ['runs'], reason: 'incompatible state format (user_version=1); original data retained' }),
-    status: async () => { touched.push('status'); return undefined },
+    resolveWorkspace: async () => { touched.push('resolve'); return undefined },
+    latest: async () => { touched.push('latest'); return undefined },
+    active: async () => { touched.push('active'); return [] },
+    recentCompleted: async () => { touched.push('recent'); return undefined },
+    byRunId: async () => { touched.push('byRunId'); return undefined },
     executions: async () => { touched.push('executions'); return [] },
     layout: async () => { touched.push('layout'); return undefined },
   })

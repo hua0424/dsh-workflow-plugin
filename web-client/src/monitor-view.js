@@ -141,6 +141,32 @@ export const RUN_STATUS_LABELS = {
   terminated: '已终止',
 }
 
+/** 空态引导（#254）：当前目录没有任何 Run 时告诉用户如何启动。 */
+export const EMPTY_GUIDANCE = '当前目录没有工作流运行记录。在会话中执行 /dsh-flow start <workflowId> 启动工作流。'
+
+/** workspace key → 短标签（路径最后一段；兼容 Windows 反斜杠）。 */
+export function workspaceLabel(workspaceKey) {
+  if (typeof workspaceKey !== 'string' || workspaceKey === '') return '未知目录'
+  const parts = workspaceKey.replace(/\\/g, '/').split('/').filter(Boolean)
+  return parts.at(-1) ?? workspaceKey
+}
+
+/** Run 引用 → 切换器选项（workspace 标识 + 流程 + 状态）。 */
+function runRefView(ref, selectedRunId) {
+  const workspace = workspaceLabel(ref?.workspaceKey)
+  const workflowId = typeof ref?.workflowId === 'string' ? ref.workflowId : '—'
+  return {
+    runId: ref?.runId ?? '',
+    workspaceKey: ref?.workspaceKey ?? '',
+    workspaceLabel: workspace,
+    workflowId,
+    status: ref?.status ?? '',
+    statusLabel: RUN_STATUS_LABELS[ref?.status] ?? String(ref?.status ?? ''),
+    label: `${workspace} · ${workflowId}`,
+    selected: ref?.runId === selectedRunId,
+  }
+}
+
 function phaseOf(phase) {
   const entry = PHASE_LABELS[phase]
   return entry === undefined ? [String(phase), 'phase-ready'] : entry
@@ -168,17 +194,30 @@ function elapsedText(ms) {
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'terminated'])
 
 /**
- * payload（服务端 MonitorRunStatus）→ 视图模型。
+ * payload（服务端 MonitorRunStatus）→ 视图模型（#254 起区分 run/terminal/empty）。
  * payload 为 null/undefined（尚无数据）时返回 { mode: 'loading' }。
- * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅。
+ * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅；
+ * options.selectedRunId 是切换器选中的 Run（缺省 = 当前 cwd 默认 Run）。
+ * polling=false 的模式（terminal/empty/maintenance）由组件停止轮询。
  */
 export function monitorViewModel(payload, options = {}) {
   const banner = typeof options.banner === 'string' ? options.banner : ''
-  if (payload === null || payload === undefined || typeof payload !== 'object') return { mode: 'loading', banner }
+  if (payload === null || payload === undefined || typeof payload !== 'object') return { mode: 'loading', banner, polling: true, runs: [], recent: null }
   if (payload.mode === 'maintenance') {
-    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner }
+    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner, polling: false, runs: [], recent: null }
   }
-  if (payload.mode !== 'run' || payload.run === undefined || payload.run === null) return { mode: 'empty', banner }
+  const payloadRuns = Array.isArray(payload.runs) ? payload.runs : []
+  const recent = payload.recent === null || payload.recent === undefined ? null : runRefView(payload.recent, null)
+  const selectedRunId = typeof options.selectedRunId === 'string' ? options.selectedRunId : payload.run?.runId ?? null
+  const runs = payloadRuns.map(ref => runRefView(ref, selectedRunId))
+  // 选中的 Run 可能已离开活跃清单（终态）：补一个选项，避免切换器值悬空。
+  if (payload.run !== undefined && payload.run !== null && !runs.some(ref => ref.runId === payload.run.runId)) {
+    runs.push(runRefView({ ...payload.run, workspaceKey: payload.run.workspaceKey }, selectedRunId))
+  }
+  const base = { banner, runs, recent, selectedRunId }
+  if (payload.run === undefined || payload.run === null) {
+    return { ...base, mode: 'empty', polling: false, guidance: EMPTY_GUIDANCE }
+  }
   const run = payload.run
   const now = Number.isFinite(options.now) ? options.now : Date.now()
   const [statusLabel, statusClass] = run.status === 'blocked' ? ['已阻塞', 'run-blocked'] : [RUN_STATUS_LABELS[run.status] ?? String(run.status), 'run-ok']
@@ -189,21 +228,25 @@ export function monitorViewModel(payload, options = {}) {
   // 开始时间取首个工作单的进入时刻（不新增持久化字段）；终态用最后工作单的退出时刻。
   const startedAt = typeof nodes[0]?.enteredAt === 'string' ? nodes[0].enteredAt : null
   const startedMs = startedAt === null ? Number.NaN : Date.parse(startedAt)
+  const terminal = run.terminal === true || TERMINAL_RUN_STATUSES.has(run.status)
   const lastExitedAt = nodes[nodes.length - 1]?.exitedAt
-  const endMs = TERMINAL_RUN_STATUSES.has(run.status) && typeof lastExitedAt === 'string' ? Date.parse(lastExitedAt) : now
+  const endMs = terminal && typeof lastExitedAt === 'string' ? Date.parse(lastExitedAt) : now
   const durationText = Number.isFinite(startedMs) ? elapsedText((Number.isFinite(endMs) ? endMs : now) - startedMs) : null
   return {
-    mode: 'run',
-    banner,
+    ...base,
+    mode: terminal ? 'terminal' : 'run',
+    polling: !terminal,
+    terminalNote: terminal ? '该 Run 已结束，已停止轮询（展示冻结终态图）。' : null,
     run: {
       workflowId: run.workflowId ?? '—',
       runId: run.runId ?? '—',
+      workspaceKey: run.workspaceKey ?? '',
       statusLabel,
       statusClass,
       startedAt,
       startedAtText: Number.isFinite(startedMs) ? new Date(startedMs).toLocaleString('zh-CN', { hour12: false }) : null,
       durationText,
-      durationLabel: TERMINAL_RUN_STATUSES.has(run.status) ? '总耗时' : '已运行',
+      durationLabel: terminal ? '总耗时' : '已运行',
       blockReason: run.blockReason ?? null,
       businessReturn: run.businessReturn ? `${run.businessReturn.name}` : null,
       launchPrompt: run.launchPrompt ?? '',
@@ -239,8 +282,10 @@ export function monitorErrorState(banner, errorText) {
   return typeof errorText === 'string' && errorText !== '' ? errorText : banner
 }
 
-/** better-sidebar TabComponentProps.scope → status payload：只上行会话 cwd（缺席则空载荷）。 */
-export function monitorStatusPayload(scope) {
+/** better-sidebar TabComponentProps.scope + 切换器选中 Run → status payload。 */
+export function monitorStatusPayload(scope, runId) {
   const cwd = scope?.cwd
-  return typeof cwd === 'string' && cwd !== '' ? { cwd } : {}
+  const payload = typeof cwd === 'string' && cwd !== '' ? { cwd } : {}
+  if (typeof runId === 'string' && runId !== '') payload.runId = runId
+  return payload
 }

@@ -77,14 +77,14 @@ export function apply(ctx) {
       if (typeof sidebar?.registerTab !== 'function') return
       // 每次请求带上 tab 收到的 scope.cwd：宿主按会话工作目录解析 workspace，
       // 服务端不再回退 process.cwd（R1 F4）。
-      const fetchStatus = (scope) => callChannel(ctx.connection, MONITOR_RPC_CHANNEL, 'status', monitorStatusPayload(scope))
+      const fetchStatus = (scope, runId) => callChannel(ctx.connection, MONITOR_RPC_CHANNEL, 'status', monitorStatusPayload(scope, runId))
       // better-sidebar 0.28 descriptor 契约：title/component 必填；描述字段名是
       // description（`desc` 是死字段，宿主不会渲染——R1 F1）。
       sidebar.registerTab({
         id: MONITOR_TAB_ID,
         title: '工作流监控',
         description: '运行状态、节点进度与子流程下钻',
-        component: (props) => WorkflowMonitorTab({ ...props, fetchStatus: () => fetchStatus(props?.scope) }),
+        component: (props) => WorkflowMonitorTab({ ...props, fetchStatus: runId => fetchStatus(props?.scope, runId) }),
       })
     })
   }
