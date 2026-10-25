@@ -206,6 +206,7 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   assert.match(bundle, /registerTab/)
   // AC3 实证：better-sidebar 0.28 只认单 descriptor，title/component 必填（旧双参写法 tab 不出现）。
   assert.match(bundle, /title: '工作流监控'/)
+  assert.match(bundle, /description: '运行状态、节点进度与子流程下钻'/)
   assert.match(bundle, /component: \(props\) => WorkflowMonitorTab/)
   // scope.cwd 经 monitorStatusPayload 上行，服务端不再猜 process.cwd。
   assert.match(bundle, /monitorStatusPayload/)
