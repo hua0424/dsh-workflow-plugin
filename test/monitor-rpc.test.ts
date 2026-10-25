@@ -3,7 +3,7 @@
 // 视图模型纯函数与 bundle 注册断言在 test/monitor-view.test.ts。
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ClaimCaller, WorkflowConfig } from '../src/types.ts'
@@ -140,6 +140,28 @@ test('#252 status：布局坐标随 payload 返回（缺失补网格）且不改
     // 结果端口随图返回，供只读画布绘制结果端口与连线。
     const plan = payload.run!.flows.test.nodes.find(node => node.id === 'plan')!
     assert.deepEqual(plan.results, { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } })
+  } finally { h.cleanup() }
+})
+
+test('#252 status：启动后变更配置对象/磁盘 YAML，冻结图不变（AC4）', async () => {
+  const h = harness()
+  try {
+    const launched = structuredClone(config)
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', launched, 'hash'), undefined, '受控启动请求')).ok, true)
+    const first = await handlerOf(h)('status', { cwd: 'ws' })
+    const payload = first.value as Extract<typeof first.value, { mode: 'run' }>
+    const frozenFlows = structuredClone(payload.run!.flows)
+    // 启动后深改内存配置：结果目标、角色模型、节点清单都应只影响后续启动的 Run。
+    launched.workflow.nodes.plan.results.succeeded.target = { return: 'done' }
+    launched.roles.reviewer.model!.modelId = 'm-mutated'
+    launched.workflow.nodes.extra = { execution: { type: 'actor-task', role: 'reviewer', instruction: 'x' }, checker: { checkerId: 'judge.claim-correct', config: { criteria: 'x' } }, results: { succeeded: { criteria: 'x', target: { return: 'done' } } } }
+    // 启动后改写磁盘 YAML：status 只读 Run 的冻结快照，不重新加载 catalog。
+    mkdirSync(join(h.home, 'workflows'), { recursive: true })
+    writeFileSync(join(h.home, 'workflows', 'test.yaml'), 'schemaVersion: agent-workflow/v3\nworkflow:\n  startNode: extra\n')
+    const second = await handlerOf(h)('status', { cwd: 'ws' })
+    const after = second.value as Extract<typeof second.value, { mode: 'run' }>
+    assert.deepEqual(after.run!.flows, frozenFlows, 'flows 与启动时冻结快照一致')
+    assert.equal(after.run!.roles.find(role => role.role === 'reviewer')!.model.modelId, 'm-review')
   } finally { h.cleanup() }
 })
 
