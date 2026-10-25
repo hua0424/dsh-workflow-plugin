@@ -322,7 +322,6 @@ function createWorld() {
     resolveWorkspace: async (cwd?: string) => { stateReads += 1; return typeof cwd === 'string' && cwd !== '' ? cwd : 'ws' },
     latest: async workspaceKey => { stateReads += 1; return store.get(workspaceKey) },
     active: async () => { stateReads += 1; return store.activeRuns() },
-    recentCompleted: async workspaceKey => { stateReads += 1; return store.latestCompleted(workspaceKey) },
     byRunId: async runId => { stateReads += 1; return store.getByRunId(runId) },
     executions: async runId => { stateReads += 1; return store.runExecutionsByRunId(runId) },
     layout: async () => undefined,

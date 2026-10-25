@@ -461,7 +461,6 @@ export function apply(ctx: Context) {
         resolveWorkspace: cwd => monitorWorkspace(cwd),
         latest: workspaceKey => store().get(workspaceKey),
         active: () => store().activeRuns(),
-        recentCompleted: workspaceKey => store().latestCompleted(workspaceKey),
         byRunId: runId => store().getByRunId(runId),
         executions: runId => store().runExecutionsByRunId(runId),
         // #252：坐标与配置同目录，只读；缺失/损坏回退网格补位，不影响 status。
