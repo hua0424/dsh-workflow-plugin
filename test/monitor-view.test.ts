@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildClientBundle } from '../web-client/build.mjs'
-import { monitorViewModel, monitorErrorState, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, PHASE_LABELS } from '../web-client/src/monitor-view.js'
+import { monitorViewModel, monitorErrorState, monitorPollingContinues, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, PHASE_LABELS } from '../web-client/src/monitor-view.js'
 
 const STARTED_AT = '2026-10-25T04:00:00.000Z'
 
@@ -157,22 +157,38 @@ test('#254 monitorViewModel：终态 Run 停止轮询并展示终态图', () => 
   const done = monitorViewModel({ ...RUN_PAYLOAD, runs: [], recent: { runId: 'r1', workspaceKey: 'D:/ws', workflowId: 'test', status: 'completed' }, run: { ...RUN_PAYLOAD.run, status: 'completed' } })
   assert.equal(done.mode, 'terminal')
   assert.equal(done.polling, false)
-  assert.match(done.terminalNote, /停止轮询/)
+  // #261：终态文案明确「停止自动轮询 + 可手动刷新」，与只读刷新入口一致。
+  assert.match(done.terminalNote, /停止自动轮询/)
+  assert.match(done.terminalNote, /刷新状态/)
   assert.equal(done.run.graph.flows.length, 2)
   assert.equal(done.recent.runId, 'r1')
+})
+
+test('#261 monitorPollingContinues：只有终态 Run 停周期，空态/维护态/活跃 Run 继续', () => {
+  assert.equal(monitorPollingContinues(undefined), true)
+  assert.equal(monitorPollingContinues({ mode: 'empty', runs: [], recent: null }), true)
+  assert.equal(monitorPollingContinues({ mode: 'maintenance', maintenance: { kind: 'corrupt', reason: 'x' } }), true)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'running' } }), true)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'blocked' } }), true)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'completed' } }), false)
+  assert.equal(monitorPollingContinues({ mode: 'run', run: { runId: 'r1', status: 'terminated' } }), false)
+  // 视图模型的 polling 与该判定同源（不出现两套规则）。
+  const blocked = monitorViewModel({ ...RUN_PAYLOAD, run: { ...RUN_PAYLOAD.run, status: 'blocked' } })
+  assert.equal(blocked.polling, true)
 })
 
 test('#254 monitorViewModel：空态三形态（无 Run 引导 / 维护态 / 加载中）', () => {
   const empty = monitorViewModel({ mode: 'empty', runs: [], recent: null })
   assert.equal(empty.mode, 'empty')
-  // R1 F2：空态继续轮询（外部启动新 Run 后自动出现）；只有终态/维护态停轮询。
+  // R1 F2：空态继续轮询（外部启动新 Run 后自动出现）。
   assert.equal(empty.polling, true)
   assert.match(empty.guidance, /dsh-flow start/)
   assert.deepEqual(empty.runs, [])
   assert.equal(empty.recent, null)
   const maintenance = monitorViewModel({ mode: 'maintenance', maintenance: { kind: 'incompatible', reason: '版本不兼容' }, runs: [], recent: null })
   assert.equal(maintenance.mode, 'maintenance')
-  assert.equal(maintenance.polling, false)
+  // #261：维护态继续探测，运维恢复状态库后自动回到正常视图（此前完全停请求，只能重挂载自愈）。
+  assert.equal(maintenance.polling, true)
   assert.match(maintenance.reason, /版本不兼容/)
   assert.equal(monitorViewModel(undefined).mode, 'loading')
 })
@@ -281,8 +297,14 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   assert.match(bundle, /该 Run 已结束/)
   assert.match(bundle, /dsh-flow start/)
   assert.match(bundle, /fetchStatus = \(scope, runId\)/)
-  // R1 F2：停轮询只收窄到终态/维护态，空态继续轮询以发现新 Run。
-  assert.match(bundle, /payload\?\.mode !== 'maintenance' && payload\?\.run\?\.terminal !== true/)
+  // #261 刷新恢复与目录隔离：统一停轮询判定、只读刷新入口、可见性监听、上下文键隔离打进 bundle。
+  assert.match(bundle, /monitorPollingContinues/)
+  assert.doesNotMatch(bundle, /payload\?\.mode !== 'maintenance' && payload\?\.run\?\.terminal !== true/)
+  assert.match(bundle, /刷新状态/)
+  assert.match(bundle, /正在刷新/)
+  assert.match(bundle, /visibilitychange/)
+  assert.match(bundle, /pollContextKey/)
+  assert.match(bundle, /useMonitorPolling\(\s*runId => fetchStatus\(runId\)/)
   // 宿主 client bundle 不做 JSX 转译：产物必须是可直接解析的纯 JS（#252 发现 #251 JSX 隐患）。
   assert.doesNotThrow(() => new Function(bundle), 'bundle 必须是可解析的纯 JS')
 })

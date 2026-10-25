@@ -194,17 +194,31 @@ function elapsedText(ms) {
 const TERMINAL_RUN_STATUSES = new Set(['completed', 'terminated'])
 
 /**
+ * 该 payload 是否还要继续自动轮询（#261 统一口径，组件与 Hook 共用一份判断）。
+ * 只有终态 Run 停周期：运行中/BLOCK/空态/维护态都在可见时按 2s 继续探测——
+ * 维护态是运维临时状态，继续探测才能在状态库恢复后自动回到正常视图；
+ * 终态 Run 由「刷新状态」手动读取（不引入自动发现）。
+ */
+export function monitorPollingContinues(payload) {
+  const run = payload?.run
+  if (run === undefined || run === null) return true
+  return run.terminal !== true && !TERMINAL_RUN_STATUSES.has(run.status)
+}
+
+/**
  * payload（服务端 MonitorRunStatus）→ 视图模型（#254 起区分 run/terminal/empty）。
  * payload 为 null/undefined（尚无数据）时返回 { mode: 'loading' }。
  * options.now 固定当前时刻（单测可复现）；options.banner 是 RPC 失败横幅；
  * options.selectedRunId 是切换器选中的 Run（缺省 = 当前 cwd 默认 Run）。
- * polling=false 的模式（terminal/maintenance）由组件停止轮询；empty 继续轮询以发现新 Run（#254 R1 F2）。
+ * polling=false 只剩终态 Run 一种（#261）：维护态同样继续探测，状态库恢复后自愈；
+ * 终态由只读「刷新状态」手动读取。是否继续的判定见 monitorPollingContinues。
  */
 export function monitorViewModel(payload, options = {}) {
   const banner = typeof options.banner === 'string' ? options.banner : ''
   if (payload === null || payload === undefined || typeof payload !== 'object') return { mode: 'loading', banner, polling: true, runs: [], recent: null }
   if (payload.mode === 'maintenance') {
-    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner, polling: false, runs: [], recent: null }
+    // 维护态继续按可见性探测（#261）：否则运维恢复状态库后面板永远停在维护视图。
+    return { mode: 'maintenance', reason: payload.maintenance?.reason ?? '状态库处于维护模式', banner, polling: true, runs: [], recent: null }
   }
   const payloadRuns = Array.isArray(payload.runs) ? payload.runs : []
   const recent = payload.recent === null || payload.recent === undefined ? null : runRefView(payload.recent, null)
@@ -228,7 +242,7 @@ export function monitorViewModel(payload, options = {}) {
   // 开始时间取首个工作单的进入时刻（不新增持久化字段）；终态用最后工作单的退出时刻。
   const startedAt = typeof nodes[0]?.enteredAt === 'string' ? nodes[0].enteredAt : null
   const startedMs = startedAt === null ? Number.NaN : Date.parse(startedAt)
-  const terminal = run.terminal === true || TERMINAL_RUN_STATUSES.has(run.status)
+  const terminal = !monitorPollingContinues(payload)
   const lastExitedAt = nodes[nodes.length - 1]?.exitedAt
   const endMs = terminal && typeof lastExitedAt === 'string' ? Date.parse(lastExitedAt) : now
   const durationText = Number.isFinite(startedMs) ? elapsedText((Number.isFinite(endMs) ? endMs : now) - startedMs) : null
@@ -236,7 +250,7 @@ export function monitorViewModel(payload, options = {}) {
     ...base,
     mode: terminal ? 'terminal' : 'run',
     polling: !terminal,
-    terminalNote: terminal ? '该 Run 已结束，已停止轮询（展示冻结终态图）。' : null,
+    terminalNote: terminal ? '该 Run 已结束，已停止自动轮询；点击「刷新状态」可查看最新状态。' : null,
     run: {
       workflowId: run.workflowId ?? '—',
       runId: run.runId ?? '—',
