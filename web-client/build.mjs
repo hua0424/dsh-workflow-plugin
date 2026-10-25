@@ -61,11 +61,11 @@ export function bundleSources() {
     .replace(/^export\s+/gm, '')
   const panel = rewriteImports(read('panel.js'), 'react', "require('react')")
   const panelLinked = rewriteImports(rewriteImports(rewriteImports(rewriteImports(panel, './rpc.js', '__rpc'), './edits.js', '__edits'), './styles.js', '__styles'), './model-selector.js', '__modelSelector')
-  const index = rewriteImports(rewriteImports(rewriteImports(
+  const index = rewriteImports(rewriteImports(rewriteImports(rewriteImports(
     rewriteImports(rewriteImports(read('index.js'), './panel.js', '__panel'),
       './rpc.js',
       '__rpc',
-    ), './model-selector.js', '__modelSelector'), './start-modal.js', '__startModal'), './monitor.js', '__monitor')
+    ), './model-selector.js', '__modelSelector'), './start-modal.js', '__startModal'), './monitor.js', '__monitor'), './monitor-view.js', '__monitorView')
   return {
     rpc,
     edits,
@@ -111,7 +111,7 @@ return { START_PROMPT_MAX_CHARS, START_MODAL_STYLES, normalizeStartPrompt, start
 })();
 var __monitorView = (function () {
 ${monitorView}
-return { PHASE_LABELS, RUN_STATUS_LABELS, monitorViewModel, monitorErrorState };
+return { PHASE_LABELS, RUN_STATUS_LABELS, monitorViewModel, monitorErrorState, monitorStatusPayload };
 })();
 var __monitor = (function () {
 ${monitor}

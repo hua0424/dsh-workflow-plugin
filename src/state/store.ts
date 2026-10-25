@@ -174,14 +174,19 @@ export class StateStore {
     return this.db.prepare('SELECT r.* FROM runs r JOIN node_executions e ON e.run_id = r.run_id WHERE r.workspace_key = ? AND e.execution_id = ?').get(workspaceKey, executionId) as RunRow | undefined
   }
 
-  /** #96: validate=false 时跳过 Execution 单独校验，供调用方随后用一次 checkStateInvariants(run, execution) 复用同一材料收敛重复校验。 */
-  private readExecution(run: RunState, executionId: string, validate = true): NodeExecution | undefined {
-    const row = this.db.prepare('SELECT * FROM node_executions WHERE run_id = ? AND execution_id = ?').get(run.runId, executionId) as ExecutionRow | undefined
-    if (!row) return undefined
+  /** 执行行解码 + 列/快照一致性校验（readExecution 与 runExecutions 共用）。 */
+  private decodeExecution(run: RunState, row: ExecutionRow, validate = true): NodeExecution {
     const execution = parse<NodeExecution>(row.snapshot_json)
     if (validate) assertValid(checkExecutionInvariants(run, execution))
     if (execution.executionId !== row.execution_id || execution.runId !== row.run_id || execution.visit !== row.visit || execution.revision !== row.revision) throw new Error('corrupt execution columns/snapshot mismatch')
     return execution
+  }
+
+  /** #96: validate=false 时跳过 Execution 单独校验，供调用方随后用一次 checkStateInvariants(run, execution) 复用同一材料收敛重复校验。 */
+  private readExecution(run: RunState, executionId: string, validate = true): NodeExecution | undefined {
+    const row = this.db.prepare('SELECT * FROM node_executions WHERE run_id = ? AND execution_id = ?').get(run.runId, executionId) as ExecutionRow | undefined
+    if (!row) return undefined
+    return this.decodeExecution(run, row, validate)
   }
 
   /** Run 形状/定义 hash 单次校验；供只需要 Run 的读取（history/execution/events owner）复用。 */
@@ -220,12 +225,7 @@ export class StateStore {
       if (!row) return []
       const run = this.decodeRun(row)
       const rows = this.db.prepare('SELECT execution_id, run_id, visit, revision, snapshot_json FROM node_executions WHERE run_id = ? ORDER BY visit').all(row.run_id) as unknown as ExecutionRow[]
-      return rows.map(r => {
-        const execution = parse<NodeExecution>(r.snapshot_json)
-        assertValid(checkExecutionInvariants(run, execution))
-        if (execution.executionId !== r.execution_id || execution.runId !== r.run_id || execution.visit !== r.visit || execution.revision !== r.revision) throw new Error('corrupt execution columns/snapshot mismatch')
-        return execution
-      })
+      return rows.map(r => this.decodeExecution(run, r))
     })
   }
 

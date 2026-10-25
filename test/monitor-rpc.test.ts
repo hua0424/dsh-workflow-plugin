@@ -50,7 +50,7 @@ function harness() {
   return { home, store, engine, cleanup() { store.close(); rmSync(home, { recursive: true, force: true }) } }
 }
 
-/** cwd 缺省 → 宿主 process.cwd()；本测试显式传 workspace key 形状的 cwd 恒等解析。 */
+/** 显式传 workspace key 形状的 cwd：服务端只按请求上行解析，不再回退 process.cwd。 */
 function handlerOf(h: ReturnType<typeof harness>) {
   return createMonitorRpcHandler({
     maintenance: () => undefined,
@@ -119,7 +119,6 @@ test('#251 status：活跃 Run → 完整只读投影（节点/角色模型/图/
     // 未知 endpoint 与非法 payload 明确拒绝。
     assert.equal((await handler('reset', {})).ok, false)
     assert.equal((await handler('status', { cwd: 42 })).ok, false)
-    void payload; void checking
   } finally { h.cleanup() }
 })
 
@@ -166,6 +165,18 @@ test('#251 status：终态 Run → completed + 业务返回', async () => {
     assert.deepEqual(payload.run!.businessReturn, { name: 'done', source: row.execution.executionId })
     assert.deepEqual(payload.run!.nodes.map(node => [node.visit, node.phase]), [[1, 'exited'], [2, 'exited']])
   } finally { h.cleanup() }
+})
+
+test('#251 status：cwd 原样透传，缺省不猜宿主 process.cwd（F4）', async () => {
+  const seen: Array<string | undefined> = []
+  const handler = createMonitorRpcHandler({
+    maintenance: () => undefined,
+    status: async cwd => { seen.push(cwd); return undefined },
+    executions: async cwd => { seen.push(cwd); return [] },
+  })
+  assert.deepEqual(await handler('status', {}), { ok: true, value: { mode: 'empty' } })
+  assert.deepEqual(await handler('status', { cwd: 'D:/ws' }), { ok: true, value: { mode: 'empty' } })
+  assert.deepEqual(seen, [undefined, undefined, 'D:/ws', 'D:/ws'])
 })
 
 test('#251 status：维护诊断短路，不触碰状态库', async () => {

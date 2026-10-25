@@ -15,6 +15,7 @@
 import { WorkflowConfigEditorIcon, WorkflowConfigEditorPanel } from './panel.js'
 import { StartWorkflowButton } from './start-modal.js'
 import { WorkflowMonitorTab, MONITOR_STYLES } from './monitor.js'
+import { monitorStatusPayload } from './monitor-view.js'
 import { callChannel, callEditor, readWorkflowCatalog } from './rpc.js'
 import { readModelCatalog } from './model-selector.js'
 
@@ -72,10 +73,12 @@ export function apply(ctx) {
     ctx.inject(['better-sidebar'], (sidebarCtx) => {
       const sidebar = sidebarCtx?.betterSidebar ?? sidebarCtx?.['better-sidebar']
       if (typeof sidebar?.registerTab !== 'function') return
-      const fetchStatus = () => callChannel(ctx.connection, MONITOR_RPC_CHANNEL, 'status', {})
+      // 每次请求带上 tab 收到的 scope.cwd：宿主按会话工作目录解析 workspace，
+      // 服务端不再回退 process.cwd（R1 F4）。
+      const fetchStatus = (scope) => callChannel(ctx.connection, MONITOR_RPC_CHANNEL, 'status', monitorStatusPayload(scope))
       sidebar.registerTab(
         { id: MONITOR_TAB_ID, label: '工作流监控', styles: MONITOR_STYLES },
-        (props) => WorkflowMonitorTab({ ...props, fetchStatus }),
+        (props) => WorkflowMonitorTab({ ...props, fetchStatus: () => fetchStatus(props?.scope) }),
       )
     })
   }

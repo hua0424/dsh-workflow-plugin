@@ -3,7 +3,7 @@
  * RPC 失败显示横幅并保留上一次成功数据，恢复后自动清横幅继续轮询。
  * 只读展示：run 信息条 + 启动 prompt 展开 + 节点列表；无任何控制入口（ADR-0005）。
  */
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { monitorViewModel, monitorErrorState } from './monitor-view.js'
 
 const POLL_INTERVAL_MS = 2000
@@ -31,6 +31,9 @@ export const MONITOR_STYLES = `
 export function useMonitorPolling(fetchStatus, enabled) {
   const [data, setData] = useState(null)
   const [banner, setBanner] = useState('')
+  // 轮询不离散：scope.cwd 变化时更新闭包，但不重启 2s 周期（R1 F4）。
+  const fetchRef = useRef(fetchStatus)
+  useEffect(() => { fetchRef.current = fetchStatus }, [fetchStatus])
   useEffect(() => {
     if (!enabled) return undefined
     let disposed = false
@@ -38,7 +41,7 @@ export function useMonitorPolling(fetchStatus, enabled) {
     const tick = async () => {
       if (document.visibilityState === 'visible') {
         try {
-          const result = await fetchStatus()
+          const result = await fetchRef.current()
           if (disposed) return
           if (result?.ok) { setData(result.value); setBanner('') } else { setBanner(prev => monitorErrorState(prev, result?.error?.message ?? String(result?.error?.code ?? 'monitor failed'))) }
         } catch (error) {
@@ -56,20 +59,32 @@ export function useMonitorPolling(fetchStatus, enabled) {
 export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
   const { data, banner } = useMonitorPolling(fetchStatus, visible !== false)
   const [promptOpen, setPromptOpen] = useState(false)
-  const view = monitorViewModel(data)
-  if (view.mode === 'loading') return <div className="wf-monitor">正在加载运行状态…</div>
-  if (view.mode === 'maintenance') {
-    return <div className="wf-monitor"><div className="wf-monitor-banner">状态库维护模式：{view.reason}</div></div>
+  const view = monitorViewModel(data, { banner })
+  // 横幅在全部模式（loading/maintenance/empty/run）都渲染：首轮失败必须可见（R1 F5）。
+  const bannerEl = view.banner !== ''
+    ? <div className="wf-monitor-banner">状态刷新失败（保留上次数据）：{view.banner}</div>
+    : null
+  if (view.mode === 'loading') {
+    return <div className="wf-monitor">{bannerEl}<div className="wf-monitor-muted">正在加载运行状态…</div></div>
   }
-  if (view.mode === 'empty') return <div className="wf-monitor"><div className="wf-monitor-muted">当前 workspace 没有工作流运行记录。</div></div>
+  if (view.mode === 'maintenance') {
+    return <div className="wf-monitor">{bannerEl}<div className="wf-monitor-banner">状态库维护模式：{view.reason}</div></div>
+  }
+  if (view.mode === 'empty') {
+    return <div className="wf-monitor">{bannerEl}<div className="wf-monitor-muted">当前 workspace 没有工作流运行记录。</div></div>
+  }
   const run = view.run
   return (
     <div className="wf-monitor">
-      {banner !== '' && <div className="wf-monitor-banner">状态刷新失败（保留上次数据）：{banner}</div>}
+      {bannerEl}
       <div>
         <span className={`wf-monitor-status ${run.statusClass}`}>{run.statusLabel}</span>
         {run.blockReason && <span className="wf-node-block"> — {run.blockReason}</span>}
         {run.businessReturn && <span className="wf-monitor-muted"> · 返回：{run.businessReturn}</span>}
+      </div>
+      <div className="wf-monitor-muted">
+        <div>工作流：{run.workflowId} · Run：{run.runId}</div>
+        <div>开始：{run.startedAtText ?? '—'} · {run.durationLabel}：{run.durationText ?? '—'}</div>
       </div>
       {run.roles !== '' && <div className="wf-monitor-muted">角色模型：{run.roles}</div>}
       <div>
@@ -82,8 +97,12 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true }) {
         {view.nodes.map(node => (
           <li key={node.key} className={`wf-monitor-node${node.current ? ' wf-node-current' : ''}`}>
             <span>{node.label}</span>
+            {(node.role !== null || node.modelText !== '') && (
+              <span className="wf-monitor-muted">{[node.role, node.modelText].filter(Boolean).join(' · ')}</span>
+            )}
+            {node.targetText !== null && <span className="wf-monitor-muted">{node.targetText}</span>}
             <span className={`wf-node-phase ${node.phaseClass}`}>{node.phaseLabel}</span>
-            {node.blocked && <span className="wf-node-block">{node.blockReason}</span>}
+            {node.blocked && <span className="wf-node-block">BLOCK：{node.blockReason}</span>}
           </li>
         ))}
       </ul>

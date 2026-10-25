@@ -455,9 +455,10 @@ export function apply(ctx: Context) {
   const disposeEditorRpcFns: Array<() => void> = []
   // #178 catalog 端点复用命令层 list（fresh 扫描 + 维护判定），与 /dsh-flow list 同源。
   const catalogDeps = { listCatalog: () => commandHost.list() }
-  // #251 运行监控只读 RPC：maintenance 短路诊断，不触碰状态库；cwd 缺省按宿主
-  // process.cwd() 解析（web GUI 与 DSH 同机同 workspace 的部署形态）。
-  const monitorWorkspace = (cwd?: string) => workspaceKeyOf(cwd ?? process.cwd())
+  // #251 运行监控只读 RPC：maintenance 短路诊断，不触碰状态库；workspace 只按
+  // 浏览器上行的 scope.cwd 解析（缺省 → empty，绝不回退 process.cwd：宿主进程
+  // 目录不等于会话目录，R1 F4）。
+  const monitorWorkspace = (cwd?: string) => workspaceKeyOf(cwd)
   if (typeof ctx.inject === 'function') {
     ctx.inject(['connection', 'webServer'], (webCtx: unknown) => {
       const installed = installEditorRpc(webCtx as Parameters<typeof installEditorRpc>[0], catalogDeps)

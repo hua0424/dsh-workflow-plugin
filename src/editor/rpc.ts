@@ -280,9 +280,14 @@ interface ConnectionService {
  */
 export function registerEditorRpc(ctx: { connection?: ConnectionService },
   deps: { listCatalog?: CatalogListSource } = {},
-  handler: EditorRpcHandler = createEditorRpcHandler(deps),
-  channel: string = EDITOR_RPC_CHANNEL,
 ):
+  | { status: 'registered'; dispose: () => Promise<void> }
+  | { status: 'skipped-no-connection' } {
+  return registerConnectionRpc(ctx, EDITOR_RPC_CHANNEL, createEditorRpcHandler(deps))
+}
+
+/** 旧宿主回退路径的内部注册（通道/处理器由挂载主干提供，不对外暴露）。 */
+function registerConnectionRpc(ctx: { connection?: ConnectionService }, channel: string, handler: EditorRpcHandler):
   | { status: 'registered'; dispose: () => Promise<void> }
   | { status: 'skipped-no-connection' } {
   const connection = ctx.connection
@@ -339,7 +344,7 @@ export function mountRpcChannel(ctx: EditorWebCtx, channel: string, handler: Edi
         : () => {}
     return { status: 'mounted', dispose: cleanup }
   }
-  const fallback = registerEditorRpc(ctx, { }, handler, channel)
+  const fallback = registerConnectionRpc(ctx, channel, handler)
   if (fallback.status === 'registered') return { status: 'fallback', dispose: fallback.dispose }
   return { status: 'skipped' }
 }
