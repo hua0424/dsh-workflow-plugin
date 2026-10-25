@@ -11,6 +11,7 @@ import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { createMonitorRpcHandler, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
+import { monitorViewModel } from '../web-client/src/monitor-view.js'
 import { readRunLayout } from '../src/monitor/layout.ts'
 import type { EditorLayout } from '../src/editor/layout.ts'
 
@@ -151,6 +152,24 @@ test('#252 status：布局坐标随 payload 返回（缺失补网格）且不改
     // 结果端口随图返回，供只读画布绘制结果端口与连线。
     const plan = payload.run!.flows.test.nodes.find(node => node.id === 'plan')!
     assert.deepEqual(plan.results, { succeeded: { criteria: 'The plan is complete.', target: { node: 'review' } } })
+  } finally { h.cleanup() }
+})
+
+test('#262 status→视图投影：图卡生效模型来自服务端投影，缺路由不虚构', async () => {
+  const h = harness()
+  try {
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const result = await handlerOf(h)('status', { cwd: 'ws' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
+    const main = monitorViewModel(payload).run!.graph.flows.find(flow => flow.id === 'test')!
+    // reviewer 显式声明模型：画布装饰文本直接用服务端算出的 provider/modelId。
+    assert.equal(main.decorations.review.summary, 'prov/m-review')
+    // manager 继承默认路由：本 harness 无冻结路由 → 服务端投影为空对象，
+    // 客户端安全降级（不制造 unknown/假 provider），已执行节点的状态徽标照常。
+    assert.deepEqual(payload.run!.flows.test.nodes.find(node => node.id === 'plan')!.model, {})
+    assert.equal(main.decorations.plan.summary, undefined)
+    assert.equal(typeof main.decorations.plan.badge, 'string')
   } finally { h.cleanup() }
 })
 

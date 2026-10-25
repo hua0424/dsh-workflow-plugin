@@ -253,6 +253,11 @@ export function NodeCanvas(props) {
           ...nodes.map(([nodeId, node]) => {
             const pos = displayPoint(nodeId)
             const decoration = decorations[nodeId]
+            // #262：监控可选的 decoration.summary（当前生效模型）接在现有类型摘要行后，完整文本走 title；
+            // 行高固定、overflow 省略，不改变节点尺寸与连线端点（编辑器不传 decoration 时原样）。
+            const typeText = typeof decoration?.summary === 'string' && decoration.summary !== ''
+              ? `${nodeSummary(node)} · ${decoration.summary}`
+              : nodeSummary(node)
             return h('div', {
               key: nodeId, className: `wf-node${nodeId === selectedNode ? ' wf-selected' : ''}${decoration?.className ? ` ${decoration.className}` : ''}${decoration?.redo ? ' wf-node-redo' : ''}`,
               style: { left: `${pos.x}px`, top: `${pos.y}px` },
@@ -265,7 +270,7 @@ export function NodeCanvas(props) {
                 onPointerUp: () => endDrag(false), onPointerCancel: () => endDrag(true),
                 title: readOnly ? '只读运行图节点' : '点击编辑，拖动调整位置',
               }, `${nodeId}${nodeId === startNode ? ' ★' : ''}`),
-              h('div', { className: 'wf-node-type', title: nodeSummary(node) }, nodeSummary(node)),
+              h('div', { className: 'wf-node-type', title: typeText }, typeText),
               decoration?.badge ? h('div', { className: 'wf-node-state' }, decoration.badge) : null,
               decoration?.detail ? h('div', { className: 'wf-node-detail', title: decoration.detail }, decoration.detail) : null,
               ...portsOf(node).map((port) => h('button', {
