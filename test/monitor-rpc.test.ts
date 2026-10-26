@@ -11,7 +11,7 @@ import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { createMonitorRpcHandler, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
-import { monitorViewModel } from '../web-client/src/monitor-view.js'
+import { monitorViewModel, EMPTY_GUIDANCE } from '../web-client/src/monitor-view.js'
 import { readRunLayout } from '../src/monitor/layout.ts'
 import type { EditorLayout } from '../src/editor/layout.ts'
 
@@ -310,6 +310,10 @@ test('#263 status：同 cwd 旧终态→新 Run —— 默认读新 Run，显式
     assert.deepEqual(oldCompleted.run.callStack, [])
 
     // terminated 结局：reset 终止当前 Run，同 cwd 再起新 Run，旧 Run 仍可经 runId 复盘（无业务返回）。
+    // #270 AC-12 前置：reset 前经 status 投影捕获非空停止栈（禁止空对空通过）。
+    const beforeReset = await view({ cwd: 'ws' })
+    const stoppedFrames = structuredClone(beforeReset.run.callStack)
+    assert.ok(stoppedFrames.length > 0, '#270 AC-12 前置：reset 前调用栈非空')
     assert.equal((await h.engine.handleReset('ws', true)).ok, true)
     const terminatedRow = (await h.store.get('ws'))!
     assert.equal(terminatedRow.run.status, 'terminated')
@@ -323,6 +327,11 @@ test('#263 status：同 cwd 旧终态→新 Run —— 默认读新 Run，显式
     assert.equal(oldTerminated.run.terminal, true)
     assert.equal(oldTerminated.run.businessReturn, null)
     assert.equal(oldTerminated.run.nodes.length, 1)
+    // #270 AC-12：terminated 返回原停止位置的有序帧，帧仅 workflowId/nodeId/executionId 三字段（无 nodeToken）。
+    assert.deepEqual(oldTerminated.run.callStack, stoppedFrames, 'terminated 复盘原停止位置的有序帧')
+    for (const frame of oldTerminated.run.callStack) {
+      assert.deepEqual(Object.keys(frame as object).sort(), ['executionId', 'nodeId', 'workflowId'], '帧字段恰为三，无 nodeToken')
+    }
   } finally { h.cleanup() }
 })
 
@@ -384,4 +393,92 @@ test('#251 status：维护诊断短路，不触碰状态库', async () => {
   assert.deepEqual(touched, [])
   // 通道名与编辑器通道分离（ADR-0005：独立通道）。
   assert.notEqual(MONITOR_RPC_CHANNEL, '/workflow-config-editor')
+})
+
+// #270 AC-10：根+子流程配置。manager 未显式设 model（继承默认路由），reviewer 显式，
+// call-child 是无工作单的 child-workflow 节点，s1 是子流程 manager 节点。
+const modelConfig: WorkflowConfig = {
+  schemaVersion: 'agent-workflow/v3', roles: { reviewer: { persona: 'Review', model: { provider: 'prov', modelId: 'm-review' } } }, judgeRole: { persona: 'Read only' },
+  workflow: { startNode: 'plan', returns: ['done'], nodes: {
+    plan: {
+      execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
+      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct plan' } },
+      results: { succeeded: { criteria: 'The plan is complete.', target: { node: 'call-child' } } },
+    },
+    'call-child': {
+      execution: { type: 'child-workflow', workflowId: 'sub' },
+      onReturn: { out: { node: 'review' } },
+    },
+    review: {
+      execution: { type: 'actor-task', role: 'reviewer', instruction: 'Review' },
+      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct review' } },
+      results: { succeeded: { criteria: 'The review is complete.', target: { return: 'done' } } },
+    },
+  } },
+  childWorkflows: { sub: { startNode: 's1', returns: ['out'], nodes: {
+    s1: {
+      execution: { type: 'actor-task', role: 'manager', instruction: 'Sub work' },
+      checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct sub work' } },
+      results: { succeeded: { criteria: 'The sub work is complete.', target: { return: 'out' } } },
+    },
+  } } },
+}
+
+test('#270 AC-10 默认模型继承正例：冻结 managerRoute 投影到根/子流程，显式路由不被覆盖', async () => {
+  const h = harness()
+  try {
+    // 启动前注入非空默认路由（#223 语义：由宿主装配决定，engine seam 可覆盖）。
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', modelConfig, 'hash'), undefined, '受控启动请求')).ok, true)
+    // 启动后改默认路由：投影必须读启动时冻结的值。
+    h.engine.managerRoute = async () => ({ provider: 'mut', model: 'm-mutated' })
+    const result = await handlerOf(h)('status', { cwd: 'ws' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'run' }>
+
+    // 根流程：plan（未显式设 model 的 manager）继承冻结默认路由。
+    const main = payload.run!.flows.test
+    assert.deepEqual(main.nodes.find(node => node.id === 'plan')!.model, { provider: 'mgr', modelId: 'm-manager' })
+    // 显式路由不被默认覆盖。
+    assert.deepEqual(main.nodes.find(node => node.id === 'review')!.model, { provider: 'prov', modelId: 'm-review' })
+    // 无工作单的 child-workflow 节点：不虚构模型（无 model 键）。
+    const callChild = main.nodes.find(node => node.id === 'call-child')!
+    assert.equal(callChild.kind, 'child-workflow')
+    assert.equal(callChild.childWorkflowId, 'sub')
+    assert.equal(callChild.model, undefined)
+    // 子流程：s1 同为 manager，继承同一冻结默认。
+    assert.deepEqual(payload.run!.flows.sub.nodes.find(node => node.id === 's1')!.model, { provider: 'mgr', modelId: 'm-manager' })
+    // 角色清单：reviewer 显式路由不被默认覆盖（manager 不在角色清单，其继承路由由节点投影覆盖）。
+    const roles = Object.fromEntries(payload.run!.roles.map(role => [role.role, role.model.modelId]))
+    assert.equal(roles.reviewer, 'm-review')
+
+    // 同一 payload 经 view-model：summary 为精确 provider/modelId 文本；无工作单节点不虚构 badge。
+    const view = monitorViewModel(payload)
+    const mainFlow = view.run!.graph.flows.find(flow => flow.id === 'test')!
+    assert.equal(mainFlow.decorations.plan.summary, 'mgr/m-manager')
+    assert.equal(mainFlow.decorations.review.summary, 'prov/m-review')
+    assert.equal(mainFlow.decorations['call-child'], undefined, '无工作单节点无叠加态（不虚构 badge/summary）')
+    const subFlow = view.run!.graph.flows.find(flow => flow.id === 'sub')!
+    assert.equal(subFlow.decorations.s1.summary, 'mgr/m-manager')
+  } finally { h.cleanup() }
+})
+
+test('#270 AC-11 空 cwd + 跨目录活跃 Run：mode=empty，视图保留选项与启动引导', async () => {
+  const h = harness()
+  try {
+    assert.equal((await h.engine.startRun('ws2', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, 'B')).ok, true)
+    const otherRunId = (await h.store.get('ws2'))!.run.runId
+    const result = await handlerOf(h)('status', { cwd: 'ws-empty' })
+    assert.equal(result.ok, true)
+    const payload = result.value as Extract<typeof result.value, { mode: 'empty' }>
+    assert.equal(payload.mode, 'empty')
+    assert.equal(payload.run, undefined)
+    assert.deepEqual(payload.runs, [{ runId: otherRunId, workspaceKey: 'ws2', workflowId: 'test', status: 'running' }])
+
+    const view = monitorViewModel(payload)
+    assert.equal(view.mode, 'empty')
+    assert.equal(view.polling, true, '空态继续轮询')
+    assert.equal(view.guidance, EMPTY_GUIDANCE, '保留启动引导')
+    assert.deepEqual(view.runs, [{ runId: otherRunId, workflowId: 'test', status: 'running', statusLabel: '运行中', label: `ws2 · test` }])
+  } finally { h.cleanup() }
 })
