@@ -84,6 +84,8 @@ export interface MonitorNodeExecution {
   current: boolean
   /** #274 本工作单的 Actor 派发事实（缺字段 = 旧记录未采集）。 */
   dispatch?: MonitorDispatchFacts
+  /** #274 同一工作单被重派前的旧轮派发事实（故障切换/换模 resume 留档；缺 = 从未重派）。 */
+  previousDispatch?: MonitorDispatchFacts
   /** #274 本工作单已提交的结果（result 为声明结果名；handoff 只给有界预览）。 */
   claim?: { id: string; result: string; handoff: string }
   /** #274 本工作单的 Judge 派发事实。 */
@@ -246,6 +248,8 @@ export function projectRunStatus(row: StateRow | undefined, executions: readonly
         current: top !== undefined && top.workflowId === execution.workflowId && top.nodeId === execution.nodeId && top.executionId === execution.executionId,
         // #274：派发/claim/判定事实只来自本工作单的落库快照（旧行缺字段 = 未记录）。
         ...(execution.dispatch !== undefined ? { dispatch: dispatchFactsOf(execution.dispatch) } : {}),
+        // 重派前的旧轮单独转发，供卡片显示「上一轮」；不覆盖、不推算。
+        ...(execution.previousDispatch !== undefined ? { previousDispatch: dispatchFactsOf(execution.previousDispatch) } : {}),
         ...(execution.claim !== undefined ? { claim: { id: execution.claim.id, result: execution.claim.result, handoff: previewHandoff(execution.claim.handoff) } } : {}),
         ...(execution.judge !== undefined ? { judge: judgeFactsOf(execution.judge, execution.judgment) } : {}),
       })),

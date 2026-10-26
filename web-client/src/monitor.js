@@ -164,6 +164,10 @@ function currentCardEl(card) {
     entry.modelText === null || entry.modelText === ''
       ? null
       : h('span', { className: 'wf-monitor-muted', title: entry.modelText }, entry.modelText),
+    // #274 重派后的旧轮：另起一段标注「上一轮 …」，当前轮不因此变色/移位。
+    entry.previousText === null || entry.previousText === undefined
+      ? null
+      : h('span', { className: 'wf-monitor-muted wf-monitor-card-prev', title: entry.previousText }, entry.previousText),
     h('span', { className: 'wf-monitor-card-state' }, entry.status))
   return h('div', {
     className: `wf-monitor-current${card.active ? '' : ' is-terminal'}`,

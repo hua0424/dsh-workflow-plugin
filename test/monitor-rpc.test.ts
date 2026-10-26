@@ -620,3 +620,23 @@ test('#274 status：长 handoff 只给有界预览，2 秒轮询 payload 不随�
     assert.match(projected, /…（共 \d+ 字）$/, '截断标记说明原文长度，完整正文归状态库')
   } finally { h.cleanup() }
 })
+test('#274 R1 status：重派旧轮经 previousDispatch 投影，卡片「上一轮」不覆盖当前轮', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    // 引擎在故障切换/换模 resume 覆盖当前派发前留档到 previousDispatch；这里按同一合同落一行。
+    const before = (await h.store.get('ws'))!
+    const current = structuredClone(before.execution)
+    const previous = { ...current.dispatch!, id: 'dispatch-previous', messageId: 'actor-message-0', settled: true, model: { provider: 'backup', modelId: 'backup-model' }, source: 'fallback' as const }
+    await h.store.updateRow('ws', before.run, before.stateVersion, [{ execution: { ...current, previousDispatch: previous }, expectedRevision: before.execution.revision, events: [] }])
+    const payload = (await handlerOf(h)('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const node = nodeOf(payload, 'plan')
+    assert.deepEqual(node.previousDispatch, { id: 'dispatch-previous', dispatched: true, settled: true, model: { provider: 'backup', modelId: 'backup-model' }, source: 'fallback' })
+    assert.deepEqual(node.dispatch!.model, current.dispatch!.model, '当前轮仍是自己的快照，未被旧轮替换')
+    assert.deepEqual(node.dispatch!.source, current.dispatch!.source)
+    const card = monitorViewModel(payload).currentExecution!
+    assert.equal(card.actor!.previousText, '上一轮 backup/backup-model · 备选')
+    assert.notEqual(card.actor!.previousText, card.actor!.modelText, '上一轮与当前轮分开呈现')
+  } finally { h.cleanup() }
+})

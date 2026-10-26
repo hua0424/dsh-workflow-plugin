@@ -290,6 +290,10 @@ export function currentExecutionView(run, ctx = {}) {
       ? {
         role: def?.role ?? null,
         modelText: node.dispatch === undefined || node.dispatch === null ? null : dispatchModelText(node.dispatch),
+        // 同一工作单重派过（故障切换/换模 resume）时，旧轮另有留档：显式标「上一轮」，不冒充当前。
+        previousText: node.previousDispatch === undefined || node.previousDispatch === null
+          ? null
+          : `上一轮 ${dispatchModelText(node.previousDispatch)}`,
         status: settle(actorStatusOf(node)),
       }
       : null,
