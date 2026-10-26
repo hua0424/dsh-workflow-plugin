@@ -36,6 +36,9 @@ export const MONITOR_STYLES = `
 .wf-monitor-graph .wf-canvas-help { margin-top: 4px; }
 .wf-monitor-flowtabs { display: flex; gap: 4px; flex-wrap: wrap; }
 .wf-monitor-flowtabs button { padding: 3px 8px; font-size: 12px; }
+/* #276 只读查看工具：临时调整只在本页生效，恢复布局只重置当前流程。 */
+.wf-monitor-viewtools { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; font-size: 12px; }
+.wf-monitor-viewtools button { padding: 3px 8px; font-size: 12px; }
 .wf-monitor-flowtabs button[aria-selected="true"] { border-color: #3b82f6; color: #1d4ed8; background: #e8efff; }
 /* #253 子流程下钻：面包屑导航 + 暂停跟随后的「回到当前节点」入口。 */
 .wf-monitor-breadcrumb { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; font-size: 12px; }
@@ -285,6 +288,8 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
   const [follow, setFollow] = useState(initialFollowState)
   // #275 执行记录表下钻：一次只展开一行；Run 变化时收起（行 key 含 runId 之外的身份，显式重置更稳）。
   const [openRecord, setOpenRecord] = useState(null)
+  // #276 恢复布局：只递增信号让画布重置当前流程的临时位置/视图，不触碰数据与配置。
+  const [layoutReset, setLayoutReset] = useState(0)
   // 维护态继续探测、终态停周期、只读手动刷新都在 hook 里（#261）。
   const { data, banner, refreshing, refresh } = useMonitorPolling(
     runId => fetchStatus(runId),
@@ -382,11 +387,22 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
         ...graph.flows.map(item => h('button', {
           key: item.id, type: 'button', role: 'tab', 'aria-selected': item.id === flow.id, onClick: () => setFollow(selectFlow(follow, item.id, currentFlowId)),
         }, item.label))) : null,
-      followView.showReturn ? h('button', { type: 'button', className: 'wf-monitor-return', onClick: () => setFollow(resumeFollow()) }, '回到当前节点') : null,
+      h('div', { className: 'wf-monitor-viewtools' },
+        followView.showReturn ? h('button', { type: 'button', className: 'wf-monitor-return', onClick: () => setFollow(resumeFollow()) }, '回到当前节点') : null,
+        h('button', {
+          type: 'button',
+          className: 'wf-monitor-reset-layout',
+          title: '只重置当前流程在本页的临时布局（上游布局文件与配置不变，其他流程/Run 不受影响）',
+          onClick: () => setLayoutReset(value => value + 1),
+        }, '恢复布局'),
+      ),
       h('div', { className: 'wf-editor wf-monitor-canvas' },
         h(NodeCanvas, {
           key: `${run.runId}:${flow.id}`,
           readOnly: true,
+          // 临时布局/查看状态的隔离身份：同一 Run 的不同流程、同一流程的不同 Run 都不共享。
+          viewKey: `${run.runId}:${flow.id}`,
+          resetSignal: layoutReset,
           flowId: flow.id === run.workflowId ? null : flow.id,
           def: flow.def,
           positions: flow.positions,
