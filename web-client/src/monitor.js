@@ -6,7 +6,7 @@
  * 只读展示：run 信息条 + 启动 prompt 展开 + 节点列表；无任何控制入口（ADR-0005）。
  */
 import { createElement as h, useState, useEffect, useRef } from 'react'
-import { monitorViewModel, monitorErrorState, monitorPollingContinues, initialFollowState, monitorFollowView, selectFlow, resumeFollow } from './monitor-view.js'
+import { monitorViewModel, monitorErrorState, monitorPollingContinues, initialFollowState, monitorFollowView, selectFlow, resumeFollow, RECORD_COLUMNS } from './monitor-view.js'
 import { NodeCanvas } from './graph-canvas.js'
 import { EDITOR_STYLES } from './styles.js'
 
@@ -61,6 +61,23 @@ export const MONITOR_STYLES = `
 .wf-monitor-card-role { min-width: 96px; opacity: 0.85; }
 .wf-monitor-card-state { font-weight: 600; }
 .wf-monitor-card-terminal { color: #9fc8ff; font-weight: 600; }
+/* #275 执行记录表：固定列序，表头吸顶、节点/流程两列吸附左侧，横向滚动不丢失行身份。 */
+.wf-monitor-records { display: flex; flex-direction: column; gap: 4px; }
+.wf-monitor-records-title { font-weight: 600; font-size: 13px; }
+.wf-monitor-records-scroll { overflow: auto; max-height: 360px; border: 1px solid rgba(128,128,128,0.3); border-radius: 6px; }
+.wf-record-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; }
+.wf-record-table th, .wf-record-table td { padding: 4px 6px; text-align: left; white-space: nowrap; border-bottom: 1px solid rgba(128,128,128,0.2); }
+.wf-record-table thead th { position: sticky; top: 0; z-index: 3; background: Canvas; border-bottom: 1px solid rgba(128,128,128,0.45); }
+.wf-record-table .wf-record-sticky-1 { position: sticky; left: 0; z-index: 2; background: Canvas; width: 168px; min-width: 168px; max-width: 168px; overflow: hidden; text-overflow: ellipsis; }
+.wf-record-table .wf-record-sticky-2 { position: sticky; left: 168px; z-index: 2; background: Canvas; min-width: 96px; box-shadow: 1px 0 0 rgba(128,128,128,0.35); }
+.wf-record-table thead .wf-record-sticky-1, .wf-record-table thead .wf-record-sticky-2 { z-index: 4; }
+.wf-record-table tbody .wf-record-sticky-1, .wf-record-table tbody .wf-record-sticky-2 { background: Canvas; }
+.wf-record-row.is-blocked td { background: rgba(200,80,80,0.12); }
+.wf-record-row.is-current td { background: rgba(120,160,255,0.14); }
+.wf-record-toggle { padding: 0 4px; font-size: 11px; border: 1px solid rgba(128,128,128,0.5); background: transparent; color: inherit; margin-right: 4px; }
+.wf-record-node { font-weight: 600; }
+.wf-record-detail td { background: rgba(128,128,128,0.08); white-space: normal; }
+.wf-record-rounds { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 `
 
 /** 轮询上下文键：cwd + 选定 runId 决定一个独立读取周期；用值而非函数身份，重渲染不重启周期（#261）。 */
@@ -186,6 +203,78 @@ function currentCardEl(card) {
   card.blocked ? h('div', { className: 'wf-node-block' }, `BLOCK：${card.blockReason}`) : null)
 }
 
+/** #275 执行记录表下钻：同一次进入内的多轮提交/判定、未形成提交的重派与换模时间线。 */
+function recordDetailEl(record) {
+  const items = []
+  if (record.blockReason !== null && record.blockReason !== '') items.push(h('li', { key: 'block', className: 'wf-node-block' }, `BLOCK：${record.blockReason}`))
+  for (const round of record.drilldown.rounds) {
+    const times = [`提交 ${round.submittedAtText ?? '时间未记录'}`, round.judgedAtText === null ? null : `判定 ${round.judgedAtText}`].filter(Boolean).join(' · ')
+    items.push(h('li', { key: round.claimId }, `第 ${round.index} 轮：${round.resultText} · ${round.statusText} · ${times} · Actor ${round.actorModelText} · Judge ${round.judgeModelText}`))
+  }
+  if (record.drilldown.pending !== undefined) items.push(h('li', { key: 'pending' }, `第 ${record.drilldown.pending.index} 轮：${record.drilldown.pending.statusText} · Actor ${record.drilldown.pending.actorModelText}`))
+  for (const [index, attempt] of record.drilldown.abandoned.entries()) {
+    items.push(h('li', { key: `abandoned-${index}`, className: 'wf-monitor-muted' }, `未形成提交的派发：${attempt.reasonText} · ${attempt.modelText}${attempt.atText === null ? '' : ` · ${attempt.atText}`}`))
+  }
+  for (const [index, switchEvent] of record.drilldown.switches.entries()) {
+    items.push(h('li', { key: `switch-${index}`, className: 'wf-monitor-muted' }, `${switchEvent.roleText}${switchEvent.atText === null ? '' : `：${switchEvent.atText}`}`))
+  }
+  return h('ul', { className: 'wf-record-rounds' }, ...items)
+}
+
+/** #275 执行记录表：每次进入一行，同一次进入的多轮事实收在行下钻里。 */
+function recordsEl(records, openKey, onToggle) {
+  if (!Array.isArray(records) || records.length === 0) return null
+  const cell = (record, name) => {
+    if (name === '节点名称') {
+      const expanded = openKey === record.key
+      return h('td', { key: name, className: 'wf-record-sticky-1' },
+        h('button', {
+          type: 'button',
+          className: 'wf-record-toggle',
+          'aria-expanded': expanded ? 'true' : 'false',
+          'aria-label': `${expanded ? '收起' : '展开'} ${record.nodeLabel} 的提交/判定明细`,
+          onClick: () => onToggle(record.key),
+        }, expanded ? '▾' : '▸'),
+        h('span', { className: 'wf-record-node', title: record.nodeId }, record.nodeLabel),
+        record.visitText !== '' ? h('span', { className: 'wf-monitor-muted' }, ` ${record.visitText}`) : null)
+    }
+    if (name === '所属流程') return h('td', { key: name, className: 'wf-record-sticky-2', title: record.workflowLabel }, record.flowText)
+    if (name === '运行情况') {
+      return h('td', { key: name },
+        record.outcomeText,
+        record.roundCountText === null ? null : h('span', { className: 'wf-monitor-muted' }, ` · ${record.roundCountText}`),
+        record.waitingText === null ? null : h('span', { className: 'wf-monitor-muted' }, ` · ${record.waitingText}`))
+    }
+    if (name === '进入时间') return h('td', { key: name }, record.enteredAtText ?? '—')
+    if (name === '提交结果时间') return h('td', { key: name }, record.submittedAtText)
+    if (name === '提交判定时间') return h('td', { key: name }, record.judgedAtText)
+    if (name === 'Actor 模型') return h('td', { key: name, title: record.actorModelText }, record.actorModelText)
+    return h('td', { key: name, title: record.judgeModelText }, record.judgeModelText)
+  }
+  return h('section', { className: 'wf-monitor-records', 'aria-label': '执行记录' },
+    h('div', { className: 'wf-monitor-records-title' }, `执行记录（${records.length} 次进入）`),
+    h('div', { className: 'wf-monitor-records-scroll' },
+      h('table', { className: 'wf-record-table' },
+        h('thead', null,
+          h('tr', null, ...RECORD_COLUMNS.map((name, index) => h('th', {
+            key: name,
+            scope: 'col',
+            className: index === 0 ? 'wf-record-sticky-1' : index === 1 ? 'wf-record-sticky-2' : '',
+          }, name)))),
+        h('tbody', null,
+          ...records.flatMap(record => {
+            const expanded = openKey === record.key
+            const row = h('tr', {
+              key: record.key,
+              className: `wf-record-row${record.blocked ? ' is-blocked' : ''}${record.current === true ? ' is-current' : ''}`,
+            }, ...RECORD_COLUMNS.map(name => cell(record, name)))
+            if (!expanded) return [row]
+            return [row, h('tr', { key: `${record.key}:detail`, className: 'wf-record-detail' },
+              h('td', { colSpan: RECORD_COLUMNS.length }, recordDetailEl(record)))]
+          })))),
+  )
+}
+
 export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
   // 目录只来自 tab scope.cwd；缺席/空串不回退宿主 process.cwd（R1 F4）。
   const cwd = typeof scope?.cwd === 'string' && scope.cwd !== '' ? scope.cwd : null
@@ -194,6 +283,8 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
   const selectedRunId = selection.cwd === cwd ? selection.runId : null
   const [promptOpen, setPromptOpen] = useState(false)
   const [follow, setFollow] = useState(initialFollowState)
+  // #275 执行记录表下钻：一次只展开一行；Run 变化时收起（行 key 含 runId 之外的身份，显式重置更稳）。
+  const [openRecord, setOpenRecord] = useState(null)
   // 维护态继续探测、终态停周期、只读手动刷新都在 hook 里（#261）。
   const { data, banner, refreshing, refresh } = useMonitorPolling(
     runId => fetchStatus(runId),
@@ -203,6 +294,8 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
   const returnedRunId = view.mode === 'run' || view.mode === 'terminal' ? view.run.runId : null
   // 实际返回的 Run 变化（新 Run / 切目录 / 刷新到别的 Run）：跟随与手动流程选择回到默认。
   useEffect(() => { setFollow(initialFollowState()) }, [returnedRunId, cwd])
+  // 换 Run/换目录时收起旧 Run 的下钻，避免同名节点行在新 Run 里意外展开。
+  useEffect(() => { setOpenRecord(null) }, [returnedRunId, cwd])
   // 选中的 Run 失效/回退到 cwd 默认：清掉选择，避免切换器值悬空（loading/维护态下保留选择）。
   const selectionLost = selectedRunId !== null && view.mode !== 'loading' && view.mode !== 'maintenance'
     && !view.runs.some(ref => ref.runId === selectedRunId)
@@ -311,6 +404,8 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
     ) : null,
     // #274 当前执行卡：图下独立区块，始终指向当前（或结束）工作单；与选中/流程切换无关。
     currentCardEl(view.currentExecution),
+    // #275 执行记录表：每次进入一行；多轮提交/判定、未形成提交的重派与换模收在行下钻。
+    recordsEl(view.records, openRecord, key => setOpenRecord(current => (current === key ? null : key))),
     h('div', null,
       h('button', { type: 'button', onClick: () => setPromptOpen(open => !open) }, promptOpen ? '收起启动 prompt' : '展开启动 prompt'),
       promptOpen ? h('div', { className: 'wf-monitor-prompt' }, run.launchPrompt) : null,

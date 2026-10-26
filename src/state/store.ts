@@ -226,6 +226,29 @@ export class StateStore {
     })
   }
 
+  /**
+   * #275 只读：Run 内「提交/判定/派发/换模」事件（按 execution 的 sequence 稳定排序）。
+   * 执行记录表靠它还原同一次进入内的多轮 Actor/Judge 事实与发生时间；不静默截断，
+   * 任一快照损坏即抛错（与 executions 同口径）。
+   */
+  runEventsByRunId(runId: string): Promise<NodeExecutionEvent[]> {
+    return this.enqueue(() => {
+      const row = this.db.prepare('SELECT * FROM runs WHERE run_id = ?').get(runId) as RunRow | undefined
+      if (!row) return []
+      const run = this.decodeRun(row)
+      const rows = this.db.prepare(`SELECT execution_id, sequence, type, at, snapshot_json FROM node_execution_events
+        WHERE type IN ('actor-arranged', 'claim', 'judge-arranged', 'judgment', 'model-changed')
+        AND execution_id IN (SELECT execution_id FROM node_executions WHERE run_id = ?)
+        ORDER BY execution_id, sequence`).all(row.run_id) as { execution_id: string; sequence: number; type: NodeExecutionEvent['type']; at: string; snapshot_json: string }[]
+      return rows.map(event => {
+        const snapshot = parse<NodeExecution>(event.snapshot_json)
+        assertValid(checkExecutionInvariants(run, snapshot))
+        if (snapshot.executionId !== event.execution_id || !EVENT_TYPES.includes(event.type) || !Number.isSafeInteger(event.sequence) || event.sequence < 1) throw new Error('corrupt execution event snapshot')
+        return { executionId: event.execution_id, sequence: event.sequence, type: event.type, at: event.at, snapshot }
+      })
+    })
+  }
+
   private executionsOf(row: RunRow): NodeExecution[] {
     const run = this.decodeRun(row)
     const rows = this.db.prepare('SELECT execution_id, run_id, visit, revision, snapshot_json FROM node_executions WHERE run_id = ? ORDER BY visit').all(row.run_id) as unknown as ExecutionRow[]
