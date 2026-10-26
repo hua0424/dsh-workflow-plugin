@@ -8,4 +8,6 @@
 
 刷新采用 `visible` 时每 2 秒轮询（TabComponentProps.visible 官方语义：不可见即暂停），不引入 WebSocket 推送。v1 **严格只读**：不提供 resume/reset/切模型等任何控制入口——浏览器 RPC 是未授权的新信任路径，绕过「工具调用绑定 dispatch/nodeToken」的引擎授权模型；控制操作仍走 Manager 会话。token 用量/成本不展示（无数据源）。展示范围：当前节点高亮、已完成节点标记、BLOCK 状态与原因摘要、每节点角色 + 生效模型（冻结路由 + 运行时 override）、run 级信息条（workflowId/runId/开始时间/耗时，附启动 prompt 查看入口——原文取自 Run 首个工作单的 input 快照，不新增持久化字段）；顶部切换器默认选中 cwd 对应 Run、可切其他 workspace 的活跃 Run；child-workflow 节点可下钻子流程运行图（多层 breadcrumb）。Judge 判定徽标留待后续增量。
 
+上文「每节点角色 + 生效模型（冻结路由 + 运行时 override）」自 #274 起改为**每次派发的落库快照**（Actor/Judge 各一份 `dispatch.model` + `dispatch.source`，按派发发生时 `resolveRoleModel` 的结果写入）：同一工作单经故障切换、人工换模或退回复做会有多轮派发，只有快照能区分每轮实际模型与来源；旧行缺字段时展示「未记录 / 来源未知」，绝不回填当前配置。
+
 拒绝的替代：原生 `sidebar.panellist` 主面板（全局 canvas，无会话 cwd 上下文，且与 #219 编辑器入口迁移方向纠缠）；浏览器直读文件（重复授权、绕过宿主）；按当前 YAML 渲染（违反 Definition Snapshot 冻结合同）。

@@ -486,3 +486,157 @@ test('#270 AC-11 空 cwd + 跨目录活跃 Run：mode=empty，视图保留选项
     assert.deepEqual(view.runs, [{ runId: otherRunId, workflowId: 'test', status: 'running', statusLabel: '运行中', label: `ws2 · test` }])
   } finally { h.cleanup() }
 })
+
+// #274 断言辅助：取指定 nodeId/visit 的投影节点。
+function nodeOf(payload: Extract<Awaited<ReturnType<ReturnType<typeof handlerOf>>>, { mode: 'run' }>, nodeId: string, visit = 1) {
+  const node = payload.run!.nodes.find(item => item.nodeId === nodeId && item.visit === visit)
+  assert.ok(node, `missing node ${nodeId}#${visit}`)
+  return node
+}
+
+test('#274 status：工作单落库的记录事实随投影（派发/claim/判定各自快照，不含 endedAt）', async () => {
+  const h = harness()
+  try {
+    // 冻结默认路由：manager/judge 未显式声明时继承它（与 spawn 同一份 resolveRoleModel）。
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const handler = handlerOf(h)
+    const planRow = (await h.store.get('ws'))!
+    // 落库：派发记录带实际路由 + 来源阶段（fresh 派发 = primary）。
+    assert.deepEqual(planRow.execution.dispatch!.model, { provider: 'mgr', modelId: 'm-manager' })
+    assert.equal(planRow.execution.dispatch!.source, 'primary')
+
+    const planPayload = (await handler('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const planNode = nodeOf(planPayload, 'plan')
+    assert.equal(planNode.dispatch!.dispatched, true)
+    assert.deepEqual(planNode.dispatch!.model, { provider: 'mgr', modelId: 'm-manager' }, '投影原样透出派发快照')
+    assert.equal(planNode.dispatch!.source, 'primary')
+    assert.equal(planNode.judge, undefined, '未安排 Judge 时不虚构判定记录')
+    // 相关 AC-11：投影只给展示事实，不带 nodeToken/会话 ID/messageId 等控制凭据。
+    assert.deepEqual(Object.keys(planNode.dispatch!).sort(), ['dispatched', 'id', 'model', 'settled', 'source'])
+
+    // Actor 提交后：claim 独立快照（不因判定改写或消失），judge 事实单独记录。
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    await claim(h, manager, 'succeeded', 'plan artifact')
+    const claimedRow = (await h.store.get('ws'))!
+    assert.deepEqual(claimedRow.execution.judge!.model, { provider: 'mgr', modelId: 'm-manager' })
+    assert.equal(claimedRow.execution.judge!.source, 'primary')
+    const claimedPayload = (await handler('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const claimedNode = nodeOf(claimedPayload, 'plan')
+    assert.equal(claimedNode.claim!.result, 'succeeded', 'claim 结果与交接文本随投影')
+    assert.equal(claimedNode.claim!.handoff, 'plan artifact')
+    assert.equal(claimedNode.judge!.dispatched, true)
+    assert.deepEqual(claimedNode.judge!.model, { provider: 'mgr', modelId: 'm-manager' })
+    assert.equal(claimedNode.judge!.source, 'primary')
+    assert.deepEqual(Object.keys(claimedNode.judge!).sort(), ['claimId', 'dispatched', 'id', 'model', 'settled', 'source'])
+    assert.equal(JSON.stringify(claimedPayload).includes('nodeToken'), false, '投影不含 nodeToken')
+
+    // 判定后：判定结果保留在判定记录上，派发记录本身不被改动。
+    const planJudge: ClaimCaller = { sessionId: claimedRow.execution.judge!.sessionId!, turnUserMessageIds: new Set([claimedRow.execution.judge!.messageId!]) }
+    await judgeAccept(h, planJudge)
+    const judgedPayload = (await handler('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const planExited = nodeOf(judgedPayload, 'plan')
+    assert.equal(planExited.judge!.judgment, 'ACCEPT', '判定结果落在判定记录上')
+    assert.deepEqual(planExited.judge!.model, { provider: 'mgr', modelId: 'm-manager' }, '判定后记录保留模型事实')
+    assert.equal(planExited.exitedAt !== undefined, true, '有派发记录时照常取退出时间')
+    assert.equal(typeof planExited.judge!.endedAt, 'undefined', '记录事实不含结束时间（AC-02 边界）')
+  } finally { h.cleanup() }
+})
+
+test('#274 status：旧记录无记录事实时不回填当前配置（未记录 = 未记录）', async () => {
+  const h = harness()
+  try {
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    // 模拟 #274 之前落库的旧工作单：删掉记录字段但保留其余事实。
+    const before = (await h.store.get('ws'))!
+    const legacy = structuredClone(before.execution)
+    delete legacy.dispatch!.model
+    delete legacy.dispatch!.source
+    await h.store.updateRow('ws', before.run, before.stateVersion, [{ execution: legacy, expectedRevision: before.execution.revision, events: [] }])
+    // 改当前配置也不影响投影（没有记录就不推导）。
+    const payload = (await handlerOf(h)('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const node = nodeOf(payload, 'plan')
+    assert.deepEqual([node.dispatch!.dispatched, node.dispatch!.model, node.dispatch!.source], [true, undefined, undefined])
+    const view = monitorViewModel(payload)
+    // 视图显式标注未记录/来源未知，不借用图卡的生效模型补值。
+    assert.deepEqual([view.currentExecution!.actor!.modelText, view.currentExecution!.actor!.status], ['未记录 · 来源未知', '执行中'])
+  } finally { h.cleanup() }
+})
+
+test('#274 当前执行卡：投影 → 视图模型（角色/模型来源/状态/终态位置）', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const handler = handlerOf(h)
+    const running = monitorViewModel((await handler('status', { cwd: 'ws' })).value)
+    const card = running.currentExecution!
+    assert.equal(card.heading, '当前节点')
+    assert.equal(card.active, true)
+    assert.deepEqual([card.nodeId, card.workflowLabel, card.visitText], ['plan', '主流程', ''])
+    assert.deepEqual([card.phaseLabel, card.phaseClass, card.blocked], ['执行中', 'phase-working', false])
+    assert.deepEqual([card.actor!.role, card.actor!.modelText, card.actor!.status], ['manager', 'mgr/m-manager · 首选', '执行中'])
+    assert.deepEqual([card.judge!.modelText, card.judge!.status], [null, '未派发'])
+
+    // 推进到 review：卡片跟随栈顶，judge 未派发；节点行带 executionId 供同名节点区分。
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    await claim(h, manager, 'succeeded', 'plan artifact')
+    const row = (await h.store.get('ws'))!
+    // plan 判定 ACCEPT → review 派发（messageId 递增为 actor-message-2）。
+    const planJudge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    await judgeAccept(h, planJudge)
+    const reviewRow = (await h.store.get('ws'))!
+    assert.equal(reviewRow.execution.nodeId, 'review')
+    assert.deepEqual(reviewRow.execution.dispatch!.model, { provider: 'prov', modelId: 'm-review' })
+    const review = monitorViewModel((await handler('status', { cwd: 'ws' })).value)
+    assert.equal(review.currentExecution!.nodeId, 'review')
+    assert.deepEqual([review.currentExecution!.actor!.modelText, review.currentExecution!.actor!.status], ['prov/m-review · 首选', '执行中'])
+    assert.equal(review.currentExecution!.judge!.status, '未派发')
+    assert.ok(review.nodes.some(node => node.executionId === reviewRow.execution.executionId), '节点行携带 execution 身份')
+
+    // 结束 Run：卡片改为结束位置，活动文案不再冒充正在执行。
+    h.engine.handleReset('ws', 'manager')
+    const terminated = monitorViewModel((await handler('status', { cwd: 'ws' })).value)
+    assert.equal(terminated.currentExecution!.heading, '结束位置')
+    assert.equal(terminated.currentExecution!.active, false)
+    assert.equal(terminated.currentExecution!.terminalLabel, '已终止')
+    assert.equal(terminated.currentExecution!.actor!.status, '已终止')
+  } finally { h.cleanup() }
+})
+
+test('#274 status：长 handoff 只给有界预览，2 秒轮询 payload 不随历史长度增长', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const handler = handlerOf(h)
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    const longHandoff = `结论开头\n${'证据行 '.repeat(80)}`
+    await claim(h, manager, 'succeeded', longHandoff)
+    const payload = (await handler('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const projected = nodeOf(payload, 'plan').claim!.handoff
+    assert.ok(projected.startsWith('结论开头'), '保留开头，便于卡片识别')
+    assert.ok(projected.length < longHandoff.length, '长文本被截断，不是全量透传')
+    assert.match(projected, /…（共 \d+ 字）$/, '截断标记说明原文长度，完整正文归状态库')
+  } finally { h.cleanup() }
+})
+test('#274 R1 status：重派旧轮经 previousDispatch 投影，卡片「上一轮」不覆盖当前轮', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    // 引擎在故障切换/换模 resume 覆盖当前派发前留档到 previousDispatch；这里按同一合同落一行。
+    const before = (await h.store.get('ws'))!
+    const current = structuredClone(before.execution)
+    const previous = { ...current.dispatch!, id: 'dispatch-previous', messageId: 'actor-message-0', settled: true, model: { provider: 'backup', modelId: 'backup-model' }, source: 'fallback' as const }
+    await h.store.updateRow('ws', before.run, before.stateVersion, [{ execution: { ...current, previousDispatch: previous }, expectedRevision: before.execution.revision, events: [] }])
+    const payload = (await handlerOf(h)('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const node = nodeOf(payload, 'plan')
+    assert.deepEqual(node.previousDispatch, { id: 'dispatch-previous', dispatched: true, settled: true, model: { provider: 'backup', modelId: 'backup-model' }, source: 'fallback' })
+    assert.deepEqual(node.dispatch!.model, current.dispatch!.model, '当前轮仍是自己的快照，未被旧轮替换')
+    assert.deepEqual(node.dispatch!.source, current.dispatch!.source)
+    const card = monitorViewModel(payload).currentExecution!
+    assert.equal(card.actor!.previousText, '上一轮 backup/backup-model · 备选')
+    assert.notEqual(card.actor!.previousText, card.actor!.modelText, '上一轮与当前轮分开呈现')
+  } finally { h.cleanup() }
+})

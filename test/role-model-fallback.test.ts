@@ -1488,3 +1488,113 @@ test('#243 S4 单 Run 内 Role 与 Judge 双故障切换相互独立（预算、
     assert.deepEqual(done.run.roleRoutes, row.run.roleRoutes, '终局不重置任何一条预算/阶段')
   } finally { h.close() }
 })
+
+// ---- #274 R1：监控事实（每轮实际 model/source）在真实派发链路与关库重开后都可读 ----
+
+test('#274 R1 主→备自动切换：新旧两轮 model/source 都在 execution 行，重开仍可读', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const worker = await h.toWorker()
+    let row = await h.row()
+    assert.equal(row.execution.dispatch!.source, 'primary')
+    assert.deepEqual(row.execution.dispatch!.model, { provider: 'primary', modelId: 'primary-model' })
+    const primaryId = row.execution.dispatch!.id
+
+    await h.engine.handleTurnEnded('ws', worker, FAILOVER_503.text, FAILOVER_503.facts)
+    row = await h.row()
+    assert.equal(row.run.status, 'running')
+    assert.equal(row.execution.dispatch!.source, 'fallback')
+    assert.deepEqual(row.execution.dispatch!.model, { provider: 'backup', modelId: 'backup-model' })
+    assert.notEqual(row.execution.dispatch!.id, primaryId)
+    // F-01：被覆盖的旧轮按 previousClaim 同深度留档，不丢事实。
+    assert.equal(row.execution.previousDispatch?.id, primaryId)
+    assert.equal(row.execution.previousDispatch?.source, 'primary')
+    assert.deepEqual(row.execution.previousDispatch?.model, { provider: 'primary', modelId: 'primary-model' })
+    assert.ok(row.execution.previousDispatch?.messageId, '旧轮真实派发过（有 messageId）才留档')
+
+    const fallbackId = row.execution.dispatch!.id
+    h.reopen()
+    row = await h.row()
+    assert.equal(row.execution.dispatch!.id, fallbackId)
+    assert.equal(row.execution.dispatch!.source, 'fallback')
+    assert.deepEqual(row.execution.dispatch!.model, { provider: 'backup', modelId: 'backup-model' })
+    assert.equal(row.execution.previousDispatch?.id, primaryId)
+    assert.equal(row.execution.previousDispatch?.source, 'primary')
+  } finally { h.close() }
+})
+
+test('#274 R1 BLOCK 中人工换模：未实派设置不改写已记录轮次，resume 重派按 manual 且旧轮留档', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    const worker = await h.toWorker()
+    await h.engine.handleTurnEnded('ws', worker, FAILOVER_503.text, FAILOVER_503.facts)
+    const onBackup = await h.caller()
+    await h.engine.handleTurnEnded('ws', onBackup, FAILOVER_503.text, FAILOVER_503.facts)
+    let row = await h.row()
+    assert.equal(row.run.status, 'blocked')
+    const recorded = row.execution.dispatch!.id
+    assert.equal(row.execution.dispatch!.source, 'fallback')
+
+    // 安排（尚未实派）C：只写 Run 配置，不改写已记录的那一轮。
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'manual-co', 'manual-model', 'manager')).ok, true)
+    row = await h.row()
+    assert.equal(row.execution.dispatch!.id, recorded)
+    assert.equal(row.execution.dispatch!.source, 'fallback')
+    assert.deepEqual(row.execution.dispatch!.model, { provider: 'backup', modelId: 'backup-model' })
+
+    // resume 后新一轮实派 C：来源 manual；被覆盖的备用轮留档。
+    const token = row.execution.nodeToken
+    assert.equal((await h.engine.handleResume('ws', token, '换更强模型重试', 'manager', 'actor')).ok, true)
+    row = await h.row()
+    assert.equal(row.execution.phase, 'working')
+    assert.equal(row.execution.dispatch!.source, 'manual')
+    assert.deepEqual(row.execution.dispatch!.model, { provider: 'manual-co', modelId: 'manual-model' })
+    assert.equal(row.execution.previousDispatch?.id, recorded)
+    assert.equal(row.execution.previousDispatch?.source, 'fallback')
+  } finally { h.close() }
+})
+
+test('#274 R1 Manager 退回后重派：previousDispatch 正是被退回 claim 引用的那一轮', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    await h.toWorker()
+    const worker = await h.caller()
+    assert.equal((await h.engine.handleClaim('ws', { result: 'succeeded', handoff: 'work handoff' }, worker)).ok, true)
+    await h.engine.handleTurnEnded('ws', worker)
+    let claimed = await h.row()
+    assert.equal(claimed.execution.phase, 'checking')
+    const judge = { sessionId: claimed.execution.judge!.sessionId!, turnUserMessageIds: new Set([claimed.execution.judge!.messageId!]) }
+    const returnedDispatchId = claimed.execution.claim!.dispatchId
+    assert.equal((await h.engine.handleJudgeClaim('ws', claimed.execution.nodeToken, 'NEED_CONTEXT', '需要补充材料', judge)).ok, true)
+
+    // Manager 退回到同一 Actor 重新提交（actor resume）：被退回的 claim 与它引用的派发都要留档。
+    const blocked = await h.row()
+    assert.equal((await h.engine.handleResume('ws', blocked.execution.nodeToken, '补充材料后重新提交', 'manager', 'actor')).ok, true)
+    const row = await h.row()
+    assert.equal(row.run.status, 'running')
+    assert.equal(row.execution.phase, 'working')
+    assert.equal(row.execution.previousClaim?.id, claimed.execution.claim!.id, '被退回的 claim 留档')
+    assert.equal(row.execution.previousDispatch?.id, returnedDispatchId, '被退回 claim 引用的旧派发不悬空')
+    assert.equal(row.execution.previousDispatch?.source, 'primary')
+    assert.deepEqual(row.execution.previousDispatch?.model, { provider: 'primary', modelId: 'primary-model' })
+    assert.ok(row.execution.dispatch, '新派发已安排')
+    assert.notEqual(row.execution.dispatch!.id, returnedDispatchId)
+  } finally { h.close() }
+})
+
+test('#274 R1 C=A 的人工设置仍按 manual 记录来源（不冒充 primary）', async () => {
+  const h = harness()
+  try {
+    await h.start()
+    // 与 worker 主模型同值：实派结果与 primary 相同，但来源必须是人工阶段。
+    assert.equal((await h.engine.handleSetRoleModel('ws', 'worker', 'primary', 'primary-model', 'manager')).ok, true)
+    await h.toWorker()
+    const row = await h.row()
+    assert.equal(row.execution.dispatch!.source, 'manual')
+    assert.deepEqual(row.execution.dispatch!.model, { provider: 'primary', modelId: 'primary-model' })
+    assert.deepEqual(row.run.roleRoutes?.worker, { stage: 'manual', reason: 'manager-set', autoSwitches: 0 })
+  } finally { h.close() }
+})

@@ -328,6 +328,13 @@ export class WorkflowEngine {
       }
     })
   }
+  /**
+   * #274：Judge 派发事实（实际解析到的路由 + 来源阶段）——判定安排/重建/换模各点共用
+   * 同一份决策，避免各安排点自写一套后与实际 spawn 漂移（只读监控事实，不参与派发）。
+   */
+  private judgeRouteFacts(run: RunState) {
+    return { model: resolveRoleModel(run, 'judge', run.delegationRoute), source: effectiveRoleRouteStage(run, 'judge') }
+  }
   async startRun(ws: string, run: RunState, configPath?: string, extraText = ''): Promise<EngineOutcome> {
     if (extraText.length > LIMITS.handoffMax) return rejected(`root input exceeds ${LIMITS.handoffMax} characters`)
     const previous = await this.state.get(ws)
@@ -473,7 +480,22 @@ export class WorkflowEngine {
       let committedVersion = version
       try {
         e.phase = 'working'
-        e.dispatch = { id: newNodeToken(), settled: false, ...(role === 'manager' ? { sessionId: run.managerSessionId } : run.roleActors[role] ? { sessionId: run.roleActors[role] } : {}) }
+        // #274：记录本次派发实际用的路由与来源阶段——只读监控事实，不参与派发决策。
+        // Manager 沿用 Run 冻结路由（来源按 primary，人工换模型后为 manual）；旧 Run 无冻结值时不写这两个键。
+        const dispatchModel = role === 'manager' ? run.delegationRoute : resolveRoleModel(run, role, run.delegationRoute)
+        // Manager 没有人工/备用阶段（roleRoutes.manager 在 catalog 与 handleSetRoleModel 双重不可达），来源恒为首选。
+        const dispatchSource = role === 'manager' ? 'primary' : effectiveRoleRouteStage(run, role)
+        // #274 R1：新派发整块替换 e.dispatch——旧轮若真实派发过（有 messageId）或被 claim 引用，
+        // 先按 previousClaim 同深度留档；否则后续执行记录读不到旧轮实际模型/来源。
+        const staleDispatch = e.dispatch
+        if (staleDispatch !== undefined && (staleDispatch.messageId !== undefined || e.previousClaim?.dispatchId === staleDispatch.id)) {
+          e.previousDispatch = staleDispatch
+        }
+        e.dispatch = {
+          id: newNodeToken(), settled: false,
+          ...(dispatchModel !== undefined ? { model: dispatchModel, source: dispatchSource } : {}),
+          ...(role === 'manager' ? { sessionId: run.managerSessionId } : run.roleActors[role] ? { sessionId: run.roleActors[role] } : {}),
+        }
         e.boundary = { dispatchedAt: Date.now(), managerFromSeq: this.targets.managerSessionSeq(run), ...(role === 'manager' ? {} : e.dispatch.sessionId ? { executorSessionId: e.dispatch.sessionId } : {}) }
         await this.state.put(ws, run, version, [change(e, 'actor-arranged')])
         committedVersion = version + 1
@@ -560,7 +582,7 @@ export class WorkflowEngine {
       const continuationSessionId = e.resolution?.target === 'judge' && e.resolution.judgeMode === 'followup'
         ? e.resolution.judgeSessionId : undefined
       if (!e.judge) {
-        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
+        e.judge = { id: newNodeToken(), sessionId: continuationSessionId ?? newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, ...this.judgeRouteFacts(run) }
         await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
         committedVersion = version + 1
       } else if (e.judge.claimId !== e.claim.id || e.judge.inputVersion !== e.inputVersion
@@ -698,7 +720,7 @@ export class WorkflowEngine {
     const { run, execution: e, version } = row
     const oldSessionId = e.judge!.sessionId
     e.judgeAutoRetried = true
-    e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim!.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
+    e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim!.id, inputVersion: e.inputVersion, settled: false, ...this.judgeRouteFacts(run) }
     await this.state.put(ws, run, version, [change(e, 'judge-arranged')])
     this.trace(run, 'JUDGE-RETRY', { workflow: e.workflowId, node: e.nodeId, reason: jsonField(turnFailure ?? 'transient judge failure', LIMITS.blockReasonMax) })
     await this.subagents.retireJudge(run, oldSessionId).catch(() => {})
@@ -1201,7 +1223,7 @@ export class WorkflowEngine {
     run.roleRoutes = { ...(run.roleRoutes ?? {}), judge: { stage: next, reason, autoSwitches } }
     // 判定材料与 inputVersion 不变：新 Judge 判同一 claim，旧会话的迟到提交/Turn 结算
     // 因 e.judge 身份失配被丢弃（预算不会被扣第二次）。判定中不刷新同模型重试预算。
-    e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: target }
+    e.judge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: target, source: next }
     await this.state.put(ws, run, version, [change(e, 'model-changed', 'judge-arranged')])
     this.forgetDispatch(previousSessionId, previousJudgeId)
     await this.subagents.retireJudge(run, previousSessionId).catch(() => {})
@@ -1498,7 +1520,7 @@ export class WorkflowEngine {
     if (resolvedTarget === 'judge') {
       e.judge = {
         id: newNodeToken(), sessionId: judgeSessionId ?? newNodeToken(), claimId: e.claim!.id,
-        inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute),
+        inputVersion: e.inputVersion, settled: false, ...this.judgeRouteFacts(run),
       }
     }
     e.restartPending = false
@@ -1546,7 +1568,7 @@ export class WorkflowEngine {
         decision: reason || 'Manager requested Judge respawn',
       }
       e.restartPending = false
-      const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, model: resolveRoleModel(run, 'judge', run.delegationRoute) }
+      const arranged: ExecutionJudge = { id: newNodeToken(), sessionId: newNodeToken(), claimId: e.claim.id, inputVersion: e.inputVersion, settled: false, ...this.judgeRouteFacts(run) }
       arrangedId = arranged.id
       e.judge = arranged
       // Issue #200：Manager 显式重建是新的人工尝试，自动重试预算重置。
