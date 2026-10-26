@@ -423,7 +423,8 @@ export interface ModelOverride {
  * - `fallback`：备用路由 B（catalog `fallbackModel`）。
  * 缺省（无该角色的阶段记录）= 旧行为：override > def > frozen。
  */
-export type RoleRouteStage = 'primary' | 'fallback' | 'manual'
+export const ROLE_ROUTE_STAGES = ['primary', 'fallback', 'manual'] as const
+export type RoleRouteStage = (typeof ROLE_ROUTE_STAGES)[number]
 
 /** #235：阶段 + 切换原因 + 本轮预算消耗（自动切换次数），随 Run row 持久化。 */
 export interface RoleRouteState {
@@ -583,6 +584,11 @@ export interface NodeExecution {
   successorId?: string
   boundary?: NodeContextBoundary
   dispatch?: ExecutionDispatch
+  /**
+   * #274 R1：同一 execution 内被新派发覆盖前的上一轮 Actor 派发事实（只留真实派发过或被
+   * claim 引用的那一代），与 previousClaim/previousJudge 同深度；旧行无该键=未记录，不回填。
+   */
+  previousDispatch?: ExecutionDispatch
   claim?: ExecutionClaim
   /** REJECT/显式退回后保留的已失效旧 claim；不授予当前提交资格。 */
   previousClaim?: ExecutionClaim

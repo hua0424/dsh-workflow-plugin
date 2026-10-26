@@ -581,7 +581,6 @@ test('#274 当前执行卡：投影 → 视图模型（角色/模型来源/状�
     // 推进到 review：卡片跟随栈顶，judge 未派发；节点行带 executionId 供同名节点区分。
     const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
     await claim(h, manager, 'succeeded', 'plan artifact')
-    const waitingJudge: ClaimCaller = { sessionId: 'role-reviewer', turnUserMessageIds: new Set(['actor-message-2']) }
     const row = (await h.store.get('ws'))!
     // plan 判定 ACCEPT → review 派发（messageId 递增为 actor-message-2）。
     const planJudge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
@@ -594,7 +593,6 @@ test('#274 当前执行卡：投影 → 视图模型（角色/模型来源/状�
     assert.deepEqual([review.currentExecution!.actor!.modelText, review.currentExecution!.actor!.status], ['prov/m-review · 首选', '执行中'])
     assert.equal(review.currentExecution!.judge!.status, '未派发')
     assert.ok(review.nodes.some(node => node.executionId === reviewRow.execution.executionId), '节点行携带 execution 身份')
-    void waitingJudge
 
     // 结束 Run：卡片改为结束位置，活动文案不再冒充正在执行。
     h.engine.handleReset('ws', 'manager')
@@ -603,5 +601,22 @@ test('#274 当前执行卡：投影 → 视图模型（角色/模型来源/状�
     assert.equal(terminated.currentExecution!.active, false)
     assert.equal(terminated.currentExecution!.terminalLabel, '已终止')
     assert.equal(terminated.currentExecution!.actor!.status, '已终止')
+  } finally { h.cleanup() }
+})
+
+test('#274 status：长 handoff 只给有界预览，2 秒轮询 payload 不随历史长度增长', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const handler = handlerOf(h)
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    const longHandoff = `结论开头\n${'证据行 '.repeat(80)}`
+    await claim(h, manager, 'succeeded', longHandoff)
+    const payload = (await handler('status', { cwd: 'ws' })).value as Extract<Awaited<ReturnType<typeof handlerOf>>, { mode: 'run' }>
+    const projected = nodeOf(payload, 'plan').claim!.handoff
+    assert.ok(projected.startsWith('结论开头'), '保留开头，便于卡片识别')
+    assert.ok(projected.length < longHandoff.length, '长文本被截断，不是全量透传')
+    assert.match(projected, /…（共 \d+ 字）$/, '截断标记说明原文长度，完整正文归状态库')
   } finally { h.cleanup() }
 })

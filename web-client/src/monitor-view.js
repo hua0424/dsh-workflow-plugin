@@ -216,8 +216,6 @@ export const ROUTE_SOURCE_LABELS = { primary: '首选', fallback: '备选', manu
 
 const SOURCE_UNKNOWN = '来源未知'
 const MODEL_MISSING = '未记录'
-// 描述「正在发生」的文案：Run 已结束而工作单仍停在活动相时不得照搬，否则冒充活跃执行。
-const ACTIVE_STATUSES = new Set(['执行中', '待提交', '等待 Actor 收口', '待派发', '待判定'])
 
 /** 派发事实 → 「模型 · 来源」；未采集时显式未记录/来源未知，绝不用当前配置补值。 */
 function dispatchModelText(facts) {
@@ -225,21 +223,32 @@ function dispatchModelText(facts) {
   return `${modelText === '' ? MODEL_MISSING : modelText} · ${ROUTE_SOURCE_LABELS[facts?.source] ?? SOURCE_UNKNOWN}`
 }
 
+/**
+ * 状态文案 + 是否「正在发生」：终态 Run 只替换活动文案，已收口/未派发的如实保留。
+ * 活动性跟着事实（派发/claim/判定）走，不靠中文标签集合，文案改名也不会静默失效。
+ */
 function actorStatusOf(node) {
-  if (node.dispatch === undefined || node.dispatch === null) return '未派发'
-  if (node.dispatch.dispatched !== true) return '已安排派发未确认'
-  if (node.claim !== undefined && node.claim !== null) return '已提交结果'
-  return node.dispatch.settled === true ? '待提交' : '执行中'
+  if (node.dispatch === undefined || node.dispatch === null) return { text: '未派发', active: false }
+  if (node.dispatch.dispatched !== true) return { text: '已安排派发未确认', active: false }
+  if (node.claim !== undefined && node.claim !== null) return { text: '已提交结果', active: false }
+  return node.dispatch.settled === true ? { text: '待提交', active: true } : { text: '执行中', active: true }
 }
 
 function judgeStatusOf(node) {
-  if (node.claim === undefined || node.claim === null) return '未派发'
+  if (node.claim === undefined || node.claim === null) return { text: '未派发', active: false }
   if (node.judge === undefined || node.judge === null) {
-    return node.dispatch?.settled === false ? '等待 Actor 收口' : '待派发'
+    return node.dispatch?.settled === false ? { text: '等待 Actor 收口', active: true } : { text: '待派发', active: true }
   }
-  if (node.judge.dispatched !== true) return '已安排派发未确认'
-  if (node.judge.judgment !== undefined) return `已判定：${node.judge.judgment}`
-  return '待判定'
+  if (node.judge.dispatched !== true) return { text: '已安排派发未确认', active: false }
+  if (node.judge.judgment !== undefined) return { text: `已判定：${node.judge.judgment}`, active: false }
+  return { text: '待判定', active: true }
+}
+
+/** 程序/子流程节点的目标文案（当前卡与记录表共用一份）。 */
+function targetTextOf(def) {
+  if (def?.kind === 'builtin-program') return `程序 ${def.programId ?? '?'}`
+  if (def?.kind === 'child-workflow') return `子流程 ${def.childWorkflowId ?? '?'}`
+  return null
 }
 
 /**
@@ -259,12 +268,10 @@ export function currentExecutionView(run, ctx = {}) {
   const blocked = typeof node.blockReason === 'string' && node.blockReason !== ''
   // 终态：活动相文案换成 Run 终态标签（终止位置可查，但不冒充活跃执行）。
   const endLabel = ctx.statusLabel ?? (run?.status === 'completed' ? '已完成' : '已终止')
-  const settle = status => (terminal && ACTIVE_STATUSES.has(status) ? endLabel : status)
+  const settle = status => (terminal && status.active ? endLabel : status.text)
   const visit = typeof node.visit === 'number' ? node.visit : 1
   const actorTask = kind === 'actor-task'
-  const targetText = kind === 'builtin-program'
-    ? `程序 ${def?.programId ?? '?'}`
-    : kind === 'child-workflow' ? `子流程 ${def?.childWorkflowId ?? '?'}` : null
+  const targetText = targetTextOf(def)
   return {
     heading: terminal ? '结束位置' : '当前节点',
     active: !terminal,
@@ -359,9 +366,7 @@ export function monitorViewModel(payload, options = {}) {
     nodes: nodes.map(node => {
       const [phaseLabel, phaseClass] = phaseOf(node.phase)
       const def = run.flows?.[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId)
-      const targetText = def?.kind === 'builtin-program'
-        ? `程序 ${def.programId ?? '?'}`
-        : def?.kind === 'child-workflow' ? `子流程 ${def.childWorkflowId ?? '?'}` : null
+      const targetText = targetTextOf(def)
       return {
         key: `${node.workflowId}/${node.nodeId}#${node.visit}`,
         executionId: node.executionId ?? null,

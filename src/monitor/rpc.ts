@@ -84,7 +84,7 @@ export interface MonitorNodeExecution {
   current: boolean
   /** #274 本工作单的 Actor 派发事实（缺字段 = 旧记录未采集）。 */
   dispatch?: MonitorDispatchFacts
-  /** #274 本工作单已提交的结果（result 为声明结果名）。 */
+  /** #274 本工作单已提交的结果（result 为声明结果名；handoff 只给有界预览）。 */
   claim?: { id: string; result: string; handoff: string }
   /** #274 本工作单的 Judge 派发事实。 */
   judge?: MonitorJudgeFacts
@@ -134,6 +134,15 @@ function modelCopy(route: DelegationRoute | undefined): MonitorModel | undefined
   if (route.modelId !== undefined) model.modelId = route.modelId
   if (route.reasoningEffort !== undefined) model.reasoningEffort = route.reasoningEffort
   return model
+}
+
+/**
+ * #274 handoff 是自由文本：只读监控只给有界预览，避免 2 秒轮询的 payload 与
+ * 历史长度同增长（完整正文归状态库/详情另取）。
+ */
+const HANDOFF_PREVIEW_MAX = 200
+function previewHandoff(text: string): string {
+  return text.length <= HANDOFF_PREVIEW_MAX ? text : `${text.slice(0, HANDOFF_PREVIEW_MAX)}…（共 ${text.length} 字）`
 }
 
 function modelOf(run: RunState, role: string): MonitorModel {
@@ -237,7 +246,7 @@ export function projectRunStatus(row: StateRow | undefined, executions: readonly
         current: top !== undefined && top.workflowId === execution.workflowId && top.nodeId === execution.nodeId && top.executionId === execution.executionId,
         // #274：派发/claim/判定事实只来自本工作单的落库快照（旧行缺字段 = 未记录）。
         ...(execution.dispatch !== undefined ? { dispatch: dispatchFactsOf(execution.dispatch) } : {}),
-        ...(execution.claim !== undefined ? { claim: { id: execution.claim.id, result: execution.claim.result, handoff: execution.claim.handoff } } : {}),
+        ...(execution.claim !== undefined ? { claim: { id: execution.claim.id, result: execution.claim.result, handoff: previewHandoff(execution.claim.handoff) } } : {}),
         ...(execution.judge !== undefined ? { judge: judgeFactsOf(execution.judge, execution.judgment) } : {}),
       })),
       callStack: run.callStack.map(frame => ({ workflowId: frame.workflowId, nodeId: frame.nodeId, executionId: frame.executionId })),

@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { workflowConfigSchema } from '../catalog/schema.ts'
 import { computeDefinitionHash } from '../catalog/validate.ts'
-import { LIMITS, ID_PATTERN, declaredResults, roleKeysWithJudge, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
+import { LIMITS, ID_PATTERN, ROLE_ROUTE_STAGES, declaredResults, roleKeysWithJudge, type CallFrame, type NodeDef, type NodeExecution, type RunState } from '../types.ts'
 
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
@@ -14,7 +14,7 @@ const route = z.object({ provider: text.optional(), modelId: text.optional(), re
 //（投影显示未记录/来源未知，绝不回填当前配置）。
 const dispatch = z.object({
   id: text, sessionId: text.optional(), messageId: text.optional(), settled: z.boolean(),
-  model: route.optional(), source: z.enum(['primary', 'fallback', 'manual']).optional(),
+  model: route.optional(), source: z.enum(ROLE_ROUTE_STAGES).optional(),
 }).strict()
 const judge = dispatch.extend({ sessionId: text, claimId: text, inputVersion: revision, model: route.optional() })
 // v3: claim 携带一个已声明的节点结果名（result），不再有 outcome。
@@ -46,7 +46,7 @@ const executionSchema = z.object({
   phase: z.enum(['ready', 'working', 'checking', 'settling', 'exited']), roleBoundaryPrepared: z.boolean(), restartPending: z.boolean(),
   predecessorId: text.optional(), successorId: text.optional(),
   boundary: z.object({ dispatchedAt: revision, managerFromSeq: revision, executorSessionId: text.optional(), executorDispatchMessageId: text.optional() }).strict().optional(),
-  dispatch: dispatch.optional(), claim: claim.optional(), previousClaim: claim.optional(),
+  dispatch: dispatch.optional(), previousDispatch: dispatch.optional(), claim: claim.optional(), previousClaim: claim.optional(),
   judge: judge.optional(), previousJudge: judge.optional(),
   // Issue #200：Judge 有界自动重试 1 次的消费标记（旧行无该键 = 未重试）。
   judgeAutoRetried: z.boolean().optional(),
@@ -99,7 +99,7 @@ export function checkExecutionInvariants(run: RunState, execution: NodeExecution
   if (execution.program && node?.execution.type !== 'builtin-program') problems.push('Program materials require a builtin-program execution')
   if (execution.child && (node?.execution.type !== 'child-workflow' || execution.child.workflowId !== node.execution.workflowId)) problems.push('Child materials do not match the child-workflow execution')
   if (node?.execution.type === 'builtin-program') {
-    if (execution.dispatch || execution.boundary || execution.claim || execution.previousClaim || execution.judge || execution.previousJudge || execution.judgment || execution.resolution) problems.push('builtin-program cannot carry Actor/Judge materials')
+    if (execution.dispatch || execution.previousDispatch || execution.boundary || execution.claim || execution.previousClaim || execution.judge || execution.previousJudge || execution.judgment || execution.resolution) problems.push('builtin-program cannot carry Actor/Judge materials')
     if (execution.phase === 'checking') problems.push('builtin-program cannot enter checking')
     if (execution.phase === 'ready' && execution.program) problems.push('ready Program cannot have an invocation')
     if (execution.phase === 'working' && (!execution.program || execution.program.result)) problems.push('working Program requires one unresolved invocation')
@@ -107,7 +107,7 @@ export function checkExecutionInvariants(run: RunState, execution: NodeExecution
     if (execution.phase === 'exited' && (!execution.program?.result || execution.program.result.kind === 'ERROR')) problems.push('exited Program requires PASS or FAIL result')
   }
   if (node?.execution.type === 'child-workflow') {
-    if (execution.dispatch || execution.boundary || execution.claim || execution.previousClaim || execution.judge || execution.previousJudge || execution.judgment || execution.program) problems.push('child-workflow cannot carry Actor/Judge/Program materials')
+    if (execution.dispatch || execution.previousDispatch || execution.boundary || execution.claim || execution.previousClaim || execution.judge || execution.previousJudge || execution.judgment || execution.program) problems.push('child-workflow cannot carry Actor/Judge/Program materials')
     if (execution.resolution && execution.resolution.target !== 'child') problems.push('Child recovery metadata must target child')
     if (execution.phase === 'checking' || execution.phase === 'settling') problems.push('child-workflow has no checking or settling phase')
     if (execution.phase === 'ready' && execution.child) problems.push('ready Child caller cannot have an invocation')
