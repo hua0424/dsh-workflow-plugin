@@ -215,7 +215,8 @@ export function monitorPollingContinues(payload) {
 export const ROUTE_SOURCE_LABELS = { primary: '首选', fallback: '备选', manual: '人工指定' }
 
 const SOURCE_UNKNOWN = '来源未知'
-const MODEL_MISSING = '未记录'
+/** #274/#275 无可靠记录时的统一文案（不按当前配置/当前时刻猜补）。 */
+export const MODEL_MISSING = '未记录'
 
 /** 派发事实 → 「模型 · 来源」；未采集时显式未记录/来源未知，绝不用当前配置补值。 */
 function dispatchModelText(facts) {
@@ -306,6 +307,145 @@ export function currentExecutionView(run, ctx = {}) {
   }
 }
 
+/** #275 执行记录表列顺序（固定列序；「所属流程」靠左、节点列固定由 CSS 处理）。 */
+export const RECORD_COLUMNS = ['节点名称', '所属流程', '运行情况', '进入时间', '提交结果时间', '提交判定时间', 'Actor 模型', 'Judge 模型']
+/** #275 缺失值口径（与设计文档 §5.3 一致；不按当前配置/当前时刻猜补）。 */
+export const RECORD_PENDING = '待提交'
+export const RECORD_JUDGE_PENDING = '待判定'
+export const RECORD_NOT_DISPATCHED = '未派发'
+export const RECORD_SCHEDULED = '已安排派发未确认'
+export const RECORD_NOT_APPLICABLE = '不适用'
+/** 判定等待超过该时长只在视图标注「较久」，不宣称失败（真实卡片/表格共用口径）。 */
+const RECORD_SLOW_MS = 120_000
+
+function timeText(value) {
+  const ms = typeof value === 'string' ? Date.parse(value) : Number.NaN
+  return Number.isFinite(ms) ? new Date(ms).toLocaleString('zh-CN', { hour12: false }) : null
+}
+
+function judgmentLabelOf(result) {
+  if (result === 'ACCEPT') return '通过'
+  if (result === 'REJECT') return '不通过'
+  if (result === 'NEED_CONTEXT') return '需补充'
+  return result ?? '—'
+}
+
+function roundModelText(dispatch) {
+  if (dispatch === undefined || dispatch === null) return MODEL_MISSING
+  return dispatchModelText(dispatch)
+}
+
+/**
+ * #275 执行记录表（纯函数）：一行 = 一次进入节点的工作单（不把多次进入合并成一行）；
+ * 同一次进入内的多轮提交/判定放在该行的下钻里，按 claimId 配对、按事件时间给时间，
+ * 绝不跨轮借模型/时间，也绝不用当前配置冒充历史。无事件留档的旧记录显式「未记录」。
+ */
+export function monitorRecordsView(run, ctx = {}) {
+  const nodes = Array.isArray(run?.nodes) ? run.nodes : []
+  const flows = run?.flows ?? {}
+  const rootWorkflowId = run?.workflowId
+  const terminal = ctx.terminal === true
+  const now = Number.isFinite(ctx.now) ? ctx.now : Date.now()
+  return nodes.map(node => {
+    const def = flows[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId) ?? null
+    const [phaseLabel] = phaseOf(node.phase)
+    const history = node.history ?? {}
+    const rounds = (Array.isArray(history.rounds) ? history.rounds : []).map((round, index) => {
+      const judgment = round.judgment ?? null
+      return {
+        index: index + 1,
+        claimId: round.claimId,
+        result: round.result,
+        resultText: `提交「${round.result}」`,
+        statusText: judgment === null ? RECORD_JUDGE_PENDING : `判定${judgmentLabelOf(judgment.result)}`,
+        judgmentResult: judgment?.result ?? null,
+        submittedAt: typeof round.submittedAt === 'string' ? round.submittedAt : null,
+        submittedAtText: timeText(round.submittedAt),
+        judgedAtText: judgment === null ? null : timeText(judgment.at),
+        actorModelText: roundModelText(round.actor),
+        judgeModelText: judgment === null ? RECORD_JUDGE_PENDING : roundModelText(judgment.judge),
+      }
+    })
+    const pending = history.pending ?? null
+    const abandoned = Array.isArray(history.abandoned) ? history.abandoned : []
+    const switches = Array.isArray(history.switches) ? history.switches : []
+    const last = rounds.at(-1) ?? null
+    const ended = typeof node.exitedAt === 'string'
+    const blocked = typeof node.blockReason === 'string' && node.blockReason !== ''
+    // 最新一轮的「等待中」派生自提交时间（不新增持久化字段，不宣称失败）。
+    const waitingMs = !terminal && last !== null && last.judgmentResult === null && last.submittedAtText !== null
+      ? now - Date.parse(last.submittedAt)
+      : Number.NaN
+    const waitingText = Number.isFinite(waitingMs) && waitingMs >= RECORD_SLOW_MS
+      ? `已判定等待 ${elapsedText(waitingMs)}`
+      : null
+    const pendingRound = pending === null ? null : {
+      index: rounds.length + 1,
+      statusText: pending.dispatched === true ? RECORD_PENDING : RECORD_SCHEDULED,
+      actorModelText: roundModelText(pending),
+    }
+    // 无事件回放（旧记录）时只用工作单上仍保留的当前事实做定性，时间/历史模型显式「未记录」。
+    const claimed = node.claim !== undefined && node.claim !== null
+    const judged = node.judgment !== undefined && node.judgment !== null
+    const judgeArranged = node.judge !== undefined && node.judge !== null
+    const outcomeText = blocked
+      ? '阻塞'
+      : ended
+        ? '已结束'
+        : last === null
+          ? !claimed
+            ? (pending !== null && pending.dispatched !== true
+              ? RECORD_SCHEDULED
+              : node.dispatch === undefined || node.dispatch === null ? phaseLabel : RECORD_PENDING)
+            : judged ? `判定${judgmentLabelOf(node.judgment.result)}` : '待判定'
+          : last.judgmentResult === null ? '待判定' : `判定${judgmentLabelOf(last.judgmentResult)}`
+    return {
+      key: `${node.workflowId}/${node.nodeId}#${node.visit}`,
+      executionId: node.executionId ?? null,
+      workflowId: node.workflowId,
+      nodeId: node.nodeId,
+      // 节点名称：节点 id（有角色时附角色），表格与画布可交叉核对。
+      nodeLabel: def?.role === undefined || def?.role === null ? node.nodeId : `${node.nodeId}（${def.role}）`,
+      flowText: node.workflowId === rootWorkflowId ? '主流程' : `子流程 ${node.workflowId}`,
+      workflowLabel: node.workflowId,
+      visit: node.visit,
+      current: node.current === true,
+      visitText: typeof node.visit === 'number' && node.visit > 1 ? `第 ${node.visit} 次` : '',
+      phaseLabel,
+      blocked,
+      blockReason: node.blockReason ?? null,
+      outcomeText,
+      roundCountText: rounds.length > 0 ? `共 ${rounds.length} 轮` : null,
+      enteredAtText: timeText(node.enteredAt),
+      // 无事件回放：有 claim/判定事实但时间不可还原 → 未记录；还没提交才是待提交。
+      submittedAtText: last === null ? (claimed ? MODEL_MISSING : RECORD_PENDING) : last.submittedAtText,
+      judgedAtText: last === null
+        ? (judged ? MODEL_MISSING : judgeArranged ? RECORD_JUDGE_PENDING : RECORD_NOT_APPLICABLE)
+        : last.judgedAtText ?? RECORD_JUDGE_PENDING,
+      // 旧记录（无事件回放）：已提交/已安排但无派发事实可还原 → 未记录，不拿当前配置填。
+      actorModelText: last !== null
+        ? last.actorModelText
+        : (node.dispatch !== undefined && node.dispatch !== null ? roundModelText(node.dispatch) : RECORD_NOT_DISPATCHED),
+      judgeModelText: last !== null
+        ? last.judgeModelText
+        : (node.judge !== undefined && node.judge !== null ? roundModelText(node.judge) : RECORD_NOT_APPLICABLE),
+      waitingText,
+      drilldown: {
+        rounds,
+        ...(pendingRound === null ? {} : { pending: pendingRound }),
+        // 未形成提交的派发（故障切换/超时重派/被覆盖的旧轮）：有时间给时间，未知显式「时间未记录」。
+        abandoned: abandoned.map(attempt => ({
+          atText: timeText(attempt.at),
+          modelText: roundModelText(attempt.dispatch),
+          reasonText: attempt.at === null ? '时间未记录' : '未形成提交',
+        })),
+        // 角色只在事件能证明时显示（Judge 侧有差分）；证明不了就只报「换模」，不猜是谁。
+        switches: switches.map(switchEvent => ({ atText: timeText(switchEvent.at), roleText: switchEvent.role === 'judge' ? 'Judge 换模' : switchEvent.role === 'actor' ? 'Actor 换模' : '换模' })),
+      },
+    }
+  })
+}
+
 /**
  * payload（服务端 MonitorRunStatus）→ 视图模型（#254 起区分 run/terminal/empty）。
  * payload 为 null/undefined（尚无数据）时返回 { mode: 'loading' }。
@@ -367,6 +507,8 @@ export function monitorViewModel(payload, options = {}) {
     },
     // #274：当前执行卡独立于选中详情/流程选择，始终指向当前（或结束）工作单。
     currentExecution: currentExecutionView(run, { terminal, statusLabel }),
+    // #275：执行记录表（每次进入一行；多轮提交/判定在下钻里）。
+    records: monitorRecordsView(run, { terminal, now }),
     nodes: nodes.map(node => {
       const [phaseLabel, phaseClass] = phaseOf(node.phase)
       const def = run.flows?.[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId)

@@ -117,7 +117,7 @@ return { START_PROMPT_MAX_CHARS, START_MODAL_STYLES, normalizeStartPrompt, start
 })();
 var __monitorView = (function () {
 ${monitorView}
-return { PHASE_LABELS, RUN_STATUS_LABELS, monitorViewModel, monitorErrorState, monitorPollingContinues, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow };
+return { PHASE_LABELS, RUN_STATUS_LABELS, monitorViewModel, monitorErrorState, monitorPollingContinues, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, ROUTE_SOURCE_LABELS, MODEL_MISSING, currentExecutionView, monitorRecordsView, RECORD_COLUMNS, RECORD_PENDING, RECORD_JUDGE_PENDING, RECORD_NOT_DISPATCHED, RECORD_SCHEDULED, RECORD_NOT_APPLICABLE };
 })();
 var __monitor = (function () {
 ${monitor}

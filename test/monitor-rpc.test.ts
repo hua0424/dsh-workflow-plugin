@@ -10,7 +10,7 @@ import type { ClaimCaller, WorkflowConfig } from '../src/types.ts'
 import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
-import { createMonitorRpcHandler, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
+import { createMonitorRpcHandler, projectRunStatus, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
 import { monitorViewModel, EMPTY_GUIDANCE } from '../web-client/src/monitor-view.js'
 import { readRunLayout } from '../src/monitor/layout.ts'
 import type { EditorLayout } from '../src/editor/layout.ts'
@@ -62,6 +62,7 @@ function handlerOf(h: ReturnType<typeof harness>, layout?: EditorLayout) {
     active: async () => h.store.activeRuns(),
     byRunId: async runId => h.store.getByRunId(runId),
     executions: async runId => h.store.runExecutionsByRunId(runId),
+    events: async runId => h.store.runEventsByRunId(runId),
     layout: async () => layout,
   })
 }
@@ -74,6 +75,12 @@ async function claim(h: ReturnType<typeof harness>, caller: ClaimCaller, result:
 async function judgeAccept(h: ReturnType<typeof harness>, caller: ClaimCaller): Promise<void> {
   const row = (await h.store.get('ws'))!
   assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'ACCEPT', 'verified', caller)).ok, true)
+  await h.engine.handleTurnEnded('ws', caller)
+}
+
+async function judgeReject(h: ReturnType<typeof harness>, caller: ClaimCaller, reason: string): Promise<void> {
+  const row = (await h.store.get('ws'))!
+  assert.equal((await h.engine.handleJudgeClaim('ws', row.execution.nodeToken, 'REJECT', reason, caller)).ok, true)
   await h.engine.handleTurnEnded('ws', caller)
 }
 
@@ -638,5 +645,114 @@ test('#274 R1 status：重派旧轮经 previousDispatch 投影，卡片「上一
     const card = monitorViewModel(payload).currentExecution!
     assert.equal(card.actor!.previousText, '上一轮 backup/backup-model · 备选')
     assert.notEqual(card.actor!.previousText, card.actor!.modelText, '上一轮与当前轮分开呈现')
+  } finally { h.cleanup() }
+})
+
+type RunPayload = Extract<Awaited<ReturnType<ReturnType<typeof handlerOf>>>, { mode: 'run' }>
+
+test('#275 status：多轮提交/判定 history 按 claim 配对、事件时间与重派事实独立', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const handler = handlerOf(h)
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    await claim(h, manager, 'succeeded', 'first attempt')
+    let row = (await h.store.get('ws'))!
+    const judge1: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    await judgeReject(h, judge1, '缺少证据')
+
+    // REJECT 后引擎自动重派：新一轮 Actor 派发已安排、尚未提交（待提交那一轮）。
+    row = (await h.store.get('ws'))!
+    const waiting = nodeOf((await handler('status', { cwd: 'ws' })).value as RunPayload, 'plan')
+    assert.equal(waiting.history!.rounds.length, 1, '已提交的只有第一轮')
+    assert.equal(waiting.history!.rounds[0].judgment!.result, 'REJECT')
+    assert.equal(waiting.history!.pending!.id, row.execution.dispatch!.id, '待提交轮次来自新派发')
+    assert.equal(waiting.history!.pending!.model!.modelId, 'm-manager', '待提交轮次带自己的实际模型')
+    assert.equal(waiting.history!.pending!.source, 'primary')
+    assert.deepEqual(waiting.history!.abandoned, [], '重派被提交前不算放弃')
+
+    // 第二轮提交 + ACCEPT：两轮各自的事实都能取到。
+    const manager2: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
+    await claim(h, manager2, 'succeeded', 'second attempt')
+    row = (await h.store.get('ws'))!
+    const judge2: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    await judgeAccept(h, judge2)
+    const judged = nodeOf((await handler('status', { cwd: 'ws' })).value as RunPayload, 'plan')
+    const history = judged.history!
+    assert.equal(history.rounds.length, 2)
+    assert.deepEqual(history.rounds.map(round => round.result), ['succeeded', 'succeeded'])
+    assert.notEqual(history.rounds[0].claimId, history.rounds[1].claimId, '每轮独立 claim')
+    assert.deepEqual(history.rounds.map(round => round.judgment!.result), ['REJECT', 'ACCEPT'], '判定按 claimId 配对，不跨轮')
+    assert.notEqual(history.rounds[0].actor!.id, history.rounds[1].actor!.id, '每轮自己的派发事实')
+    assert.deepEqual([history.rounds[0].actor!.model!.modelId, history.rounds[1].actor!.model!.modelId], ['m-manager', 'm-manager'])
+    assert.ok(Date.parse(history.rounds[1].submittedAt) >= Date.parse(history.rounds[0].submittedAt), '提交时间来自各自事件')
+    assert.ok(Date.parse(history.rounds[0].judgment!.at) <= Date.parse(history.rounds[1].submittedAt), '第一轮判定时间早于第二轮提交')
+    assert.equal(history.pending, undefined, '最新一轮已提交，不再待提交')
+    assert.deepEqual(history.abandoned, [])
+    assert.equal(judged.claim!.id, history.rounds[1].claimId, '当前 claim 与最新一轮一致')
+    assert.equal(JSON.stringify(history).includes('endedAt'), false, '历史事实不带结束时间')
+
+    // 回放确定性：重复读取与事件输入顺序都不影响 history。
+    const executions = await h.store.runExecutionsByRunId(row.run.runId)
+    const events = await h.store.runEventsByRunId(row.run.runId)
+    const replayed = projectRunStatus(row, executions, undefined, undefined, [], [...events].reverse())
+    assert.deepEqual(replayed.run!.nodes[0].history, history)
+    assert.deepEqual(projectRunStatus(row, executions, undefined, undefined, [], events).run!.nodes[0].history, history)
+  } finally { h.cleanup() }
+})
+
+test('#275 status：旧行无事件回放时 history 缺省，不回填当前配置', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    // 已提交但无事件回放（旧记录/旧宿主）：轮次事实不可还原，投影不虚构。
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    await claim(h, manager, 'succeeded', 'legacy artifact')
+    // 不带 events 依赖 = 旧记录/旧宿主：多轮事实不可还原，投影不虚构。
+    const legacyHandler = createMonitorRpcHandler({
+      maintenance: () => undefined,
+      resolveWorkspace: async cwd => cwd ?? 'ws',
+      latest: async workspaceKey => h.store.get(workspaceKey),
+      active: async () => h.store.activeRuns(),
+      byRunId: async runId => h.store.getByRunId(runId),
+      executions: async runId => h.store.runExecutionsByRunId(runId),
+      layout: async () => undefined,
+    })
+    const node = nodeOf((await legacyHandler('status', { cwd: 'ws' })).value as RunPayload, 'plan')
+    assert.equal(node.history, undefined, '无事件 → 无多轮历史（不伪造轮次/时间）')
+    assert.ok(node.claim !== undefined, '旧行仍保留 #274 的当前 claim 事实')
+    const view = monitorViewModel((await legacyHandler('status', { cwd: 'ws' })).value)
+    const record = view.records.find(item => item.nodeId === 'plan')!
+    assert.deepEqual([record.submittedAtText, record.judgedAtText], ['未记录', '待判定'], '无事件回放：提交时间不可还原显式未记录，不被当成待提交')
+    assert.deepEqual([record.actorModelText, record.judgeModelText], ['mgr/m-manager · 首选', 'mgr/m-manager · 首选'], '模型取工作单派发快照，不拿当前配置补')
+  } finally { h.cleanup() }
+})
+test('#275 status：换模角色只在事件能证明时给出（Judge 侧差分），其余留空不猜', async () => {
+  const h = harness()
+  try {
+    await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    await claim(h, manager, 'succeeded', 'artifact')
+    const row = (await h.store.get('ws'))!
+    const base = (await h.store.runExecutionsByRunId(row.run.runId))[0]!
+    const at = (minute: number) => `2026-10-25T04:${String(minute).padStart(2, '0')}:00.000Z`
+    const eventsOf = (snapshot: typeof base) => [
+      { executionId: base.executionId, sequence: 1, type: 'claim' as const, at: at(0), snapshot: base },
+      { executionId: base.executionId, sequence: 2, type: 'model-changed' as const, at: at(1), snapshot },
+    ]
+    const switchesOf = (snapshot: typeof base) => {
+      const projection = projectRunStatus(row, [base], undefined, undefined, [], eventsOf(snapshot))
+      return projection.run!.nodes[0]!.history!.switches
+    }
+    // Judge 侧模型差分：能证明是 Judge 换模。
+    const judgeSwitched = { ...base, judge: { ...(base.judge!), model: { provider: 'prov', modelId: 'm-judge-x' } } }
+    assert.deepEqual(switchesOf(judgeSwitched), [{ at: at(1), role: 'judge' }])
+    // Actor 重新派发（id 变化）：能证明是 Actor 换模。
+    const actorSwitched = { ...base, dispatch: { ...(base.dispatch!), id: 'd-new' } }
+    assert.deepEqual(switchesOf(actorSwitched), [{ at: at(1), role: 'actor' }])
+    // 快照无差分（人工换模只写 Run 行，事件里看不到新路由）：角色留空，不按当前配置猜。
+    assert.deepEqual(switchesOf(base), [{ at: at(1), role: null }])
   } finally { h.cleanup() }
 })

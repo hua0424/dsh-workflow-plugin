@@ -359,6 +359,8 @@ function createWorld() {
     active: async () => { stateReads += 1; return (await store.activeRuns()).filter(row => !hiddenRuns.has(row.run.runId)) },
     byRunId: async runId => { stateReads += 1; return hiddenRuns.has(runId) ? undefined : store.getByRunId(runId) },
     executions: async runId => { stateReads += 1; return store.runExecutionsByRunId(runId) },
+    // #275 执行记录表：事件回放事实随投影一起读（只读）。
+    events: async runId => { stateReads += 1; return store.runEventsByRunId(runId) },
     layout: async () => undefined,
   })
   const bridge = createBridge((endpoint, payload) => handler(endpoint, payload))
@@ -999,4 +1001,80 @@ test('#274 当前执行卡：真实 engine→status RPC→bundle 渲染（活动
     assert.match(text, /已判定：ACCEPT/, '判定结果来自判定记录')
     assert.doesNotMatch(text, /当前节点：/, '终态不再冒充当前执行')
   } finally { terminal.cleanup() }
+})
+
+test('#275 执行记录表：真实 engine→status RPC→bundle 渲染列/行与多轮下钻', async () => {
+  const w = createWorld()
+  try {
+    w.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    await w.startRun('ws-a', 'records')
+    const ui = w.mount({ cwd: 'ws-a' })
+    await settle()
+
+    // 列序固定（所属流程靠左、时间在模型之前），一次进入一行。
+    let text = ui.text()
+    assert.match(text, /执行记录（1 次进入）/)
+    for (const column of ['节点名称', '所属流程', '运行情况', '进入时间', '提交结果时间', '提交判定时间', 'Actor 模型', 'Judge 模型']) {
+      assert.match(text, new RegExp(column), `表头列：${column}`)
+    }
+    assert.match(text, /plan（manager）/)
+    assert.match(text, /主流程/)
+    assert.match(text, /mgr\/m-manager · 首选/, 'Actor 模型来自派发快照')
+    assert.match(text, /未派发/, 'Judge 未派发与 #274 口径一致')
+    const scroll = ui.find((el: any) => el.props?.className === 'wf-monitor-records-scroll')
+    assert.equal(collect(scroll?.props?.children, el => el.type === 'table')[0]?.props?.className, 'wf-record-table', '表格在可滚动容器内，表头/前两列用系统色固定在滚动容器外')
+    const header = ui.find((el: any) => el.type === 'th' && el.props?.className === 'wf-record-sticky-1')
+    assert.equal(header?.props?.scope, 'col')
+
+    // 第一轮被 Judge 拒绝 → 同一 execution 内重派：主行仍一行，轮次下钻累积。
+    const rejectRound = async () => {
+      const row = (await w.store.get('ws-a'))!
+      const caller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+      assert.equal((await w.engine.handleJudgeClaim('ws-a', row.execution.nodeToken, 'REJECT', 'needs work', caller)).ok, true)
+      await w.engine.handleTurnEnded('ws-a', caller)
+    }
+    const claimRound = async (caller: ClaimCaller, handoff: string) => {
+      const row = (await w.store.get('ws-a'))!
+      const turn: ClaimCaller = { sessionId: caller.sessionId, turnUserMessageIds: new Set([row.execution.dispatch?.messageId ?? ('continuation-' + row.execution.executionId)]) }
+      assert.equal((await w.engine.handleClaim('ws-a', { result: 'succeeded', handoff }, turn)).ok, true)
+      await w.engine.handleTurnEnded('ws-a', turn)
+    }
+
+    await claimRound({ sessionId: 'manager', turnUserMessageIds: new Set() }, 'plan v1')
+    await rejectRound()
+    w.tick(2000)
+    await settle()
+    text = ui.text()
+    assert.match(text, /共 1 轮/, '拒绝后主行仍是一次进入，轮次在行内累计')
+    const toggle = ui.find((el: any) => el.props?.className === 'wf-record-toggle')
+    assert.equal(toggle?.props?.['aria-expanded'], 'false')
+    assert.match(String(toggle?.props?.['aria-label']), /展开/)
+    toggle.props.onClick()
+    await settle()
+    text = ui.text()
+    assert.match(text, /第 1 轮：提交「succeeded」 · 判定不通过/, '下钻显示每轮提交与判定')
+    assert.match(text, /第 2 轮：待提交/, '自动重派的当前轮显式待提交，不把上一轮判定时间当成新轮提交时间')
+    assert.match(text, /Actor mgr\/m-manager · 首选/, '每轮模型来自该轮派发快照')
+
+    // 第二轮通过 → 进入 review 节点：plan 行结束，review 行独立。
+    await claimRound({ sessionId: 'manager', turnUserMessageIds: new Set() }, 'plan v2')
+    const judgeCaller = async () => {
+      const row = (await w.store.get('ws-a'))!
+      return { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    }
+    const accept = await judgeCaller()
+    assert.equal((await w.engine.handleJudgeClaim('ws-a', (await w.store.get('ws-a'))!.execution.nodeToken, 'ACCEPT', 'ok', accept)).ok, true)
+    await w.engine.handleTurnEnded('ws-a', accept)
+    w.tick(2000)
+    await settle()
+    text = ui.text()
+    assert.match(text, /执行记录（2 次进入）/)
+    // 收起后再展开第二轮事实（开合只靠 key，不重放历史）。
+    const toggles = ui.find((el: any) => el.props?.className === 'wf-record-toggle')
+    toggles.props.onClick()
+    await settle()
+    text = ui.text()
+    assert.match(text, /共 2 轮/)
+    assert.doesNotMatch(text, /第 1 轮：提交「succeeded」 · 判定不通过/, '收起后不再渲染下钻')
+  } finally { w.cleanup() }
 })

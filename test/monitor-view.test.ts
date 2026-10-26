@@ -3,7 +3,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildClientBundle } from '../web-client/build.mjs'
-import { monitorViewModel, monitorErrorState, monitorPollingContinues, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, PHASE_LABELS } from '../web-client/src/monitor-view.js'
+import { monitorViewModel, monitorErrorState, monitorPollingContinues, monitorStatusPayload, monitorCallPath, monitorNodeState, initialFollowState, monitorFollowView, selectFlow, resumeFollow, PHASE_LABELS, monitorRecordsView, RECORD_COLUMNS, RECORD_PENDING, RECORD_JUDGE_PENDING, RECORD_NOT_APPLICABLE, RECORD_SCHEDULED, MODEL_MISSING } from '../web-client/src/monitor-view.js'
 
 const STARTED_AT = '2026-10-25T04:00:00.000Z'
 
@@ -427,4 +427,107 @@ test('#274 currentExecutionView：Program/Child/子流程卡与终态结束位�
   // 从未派发的节点仍如实显示未派发（不属活动文案）。
   terminated.run.nodes[1].dispatch = undefined
   assert.equal(monitorViewModel(terminated).currentExecution.actor.status, '未派发')
+})
+// #275 执行记录表：每次进入一行、列序固定、多轮提交/判定下钻按 claim 配对。
+test('#275 monitorRecordsView：列序/一行一次进入/多轮模型与时间/缺失值口径', () => {
+  const payload = structuredClone(RUN_PAYLOAD)
+  payload.run.status = 'completed'
+  payload.run.terminal = true
+  payload.run.nodes = [
+    {
+      workflowId: 'test', nodeId: 'plan', executionId: 'e1', visit: 1, revision: 5, phase: 'exited', blockReason: null,
+      enteredAt: '2026-10-25T04:00:00.000Z', exitedAt: '2026-10-25T04:10:00.000Z', current: false,
+      dispatch: { id: 'd2', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-plan-b' }, source: 'fallback' },
+      claim: { id: 'c2', result: 'succeeded', handoff: 'h' },
+      judge: { id: 'j2', claimId: 'c2', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-judge-b' }, source: 'fallback', judgment: 'ACCEPT' },
+      history: {
+        rounds: [
+          {
+            claimId: 'c1', result: 'succeeded', submittedAt: '2026-10-25T04:02:00.000Z',
+            actor: { id: 'd1', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-plan-a' }, source: 'primary' },
+            judgment: { result: 'REJECT', at: '2026-10-25T04:03:00.000Z', judge: { id: 'j1', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-judge-a' }, source: 'primary' } },
+          },
+          {
+            claimId: 'c2', result: 'succeeded', submittedAt: '2026-10-25T04:05:00.000Z',
+            actor: { id: 'd2', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-plan-b' }, source: 'fallback' },
+            judgment: { result: 'ACCEPT', at: '2026-10-25T04:06:00.000Z', judge: { id: 'j2', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-judge-b' }, source: 'fallback' } },
+          },
+        ],
+        abandoned: [{ at: '2026-10-25T04:01:30.000Z', dispatch: { id: 'd0', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-plan-fail' }, source: 'primary' } }],
+        switches: [{ at: '2026-10-25T04:04:00.000Z', role: 'actor' }, { at: '2026-10-25T04:04:30.000Z', role: null }],
+      },
+    },
+    {
+      workflowId: 'test', nodeId: 'review', executionId: 'e2', visit: 2, revision: 1, phase: 'working', blockReason: null,
+      enteredAt: '2026-10-25T04:05:30.000Z', exitedAt: null, current: true,
+      // 已安排但派发尚未确认：live dispatch 保留派发意图与路由快照。
+      dispatch: { id: 'd3', dispatched: false, settled: false, model: { provider: 'prov', modelId: 'm-review' }, source: 'manual' },
+      history: {
+        rounds: [],
+        pending: { id: 'd3', dispatched: false, settled: false, model: { provider: 'prov', modelId: 'm-review' }, source: 'manual' },
+        abandoned: [], switches: [],
+      },
+    },
+    {
+      workflowId: 'sub', nodeId: 's1', executionId: 'e4', visit: 1, revision: 1, phase: 'checking', blockReason: null,
+      enteredAt: '2026-10-25T04:06:00.000Z', exitedAt: null, current: false,
+      dispatch: { id: 'd9', dispatched: true, settled: false, model: { provider: 'prov', modelId: 'm-sub' }, source: 'primary' },
+      claim: { id: 'c9', result: 'succeeded', handoff: 'h' },
+      judge: { id: 'j9', claimId: 'c9', dispatched: true, settled: false, model: { provider: 'prov', modelId: 'm-judge9' }, source: 'manual' },
+    },
+  ]
+  const records = monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:07:00.000Z'), terminal: true })
+  assert.deepEqual(RECORD_COLUMNS, ['节点名称', '所属流程', '运行情况', '进入时间', '提交结果时间', '提交判定时间', 'Actor 模型', 'Judge 模型'], '列序固定：所属流程靠左、时间在模型之前')
+  assert.equal(records.length, 3, '一行 = 一次进入（子流程节点单独成行）')
+  const time = value => new Date(value).toLocaleString('zh-CN', { hour12: false })
+  const [plan, review, sub] = records
+  assert.deepEqual([plan.nodeLabel, plan.flowText, plan.current], ['plan（manager）', '主流程', false])
+  assert.deepEqual([plan.outcomeText, plan.roundCountText, plan.roundCountText], ['已结束', '共 2 轮', '共 2 轮'])
+  // 主行取最新一轮的时间/模型；第二轮是备选模型，第一轮的事实留在下钻里。
+  assert.deepEqual([plan.submittedAtText, plan.judgedAtText], [time('2026-10-25T04:05:00.000Z'), time('2026-10-25T04:06:00.000Z')])
+  assert.deepEqual([plan.actorModelText, plan.judgeModelText], ['prov/m-plan-b · 备选', 'prov/m-judge-b · 备选'])
+  assert.deepEqual(plan.drilldown.rounds.map(round => [round.index, round.resultText, round.statusText]), [
+    [1, '提交「succeeded」', '判定不通过'],
+    [2, '提交「succeeded」', '判定通过'],
+  ])
+  assert.deepEqual(plan.drilldown.rounds.map(round => [round.actorModelText, round.judgeModelText]), [
+    ['prov/m-plan-a · 首选', 'prov/m-judge-a · 首选'],
+    ['prov/m-plan-b · 备选', 'prov/m-judge-b · 备选'],
+  ], '每轮模型来自该轮派发快照，不跨轮借值')
+  assert.deepEqual(plan.drilldown.abandoned.map(item => [item.reasonText, item.modelText]), [['未形成提交', 'prov/m-plan-fail · 首选']])
+  assert.deepEqual(plan.drilldown.switches.map(item => item.roleText), ['Actor 换模', '换模'], '角色证明不了时只报换模，不猜')
+  assert.equal(JSON.stringify(plan.drilldown).includes('endedAt'), false, '历史事实不带结束时间')
+  // 待提交那一轮：已安排未确认 + 自己的实际模型，不把上一轮判定时间当成新轮提交时间。
+  assert.deepEqual([review.outcomeText, review.submittedAtText, review.judgedAtText], [RECORD_SCHEDULED, RECORD_PENDING, RECORD_NOT_APPLICABLE])
+  assert.equal(review.actorModelText, 'prov/m-review · 人工指定')
+  assert.deepEqual(review.drilldown.pending.statusText, RECORD_SCHEDULED)
+  // 旧记录（无事件回放）：时间未记录，模型只取工作单派发快照。
+  assert.deepEqual([sub.outcomeText, sub.submittedAtText, sub.judgedAtText], ['待判定', MODEL_MISSING, RECORD_JUDGE_PENDING])
+  assert.deepEqual([sub.actorModelText, sub.judgeModelText], ['prov/m-sub · 首选', 'prov/m-judge9 · 人工指定'])
+  // 视图模型统一出口：run/terminal 模式带 records，且与纯函数一致。
+  assert.deepEqual(monitorViewModel(payload, { now: Date.parse('2026-10-25T04:07:00.000Z') }).records, monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:07:00.000Z'), terminal: true }))
+})
+
+test('#275 monitorRecordsView：自环/回边新进入各自成行，等待时长按读取时刻派生', () => {
+  const payload = structuredClone(RUN_PAYLOAD)
+  payload.run.nodes = [
+    {
+      workflowId: 'test', nodeId: 'plan', executionId: 'e1', visit: 1, revision: 9, phase: 'exited', blockReason: null,
+      enteredAt: '2026-10-25T04:00:00.000Z', exitedAt: '2026-10-25T04:04:00.000Z', current: false,
+      history: { rounds: [{ claimId: 'c1', result: 'succeeded', submittedAt: '2026-10-25T04:01:00.000Z', judgment: { result: 'REJECT', at: '2026-10-25T04:02:00.000Z' } }], abandoned: [], switches: [] },
+    },
+    {
+      workflowId: 'test', nodeId: 'plan', executionId: 'e2', visit: 2, revision: 2, phase: 'working', blockReason: null,
+      enteredAt: '2026-10-25T04:03:00.000Z', exitedAt: null, current: true,
+      history: { rounds: [{ claimId: 'c2', result: 'succeeded', submittedAt: '2026-10-25T04:04:00.000Z' }], abandoned: [], switches: [] },
+    },
+  ]
+  const records = monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:06:10.000Z') })
+  assert.deepEqual(records.map(record => [record.key, record.visitText]), [['test/plan#1', ''], ['test/plan#2', '第 2 次']], '同节点两次进入 → 两行，不合并')
+  assert.notEqual(records[0].key, records[1].key)
+  // 等待时长只在读取时按 claim 时间派生（130s），不宣称判定失败；不显示结束时间。
+  assert.equal(records[1].waitingText, '已判定等待 2分10秒')
+  assert.equal(records[0].waitingText, null, '已判定/已结束的行不显示等待')
+  // 终态读取不再派生等待时长。
+  assert.equal(monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T05:00:00.000Z'), terminal: true })[1].waitingText, null)
 })
