@@ -341,6 +341,33 @@ const PAYLOAD = {
   },
 }
 
+// F-01 防回归：React 会把事件对象传给 onClick；节点 id 与事件属性同名（type/target/view）时，
+// 事件不能被当成坐标表（会算出 NaN 缩放/相机）。用真实源码 + 同名 id 的流程锁定该行为。
+test('#276 适应画布按钮忽略点击事件参数：节点 id 与事件属性同名也不产生 NaN 视图', async () => {
+  const def = {
+    startNode: 'type',
+    returns: ['done'],
+    nodes: {
+      type: { id: 'type', kind: 'actor-task', role: 'manager', results: { succeeded: { criteria: 'done', target: { node: 'target' } } } },
+      target: { id: 'target', kind: 'actor-task', role: 'reviewer' },
+      view: { id: 'view', kind: 'actor-task', role: 'reviewer' },
+    },
+  }
+  const positions = { type: { x: 40, y: 40 }, target: { x: 260, y: 40 }, view: { x: 480, y: 40 } }
+  const ui = mountCanvas(createCanvasPage(), canvasProps({ def, positions, startNode: 'type' }))
+  await settle()
+  const button = (name: string) => collect(ui.tree, (element) => element.type === 'button' && textOf(element) === name)[0]
+  // 模拟真实 React 传入的 SyntheticEvent：属性名与节点 id 重合，且值非空。
+  const event = { type: 'click', target: { tagName: 'BUTTON' }, view: {}, bubbles: true, nativeEvent: {} }
+  button('适应画布').props.onClick(event)
+  await settle()
+  const surface = collect(ui.tree, (element) => element.props.className === 'wf-canvas-surface')[0].props.style.transform
+  const percentage = collect(ui.tree, (element) => element.type === 'button' && /^\d+%$/.test(textOf(element)))[0]
+  assert.notEqual(percentage, undefined, '缩放百分比必须可读，不得是 NaN')
+  assert.doesNotMatch(textOf(percentage), /NaN/)
+  assert.doesNotMatch(surface, /NaN/, '相机/缩放不得为 NaN')
+  assert.deepEqual(nodeStyle(ui.tree, 'target'), { left: '260px', top: '40px' }, '适应画布只调整视图，不改节点位置')
+})
 test('#276 监控接线：画布按 Run+流程拿隔离身份，恢复布局入口不换身份、不重新挂载', async () => {
   const factory = loadMonitorPage()
   const render = (() => {

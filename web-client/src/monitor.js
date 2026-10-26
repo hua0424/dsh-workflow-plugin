@@ -387,7 +387,7 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
         ...graph.flows.map(item => h('button', {
           key: item.id, type: 'button', role: 'tab', 'aria-selected': item.id === flow.id, onClick: () => setFollow(selectFlow(follow, item.id, currentFlowId)),
         }, item.label))) : null,
-      followView.showReturn || graph.flows.length > 0 ? h('div', { className: 'wf-monitor-viewtools' },
+      h('div', { className: 'wf-monitor-viewtools' },
         followView.showReturn ? h('button', { type: 'button', className: 'wf-monitor-return', onClick: () => setFollow(resumeFollow()) }, '回到当前节点') : null,
         h('button', {
           type: 'button',
@@ -395,7 +395,7 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
           title: '只重置当前流程在本页的临时布局（上游布局文件与配置不变，其他流程/Run 不受影响）',
           onClick: () => setLayoutReset(value => value + 1),
         }, '恢复布局'),
-      ) : null,
+      ),
       h('div', { className: 'wf-editor wf-monitor-canvas' },
         h(NodeCanvas, {
           key: `${run.runId}:${flow.id}`,

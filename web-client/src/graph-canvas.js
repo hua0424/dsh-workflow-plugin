@@ -15,6 +15,8 @@ const noop = () => {}
 /**
  * #276 页面存活期的只读查看状态：viewKey → { positions, zoom, camera }。
  * 只存在内存：整页刷新即回原布局；不跨 Run/流程共享，不落盘。
+ * ponytail: 不做淘汰/容量上限，天花板 = 单页面会话内查看过的 Run+流程数；
+ * 升级路径 = 加 LRU（按最近一次 storeView 排序，上限几十条）。
  */
 const viewStates = new Map()
 const savedView = (viewKey) => (viewKey === null || viewKey === undefined ? null : viewStates.get(viewKey) ?? null)
@@ -61,6 +63,7 @@ export function NodeCanvas(props) {
   const dragRef = props.dragRef ?? { current: null }
   // #276：viewKey = Run + 流程 identity。只读监控传它 → 允许单节点临时拖动并在
   // 卸载/重挂后按同一 viewKey 恢复；配置编辑器不传，行为保持原样（拖动即写回布局）。
+  // 不变量：viewKey 变更必须伴随重挂（调用方用 key），否则会继续显示旧 key 的位置/缩放。
   const { viewKey = null, resetSignal = 0 } = props
   const tempLayout = readOnly && viewKey !== null
   const restoredRef = useRef(savedView(viewKey))
@@ -205,7 +208,8 @@ export function NodeCanvas(props) {
         h('button', { onClick: () => changeZoom(Math.max(Math.min(0.25, zoom), zoom - 0.1)), 'aria-label': '缩小画布' }, '−'),
         h('button', { onClick: () => changeZoom(1), title: '恢复原始大小' }, `${Math.round(zoom * 100)}%`),
         h('button', { onClick: () => changeZoom(Math.min(1.5, zoom + 0.1)), 'aria-label': '放大画布' }, '＋'),
-        h('button', { onClick: fit }, '适应画布'),
+        // F-01：React 会把点击事件传进 onClick——显式丢弃，避免事件对象被当成坐标表（节点 id 与 type/target 等属性同名时 NaN）。
+        h('button', { onClick: () => fit() }, '适应画布'),
       ),
     ),
     wire !== null ? h('div', { className: 'wf-wire', role: 'status' },
