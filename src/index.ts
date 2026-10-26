@@ -463,6 +463,7 @@ export function apply(ctx: Context) {
         active: () => store().activeRuns(),
         byRunId: runId => store().getByRunId(runId),
         executions: runId => store().runExecutionsByRunId(runId),
+        events: runId => store().runEventsByRunId(runId),
         // #252：坐标与配置同目录，只读；缺失/损坏回退网格补位，不影响 status。
         layout: workflowId => readRunLayout(home, workflowId),
       }))

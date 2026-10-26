@@ -359,6 +359,8 @@ function createWorld() {
     active: async () => { stateReads += 1; return (await store.activeRuns()).filter(row => !hiddenRuns.has(row.run.runId)) },
     byRunId: async runId => { stateReads += 1; return hiddenRuns.has(runId) ? undefined : store.getByRunId(runId) },
     executions: async runId => { stateReads += 1; return store.runExecutionsByRunId(runId) },
+    // #275 执行记录表：事件回放事实随投影一起读（只读）。
+    events: async runId => { stateReads += 1; return store.runEventsByRunId(runId) },
     layout: async () => undefined,
   })
   const bridge = createBridge((endpoint, payload) => handler(endpoint, payload))
@@ -969,5 +971,147 @@ test('#270 AC-09 同 cwd 维护态→空态→Run：无需重挂载，每步都�
     await w.tick(2000)
     assert.doesNotMatch(ui.text(), /dsh-flow start/)
     assert.match(ui.text(), new RegExp(`Run：${runId}`), '空态继续探测后直接发现新 Run')
+  } finally { w.cleanup() }
+})
+
+test('#274 当前执行卡：真实 engine→status RPC→bundle 渲染（活动 + 终态结束位置）', async () => {
+  const w = createWorld()
+  try {
+    // 注入冻结默认路由：投影只显示落库事实，不看当前配置。
+    w.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    await w.startRun('ws-a', 'card')
+    const ui = w.mount({ cwd: 'ws-a' })
+    await settle()
+    const text = ui.text()
+    assert.match(text, /当前节点：plan/)
+    assert.match(text, /Actor（manager）/)
+    assert.match(text, /mgr\/m-manager · 首选/, '活动卡显示派发时的模型与来源')
+    assert.match(text, /Judge/)
+    assert.match(text, /未派发/, 'Actor 未提交前 Judge 显示未派发')
+    assert.doesNotMatch(text, /结束位置/, '活跃 Run 不显示结束位置')
+  } finally { w.cleanup() }
+
+  const terminal = createWorld()
+  try {
+    await terminal.completeRun('ws-a')
+    const ui = terminal.mount({ cwd: 'ws-a' })
+    await settle()
+    const text = ui.text()
+    assert.match(text, /结束位置：review/, '终态 Run 的卡指向最后一个工作单')
+    assert.match(text, /已判定：ACCEPT/, '判定结果来自判定记录')
+    assert.doesNotMatch(text, /当前节点：/, '终态不再冒充当前执行')
+  } finally { terminal.cleanup() }
+})
+
+test('#275 执行记录表：真实 engine→status RPC→bundle 渲染列/行与多轮下钻', async () => {
+  const w = createWorld()
+  try {
+    w.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    await w.startRun('ws-a', 'records')
+    const ui = w.mount({ cwd: 'ws-a' })
+    await settle()
+
+    // 活跃当前节点由上方当前执行卡承载，主表不重复占一行。
+    let text = ui.text()
+    assert.match(text, /当前节点：plan/)
+    assert.match(text, /未派发/, 'Judge 未派发与 #274 口径一致')
+    assert.doesNotMatch(text, /执行记录（/, '当前执行不在主表重复占一行')
+
+    const rejectRound = async () => {
+      const row = (await w.store.get('ws-a'))!
+      const caller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+      assert.equal((await w.engine.handleJudgeClaim('ws-a', row.execution.nodeToken, 'REJECT', 'needs work', caller)).ok, true)
+      await w.engine.handleTurnEnded('ws-a', caller)
+    }
+    const claimRound = async (caller: ClaimCaller, handoff: string) => {
+      const row = (await w.store.get('ws-a'))!
+      const turn: ClaimCaller = { sessionId: caller.sessionId, turnUserMessageIds: new Set([row.execution.dispatch?.messageId ?? ('continuation-' + row.execution.executionId)]) }
+      assert.equal((await w.engine.handleClaim('ws-a', { result: 'succeeded', handoff }, turn)).ok, true)
+      await w.engine.handleTurnEnded('ws-a', turn)
+    }
+    const acceptRound = async () => {
+      const row = (await w.store.get('ws-a'))!
+      const caller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+      assert.equal((await w.engine.handleJudgeClaim('ws-a', row.execution.nodeToken, 'ACCEPT', 'ok', caller)).ok, true)
+      await w.engine.handleTurnEnded('ws-a', caller)
+    }
+
+    // 同一次进入里的多轮：Actor A 提交 → Judge REJECT → 自动重派仍待提交 → 再提交 → ACCEPT。
+    await claimRound({ sessionId: 'manager', turnUserMessageIds: new Set() }, 'plan v1')
+    await rejectRound()
+    w.tick(2000)
+    await settle()
+    assert.doesNotMatch(ui.text(), /执行记录（/, '当前轮仍在当前卡，不提前占主表一行')
+    await claimRound({ sessionId: 'manager', turnUserMessageIds: new Set() }, 'plan v2')
+    await acceptRound()
+    w.tick(2000)
+    await settle()
+    text = ui.text()
+    assert.match(text, /执行记录（1 次进入）/, '一次进入 = 一行（多轮不新增主行）')
+    for (const column of ['节点名称', '所属流程', '运行情况', '进入时间', '提交结果时间', '提交判定时间', 'Actor 模型', 'Judge 模型']) {
+      assert.match(text, new RegExp(column), `表头列：${column}`)
+    }
+    assert.match(text, /plan（manager）/)
+    assert.match(text, /主流程/)
+    assert.match(text, /mgr\/m-manager · 首选/, 'Actor 模型来自派发快照')
+    const scroll = ui.find((el: any) => el.props?.className === 'wf-monitor-records-scroll')
+    assert.equal(collect(scroll?.props?.children, el => el.type === 'table')[0]?.props?.className, 'wf-record-table', '表格在可滚动容器内，表头/前两列用系统色固定在滚动容器外')
+    const header = ui.find((el: any) => el.type === 'th' && el.props?.className === 'wf-record-sticky-1')
+    assert.equal(header?.props?.scope, 'col')
+    const toggle = ui.find((el: any) => el.props?.className === 'wf-record-toggle')
+    assert.equal(toggle?.props?.['aria-expanded'], 'false')
+    assert.match(String(toggle?.props?.['aria-label']), /展开/)
+    assert.match(text, /共 2 轮/, '拒绝后同一次进入轮次累计')
+    toggle.props.onClick()
+    await settle()
+    text = ui.text()
+    assert.match(text, /第 1 轮：提交「succeeded」 · 判定不通过/, '下钻显示每轮提交与判定')
+    assert.match(text, /第 2 轮：提交「succeeded」/, '第二轮取自己的提交时间')
+    assert.match(text, /Actor mgr\/m-manager · 首选/, '每轮模型来自该轮派发快照')
+
+    // review 通过 → Run 终态：末次记录保留，当前卡不再冒充当前执行。
+    const reviewDispatch = (await w.store.get('ws-a'))!.execution.dispatch!
+    await claimRound({ sessionId: reviewDispatch.sessionId!, turnUserMessageIds: new Set() }, 'review ok')
+    const reviewJudge = async () => {
+      const row = (await w.store.get('ws-a'))!
+      return { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    }
+    const accept = await reviewJudge()
+    assert.equal((await w.engine.handleJudgeClaim('ws-a', (await w.store.get('ws-a'))!.execution.nodeToken, 'ACCEPT', 'ok', accept)).ok, true)
+    await w.engine.handleTurnEnded('ws-a', accept)
+    w.tick(2000)
+    await settle()
+    text = ui.text()
+    assert.match(text, /执行记录（2 次进入）/, '终态后两次进入都保留在表中')
+    assert.match(text, /review/)
+    assert.doesNotMatch(text, /第 2 次进入/, '线性流第 2 个节点 visit=2 但首次进入：不显示为第 2 次进入')
+  } finally { w.cleanup() }
+})
+
+test('#275 执行记录表：等待子流程的父节点仍成行，主/子流程路径可分', async () => {
+  const w = createWorld()
+  try {
+    w.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    await w.startRun('ws-a', 'child', childConfig)
+    let row = (await w.store.get('ws-a'))!
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
+    assert.equal((await w.engine.handleClaim('ws-a', { result: 'succeeded', handoff: 'plan ok' }, manager)).ok, true)
+    await w.engine.handleTurnEnded('ws-a', manager)
+    row = (await w.store.get('ws-a'))!
+    const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    assert.equal((await w.engine.handleJudgeClaim('ws-a', row.execution.nodeToken, 'ACCEPT', 'ok', judge)).ok, true)
+    await w.engine.handleTurnEnded('ws-a', judge)
+    // 已下钻到子流程：父节点 call-child 等待子流程，子流程 s1 已进入。
+    row = (await w.store.get('ws-a'))!
+    assert.deepEqual(row.run.callStack.map(frame => frame.workflowId), ['test', 'sub'])
+
+    const ui = w.mount({ cwd: 'ws-a' })
+    await settle()
+    const text = ui.text()
+    assert.match(text, /执行记录（2 次进入）/, '已结束的 plan 与等待子流程的 call-child 都成行（当前子流程节点只在当前卡）')
+    assert.match(text, /call-child/)
+    assert.match(text, /子流程 sub/)
+    assert.match(text, /执行中/, '等待子流程的父节点不画成成功')
+    assert.match(text, /不适用/, '子流程节点行没有 Actor 提交/判定与模型派发：相关列不适用（R1 F-01）')
   } finally { w.cleanup() }
 })

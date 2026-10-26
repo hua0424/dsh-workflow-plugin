@@ -2,13 +2,28 @@
  * #252 共享流程画布：从配置编辑器 panel.js 抽出的节点/连线画布（渲染 + 拖拽/
  * 缩放/平移），配置编辑器与运行监控共用，避免第二套画布实现漂移。
  *
- * 监控只读用法：`readOnly` 关闭编辑交互（拖动/连线/端口点击），节点点击仍回调
- * `onSelectNode`（监控用于下钻子流程）；`decorations[nodeId]` 叠加运行态徽标
- * （className/badge/detail），不改图数据；平移/缩放/适应画布仍可用。
+ * 监控只读用法：`readOnly` 关闭结构编辑（连线/端口/保存），节点点击仍回调
+ * `onSelectNode`（监控用于下钻子流程）；传入 `viewKey`（Run + 流程 identity）时
+ * 额外允许拖动单个节点做**页面内临时调整**，位置/缩放/平移按 viewKey 隔离保存在
+ * 本模块内存里，整页刷新即清空（不写 localStorage/文件，也不改工作流内容）。
+ * `decorations[nodeId]` 叠加运行态徽标（className/badge/detail），不改图数据。
  */
 import { createElement as h, useEffect, useRef, useState } from 'react'
 
 const noop = () => {}
+
+/**
+ * #276 页面存活期的只读查看状态：viewKey → { positions, zoom, camera }。
+ * 只存在内存：整页刷新即回原布局；不跨 Run/流程共享，不落盘。
+ * ponytail: 不做淘汰/容量上限，天花板 = 单页面会话内查看过的 Run+流程数；
+ * 升级路径 = 加 LRU（按最近一次 storeView 排序，上限几十条）。
+ */
+const viewStates = new Map()
+const savedView = (viewKey) => (viewKey === null || viewKey === undefined ? null : viewStates.get(viewKey) ?? null)
+const storeView = (viewKey, state) => {
+  if (viewKey === null || viewKey === undefined) return
+  viewStates.set(viewKey, state)
+}
 
 export function targetLabel(target) {
   if (target !== null && typeof target === 'object' && !Array.isArray(target)) {
@@ -46,18 +61,35 @@ export function NodeCanvas(props) {
   const { flowId, def, positions, startNode, returns = [], onMove = noop, busy } = props
   const { selectedNode = null, wire = null, onSelectNode = noop, onPortStart = noop, onWireNode = noop, onWireReturn = noop, onCancelWire = noop, decorations = {}, readOnly = false } = props
   const dragRef = props.dragRef ?? { current: null }
+  // #276：viewKey = Run + 流程 identity。只读监控传它 → 允许单节点临时拖动并在
+  // 卸载/重挂后按同一 viewKey 恢复；配置编辑器不传，行为保持原样（拖动即写回布局）。
+  // 不变量：viewKey 变更必须伴随重挂（调用方用 key），否则会继续显示旧 key 的位置/缩放。
+  const { viewKey = null, resetSignal = 0 } = props
+  const tempLayout = readOnly && viewKey !== null
+  const restoredRef = useRef(savedView(viewKey))
+  const [tempPositions, setTempPositions] = useState(() => restoredRef.current?.positions ?? {})
   const [dragPosition, setDragPosition] = useState(null)
-  const [zoom, setZoom] = useState(1)
-  const [camera, setCamera] = useState({ x: 0, y: 0 })
+  const [zoom, setZoom] = useState(() => restoredRef.current?.zoom ?? 1)
+  const [camera, setCamera] = useState(() => restoredRef.current?.camera ?? { x: 0, y: 0 })
   const [selectedEdge, setSelectedEdge] = useState(null)
   const edgeDragRef = useRef(null)
   const viewportRef = useRef(null)
   const panRef = useRef(null)
   const suppressClick = useRef(false)
+  const skipFit = useRef(restoredRef.current !== null)
+  const lastReset = useRef(resetSignal)
   const nodes = Object.entries(def.nodes ?? {})
-  const nodePoint = (id) => positions[id] ?? { x: 40 + (Math.max(0, nodes.findIndex(([key]) => key === id)) % 4) * 220, y: 40 + Math.floor(Math.max(0, nodes.findIndex(([key]) => key === id)) / 4) * 140 }
+  // 临时位置叠加在原布局之上；只影响渲染，不回写 positions 或任何配置文件。
+  const placed = { ...(positions ?? {}), ...tempPositions }
+  const gridPoint = (id) => {
+    const order = Math.max(0, nodes.findIndex(([key]) => key === id))
+    return { x: 40 + (order % 4) * 220, y: 40 + Math.floor(order / 4) * 140 }
+  }
+  const nodePoint = (id) => placed[id] ?? gridPoint(id)
+  // 原布局坐标（含缺坐标兜底），不含本页临时位置：恢复布局据此重新适应。
+  const layoutPositions = Object.fromEntries(nodes.map(([id]) => [id, (positions ?? {})[id] ?? gridPoint(id)]))
   const returnX = Math.max(360, ...nodes.map(([id]) => nodePoint(id).x + 270))
-  const point = (id) => dragPosition?.id === id ? dragPosition.pos : positions[id] ?? (id.startsWith('return:') ? { x: returnX, y: 40 + returns.indexOf(id.slice(7)) * 64 } : nodePoint(id))
+  const point = (id, map = placed) => dragPosition?.id === id ? dragPosition.pos : map[id] ?? (id.startsWith('return:') ? { x: returnX, y: 40 + returns.indexOf(id.slice(7)) * 64 } : nodePoint(id))
   const itemIds = [...nodes.map(([id]) => id), ...returns.map((ret) => `return:${ret}`)]
   // 视口平移与节点的世界坐标分离，空白区域没有滚动边界。
   // 运行态徽标/原因行会撑高节点；连线路由与画布高度按同样增量下移（#252）。
@@ -69,7 +101,8 @@ export function NodeCanvas(props) {
   const width = Math.max(570, ...itemIds.map((id) => point(id).x + 240))
   const height = Math.max(420, ...returns.map((ret) => point(`return:${ret}`).y + 80), ...nodes.map(([id, node]) => point(id).y + 100 + decorationExtra(id) + portsOf(node).length * 32))
   const onPointerDown = (event, nodeId) => {
-    if (busy || readOnly || wire !== null || event.button !== 0) return
+    // 只读运行图在给定 viewKey 时允许「为查看而移动」：只改本页临时位置，不触达结构编辑。
+    if (busy || wire !== null || event.button !== 0 || (readOnly && !tempLayout)) return
     const start = point(nodeId)
     suppressClick.current = false
     dragRef.current = { nodeId, startX: event.clientX, startY: event.clientY, origin: start, pos: start }
@@ -89,8 +122,10 @@ export function NodeCanvas(props) {
     const drag = dragRef.current
     dragRef.current = null
     setDragPosition(null)
-    // 一次拖动只写一条历史，避免每个 pointermove 克隆完整配置并挤满撤销栈。
-    if (!cancelled && drag !== null && suppressClick.current) onMove(flowId, drag.nodeId, drag.pos)
+    if (cancelled || drag === null || !suppressClick.current) return
+    // 只读临时调整只写本页内存（恢复布局/刷新即还原）；编辑器仍写回布局（一次拖动一条历史）。
+    if (tempLayout) setTempPositions((previous) => ({ ...previous, [drag.nodeId]: drag.pos }))
+    else onMove(flowId, drag.nodeId, drag.pos)
   }
   const selectNode = (nodeId) => {
     if (busy || suppressClick.current) { suppressClick.current = false; return }
@@ -99,12 +134,12 @@ export function NodeCanvas(props) {
     if (wire !== null) onWireNode(nodeId)
     else onSelectNode(nodeId)
   }
-  const fit = () => {
+  const fit = (map = placed) => {
     const viewport = viewportRef.current
     if (viewport === null) return
     const elements = viewport.querySelectorAll('.wf-node, .wf-return-marker')
     // 使用真实内容边界；节点整体位于远处时不把世界原点纳入范围。
-    const bounds = itemIds.map((id, index) => ({ ...point(id), width: elements[index]?.offsetWidth ?? 196, height: elements[index]?.offsetHeight ?? 100 }))
+    const bounds = itemIds.map((id, index) => ({ ...point(id, map), width: elements[index]?.offsetWidth ?? 196, height: elements[index]?.offsetHeight ?? 100 }))
     const left = bounds.length ? Math.min(...bounds.map((item) => item.x)) : 0
     const top = bounds.length ? Math.min(...bounds.map((item) => item.y)) : 0
     const contentWidth = Math.max(1, ...bounds.map((item) => item.x + item.width - left))
@@ -113,7 +148,21 @@ export function NodeCanvas(props) {
     setZoom(nextZoom)
     setCamera({ x: 24 - left * nextZoom, y: 24 - top * nextZoom })
   }
-  useEffect(() => { fit(); setSelectedEdge(null) }, [flowId])
+  useEffect(() => {
+    // 同一 viewKey 的临时查看状态（卸载重挂/切回该流程）优先恢复，不被首帧 fit 覆盖。
+    if (skipFit.current) { skipFit.current = false; setSelectedEdge(null); return }
+    fit(); setSelectedEdge(null)
+  }, [flowId])
+  // 页面存活期保存查看状态：轮询 payload 只更新 decorations/def，不动这里的位置/相机。
+  useEffect(() => { storeView(viewKey, { zoom, camera, positions: tempPositions }) }, [viewKey, zoom, camera, tempPositions])
+  // 恢复布局：只重置当前流程的临时位置并用原布局重新适应，不动其他流程/Run，也不写配置。
+  useEffect(() => {
+    if (resetSignal === lastReset.current) return
+    lastReset.current = resetSignal
+    if (!tempLayout) return
+    setTempPositions({})
+    fit(layoutPositions)
+  }, [resetSignal])
   useEffect(() => {
     const viewport = viewportRef.current
     const panWheel = (event) => {
@@ -159,7 +208,8 @@ export function NodeCanvas(props) {
         h('button', { onClick: () => changeZoom(Math.max(Math.min(0.25, zoom), zoom - 0.1)), 'aria-label': '缩小画布' }, '−'),
         h('button', { onClick: () => changeZoom(1), title: '恢复原始大小' }, `${Math.round(zoom * 100)}%`),
         h('button', { onClick: () => changeZoom(Math.min(1.5, zoom + 0.1)), 'aria-label': '放大画布' }, '＋'),
-        h('button', { onClick: fit }, '适应画布'),
+        // F-01：React 会把点击事件传进 onClick——显式丢弃，避免事件对象被当成坐标表（节点 id 与 type/target 等属性同名时 NaN）。
+        h('button', { onClick: () => fit() }, '适应画布'),
       ),
     ),
     wire !== null ? h('div', { className: 'wf-wire', role: 'status' },
@@ -267,7 +317,7 @@ export function NodeCanvas(props) {
                 onPointerDown: (event) => onPointerDown(event, nodeId),
                 onPointerMove: (event) => onPointerMove(event, nodeId),
                 onPointerUp: () => endDrag(false), onPointerCancel: () => endDrag(true),
-                title: readOnly ? '只读运行图节点' : '点击编辑，拖动调整位置',
+                title: readOnly ? (tempLayout ? '只读运行图节点：拖动临时调整位置，点击查看' : '只读运行图节点') : '点击编辑，拖动调整位置',
               }, `${nodeId}${nodeId === startNode ? ' ★' : ''}`),
               h('div', { className: 'wf-node-type', title: typeText }, typeText),
               decoration?.badge ? h('div', { className: 'wf-node-state' }, decoration.badge) : null,
@@ -293,7 +343,9 @@ export function NodeCanvas(props) {
       ),
     ),
     h('div', { className: 'wf-canvas-help' }, readOnly
-      ? '只读运行图 · 空白处右键/中键平移 · 滚轮平移 · 缩放按钮调整视图 · ★ 入口'
+      ? (tempLayout
+        ? '只读运行图 · 拖动节点临时调整位置（不保存，恢复布局可还原） · 空白处右键/中键平移 · 滚轮平移 · 缩放按钮调整视图 · ★ 入口'
+        : '只读运行图 · 空白处右键/中键平移 · 滚轮平移 · 缩放按钮调整视图 · ★ 入口')
       : '空白处右键/中键自由平移 · 滚轮平移 · 拖动标题移动节点 · 点击连线高亮，拖动圆点调整折线 · ★ 入口'),
   )
 }
