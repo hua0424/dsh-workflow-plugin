@@ -354,3 +354,77 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   // 宿主 client bundle 不做 JSX 转译：产物必须是可直接解析的纯 JS（#252 发现 #251 JSX 隐患）。
   assert.doesNotThrow(() => new Function(bundle), 'bundle 必须是可解析的纯 JS')
 })
+
+// #274 当前执行卡：只读派发/claim/判定快照；缺事实显式未记录，终态不冒充活动执行。
+test('#274 currentExecutionView：Actor/Judge 模型·来源·状态 + 节点/流程/visit/BLOCK', () => {
+  const payload = structuredClone(RUN_PAYLOAD)
+  Object.assign(payload.run.nodes[1], {
+    dispatch: { id: 'd2', dispatched: true, settled: false, model: { provider: 'prov', modelId: 'm-review' }, source: 'fallback' },
+    claim: { id: 'c2', result: 'succeeded', handoff: 'review artifact' },
+    judge: { id: 'j2', claimId: 'c2', dispatched: true, settled: false, model: { provider: 'prov', modelId: 'm-judge' }, source: 'primary' },
+  })
+  const view = monitorViewModel(payload)
+  const card = view.currentExecution
+  assert.deepEqual([card.heading, card.active, card.nodeId, card.workflowLabel, card.visitText], ['当前节点', true, 'review', '主流程', '第 2 次'])
+  assert.deepEqual([card.phaseLabel, card.blocked, card.blockReason], [PHASE_LABELS.working[0], true, '等待授权'])
+  // AC-03：模型按「模型 · 来源」显示，来源来自派发快照（fallback → 备选）。
+  assert.deepEqual([card.actor.role, card.actor.modelText, card.actor.status], ['reviewer', 'prov/m-review · 备选', '已提交结果'])
+  // claim 已提交 → Judge 已安排：判定前显示待判定，不提前写结论。
+  assert.deepEqual([card.judge.modelText, card.judge.status], ['prov/m-judge · 首选', '待判定'])
+  assert.equal(card.executionId, 'e2')
+  assert.equal(view.nodes[1].executionId, 'e2', '节点行携带 execution 身份，同名节点可分')
+  // 判定结果只写判定记录本身。
+  payload.run.nodes[1].judge.judgment = 'REJECT'
+  assert.equal(monitorViewModel(payload).currentExecution.judge.status, '已判定：REJECT')
+})
+
+test('#274 currentExecutionView：派发/判定相边界与缺事实文案（未记录/来源未知/未派发/等待收口）', () => {
+  const payload = structuredClone(RUN_PAYLOAD)
+  const review = payload.run.nodes[1]
+  // 只有派发、无模型/来源记录：显式未记录，不按当前配置补值。
+  review.dispatch = { id: 'd2', dispatched: true, settled: false }
+  let card = monitorViewModel(payload).currentExecution
+  assert.deepEqual([card.actor.modelText, card.actor.status], ['未记录 · 来源未知', '执行中'])
+  assert.deepEqual([card.judge.modelText, card.judge.status], [null, '未派发'])
+  // 已安排未确认：dispatch 存在但 messageId 尚未回填。
+  review.dispatch = { id: 'd2', dispatched: false, settled: false }
+  assert.equal(monitorViewModel(payload).currentExecution.actor.status, '已安排派发未确认')
+  // claim 已提交而 Judge 未安排、Actor 未收口 → 等待 Actor 收口。
+  review.dispatch = { id: 'd2', dispatched: true, settled: false }
+  review.claim = { id: 'c2', result: 'succeeded', handoff: 'h' }
+  assert.equal(monitorViewModel(payload).currentExecution.judge.status, '等待 Actor 收口')
+  // Actor 已收口但 Judge 未安排 → 待派发。
+  review.dispatch = { id: 'd2', dispatched: true, settled: true }
+  assert.equal(monitorViewModel(payload).currentExecution.judge.status, '待派发')
+  // Judge 已安排未确认。
+  review.judge = { id: 'j2', claimId: 'c2', dispatched: false, settled: false }
+  assert.equal(monitorViewModel(payload).currentExecution.judge.status, '已安排派发未确认')
+})
+
+test('#274 currentExecutionView：Program/Child/子流程卡与终态结束位置', () => {
+  // Program 节点为当前：不伪造 Actor/Judge 行，目标明确，BLOCK 原因可见。
+  const program = structuredClone(RUN_PAYLOAD)
+  program.run.nodes[2].current = true
+  program.run.nodes[1].current = false
+  const programCard = monitorViewModel(program).currentExecution
+  assert.deepEqual([programCard.nodeId, programCard.targetText], ['report', '程序 write-report'])
+  assert.deepEqual([programCard.actor, programCard.judge], [null, null])
+  assert.equal(programCard.blocked, true)
+  // 子流程工作单：流程标注为子流程，不误标主流程。
+  const child = structuredClone(RUN_PAYLOAD)
+  child.run.nodes.push({ workflowId: 'sub', nodeId: 's1', executionId: 'e5', visit: 1, revision: 1, phase: 'working', blockReason: null, enteredAt: STARTED_AT, exitedAt: null, current: true })
+  child.run.nodes[1].current = false
+  const childCard = monitorViewModel(child).currentExecution
+  assert.deepEqual([childCard.nodeId, childCard.workflowLabel, childCard.actor.role], ['s1', '子流程 sub', 'reviewer'])
+  // 终态：图下卡改为结束位置，活动文案换成 Run 终态标签（不冒充正在执行）。
+  const terminated = structuredClone(RUN_PAYLOAD)
+  terminated.run.status = 'terminated'
+  terminated.run.terminal = true
+  terminated.run.nodes[1].dispatch = { id: 'd2', dispatched: true, settled: false }
+  const endCard = monitorViewModel(terminated).currentExecution
+  assert.deepEqual([endCard.heading, endCard.active, endCard.terminalLabel], ['结束位置', false, '已终止'])
+  assert.equal(endCard.actor.status, '已终止', '停在 working 相的旧状态不冒充正在执行')
+  // 从未派发的节点仍如实显示未派发（不属活动文案）。
+  terminated.run.nodes[1].dispatch = undefined
+  assert.equal(monitorViewModel(terminated).currentExecution.actor.status, '未派发')
+})

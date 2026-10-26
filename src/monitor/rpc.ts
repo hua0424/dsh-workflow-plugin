@@ -8,7 +8,10 @@
  * `status`/`executions` 依赖完成；维护态短路返回诊断，绝不触碰状态库。
  * `projectRunStatus` 是纯函数：单测直接喂 StateRow/工作单快照，不需要 Store。
  */
-import { isActorTaskNode, nodeOnReturn, nodeResults, roleKeysWithJudge, type NodeExecution, type RunState, type StateRow } from '../types.ts'
+import {
+  isActorTaskNode, nodeOnReturn, nodeResults, roleKeysWithJudge,
+  type DelegationRoute, type ExecutionDispatch, type ExecutionJudge, type JudgeResult, type NodeExecution, type RoleRouteStage, type RunState, type StateRow,
+} from '../types.ts'
 import { resolveRoleModel } from '../roles/roles.ts'
 import type { StateMaintenanceDiagnostic } from '../state/store.ts'
 import { maintenanceText } from '../state/maintenance.ts'
@@ -50,6 +53,23 @@ export interface MonitorCallFrame {
   executionId: string
 }
 
+/** #274 一次派发的监控事实：只转发落库的值，不按当前配置重算（旧行缺字段 = 未记录）。 */
+export interface MonitorDispatchFacts {
+  id: string
+  /** Host 已确认派发（dispatch.messageId 存在）；false = 已安排未确认。 */
+  dispatched: boolean
+  /** Actor 的 Turn 已由 Host 收口（用于「等待 Actor 收口 / 待提交」状态，不作为结束时间展示）。 */
+  settled: boolean
+  model?: MonitorModel
+  source?: RoleRouteStage
+}
+
+/** #274 Judge 派发事实：同 dispatch，另带本次判定的结论（仅当时判定）。 */
+export interface MonitorJudgeFacts extends MonitorDispatchFacts {
+  claimId: string
+  judgment?: JudgeResult['result']
+}
+
 export interface MonitorNodeExecution {
   workflowId: string
   nodeId: string
@@ -62,6 +82,12 @@ export interface MonitorNodeExecution {
   exitedAt: string | null
   /** 调用栈栈顶帧（当前焦点节点）标记。 */
   current: boolean
+  /** #274 本工作单的 Actor 派发事实（缺字段 = 旧记录未采集）。 */
+  dispatch?: MonitorDispatchFacts
+  /** #274 本工作单已提交的结果（result 为声明结果名）。 */
+  claim?: { id: string; result: string; handoff: string }
+  /** #274 本工作单的 Judge 派发事实。 */
+  judge?: MonitorJudgeFacts
 }
 
 /** Run 引用（#254 切换器/空态）：带 workspace 标识，供跨目录选择。 */
@@ -100,13 +126,34 @@ export interface MonitorRunStatus {
   }
 }
 
-function modelOf(run: RunState, role: string): MonitorModel {
-  const route = resolveRoleModel(run, role, run.delegationRoute)
+/** 路由快照的 lossless 副本（只拷贝存在的键；undefined 表示未记录，不补空值）。 */
+function modelCopy(route: DelegationRoute | undefined): MonitorModel | undefined {
+  if (route === undefined) return undefined
   const model: MonitorModel = {}
   if (route.provider !== undefined) model.provider = route.provider
   if (route.modelId !== undefined) model.modelId = route.modelId
   if (route.reasoningEffort !== undefined) model.reasoningEffort = route.reasoningEffort
   return model
+}
+
+function modelOf(run: RunState, role: string): MonitorModel {
+  return modelCopy(resolveRoleModel(run, role, run.delegationRoute)) ?? {}
+}
+
+/** #274 Actor 派发事实：模型/来源直接取落库快照，不从当前 override 反推。 */
+function dispatchFactsOf(dispatch: ExecutionDispatch): MonitorDispatchFacts {
+  const model = modelCopy(dispatch.model)
+  const facts: MonitorDispatchFacts = { id: dispatch.id, dispatched: dispatch.messageId !== undefined, settled: dispatch.settled }
+  if (model !== undefined) facts.model = model
+  if (dispatch.source !== undefined) facts.source = dispatch.source
+  return facts
+}
+
+/** #274 Judge 派发事实：只认属于本次 Judge 派发的判定（历史判定不冒充当前结论）。 */
+function judgeFactsOf(judge: ExecutionJudge, judgment: NodeExecution['judgment']): MonitorJudgeFacts {
+  const facts: MonitorJudgeFacts = { ...dispatchFactsOf(judge), claimId: judge.claimId }
+  if (judgment !== undefined && judgment.judgeDispatchId === judge.id) facts.judgment = judgment.result
+  return facts
 }
 
 function flowOf(workflowId: string, def: RunState['definitionSnapshot']['workflow'], run: RunState): MonitorFlowDef {
@@ -188,6 +235,10 @@ export function projectRunStatus(row: StateRow | undefined, executions: readonly
         enteredAt: execution.enteredAt,
         exitedAt: execution.exitedAt ?? null,
         current: top !== undefined && top.workflowId === execution.workflowId && top.nodeId === execution.nodeId && top.executionId === execution.executionId,
+        // #274：派发/claim/判定事实只来自本工作单的落库快照（旧行缺字段 = 未记录）。
+        ...(execution.dispatch !== undefined ? { dispatch: dispatchFactsOf(execution.dispatch) } : {}),
+        ...(execution.claim !== undefined ? { claim: { id: execution.claim.id, result: execution.claim.result, handoff: execution.claim.handoff } } : {}),
+        ...(execution.judge !== undefined ? { judge: judgeFactsOf(execution.judge, execution.judgment) } : {}),
       })),
       callStack: run.callStack.map(frame => ({ workflowId: frame.workflowId, nodeId: frame.nodeId, executionId: frame.executionId })),
     },

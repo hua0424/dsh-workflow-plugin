@@ -971,3 +971,32 @@ test('#270 AC-09 同 cwd 维护态→空态→Run：无需重挂载，每步都�
     assert.match(ui.text(), new RegExp(`Run：${runId}`), '空态继续探测后直接发现新 Run')
   } finally { w.cleanup() }
 })
+
+test('#274 当前执行卡：真实 engine→status RPC→bundle 渲染（活动 + 终态结束位置）', async () => {
+  const w = createWorld()
+  try {
+    // 注入冻结默认路由：投影只显示落库事实，不看当前配置。
+    w.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    await w.startRun('ws-a', 'card')
+    const ui = w.mount({ cwd: 'ws-a' })
+    await settle()
+    const text = ui.text()
+    assert.match(text, /当前节点：plan/)
+    assert.match(text, /Actor（manager）/)
+    assert.match(text, /mgr\/m-manager · 首选/, '活动卡显示派发时的模型与来源')
+    assert.match(text, /Judge/)
+    assert.match(text, /未派发/, 'Actor 未提交前 Judge 显示未派发')
+    assert.doesNotMatch(text, /结束位置/, '活跃 Run 不显示结束位置')
+  } finally { w.cleanup() }
+
+  const terminal = createWorld()
+  try {
+    await terminal.completeRun('ws-a')
+    const ui = terminal.mount({ cwd: 'ws-a' })
+    await settle()
+    const text = ui.text()
+    assert.match(text, /结束位置：review/, '终态 Run 的卡指向最后一个工作单')
+    assert.match(text, /已判定：ACCEPT/, '判定结果来自判定记录')
+    assert.doesNotMatch(text, /当前节点：/, '终态不再冒充当前执行')
+  } finally { terminal.cleanup() }
+})

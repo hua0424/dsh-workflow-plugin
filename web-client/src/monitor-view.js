@@ -211,6 +211,90 @@ export function monitorPollingContinues(payload) {
   return run.terminal !== true && !TERMINAL_RUN_STATUSES.has(run.status)
 }
 
+/** #274 路由来源中文标签；缺来源 = 来源未知（不从当前配置推导）。 */
+export const ROUTE_SOURCE_LABELS = { primary: '首选', fallback: '备选', manual: '人工指定' }
+
+const SOURCE_UNKNOWN = '来源未知'
+const MODEL_MISSING = '未记录'
+// 描述「正在发生」的文案：Run 已结束而工作单仍停在活动相时不得照搬，否则冒充活跃执行。
+const ACTIVE_STATUSES = new Set(['执行中', '待提交', '等待 Actor 收口', '待派发', '待判定'])
+
+/** 派发事实 → 「模型 · 来源」；未采集时显式未记录/来源未知，绝不用当前配置补值。 */
+function dispatchModelText(facts) {
+  const modelText = modelTextOf(facts?.model)
+  return `${modelText === '' ? MODEL_MISSING : modelText} · ${ROUTE_SOURCE_LABELS[facts?.source] ?? SOURCE_UNKNOWN}`
+}
+
+function actorStatusOf(node) {
+  if (node.dispatch === undefined || node.dispatch === null) return '未派发'
+  if (node.dispatch.dispatched !== true) return '已安排派发未确认'
+  if (node.claim !== undefined && node.claim !== null) return '已提交结果'
+  return node.dispatch.settled === true ? '待提交' : '执行中'
+}
+
+function judgeStatusOf(node) {
+  if (node.claim === undefined || node.claim === null) return '未派发'
+  if (node.judge === undefined || node.judge === null) {
+    return node.dispatch?.settled === false ? '等待 Actor 收口' : '待派发'
+  }
+  if (node.judge.dispatched !== true) return '已安排派发未确认'
+  if (node.judge.judgment !== undefined) return `已判定：${node.judge.judgment}`
+  return '待判定'
+}
+
+/**
+ * #274 当前执行卡（纯函数）：独立于「选中详情/流程选择」，始终指向调用栈栈顶的
+ * 当前工作单（终态取最后一个工作单作为结束位置）。模型与来源只读工作单落库的
+ * 派发快照，不按当前配置重算；Run 已结束时活动文案改成终态标签，不冒充正在执行。
+ */
+export function currentExecutionView(run, ctx = {}) {
+  const nodes = Array.isArray(run?.nodes) ? run.nodes : []
+  const node = nodes.find(item => item.current === true) ?? nodes[nodes.length - 1] ?? null
+  if (node === null) return null
+  const flows = run?.flows ?? {}
+  const def = flows[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId) ?? null
+  const kind = def?.kind ?? 'actor-task'
+  const terminal = ctx.terminal === true
+  const [phaseLabel, phaseClass] = phaseOf(node.phase)
+  const blocked = typeof node.blockReason === 'string' && node.blockReason !== ''
+  // 终态：活动相文案换成 Run 终态标签（终止位置可查，但不冒充活跃执行）。
+  const endLabel = ctx.statusLabel ?? (run?.status === 'completed' ? '已完成' : '已终止')
+  const settle = status => (terminal && ACTIVE_STATUSES.has(status) ? endLabel : status)
+  const visit = typeof node.visit === 'number' ? node.visit : 1
+  const actorTask = kind === 'actor-task'
+  const targetText = kind === 'builtin-program'
+    ? `程序 ${def?.programId ?? '?'}`
+    : kind === 'child-workflow' ? `子流程 ${def?.childWorkflowId ?? '?'}` : null
+  return {
+    heading: terminal ? '结束位置' : '当前节点',
+    active: !terminal,
+    terminalLabel: terminal ? endLabel : null,
+    executionId: node.executionId ?? null,
+    workflowId: node.workflowId,
+    nodeId: node.nodeId,
+    workflowLabel: node.workflowId === run?.workflowId ? '主流程' : `子流程 ${node.workflowId}`,
+    visitText: visit > 1 ? `第 ${visit} 次` : '',
+    phaseLabel,
+    phaseClass,
+    blocked,
+    blockReason: node.blockReason ?? null,
+    targetText,
+    actor: actorTask
+      ? {
+        role: def?.role ?? null,
+        modelText: node.dispatch === undefined || node.dispatch === null ? null : dispatchModelText(node.dispatch),
+        status: settle(actorStatusOf(node)),
+      }
+      : null,
+    judge: actorTask
+      ? {
+        modelText: node.judge === undefined || node.judge === null ? null : dispatchModelText(node.judge),
+        status: settle(judgeStatusOf(node)),
+      }
+      : null,
+  }
+}
+
 /**
  * payload（服务端 MonitorRunStatus）→ 视图模型（#254 起区分 run/terminal/empty）。
  * payload 为 null/undefined（尚无数据）时返回 { mode: 'loading' }。
@@ -270,6 +354,8 @@ export function monitorViewModel(payload, options = {}) {
       roles,
       graph: graphOf(run),
     },
+    // #274：当前执行卡独立于选中详情/流程选择，始终指向当前（或结束）工作单。
+    currentExecution: currentExecutionView(run, { terminal, statusLabel }),
     nodes: nodes.map(node => {
       const [phaseLabel, phaseClass] = phaseOf(node.phase)
       const def = run.flows?.[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId)
@@ -278,6 +364,7 @@ export function monitorViewModel(payload, options = {}) {
         : def?.kind === 'child-workflow' ? `子流程 ${def.childWorkflowId ?? '?'}` : null
       return {
         key: `${node.workflowId}/${node.nodeId}#${node.visit}`,
+        executionId: node.executionId ?? null,
         label: `${node.workflowId} / ${node.nodeId}`,
         visit: node.visit,
         phaseLabel,

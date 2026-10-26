@@ -484,6 +484,13 @@ export interface ExecutionDispatch {
   sessionId?: string
   messageId?: string
   settled: boolean
+  /**
+   * #274 监控事实：本次派发实际解析到的路由（与 spawn 同源 `resolveRoleModel`）。
+   * 只供只读投影显示「实际派发模型」；旧行无该字段 = 未记录，不回填当前配置。
+   */
+  model?: DelegationRoute
+  /** #274 监控事实：该路由的来源阶段（primary/fallback/manual）；旧行缺失 = 来源未知。 */
+  source?: RoleRouteStage
 }
 
 export interface ExecutionClaim extends NodeClaim {

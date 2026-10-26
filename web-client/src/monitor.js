@@ -52,6 +52,15 @@ export const MONITOR_STYLES = `
 /* #261 只读刷新入口：终态停周期后由用户决定何时重新读取。 */
 .wf-monitor-toolbar { display: flex; justify-content: flex-end; }
 .wf-monitor-refresh { padding: 2px 8px; font-size: 12px; }
+/* #274 当前执行卡：图下独立区块，一眼看清谁在干活、用什么模型、来源阶段。 */
+.wf-monitor-current { display: flex; flex-direction: column; gap: 4px; background: rgba(128,128,128,0.12); border-left: 3px solid #3b82f6; border-radius: 6px; padding: 8px; }
+.wf-monitor-current.is-terminal { border-left-color: #8a8a8a; }
+.wf-monitor-card-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.wf-monitor-card-title { font-size: 14px; }
+.wf-monitor-card-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.wf-monitor-card-role { min-width: 96px; opacity: 0.85; }
+.wf-monitor-card-state { font-weight: 600; }
+.wf-monitor-card-terminal { color: #9fc8ff; font-weight: 600; }
 `
 
 /** 轮询上下文键：cwd + 选定 runId 决定一个独立读取周期；用值而非函数身份，重渲染不重启周期（#261）。 */
@@ -145,6 +154,32 @@ export function useMonitorPolling(fetchStatus, options = {}) {
     refreshing: current.refreshing,
     refresh: () => { const invoke = refreshRef.current; if (invoke !== null) invoke() },
   }
+}
+
+/** #274 当前执行卡：节点为主标题，Actor/Judge 的模型·来源·状态分行显示；无事实的字段不渲染。 */
+function currentCardEl(card) {
+  if (card === null || card === undefined) return null
+  const row = (name, entry) => h('div', { className: 'wf-monitor-card-row' },
+    h('span', { className: 'wf-monitor-card-role' }, name),
+    entry.modelText === null || entry.modelText === ''
+      ? null
+      : h('span', { className: 'wf-monitor-muted', title: entry.modelText }, entry.modelText),
+    h('span', { className: 'wf-monitor-card-state' }, entry.status))
+  return h('div', {
+    className: `wf-monitor-current${card.active ? '' : ' is-terminal'}`,
+    role: 'region',
+    'aria-label': card.heading,
+    'data-execution-id': card.executionId ?? '',
+  },
+  h('div', { className: 'wf-monitor-card-head' },
+    h('strong', { className: 'wf-monitor-card-title' }, `${card.heading}：${card.nodeId}`),
+    h('span', { className: 'wf-monitor-muted' }, [card.workflowLabel, card.visitText].filter(Boolean).join(' · ')),
+    h('span', { className: `wf-node-phase ${card.phaseClass}` }, card.phaseLabel),
+    card.active ? null : h('span', { className: 'wf-monitor-card-terminal' }, card.terminalLabel)),
+  card.targetText === null ? null : h('div', { className: 'wf-monitor-muted' }, card.targetText),
+  card.actor === null ? null : row(`Actor（${card.actor.role ?? '—'}）`, card.actor),
+  card.judge === null ? null : row('Judge', card.judge),
+  card.blocked ? h('div', { className: 'wf-node-block' }, `BLOCK：${card.blockReason}`) : null)
 }
 
 export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
@@ -270,6 +305,8 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
           },
         })),
     ) : null,
+    // #274 当前执行卡：图下独立区块，始终指向当前（或结束）工作单；与选中/流程切换无关。
+    currentCardEl(view.currentExecution),
     h('div', null,
       h('button', { type: 'button', onClick: () => setPromptOpen(open => !open) }, promptOpen ? '收起启动 prompt' : '展开启动 prompt'),
       promptOpen ? h('div', { className: 'wf-monitor-prompt' }, run.launchPrompt) : null,

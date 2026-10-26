@@ -7,10 +7,15 @@ import { LIMITS, ID_PATTERN, declaredResults, roleKeysWithJudge, type CallFrame,
 
 const text = z.string().min(1)
 const revision = z.number().int().nonnegative()
-const dispatch = z.object({ id: text, sessionId: text.optional(), messageId: text.optional(), settled: z.boolean() }).strict()
 // #149 T1: 严格路由 schema 接受可选 effort（Judge/previousJudge 快照、冻结默认
 // 路由）。旧行无该键照常读取；不向旧定义补默认档位，state 格式版本不变。
 const route = z.object({ provider: text.optional(), modelId: text.optional(), reasoningEffort: text.optional() }).strict()
+// #274：dispatch 增记「实际派发路由 + 来源阶段」监控事实；旧行缺两键照常读取
+//（投影显示未记录/来源未知，绝不回填当前配置）。
+const dispatch = z.object({
+  id: text, sessionId: text.optional(), messageId: text.optional(), settled: z.boolean(),
+  model: route.optional(), source: z.enum(['primary', 'fallback', 'manual']).optional(),
+}).strict()
 const judge = dispatch.extend({ sessionId: text, claimId: text, inputVersion: revision, model: route.optional() })
 // v3: claim 携带一个已声明的节点结果名（result），不再有 outcome。
 const claim = z.object({ id: text, dispatchId: text, result: z.string().regex(ID_PATTERN), handoff: z.string().trim().min(1).max(LIMITS.handoffMax) }).strict()
