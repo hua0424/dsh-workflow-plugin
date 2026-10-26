@@ -352,7 +352,9 @@ export function monitorRecordsView(run, ctx = {}) {
     const right = Date.parse(b?.enteredAt ?? '')
     return Number.isFinite(left) && Number.isFinite(right) ? right - left : 0
   })
-  return ordered.map(node => {
+  // 活跃当前节点由上方当前执行卡承载，主表不重复占一行；终态没有当前执行，末次记录照常保留。
+  const visible = terminal ? ordered : ordered.filter(node => node?.current !== true)
+  return visible.map(node => {
     const def = flows[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId) ?? null
     const [phaseLabel] = phaseOf(node.phase)
     const history = node.history ?? {}

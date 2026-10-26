@@ -459,7 +459,7 @@ test('#275 monitorRecordsView：列序/一行一次进入/多轮模型与时间/
     },
     {
       workflowId: 'test', nodeId: 'review', executionId: 'e2', visit: 2, revision: 1, phase: 'working', blockReason: null,
-      enteredAt: '2026-10-25T04:05:30.000Z', exitedAt: null, current: true,
+      enteredAt: '2026-10-25T04:05:30.000Z', exitedAt: null, current: false,
       // 已安排但派发尚未确认：live dispatch 保留派发意图与路由快照。
       dispatch: { id: 'd3', dispatched: false, settled: false, model: { provider: 'prov', modelId: 'm-review' }, source: 'manual' },
       history: {
@@ -519,7 +519,7 @@ test('#275 monitorRecordsView：自环/回边新进入各自成行，等待时�
     },
     {
       workflowId: 'test', nodeId: 'plan', executionId: 'e2', visit: 2, revision: 2, phase: 'working', blockReason: null,
-      enteredAt: '2026-10-25T04:03:00.000Z', exitedAt: null, current: true,
+      enteredAt: '2026-10-25T04:03:00.000Z', exitedAt: null, current: false,
       history: { rounds: [{ claimId: 'c2', result: 'succeeded', submittedAt: '2026-10-25T04:04:00.000Z' }], abandoned: [], switches: [] },
     },
   ]

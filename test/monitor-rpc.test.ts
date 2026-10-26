@@ -11,7 +11,7 @@ import { StateStore } from '../src/state/store.ts'
 import { makeStateHost } from '../src/plugin/host.ts'
 import { WorkflowEngine } from '../src/engine/engine.ts'
 import { createMonitorRpcHandler, projectRunStatus, MONITOR_RPC_CHANNEL } from '../src/monitor/rpc.ts'
-import { monitorViewModel, EMPTY_GUIDANCE } from '../web-client/src/monitor-view.js'
+import { monitorViewModel, monitorRecordsView, EMPTY_GUIDANCE } from '../web-client/src/monitor-view.js'
 import { readRunLayout } from '../src/monitor/layout.ts'
 import type { EditorLayout } from '../src/editor/layout.ts'
 
@@ -723,8 +723,11 @@ test('#275 status：旧行无事件回放时 history 缺省，不回填当前配
     const node = nodeOf((await legacyHandler('status', { cwd: 'ws' })).value as RunPayload, 'plan')
     assert.equal(node.history, undefined, '无事件 → 无多轮历史（不伪造轮次/时间）')
     assert.ok(node.claim !== undefined, '旧行仍保留 #274 的当前 claim 事实')
-    const view = monitorViewModel((await legacyHandler('status', { cwd: 'ws' })).value)
-    const record = view.records.find(item => item.nodeId === 'plan')!
+    // 活跃 Run 的当前执行只在当前卡；旧记录事实在终态口径的行视图里核对。
+    const activeView = monitorViewModel((await legacyHandler('status', { cwd: 'ws' })).value)
+    assert.deepEqual(activeView.records, [], '活跃当前执行不重复占主表一行')
+    const payload = (await legacyHandler('status', { cwd: 'ws' })).value as RunPayload
+    const record = monitorRecordsView(payload.run, { terminal: true }).find(item => item.nodeId === 'plan')!
     assert.deepEqual([record.submittedAtText, record.judgedAtText], ['未记录', '待判定'], '无事件回放：提交时间不可还原显式未记录，不被当成待提交')
     assert.deepEqual([record.actorModelText, record.judgeModelText], ['mgr/m-manager · 首选', 'mgr/m-manager · 首选'], '模型取工作单派发快照，不拿当前配置补')
   } finally { h.cleanup() }
