@@ -480,7 +480,8 @@ test('#275 monitorRecordsView：列序/一行一次进入/多轮模型与时间/
   assert.deepEqual(RECORD_COLUMNS, ['节点名称', '所属流程', '运行情况', '进入时间', '提交结果时间', '提交判定时间', 'Actor 模型', 'Judge 模型'], '列序固定：所属流程靠左、时间在模型之前')
   assert.equal(records.length, 3, '一行 = 一次进入（子流程节点单独成行）')
   const time = value => new Date(value).toLocaleString('zh-CN', { hour12: false })
-  const [plan, review, sub] = records
+  // 全局进入时间最新在上：sub(04:06) → review(04:05:30) → plan(04:00)。
+  const [sub, review, plan] = records
   assert.deepEqual([plan.nodeLabel, plan.flowText, plan.current], ['plan（manager）', '主流程', false])
   assert.deepEqual([plan.outcomeText, plan.roundCountText, plan.roundCountText], ['已结束', '共 2 轮', '共 2 轮'])
   // 主行取最新一轮的时间/模型；第二轮是备选模型，第一轮的事实留在下钻里。
@@ -523,11 +524,11 @@ test('#275 monitorRecordsView：自环/回边新进入各自成行，等待时�
     },
   ]
   const records = monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:06:10.000Z') })
-  assert.deepEqual(records.map(record => [record.key, record.visitText]), [['test/plan#1', ''], ['test/plan#2', '第 2 次']], '同节点两次进入 → 两行，不合并')
+  assert.deepEqual(records.map(record => [record.key, record.visitText]), [['test/plan#2', '第 2 次进入'], ['test/plan#1', '']], '最新进入在上；同节点两次进入 → 两行，不合并')
   assert.notEqual(records[0].key, records[1].key)
   // 等待时长只在读取时按 claim 时间派生（130s），不宣称判定失败；不显示结束时间。
-  assert.equal(records[1].waitingText, '已判定等待 2分10秒')
-  assert.equal(records[0].waitingText, null, '已判定/已结束的行不显示等待')
+  assert.equal(records[0].waitingText, '已判定等待 2分10秒')
+  assert.equal(records[1].waitingText, null, '已判定/已结束的行不显示等待')
   // 终态读取不再派生等待时长。
-  assert.equal(monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T05:00:00.000Z'), terminal: true })[1].waitingText, null)
+  assert.equal(monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T05:00:00.000Z'), terminal: true })[0].waitingText, null)
 })

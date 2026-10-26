@@ -1078,3 +1078,30 @@ test('#275 执行记录表：真实 engine→status RPC→bundle 渲染列/行�
     assert.doesNotMatch(text, /第 1 轮：提交「succeeded」 · 判定不通过/, '收起后不再渲染下钻')
   } finally { w.cleanup() }
 })
+
+test('#275 执行记录表：等待子流程的父节点仍成行，主/子流程路径可分', async () => {
+  const w = createWorld()
+  try {
+    w.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    await w.startRun('ws-a', 'child', childConfig)
+    let row = (await w.store.get('ws-a'))!
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
+    assert.equal((await w.engine.handleClaim('ws-a', { result: 'succeeded', handoff: 'plan ok' }, manager)).ok, true)
+    await w.engine.handleTurnEnded('ws-a', manager)
+    row = (await w.store.get('ws-a'))!
+    const judge: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    assert.equal((await w.engine.handleJudgeClaim('ws-a', row.execution.nodeToken, 'ACCEPT', 'ok', judge)).ok, true)
+    await w.engine.handleTurnEnded('ws-a', judge)
+    // 已下钻到子流程：父节点 call-child 等待子流程，子流程 s1 已进入。
+    row = (await w.store.get('ws-a'))!
+    assert.deepEqual(row.run.callStack.map(frame => frame.workflowId), ['test', 'sub'])
+
+    const ui = w.mount({ cwd: 'ws-a' })
+    await settle()
+    const text = ui.text()
+    assert.match(text, /执行记录（3 次进入）/, '父节点与子流程首次进入都成行（plan 已结束也保留末次记录）')
+    assert.match(text, /call-child/)
+    assert.match(text, /子流程 sub/)
+    assert.match(text, /执行中/, '等待子流程的父节点不画成成功')
+  } finally { w.cleanup() }
+})

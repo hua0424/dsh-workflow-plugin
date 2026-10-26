@@ -346,7 +346,13 @@ export function monitorRecordsView(run, ctx = {}) {
   const rootWorkflowId = run?.workflowId
   const terminal = ctx.terminal === true
   const now = Number.isFinite(ctx.now) ? ctx.now : Date.now()
-  return nodes.map(node => {
+  // 顺序按全局进入时间最新在上；行锚定 enteredAt（不可变），旧行事实更新不重排。
+  const ordered = [...nodes].sort((a, b) => {
+    const left = Date.parse(a?.enteredAt ?? '')
+    const right = Date.parse(b?.enteredAt ?? '')
+    return Number.isFinite(left) && Number.isFinite(right) ? right - left : 0
+  })
+  return ordered.map(node => {
     const def = flows[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId) ?? null
     const [phaseLabel] = phaseOf(node.phase)
     const history = node.history ?? {}
@@ -410,7 +416,8 @@ export function monitorRecordsView(run, ctx = {}) {
       workflowLabel: node.workflowId,
       visit: node.visit,
       current: node.current === true,
-      visitText: typeof node.visit === 'number' && node.visit > 1 ? `第 ${node.visit} 次` : '',
+      // 只说「第几次进入该节点」，不把工作单 visit 冒充全局重试次数或流程顺序。
+      visitText: typeof node.visit === 'number' && node.visit > 1 ? `第 ${node.visit} 次进入` : '',
       phaseLabel,
       blocked,
       blockReason: node.blockReason ?? null,
