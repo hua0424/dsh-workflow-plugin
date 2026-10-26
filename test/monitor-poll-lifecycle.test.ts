@@ -820,6 +820,8 @@ test('#270 AC-05 显式 Run 在 loading/维护态保持，失效后回退默认�
     // 挂起首轮响应制造 loading：选择不被重置、不额外发默认选择请求。
     w.bridge.hold(payload => payload.runId === bRunId)
     const beforeSelect = w.bridge.calls.length
+    // 选的是「有效 B」：B 必须真实出现在切换器选项里，否则后续断言不能区分真选择与直接注入。
+    assert.ok(optionValues(ui).includes(bRunId), 'B 已在切换器选项中')
     ui.select()!.props.onChange({ target: { value: bRunId } })
     await settle()
     assert.match(ui.text(), /正在加载运行状态/)
@@ -891,6 +893,7 @@ test('#270 AC-06 实际返回的 Run 变化才重置手动流程跟随', async (
     assert.equal(w.bridge.calls.at(-1)!.payload.runId, undefined, '默认请求（无显式 runId）返回新 Run')
     assert.match(ui.text(), new RegExp(`Run：${bRunId}`))
     assert.equal(tabOf(ui, '主流程').props['aria-selected'], true, '跟随重置回当前流程')
+    assert.equal(tabOf(ui, '子流程 sub').props['aria-selected'], false, '手动子流程不再选中（B 同名子流程确实存在）')
     assert.equal(returnEntry(ui), null, '重置后不再显示「回到当前节点」')
   } finally { w.cleanup() }
 })
@@ -912,6 +915,7 @@ test('#270 AC-07 cwd 变化重置手动流程跟随（同名子流程不沿用�
     assert.equal(w.bridge.calls.at(-1)!.payload.runId, undefined, 'cwd 变化不携带旧目录的选择/流程')
     assert.match(ui.text(), new RegExp(`Run：${bRunId}`))
     assert.equal(tabOf(ui, '主流程').props['aria-selected'], true, '跟随 B 的当前流程')
+    assert.equal(tabOf(ui, '子流程 sub').props['aria-selected'], false, '旧手动子流程不沿用（B 同名子流程确实存在）')
     assert.equal(returnEntry(ui), null)
   } finally { w.cleanup() }
 })
