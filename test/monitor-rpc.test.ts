@@ -702,6 +702,38 @@ test('#275 status：多轮提交/判定 history 按 claim 配对、事件时间�
   } finally { h.cleanup() }
 })
 
+test('#275 R1 status：关库重开后事件回放与投影一致（旧记录降级不因 reopen 变化）', async () => {
+  const h = harness()
+  try {
+    h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
+    assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', config, 'hash'), undefined, '受控启动请求')).ok, true)
+    const manager: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set(['actor-message-1']) }
+    await claim(h, manager, 'succeeded', 'first attempt')
+    let row = (await h.store.get('ws'))!
+    const judge1: ClaimCaller = { sessionId: row.execution.judge!.sessionId!, turnUserMessageIds: new Set([row.execution.judge!.messageId!]) }
+    await judgeReject(h, judge1, '缺少证据')
+    row = (await h.store.get('ws'))!
+    const manager2: ClaimCaller = { sessionId: 'manager', turnUserMessageIds: new Set([row.execution.dispatch!.messageId!]) }
+    await claim(h, manager2, 'succeeded', 'second attempt')
+    const handler = handlerOf(h)
+    const before = nodeOf((await handler('status', { cwd: 'ws' })).value as RunPayload, 'plan')
+    // 旧宿主/旧记录的正对照：同一份事实经真实 SQLite 重新打开后必须逐字一致。
+    h.store.close()
+    const reopened = new StateStore(h.home)
+    try {
+      const events = await reopened.runEventsByRunId(row.run.runId)
+      assert.ok(events.length > 0, '事件随库持久化')
+      const reopenedRun = (await reopened.getByRunId(row.run.runId))!
+      const replayed = projectRunStatus(reopenedRun, await reopened.runExecutionsByRunId(row.run.runId), undefined, undefined, [], events)
+      assert.deepEqual(replayed.run!.nodes[0].history, before.history, '重开读取的 history 与关库前一致（不丢轮次/时间）')
+      const replayAgain = projectRunStatus(reopenedRun, await reopened.runExecutionsByRunId(row.run.runId), undefined, undefined, [], await reopened.runEventsByRunId(row.run.runId))
+      assert.deepEqual(replayAgain.run!.nodes[0].history, before.history, '重复打开读取确定')
+    } finally {
+      reopened.close()
+    }
+  } finally { h.cleanup() }
+})
+
 test('#275 status：旧行无事件回放时 history 缺省，不回填当前配置', async () => {
   const h = harness()
   try {

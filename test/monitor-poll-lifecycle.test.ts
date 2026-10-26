@@ -1084,6 +1084,7 @@ test('#275 执行记录表：真实 engine→status RPC→bundle 渲染列/行�
     text = ui.text()
     assert.match(text, /执行记录（2 次进入）/, '终态后两次进入都保留在表中')
     assert.match(text, /review/)
+    assert.doesNotMatch(text, /第 2 次进入/, '线性流第 2 个节点 visit=2 但首次进入：不显示为第 2 次进入')
   } finally { w.cleanup() }
 })
 
@@ -1111,5 +1112,6 @@ test('#275 执行记录表：等待子流程的父节点仍成行，主/子流�
     assert.match(text, /call-child/)
     assert.match(text, /子流程 sub/)
     assert.match(text, /执行中/, '等待子流程的父节点不画成成功')
+    assert.match(text, /不适用/, '子流程节点行没有 Actor 提交/判定与模型派发：相关列不适用（R1 F-01）')
   } finally { w.cleanup() }
 })

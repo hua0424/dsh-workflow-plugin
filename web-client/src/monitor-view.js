@@ -354,9 +354,23 @@ export function monitorRecordsView(run, ctx = {}) {
   })
   // 活跃当前节点由上方当前执行卡承载，主表不重复占一行；终态没有当前执行，末次记录照常保留。
   const visible = terminal ? ordered : ordered.filter(node => node?.current !== true)
+  // 进入序号从记录自身推导：工作单 visit 是 Run 全局步进（后继=末次 visit+1），
+  // 线性流第 2 个节点首次进入仍是 visit=2，不能当「第 2 次进入」（#275 L16）。
+  const ordinals = new Map()
+  const entered = new Map()
+  // nodes 原始顺序 = visit 升序（进入先后）；不能用表格倒序推序号，否则最新进入会变成第 1 次。
+  for (const node of nodes) {
+    const scope = `${node?.workflowId}/${node?.nodeId}`
+    const ordinal = (entered.get(scope) ?? 0) + 1
+    entered.set(scope, ordinal)
+    ordinals.set(node, ordinal)
+  }
   return visible.map(node => {
+    const ordinal = ordinals.get(node) ?? 1
     const def = flows[node.workflowId]?.nodes?.find(candidate => candidate.id === node.nodeId) ?? null
     const [phaseLabel] = phaseOf(node.phase)
+    // Program / 子流程节点没有 Actor 提交、Judge 判定与模型派发：相关列「不适用」，不冒充待提交/未派发。
+    const hasResultChannel = (def?.kind ?? 'actor-task') === 'actor-task'
     const history = node.history ?? {}
     const rounds = (Array.isArray(history.rounds) ? history.rounds : []).map((round, index) => {
       const judgment = round.judgment ?? null
@@ -393,22 +407,26 @@ export function monitorRecordsView(run, ctx = {}) {
       actorModelText: roundModelText(pending),
     }
     // 无事件回放（旧记录）时只用工作单上仍保留的当前事实做定性，时间/历史模型显式「未记录」。
+    // 判定结果挂在 judge facts 上（#274 合同），工作单顶层没有 node.judgment。
     const claimed = node.claim !== undefined && node.claim !== null
-    const judged = node.judgment !== undefined && node.judgment !== null
-    const judgeArranged = node.judge !== undefined && node.judge !== null
+    const judge = node.judge ?? null
+    const judgeResult = judge?.judgment ?? null
+    const judged = judgeResult !== null && judgeResult !== undefined
     const outcomeText = blocked
       ? '阻塞'
       : ended
         ? '已结束'
-        : last === null
-          ? !claimed
-            ? (pending !== null && pending.dispatched !== true
-              ? RECORD_SCHEDULED
-              : node.dispatch === undefined || node.dispatch === null ? phaseLabel : RECORD_PENDING)
-            : judged ? `判定${judgmentLabelOf(node.judgment.result)}` : '待判定'
-          : last.judgmentResult === null ? '待判定' : `判定${judgmentLabelOf(last.judgmentResult)}`
+        : !hasResultChannel
+          ? phaseLabel
+          : last === null
+            ? !claimed
+              ? (pending !== null && pending.dispatched !== true
+                ? RECORD_SCHEDULED
+                : node.dispatch === undefined || node.dispatch === null ? phaseLabel : RECORD_PENDING)
+              : judged ? `判定${judgmentLabelOf(judgeResult)}` : '待判定'
+            : last.judgmentResult === null ? '待判定' : `判定${judgmentLabelOf(last.judgmentResult)}`
     return {
-      key: `${node.workflowId}/${node.nodeId}#${node.visit}`,
+      key: node.executionId ?? `${node.workflowId}/${node.nodeId}#${ordinal}`,
       executionId: node.executionId ?? null,
       workflowId: node.workflowId,
       nodeId: node.nodeId,
@@ -416,10 +434,10 @@ export function monitorRecordsView(run, ctx = {}) {
       nodeLabel: def?.role === undefined || def?.role === null ? node.nodeId : `${node.nodeId}（${def.role}）`,
       flowText: node.workflowId === rootWorkflowId ? '主流程' : `子流程 ${node.workflowId}`,
       workflowLabel: node.workflowId,
-      visit: node.visit,
+      visit: ordinal,
       current: node.current === true,
-      // 只说「第几次进入该节点」，不把工作单 visit 冒充全局重试次数或流程顺序。
-      visitText: typeof node.visit === 'number' && node.visit > 1 ? `第 ${node.visit} 次进入` : '',
+      // 同一节点在本 Run 里的第几次进入（从记录推导），不是工作单 visit、更不是全局重试次数。
+      visitText: ordinal > 1 ? `第 ${ordinal} 次进入` : '',
       phaseLabel,
       blocked,
       blockReason: node.blockReason ?? null,
@@ -427,17 +445,23 @@ export function monitorRecordsView(run, ctx = {}) {
       roundCountText: rounds.length > 0 ? `共 ${rounds.length} 轮` : null,
       enteredAtText: timeText(node.enteredAt),
       // 无事件回放：有 claim/判定事实但时间不可还原 → 未记录；还没提交才是待提交。
-      submittedAtText: last === null ? (claimed ? MODEL_MISSING : RECORD_PENDING) : last.submittedAtText,
-      judgedAtText: last === null
-        ? (judged ? MODEL_MISSING : judgeArranged ? RECORD_JUDGE_PENDING : RECORD_NOT_APPLICABLE)
-        : last.judgedAtText ?? RECORD_JUDGE_PENDING,
+      submittedAtText: !hasResultChannel ? RECORD_NOT_APPLICABLE : last === null ? (claimed ? MODEL_MISSING : RECORD_PENDING) : last.submittedAtText,
+      judgedAtText: !hasResultChannel
+        ? RECORD_NOT_APPLICABLE
+        : last === null
+          ? (judged ? MODEL_MISSING : judge === null ? RECORD_NOT_APPLICABLE : RECORD_JUDGE_PENDING)
+          : last.judgedAtText ?? RECORD_JUDGE_PENDING,
       // 旧记录（无事件回放）：已提交/已安排但无派发事实可还原 → 未记录，不拿当前配置填。
-      actorModelText: last !== null
-        ? last.actorModelText
-        : (node.dispatch !== undefined && node.dispatch !== null ? roundModelText(node.dispatch) : RECORD_NOT_DISPATCHED),
-      judgeModelText: last !== null
-        ? last.judgeModelText
-        : (node.judge !== undefined && node.judge !== null ? roundModelText(node.judge) : RECORD_NOT_APPLICABLE),
+      actorModelText: !hasResultChannel
+        ? RECORD_NOT_APPLICABLE
+        : last !== null
+          ? last.actorModelText
+          : (node.dispatch !== undefined && node.dispatch !== null ? roundModelText(node.dispatch) : RECORD_NOT_DISPATCHED),
+      judgeModelText: !hasResultChannel
+        ? RECORD_NOT_APPLICABLE
+        : last !== null
+          ? last.judgeModelText
+          : (judge !== null ? roundModelText(judge) : RECORD_NOT_APPLICABLE),
       waitingText,
       drilldown: {
         rounds,

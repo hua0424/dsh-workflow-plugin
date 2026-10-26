@@ -524,11 +524,75 @@ test('#275 monitorRecordsView：自环/回边新进入各自成行，等待时�
     },
   ]
   const records = monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:06:10.000Z') })
-  assert.deepEqual(records.map(record => [record.key, record.visitText]), [['test/plan#2', '第 2 次进入'], ['test/plan#1', '']], '最新进入在上；同节点两次进入 → 两行，不合并')
+  assert.deepEqual(records.map(record => [record.key, record.visitText]), [['e2', '第 2 次进入'], ['e1', '']], '最新进入在上；同节点两次进入 → 两行，不合并；行身份按 execution 区分')
   assert.notEqual(records[0].key, records[1].key)
   // 等待时长只在读取时按 claim 时间派生（130s），不宣称判定失败；不显示结束时间。
   assert.equal(records[0].waitingText, '已判定等待 2分10秒')
   assert.equal(records[1].waitingText, null, '已判定/已结束的行不显示等待')
   // 终态读取不再派生等待时长。
   assert.equal(monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T05:00:00.000Z'), terminal: true })[0].waitingText, null)
+})
+
+// R1 F-01/F-03：#275 记录表的缺失值与进入序号不能把全局 visit 冒充单节点重跑。
+test('#275 monitorRecordsView R1：Program/子流程行「不适用」，进入序号从记录推导而非全局 visit', () => {
+  const payload = structuredClone(RUN_PAYLOAD)
+  payload.run.terminal = true
+  payload.run.status = 'completed'
+  const records = monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:10:00.000Z'), terminal: true })
+  const byId = Object.fromEntries(records.map(record => [record.nodeId, record]))
+  // Program/Child 节点没有 Actor 提交、Judge 判定与模型派发：相关列一律「不适用」，不冒充待提交/未派发/待判定。
+  assert.deepEqual(
+    ['report', 'child'].map(id => [byId[id].submittedAtText, byId[id].judgedAtText, byId[id].actorModelText, byId[id].judgeModelText]),
+    [[RECORD_NOT_APPLICABLE, RECORD_NOT_APPLICABLE, RECORD_NOT_APPLICABLE, RECORD_NOT_APPLICABLE], [RECORD_NOT_APPLICABLE, RECORD_NOT_APPLICABLE, RECORD_NOT_APPLICABLE, RECORD_NOT_APPLICABLE]],
+  )
+  assert.equal(byId['report'].roundCountText, null)
+  // 线性流第 2 个节点（review，visit=2）首次进入不显示「第 2 次进入」；同名节点第二次进入才显示。
+  assert.deepEqual(records.map(record => [record.nodeId, record.visit, record.visitText]), [
+    ['child', 1, ''], ['report', 1, ''], ['review', 1, ''], ['plan', 1, ''],
+  ])
+  const twice = structuredClone(RUN_PAYLOAD)
+  twice.run.nodes.push({ ...twice.run.nodes[0], executionId: 'e5', visit: 9, enteredAt: '2026-10-25T04:05:00.000Z', exitedAt: '2026-10-25T04:06:00.000Z', current: false })
+  const reentered = monitorRecordsView(twice.run, { now: Date.parse('2026-10-25T04:10:00.000Z'), terminal: true }).filter(record => record.nodeId === 'plan')
+  assert.deepEqual(reentered.map(record => [record.key, record.visit, record.visitText]), [['e5', 2, '第 2 次进入'], ['e1', 1, '']])
+})
+
+// R1 F-02：判定结果挂在 judge facts 上；旧记录（无事件回放）已判定时显示判定与「未记录」，不是「待判定」。
+test('#275 monitorRecordsView R1：旧记录已判定时用 judge.judgment，不退回待判定', () => {
+  const payload = structuredClone(RUN_PAYLOAD)
+  payload.run.terminal = true
+  payload.run.status = 'completed'
+  payload.run.nodes = [{
+    workflowId: 'test', nodeId: 'plan', executionId: 'e1', visit: 1, revision: 4, phase: 'checking', blockReason: null,
+    enteredAt: STARTED_AT, exitedAt: null, current: true,
+    dispatch: { id: 'd1', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-plan' }, source: 'primary' },
+    claim: { id: 'c1', result: 'succeeded', handoff: 'h' },
+    judge: { id: 'j1', claimId: 'c1', dispatched: true, settled: true, judgment: 'ACCEPT' },
+  }]
+  const [record] = monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:10:00.000Z'), terminal: true })
+  assert.equal(record.outcomeText, '判定通过', '已判定不显示待判定')
+  assert.deepEqual([record.submittedAtText, record.judgedAtText], [MODEL_MISSING, MODEL_MISSING], '无事件回放：时间不可还原显式未记录')
+  assert.match(record.judgeModelText, /^未记录 · /, '判定事实在，但派发快照缺失时不虚构模型')
+})
+
+// R1 F-04（TD L57 负例）：人工指定与首选同值仍标人工指定（不比较 modelId 推断）；NEED_CONTEXT 判定有独立文案。
+test('#275 monitorRecordsView R1：人工同值不冒充首选，NEED_CONTEXT 判定可见', () => {
+  const payload = structuredClone(RUN_PAYLOAD)
+  payload.run.terminal = true
+  payload.run.status = 'completed'
+  payload.run.nodes = [{
+    workflowId: 'test', nodeId: 'plan', executionId: 'e1', visit: 1, revision: 4, phase: 'exited', blockReason: null,
+    enteredAt: STARTED_AT, exitedAt: '2026-10-25T04:10:00.000Z', current: false,
+    dispatch: { id: 'd1', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-plan' }, source: 'manual' },
+    history: {
+      rounds: [{
+        claimId: 'c1', result: 'succeeded', submittedAt: '2026-10-25T04:02:00.000Z',
+        actor: { id: 'd1', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-plan' }, source: 'manual' },
+        judgment: { result: 'NEED_CONTEXT', at: '2026-10-25T04:03:00.000Z', judge: { id: 'j1', dispatched: true, settled: true, model: { provider: 'prov', modelId: 'm-judge' }, source: 'manual' } },
+      }],
+      abandoned: [], switches: [],
+    },
+  }]
+  const [record] = monitorRecordsView(payload.run, { now: Date.parse('2026-10-25T04:10:00.000Z'), terminal: true })
+  assert.equal(record.actorModelText, 'prov/m-plan · 人工指定', '与首选同值仍按运行事实标人工指定')
+  assert.equal(record.drilldown.rounds[0].statusText, '判定需补充')
 })
