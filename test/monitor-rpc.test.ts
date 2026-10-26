@@ -395,10 +395,10 @@ test('#251 status：维护诊断短路，不触碰状态库', async () => {
   assert.notEqual(MONITOR_RPC_CHANNEL, '/workflow-config-editor')
 })
 
-// #270 AC-10：根+子流程配置。manager 未显式设 model（继承默认路由），reviewer 显式，
-// call-child 是无工作单的 child-workflow 节点，s1 是子流程 manager 节点。
+// #270 AC-10：根+子流程配置。manager 与普通角色 worker 都未显式设 model（应继承默认路由），
+// reviewer 显式模型作对照；call-child 是 child-workflow 节点，s1 是子流程内未执行的 worker。
 const modelConfig: WorkflowConfig = {
-  schemaVersion: 'agent-workflow/v3', roles: { reviewer: { persona: 'Review', model: { provider: 'prov', modelId: 'm-review' } } }, judgeRole: { persona: 'Read only' },
+  schemaVersion: 'agent-workflow/v3', roles: { worker: { persona: 'Work' }, reviewer: { persona: 'Review', model: { provider: 'prov', modelId: 'm-review' } } }, judgeRole: { persona: 'Read only' },
   workflow: { startNode: 'plan', returns: ['done'], nodes: {
     plan: {
       execution: { type: 'actor-task', role: 'manager', instruction: 'Plan' },
@@ -417,7 +417,7 @@ const modelConfig: WorkflowConfig = {
   } },
   childWorkflows: { sub: { startNode: 's1', returns: ['out'], nodes: {
     s1: {
-      execution: { type: 'actor-task', role: 'manager', instruction: 'Sub work' },
+      execution: { type: 'actor-task', role: 'worker', instruction: 'Sub work' },
       checker: { checkerId: 'judge.claim-correct', config: { criteria: 'Correct sub work' } },
       results: { succeeded: { criteria: 'The sub work is complete.', target: { return: 'out' } } },
     },
@@ -430,6 +430,8 @@ test('#270 AC-10 默认模型继承正例：冻结 managerRoute 投影到根/子
     // 启动前注入非空默认路由（#223 语义：由宿主装配决定，engine seam 可覆盖）。
     h.engine.managerRoute = async () => ({ provider: 'mgr', model: 'm-manager' })
     assert.equal((await h.engine.startRun('ws', h.engine.buildInitialRun('manager', 'test', modelConfig, 'hash'), undefined, '受控启动请求')).ok, true)
+    // 先确认落库的冻结路由（唯一基准），而不是只比对同一被测函数事后算出的第二份值。
+    assert.deepEqual((await h.store.get('ws'))!.run.delegationRoute, { provider: 'mgr', modelId: 'm-manager' })
     // 启动后改默认路由：投影必须读启动时冻结的值。
     h.engine.managerRoute = async () => ({ provider: 'mut', model: 'm-mutated' })
     const result = await handlerOf(h)('status', { cwd: 'ws' })
@@ -446,7 +448,7 @@ test('#270 AC-10 默认模型继承正例：冻结 managerRoute 投影到根/子
     assert.equal(callChild.kind, 'child-workflow')
     assert.equal(callChild.childWorkflowId, 'sub')
     assert.equal(callChild.model, undefined)
-    // 子流程：s1 同为 manager，继承同一冻结默认。
+    // 子流程：普通角色 worker（未显式设 model）继承同一冻结默认。
     assert.deepEqual(payload.run!.flows.sub.nodes.find(node => node.id === 's1')!.model, { provider: 'mgr', modelId: 'm-manager' })
     // 角色清单：reviewer 显式路由不被默认覆盖（manager 不在角色清单，其继承路由由节点投影覆盖）。
     const roles = Object.fromEntries(payload.run!.roles.map(role => [role.role, role.model.modelId]))
@@ -456,10 +458,12 @@ test('#270 AC-10 默认模型继承正例：冻结 managerRoute 投影到根/子
     const view = monitorViewModel(payload)
     const mainFlow = view.run!.graph.flows.find(flow => flow.id === 'test')!
     assert.equal(mainFlow.decorations.plan.summary, 'mgr/m-manager')
+    assert.equal(typeof mainFlow.decorations.plan.badge, 'string', '已执行节点保留执行叠加态')
     assert.equal(mainFlow.decorations.review.summary, 'prov/m-review')
-    assert.equal(mainFlow.decorations['call-child'], undefined, '无工作单节点无叠加态（不虚构 badge/summary）')
+    assert.equal(mainFlow.decorations['call-child'], undefined, '非 Actor 节点无叠加态')
     const subFlow = view.run!.graph.flows.find(flow => flow.id === 'sub')!
-    assert.equal(subFlow.decorations.s1.summary, 'mgr/m-manager')
+    // s1 是「无工作单的 Actor」：只显示生效模型，不因显示模型而伪造执行 badge。
+    assert.deepEqual(subFlow.decorations.s1, { summary: 'mgr/m-manager' })
   } finally { h.cleanup() }
 })
 

@@ -751,10 +751,12 @@ test('#270 AC-02 同 cwd 迟到的旧 Run 错误信封不产生横幅、不改�
     assert.match(ui.text(), new RegExp(`Run：${bRunId}`), 'B 的数据与状态不受影响')
     assert.match(ui.text(), /运行中/)
 
-    // 下一轮仍按 B 正常读取（周期没有被旧错误打断或叠加）。
+    // 同 AC-01 的 1999ms/1ms 边界：迟到的旧错误不额外排程；B 的周期仍是唯一一笔。
     const before = w.bridge.calls.length
-    await w.tick(2000)
-    assert.equal(w.bridge.calls.length, before + 1)
+    await w.tick(1999)
+    assert.equal(w.bridge.calls.length, before, '1999ms 内无新增请求')
+    await w.tick(1)
+    assert.equal(w.bridge.calls.length, before + 1, '满 2000ms 恰好一笔 B 请求')
     assert.equal(w.bridge.calls.at(-1)!.payload.runId, bRunId)
   } finally { w.cleanup() }
 })
