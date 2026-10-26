@@ -57,6 +57,16 @@ nodeToken 是控制面过期检查，不是授权凭证。**旧 Turn 即使查�
 
 phase 为 `ready|working|checking|settling|exited`：表示已登记业务事实，不表示宿主瞬时状态。working 不证明消息已送达；checking 不证明 Judge 已启动。BLOCK 保留阶段与材料。exited 材料不可变，只允许为待派发后继补记前驱 Judge 安全收口元数据。
 
+## 监控中的当前执行 / 执行记录
+
+**当前执行（Current Execution）**：Run 当前推进到的节点执行；查看其他节点或历史记录不改变当前执行。Run 已完成或终止时，不再表示存在活跃执行。
+
+**所选执行详情（Selected Execution Details）**：用户正在查看的某次节点执行的信息，可能属于历史，与当前执行分开。
+
+**执行记录（Execution Record）**：某个 Run 中一次进入节点的过程记录，不等于已完成或成功。重新沿边进入同一节点产生另一条记录；同一次进入内的返工、补充、恢复和重试属于这条记录的内部过程。等待子流程返回的父节点也有执行记录。
+
+**提交结果时间 / 提交判定时间**：分别指 Actor 结果提交、Judge 判定提交被记录的时间；两者均不等于实际执行结束、安全收口或节点退出时间。多轮执行时，时间与模型必须归属于同一次对应派发，不能跨轮拼接。
+
 ## Node Execution Events
 
 `node_execution_events` 只追加关键快照：进入、Actor/Judge/Program/Child安排、claim、judgment、Program结果/人工裁决、Child返回、模型变更、离开、BLOCK。事件在同 execution 内使用稳定递增 sequence；时间仅供显示。
