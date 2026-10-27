@@ -13,68 +13,91 @@ import { EDITOR_STYLES } from './styles.js'
 const POLL_INTERVAL_MS = 2000
 
 export const MONITOR_STYLES = `
-.wf-monitor { font-size: 13px; color: var(--dsh-text, #ddd); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
-.wf-monitor-banner { background: #5c2b2b; color: #ffd9d9; padding: 6px 8px; border-radius: 6px; }
+/* #282 主题契约：正文/次要文字/边框取宿主 --dsw-alias-* 语义色（浅色由 body、深色由 body[data-ds-dark-theme] 定义），
+   兜底写 currentColor；状态色由宿主状态语义色与正文色混合，浅深两套都保持 >=4.5:1，不再依赖宿主未定义的
+   --dsh-text/#ddd 浅灰兜底，也不只按操作系统偏好换色。 */
+.wf-monitor { font-size: 13px; color: var(--dsw-alias-label-primary, currentColor); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.wf-monitor-banner { background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #ec1313) 16%, transparent); border: 1px solid color-mix(in srgb, var(--dsw-alias-state-error-primary, #ec1313) 55%, transparent); color: var(--dsw-alias-label-primary, currentColor); padding: 6px 8px; border-radius: 6px; }
 .wf-monitor-status { font-weight: 600; }
-.wf-monitor-status.run-blocked { color: #ffb4b4; }
-.wf-monitor-status.run-ok { color: #9fdca4; }
-.wf-monitor-muted { opacity: 0.7; }
+.wf-monitor-status.run-blocked { color: color-mix(in srgb, var(--dsw-alias-state-error-primary, #ec1313) 60%, var(--dsw-alias-label-primary, currentColor)); }
+.wf-monitor-status.run-ok { color: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 45%, var(--dsw-alias-label-primary, currentColor)); }
+.wf-monitor-muted { color: var(--dsw-alias-label-secondary, currentColor); }
+/* #282 顶部两行摘要：状态+业务返回 / 工作流+耗时；「自动刷新已停止」只占状态旁的简短提示。 */
+.wf-monitor-summary { display: flex; flex-direction: column; gap: 2px; }
+.wf-monitor-summary-row { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.wf-monitor-return-value { color: var(--dsw-alias-label-secondary, currentColor); }
+.wf-monitor-terminal-note { margin-left: auto; color: var(--dsw-alias-label-secondary, currentColor); font-size: 12px; }
+/* #282 运行详情默认收起：原生 details/summary 保留键盘与 aria-expanded 语义。 */
+.wf-monitor-details { display: flex; flex-direction: column; gap: 2px; }
+.wf-monitor-details > summary { cursor: pointer; font-weight: 600; color: var(--dsw-alias-label-primary, currentColor); }
+.wf-monitor-details > summary:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, currentColor); outline-offset: 2px; }
+.wf-monitor-details-body { display: flex; flex-direction: column; gap: 2px; padding-top: 2px; color: var(--dsw-alias-label-secondary, currentColor); font-size: 12px; overflow-wrap: anywhere; }
 .wf-monitor-prompt { white-space: pre-wrap; background: rgba(128,128,128,0.12); border-radius: 6px; padding: 6px 8px; }
 .wf-monitor-nodes { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .wf-monitor-node { display: flex; gap: 6px; align-items: baseline; padding: 3px 6px; border-radius: 4px; }
-.wf-monitor-node.wf-node-current { background: rgba(120,160,255,0.18); }
-.wf-node-phase.phase-working { color: #ffd479; }
-.wf-node-phase.phase-checking { color: #9fc8ff; }
-.wf-node-phase.phase-settling { color: #c9a6ff; }
-.wf-node-phase.phase-exited { color: #9fdca4; }
-.wf-node-phase.phase-ready { opacity: 0.7; }
-.wf-node-block { color: #ffb4b4; }
+.wf-monitor-node.wf-node-current { background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 18%, transparent); }
+.wf-node-phase.phase-working { color: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #f59e0b) 45%, var(--dsw-alias-label-primary, currentColor)); }
+.wf-node-phase.phase-checking { color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 55%, var(--dsw-alias-label-primary, currentColor)); }
+.wf-node-phase.phase-settling { color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 55%, var(--dsw-alias-label-primary, currentColor)); }
+.wf-node-phase.phase-exited { color: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 45%, var(--dsw-alias-label-primary, currentColor)); }
+.wf-node-phase.phase-ready { color: var(--dsw-alias-label-secondary, currentColor); }
+.wf-node-block { color: color-mix(in srgb, var(--dsw-alias-state-error-primary, #ec1313) 60%, var(--dsw-alias-label-primary, currentColor)); font-weight: 600; }
 /* #252 运行图：复用配置编辑器画布样式，只读展示；侧栏里给固定高度并允许缩放/平移。 */
 .wf-monitor-graph { display: flex; flex-direction: column; gap: 4px; }
-.wf-monitor-graph .wf-editor.wf-monitor-canvas { height: auto; padding: 0; gap: 0; background: transparent; overflow: hidden; }
-.wf-monitor-graph .wf-canvas { height: 420px; min-height: 320px; }
+/* #282 图默认高度适中：0,4,0 特异度压过共享编辑器 @container 的 460px 覆盖（窄侧栏下曾长期挤占首屏）。 */
+.wf-monitor-graph .wf-editor.wf-monitor-canvas {
+  --wf-bg: transparent;
+  --wf-surface: var(--dsw-alias-bg-layer-2, #ffffff);
+  --wf-soft: var(--dsw-alias-bg-layer-3, #eef3f7);
+  --wf-text: var(--dsw-alias-label-primary, #243449);
+  --wf-muted: var(--dsw-alias-label-secondary, #65768b);
+  --wf-border: var(--dsw-alias-border-l3, #dbe3ec);
+  height: auto; padding: 0; gap: 0; background: transparent; overflow: hidden;
+}
+.wf-monitor-graph .wf-editor.wf-monitor-canvas .wf-canvas { height: 260px; min-height: 220px; }
 .wf-monitor-graph .wf-canvas-help { margin-top: 4px; }
 .wf-monitor-flowtabs { display: flex; gap: 4px; flex-wrap: wrap; }
 .wf-monitor-flowtabs button { padding: 3px 8px; font-size: 12px; }
 /* #276 只读查看工具：临时调整只在本页生效，恢复布局只重置当前流程。 */
 .wf-monitor-viewtools { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; font-size: 12px; }
 .wf-monitor-viewtools button { padding: 3px 8px; font-size: 12px; }
-.wf-monitor-flowtabs button[aria-selected="true"] { border-color: #3b82f6; color: #1d4ed8; background: #e8efff; }
+/* #282 选中态取宿主 business 语义色（文字 55% 混正文色，两种主题都 >=4.5:1）。 */
+.wf-monitor-flowtabs button[aria-selected="true"] { border-color: var(--dsw-alias-state-business-primary, currentColor); color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 55%, var(--dsw-alias-label-primary, currentColor)); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 14%, transparent); }
 /* #253 子流程下钻：面包屑导航 + 暂停跟随后的「回到当前节点」入口。 */
 .wf-monitor-breadcrumb { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; font-size: 12px; }
 .wf-monitor-breadcrumb button { padding: 2px 6px; font-size: 12px; border: 1px solid transparent; background: transparent; color: inherit; }
-.wf-monitor-breadcrumb button.is-current { border-color: #3b82f6; color: #1d4ed8; background: #e8efff; }
+.wf-monitor-breadcrumb button.is-current { border-color: var(--dsw-alias-state-business-primary, currentColor); color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 55%, var(--dsw-alias-label-primary, currentColor)); background: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 14%, transparent); }
 .wf-monitor-sep { opacity: 0.6; }
-.wf-monitor-return { align-self: flex-start; padding: 3px 8px; font-size: 12px; border-color: #3b82f6; color: #1d4ed8; }
+.wf-monitor-return { align-self: flex-start; padding: 3px 8px; font-size: 12px; border-color: var(--dsw-alias-state-business-primary, currentColor); color: color-mix(in srgb, var(--dsw-alias-state-business-primary, #4176e6) 55%, var(--dsw-alias-label-primary, currentColor)); }
 /* #254 多 Run 切换器 / 空态 / 终态提示。 */
 .wf-monitor-switcher { display: flex; align-items: center; gap: 6px; font-size: 12px; }
 .wf-monitor-switcher select { max-width: 100%; padding: 2px 4px; font-size: 12px; }
 .wf-monitor-guidance { background: rgba(128,128,128,0.12); border-radius: 6px; padding: 8px; white-space: pre-wrap; }
-.wf-monitor-terminal-note { color: #9fc8ff; font-size: 12px; }
 .wf-monitor-maintenance { white-space: pre-wrap; }
-/* #261 只读刷新入口：终态停周期后由用户决定何时重新读取。 */
-.wf-monitor-toolbar { display: flex; justify-content: flex-end; }
+/* #261 只读刷新入口：终态停周期后由用户决定何时重新读取；#282 与 Run 选择同排，少占一行。 */
+.wf-monitor-toolbar { display: flex; gap: 6px; align-items: center; justify-content: flex-end; }
 .wf-monitor-refresh { padding: 2px 8px; font-size: 12px; }
 /* #274 当前执行卡：图下独立区块，一眼看清谁在干活、用什么模型、来源阶段。 */
-.wf-monitor-current { display: flex; flex-direction: column; gap: 4px; background: rgba(128,128,128,0.12); border-left: 3px solid #3b82f6; border-radius: 6px; padding: 8px; }
-.wf-monitor-current.is-terminal { border-left-color: #8a8a8a; }
+.wf-monitor-current { display: flex; flex-direction: column; gap: 4px; background: color-mix(in srgb, var(--dsw-alias-label-primary, currentColor) 6%, transparent); border-left: 3px solid var(--dsw-alias-state-business-primary, #4176e6); border-radius: 6px; padding: 8px; }
+.wf-monitor-current.is-terminal { border-left-color: var(--dsw-alias-label-secondary, currentColor); }
 .wf-monitor-card-head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .wf-monitor-card-title { font-size: 14px; }
 .wf-monitor-card-row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
-.wf-monitor-card-role { min-width: 96px; opacity: 0.85; }
+.wf-monitor-card-role { min-width: 96px; color: var(--dsw-alias-label-secondary, currentColor); }
 .wf-monitor-card-state { font-weight: 600; }
-.wf-monitor-card-terminal { color: #9fc8ff; font-weight: 600; }
-/* #275 执行记录表：固定列序，表头吸顶、节点/流程两列吸附左侧，横向滚动不丢失行身份。 */
+.wf-monitor-card-terminal { color: var(--dsw-alias-label-primary, currentColor); font-weight: 600; }
+/* #275 执行记录表：固定列序，表头吸顶、节点/流程两列吸附左侧，横向滚动不丢失行身份。
+   #282 去掉独立纵向限高：整栏只有一条主滚动条，记录不再被困在 360px 内层滚动区里。 */
 .wf-monitor-records { display: flex; flex-direction: column; gap: 4px; }
 .wf-monitor-records-title { font-weight: 600; font-size: 13px; }
-.wf-monitor-records-scroll { overflow: auto; max-height: 360px; border: 1px solid rgba(128,128,128,0.3); border-radius: 6px; }
+.wf-monitor-records-scroll { overflow-x: auto; overflow-y: hidden; border: 1px solid var(--dsw-alias-border-l2, rgba(128,128,128,0.3)); border-radius: 6px; background: var(--dsw-alias-bg-layer-2, Canvas); }
 .wf-record-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12px; }
-.wf-record-table th, .wf-record-table td { padding: 4px 6px; text-align: left; white-space: nowrap; border-bottom: 1px solid rgba(128,128,128,0.2); }
-.wf-record-table thead th { position: sticky; top: 0; z-index: 3; background: Canvas; border-bottom: 1px solid rgba(128,128,128,0.45); }
-.wf-record-table .wf-record-sticky-1 { position: sticky; left: 0; z-index: 2; background: Canvas; width: 168px; min-width: 168px; max-width: 168px; overflow: hidden; text-overflow: ellipsis; }
-.wf-record-table .wf-record-sticky-2 { position: sticky; left: 168px; z-index: 2; background: Canvas; min-width: 96px; box-shadow: 1px 0 0 rgba(128,128,128,0.35); }
+.wf-record-table th, .wf-record-table td { padding: 4px 6px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--dsw-alias-border-l1, rgba(128,128,128,0.2)); }
+.wf-record-table thead th { position: sticky; top: 0; z-index: 3; background: var(--dsw-alias-bg-layer-2, Canvas); border-bottom: 1px solid var(--dsw-alias-border-l3, rgba(128,128,128,0.45)); }
+.wf-record-table .wf-record-sticky-1 { position: sticky; left: 0; z-index: 2; background: var(--dsw-alias-bg-layer-2, Canvas); width: 168px; min-width: 168px; max-width: 168px; overflow: hidden; text-overflow: ellipsis; }
+.wf-record-table .wf-record-sticky-2 { position: sticky; left: 168px; z-index: 2; background: var(--dsw-alias-bg-layer-2, Canvas); min-width: 96px; box-shadow: 1px 0 0 var(--dsw-alias-border-l3, rgba(128,128,128,0.35)); }
 .wf-record-table thead .wf-record-sticky-1, .wf-record-table thead .wf-record-sticky-2 { z-index: 4; }
-.wf-record-table tbody .wf-record-sticky-1, .wf-record-table tbody .wf-record-sticky-2 { background: Canvas; }
+.wf-record-table tbody .wf-record-sticky-1, .wf-record-table tbody .wf-record-sticky-2 { background: var(--dsw-alias-bg-layer-2, Canvas); }
 .wf-record-row.is-blocked td { background: rgba(200,80,80,0.12); }
 .wf-record-row.is-current td { background: rgba(120,160,255,0.14); }
 .wf-record-toggle { padding: 0 4px; font-size: 11px; border: 1px solid rgba(128,128,128,0.5); background: transparent; color: inherit; margin-right: 4px; }
@@ -313,16 +336,14 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
   // better-sidebar 的 descriptor 不支持 styles 字段，样式随组件内联注入。
   const styleEl = h('style', null, MONITOR_STYLES)
   // 只读「刷新状态」：每个模式都可用；终态停周期后这是发现同目录新 Run 的唯一入口（#261）。
-  const refreshEl = h('div', { className: 'wf-monitor-toolbar' },
-    h('button', {
-      type: 'button',
-      className: 'wf-monitor-refresh',
-      disabled: refreshing,
-      'aria-busy': refreshing ? 'true' : 'false',
-      title: '只读刷新：重新读取当前目录的运行状态，不启动也不停止 Run',
-      onClick: () => refresh(),
-    }, refreshing ? '正在刷新…' : '刷新状态'))
-  const frame = (...children) => h('div', { className: 'wf-monitor' }, styleEl, bannerEl, refreshEl, ...children)
+  const refreshEl = h('button', {
+    type: 'button',
+    className: 'wf-monitor-refresh',
+    disabled: refreshing,
+    'aria-busy': refreshing ? 'true' : 'false',
+    title: '只读刷新：重新读取当前目录的运行状态，不启动也不停止 Run',
+    onClick: () => refresh(),
+  }, refreshing ? '正在刷新…' : '刷新状态')
   // #254 切换器：默认「当前目录」，另列全部活跃 Run（跨 workspace）；选中项变化即重置轮询/跟随。
   const switcher = view.runs.length === 0 ? null : h('label', { className: 'wf-monitor-switcher' },
     '运行：',
@@ -333,6 +354,9 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
     },
     h('option', { value: '' }, '当前目录（默认）'),
     ...view.runs.map(ref => h('option', { key: ref.runId, value: ref.runId }, `${ref.label} · ${ref.statusLabel}`))))
+  // #282 切换器与刷新同排：标题区以下只留两行摘要，省掉一整行的垂直阅读成本。
+  const toolbarEl = h('div', { className: 'wf-monitor-toolbar' }, switcher, refreshEl)
+  const frame = (...children) => h('div', { className: 'wf-monitor' }, styleEl, bannerEl, toolbarEl, ...children)
   if (view.mode === 'loading') {
     return frame(h('div', { className: 'wf-monitor-muted' }, '正在加载运行状态…'))
   }
@@ -340,10 +364,8 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
     return frame(h('div', { className: 'wf-monitor-banner wf-monitor-maintenance' }, `状态库维护模式：\n${view.reason}`))
   }
   if (view.mode === 'empty') {
-    return frame(
-      switcher,
-      h('div', { className: 'wf-monitor-guidance' }, view.guidance ?? '当前目录没有工作流运行记录。'),
-    )
+    // 切换器已随 frame 序言的 toolbarEl 渲染；此处不得再放一份（否则跨目录活跃 Run 时空态出现两个切换器）。
+    return frame(h('div', { className: 'wf-monitor-guidance' }, view.guidance ?? '当前目录没有工作流运行记录。'))
   }
   const run = view.run
   const graph = run.graph ?? null
@@ -356,20 +378,31 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
   return h('div', { className: 'wf-monitor' },
     styleEl,
     bannerEl,
-    refreshEl,
-    switcher,
-    h('div', null,
-      h('span', { className: `wf-monitor-status ${run.statusClass}` }, run.statusLabel),
-      run.blockReason ? h('span', { className: 'wf-node-block' }, ` — ${run.blockReason}`) : null,
-      run.businessReturn ? h('span', { className: 'wf-monitor-muted' }, ` · 返回：${run.businessReturn}`) : null,
+    toolbarEl,
+    // #282 顶部两行摘要：状态+业务返回值 / 工作流名称+总耗时；终态只留状态旁的简短提示。
+    h('div', { className: 'wf-monitor-summary' },
+      h('div', { className: 'wf-monitor-summary-row' },
+        h('span', { className: `wf-monitor-status ${run.statusClass}` }, run.statusLabel),
+        run.blockReason ? h('span', { className: 'wf-node-block' }, ` — ${run.blockReason}`) : null,
+        run.businessReturn ? h('span', { className: 'wf-monitor-return-value' }, ` · 返回：${run.businessReturn}`) : null,
+        // 终态提示在视图模型顶层（view.terminalNote），历史上误读 run.terminalNote 导致从不渲染（#261 修正）。
+        view.terminalNote ? h('span', { className: 'wf-monitor-terminal-note' }, view.terminalNote) : null,
+      ),
+      h('div', { className: 'wf-monitor-summary-row wf-monitor-muted' },
+        h('span', null, run.workflowId),
+        h('span', { 'aria-hidden': 'true' }, '·'),
+        h('span', null, `${run.durationLabel} ${run.durationText ?? '—'}`),
+      ),
     ),
-    // 终态提示在视图模型顶层（view.terminalNote），历史上误读 run.terminalNote 导致从不渲染（#261 修正）。
-    view.terminalNote ? h('div', { className: 'wf-monitor-muted' }, view.terminalNote) : null,
-    h('div', { className: 'wf-monitor-muted' },
-      h('div', null, `工作流：${run.workflowId} · Run：${run.runId}`),
-      h('div', null, `开始：${run.startedAtText ?? '—'} · ${run.durationLabel}：${run.durationText ?? '—'}`),
+    // #282 「运行详情」默认收起（原生 details，保留键盘与 aria-expanded）；角色配置可能含 override，非实际派发。
+    h('details', { className: 'wf-monitor-details' },
+      h('summary', null, '运行详情'),
+      h('div', { className: 'wf-monitor-details-body' },
+        h('div', null, `Run：${run.runId}`),
+        h('div', null, `开始：${run.startedAtText ?? '—'}`),
+        run.roles !== '' ? h('div', null, `运行角色配置（非实际派发）：${run.roles}`) : null,
+      ),
     ),
-    run.roles !== '' ? h('div', { className: 'wf-monitor-muted' }, `角色模型：${run.roles}`) : null,
     graph !== null && flow !== null ? h('div', { className: 'wf-monitor-graph' },
       h('style', null, EDITOR_STYLES),
       callPath.frames.length > 1 ? h('div', { className: 'wf-monitor-breadcrumb', role: 'navigation', 'aria-label': '流程路径' },

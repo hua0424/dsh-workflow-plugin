@@ -521,7 +521,8 @@ export function monitorViewModel(payload, options = {}) {
     ...base,
     mode: terminal ? 'terminal' : 'run',
     polling: !terminal,
-    terminalNote: terminal ? '该 Run 已结束，已停止自动轮询；点击「刷新状态」可查看最新状态。' : null,
+    // #282 终态只用状态旁的简短提示（标题、Run 选择与刷新入口仍在），不再单独占一行说明文字。
+    terminalNote: terminal ? '自动刷新已停止' : null,
     run: {
       workflowId: run.workflowId ?? '—',
       runId: run.runId ?? '—',

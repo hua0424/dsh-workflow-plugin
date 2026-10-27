@@ -451,13 +451,48 @@ test('#261 维护态：继续按周期探测，状态库恢复后自愈（不重
   } finally { w.cleanup() }
 })
 
+test('#282 顶部两行摘要 + 运行详情默认收起：信息不减，纵向占用减少', async () => {
+  const w = createWorld()
+  try {
+    const runId = await w.completeRun('ws-a')
+    const ui = w.mount({ cwd: 'ws-a' })
+    await settle()
+    const text = ui.text()
+    assert.match(text, /已完成/)
+    assert.match(text, /返回：/, '业务返回值仍在摘要首行')
+    assert.match(text, /自动刷新已停止/, '终态提示保留')
+    assert.match(text, /总耗时/, '总耗时可读')
+    // 摘要固定两行：首行状态/业务返回/终态提示，次行工作流名 + 耗时。
+    const summary = ui.find((element: any) => element.props.className === 'wf-monitor-summary')
+    assert.ok(summary !== null, '存在两行摘要容器')
+    const rows = collect(summary, (element: any) => element.props.className?.startsWith?.('wf-monitor-summary-row'))
+    assert.equal(rows.length, 2, '摘要只占两行')
+    assert.match(textOf(rows[0]), /已完成/)
+    assert.match(textOf(rows[0]), /自动刷新已停止/, '终态提示与状态同排，不再独占一段')
+    assert.match(textOf(rows[1]), /总耗时/)
+    // 运行详情：原生 details 默认收起，完整 Run ID / 开始时间 / 角色配置（非实际派发）都在里面。
+    const details = ui.find((element: any) => element.type === 'details')
+    assert.ok(details !== null, '运行详情使用原生 details')
+    assert.notEqual(details!.props.open, true, '默认收起')
+    const detailText = textOf(details)
+    assert.match(detailText, /运行详情/)
+    assert.match(detailText, new RegExp(`Run：${runId}`))
+    assert.match(detailText, /开始：/)
+    assert.match(detailText, /运行角色配置（非实际派发）：/)
+    // 刷新入口仍在标题区工具栏里（终态才发现新 Run 的唯一入口），与 Run 选择同排。
+    const toolbar = ui.find((element: any) => element.props.className === 'wf-monitor-toolbar')
+    assert.ok(toolbar !== null, '工具栏存在')
+    assert.equal(collect(toolbar, (element: any) => element.props.className === 'wf-monitor-refresh').length, 1)
+  } finally { w.cleanup() }
+})
+
 test('#261 目录切换：旧目录的终态不再挡住新目录的 Run（同根问题）', async () => {
   const w = createWorld()
   try {
     await w.completeRun('ws-a')
     const ui = w.mount({ cwd: 'ws-a' })
     await settle()
-    assert.match(ui.text(), /已停止自动轮询/)
+    assert.match(ui.text(), /自动刷新已停止/)
     const terminalCalls = w.bridge.calls.length
     await w.tick(6000)
     assert.equal(w.bridge.calls.length, terminalCalls, '终态停周期')
@@ -466,7 +501,7 @@ test('#261 目录切换：旧目录的终态不再挡住新目录的 Run（同�
     ui.setProps({ scope: { cwd: 'ws-b' } })
     // 切换当次渲染就读不到旧目录数据（不等 effect 事后擦除）。
     assert.match(ui.text(), /正在加载运行状态/)
-    assert.doesNotMatch(ui.text(), /已停止自动轮询/)
+    assert.doesNotMatch(ui.text(), /自动刷新已停止/)
     assert.ok(ui.refreshButton() !== null, '加载态也提供只读刷新入口')
     await settle()
     assert.match(ui.text(), new RegExp(bRunId))
@@ -497,7 +532,7 @@ test('#261 旧目录迟到的终态响应：不得覆盖新目录数据，也不
     assert.equal(w.bridge.release(payload => payload.cwd === 'ws-a'), 1)
     await settle()
     assert.match(ui.text(), new RegExp(bRunId), '不被旧目录响应覆盖')
-    assert.doesNotMatch(ui.text(), /已停止自动轮询/, '旧终态响应不得停掉新目录刷新')
+    assert.doesNotMatch(ui.text(), /自动刷新已停止/, '旧终态响应不得停掉新目录刷新')
 
     const before = w.bridge.calls.length
     await w.tick(2000)
@@ -550,7 +585,7 @@ test('#261 终态手动刷新：只读、在途合并、能发现同目录新 Ru
     await w.completeRun('ws-a')
     const ui = w.mount({ cwd: 'ws-a' })
     await settle()
-    assert.match(ui.text(), /已停止自动轮询/)
+    assert.match(ui.text(), /自动刷新已停止/)
     assert.match(ui.text(), /刷新状态/)
     const terminalCalls = w.bridge.calls.length
 
@@ -651,6 +686,25 @@ test('#261 空态：继续轮询发现新 Run；失败横幅保留同上下文�
   } finally { w.cleanup() }
 })
 
+// #282 F-01：切换器并入工具栏序言后，empty 分支不能再渲染一份副本。
+// #270 AC-11 现场（当前 cwd 无 Run + 跨目录活跃 Run）才同时命中「工具栏有切换器」与「空态分支」。
+test('#282 空态 + 跨目录活跃 Run：切换器恰好一个（不因空态分支重复渲染）', async () => {
+  const w = createWorld()
+  try {
+    const otherRunId = await w.startRun('ws-other', '别处')
+    const ui = w.mount({ cwd: 'ws-empty' })
+    await settle()
+    assert.match(ui.text(), /dsh-flow start/, '空态引导仍在')
+    assert.equal(ui.select()!.props.children.some((option: any) => option.props.value === otherRunId), true,
+      '跨目录活跃 Run 仍可选择')
+    assert.match(ui.text(), /ws-other · test/, '空态也列出跨目录活跃 Run')
+    const switchers = collect(ui.tree, (element: any) => element.props?.className === 'wf-monitor-switcher')
+    assert.equal(switchers.length, 1, '切换器只渲染一次')
+    assert.equal(collect(ui.tree, (element: any) => element.type === 'select').length, 1, '下拉框只渲染一次')
+    assert.equal((ui.text().match(/运行：/g) ?? []).length, 1, '面板文案不出现两份「运行：」')
+  } finally { w.cleanup() }
+})
+
 // ---------------------------------------------------------------------------
 // #270 回归契约：同一 cwd 内的旧响应/旧终态/旧选择隔离，流程跟随的重置边界
 // ---------------------------------------------------------------------------
@@ -717,7 +771,7 @@ test('#270 AC-01 同 cwd 迟到的旧 Run 响应不覆盖新 Run，且刷新周�
     assert.equal(w.bridge.release(payload => payload.runId === aRunId), 1)
     await settle()
     assert.match(ui.text(), new RegExp(`Run：${bRunId}`), 'A 响应不覆盖 B')
-    assert.doesNotMatch(ui.text(), /已停止自动轮询/, 'A 的终态不改变 B 的刷新状态')
+    assert.doesNotMatch(ui.text(), /自动刷新已停止/, 'A 的终态不改变 B 的刷新状态')
 
     // 周期以 B 成功为起点：1999ms 无请求，再 1ms 恰好一笔，下一轮仍只一笔。
     const afterB = w.bridge.calls.length
@@ -801,7 +855,7 @@ test('#270 AC-04 显式旧终态保持：刷新仍读 A、显示 A，B 只作为
     assert.doesNotMatch(ui.text(), new RegExp(`Run：${bRunId}`))
     // B 确实在选项里（不靠断言「整棵文本不含 B」）。
     assert.deepEqual(optionValues(ui), ['', bRunId, aRunId])
-    assert.match(ui.text(), /已停止自动轮询/, '仍是终态上下文')
+    assert.match(ui.text(), /自动刷新已停止/, '仍是终态上下文')
 
     const before = w.bridge.calls.length
     await w.tick(6000)
