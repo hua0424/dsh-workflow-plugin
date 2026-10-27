@@ -195,9 +195,8 @@ test('#254 monitorViewModel：终态 Run 停止轮询并展示终态图', () => 
   const done = monitorViewModel({ ...RUN_PAYLOAD, runs: [], run: { ...RUN_PAYLOAD.run, status: 'completed' } })
   assert.equal(done.mode, 'terminal')
   assert.equal(done.polling, false)
-  // #261：终态文案明确「停止自动轮询 + 可手动刷新」，与只读刷新入口一致。
-  assert.match(done.terminalNote, /停止自动轮询/)
-  assert.match(done.terminalNote, /刷新状态/)
+  // #282：终态提示缩短为状态旁的一句话，刷新入口仍在标题区（不再独占一段长说明）。
+  assert.equal(done.terminalNote, '自动刷新已停止')
   assert.equal(done.run.graph.flows.length, 2)
   // #254：终态 Run 不在活跃清单，作为当前 Run 补进切换器选项（#263：不再有 recent 字段）。
   assert.deepEqual(done.runs.map(ref => [ref.runId, ref.statusLabel]), [['r1', '已完成']])
@@ -331,9 +330,9 @@ test('#251 client bundle：动态注入注册 better-sidebar tab（不写静态 
   assert.match(bundle, /selectFlow/)
   assert.match(bundle, /回到当前节点/)
   assert.match(bundle, /wf-node-redo/)
-  // #254 切换器/空态：Run 切换选项、终态停轮询文案、空态引导打进 bundle。
+  // #254 切换器/空态：Run 切换选项、终态停轮询文案、空态引导打进 bundle（#282 终态文案缩短为状态旁提示）。
   assert.match(bundle, /当前目录（默认）/)
-  assert.match(bundle, /该 Run 已结束/)
+  assert.match(bundle, /自动刷新已停止/)
   assert.match(bundle, /dsh-flow start/)
   assert.match(bundle, /fetchStatus = \(scope, runId\)/)
   // #261 刷新恢复与目录隔离：统一停轮询判定、只读刷新入口、可见性监听、上下文键隔离打进 bundle。
