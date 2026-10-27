@@ -364,10 +364,8 @@ export function WorkflowMonitorTab({ fetchStatus, visible = true, scope }) {
     return frame(h('div', { className: 'wf-monitor-banner wf-monitor-maintenance' }, `状态库维护模式：\n${view.reason}`))
   }
   if (view.mode === 'empty') {
-    return frame(
-      switcher,
-      h('div', { className: 'wf-monitor-guidance' }, view.guidance ?? '当前目录没有工作流运行记录。'),
-    )
+    // 切换器已随 frame 序言的 toolbarEl 渲染；此处不得再放一份（否则跨目录活跃 Run 时空态出现两个切换器）。
+    return frame(h('div', { className: 'wf-monitor-guidance' }, view.guidance ?? '当前目录没有工作流运行记录。'))
   }
   const run = view.run
   const graph = run.graph ?? null

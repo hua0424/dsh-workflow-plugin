@@ -686,6 +686,25 @@ test('#261 空态：继续轮询发现新 Run；失败横幅保留同上下文�
   } finally { w.cleanup() }
 })
 
+// #282 F-01：切换器并入工具栏序言后，empty 分支不能再渲染一份副本。
+// #270 AC-11 现场（当前 cwd 无 Run + 跨目录活跃 Run）才同时命中「工具栏有切换器」与「空态分支」。
+test('#282 空态 + 跨目录活跃 Run：切换器恰好一个（不因空态分支重复渲染）', async () => {
+  const w = createWorld()
+  try {
+    const otherRunId = await w.startRun('ws-other', '别处')
+    const ui = w.mount({ cwd: 'ws-empty' })
+    await settle()
+    assert.match(ui.text(), /dsh-flow start/, '空态引导仍在')
+    assert.equal(ui.select()!.props.children.some((option: any) => option.props.value === otherRunId), true,
+      '跨目录活跃 Run 仍可选择')
+    assert.match(ui.text(), /ws-other · test/, '空态也列出跨目录活跃 Run')
+    const switchers = collect(ui.tree, (element: any) => element.props?.className === 'wf-monitor-switcher')
+    assert.equal(switchers.length, 1, '切换器只渲染一次')
+    assert.equal(collect(ui.tree, (element: any) => element.type === 'select').length, 1, '下拉框只渲染一次')
+    assert.equal((ui.text().match(/运行：/g) ?? []).length, 1, '面板文案不出现两份「运行：」')
+  } finally { w.cleanup() }
+})
+
 // ---------------------------------------------------------------------------
 // #270 回归契约：同一 cwd 内的旧响应/旧终态/旧选择隔离，流程跟随的重置边界
 // ---------------------------------------------------------------------------
